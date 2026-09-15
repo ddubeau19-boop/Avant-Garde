@@ -1,31 +1,135 @@
 // Condo Stratégis — Inspection terrain (mobile field app)
-// Vanilla JS SPA, no build step. Wires the "Inspection Terrain" mockup screens
-// to the real /api/* backend described in api-contract.md.
+// Vanilla JS SPA, no build step. Wires les écrans de visite au backend /api/*.
+//
+// Modèle d'inspection maison (feuille « Relevé ») :
+//   cote 1-4 + na, marqueur R,
+//   observation → cause possible → délai suggéré → conséquences,
+//   facettes optionnelles (position de façade, emplacement, variante de matériau),
+//   attributs typés libres, et l'année anticipée de remplacement dérivée de
+//   « année de construction ou réparation + durée de vie utile ».
 
 const TOKEN_KEY = 'cs_terrain_token';
 
+/* ---------- Taxonomie maison : 10 catégories ---------- */
+
 const CATS = {
-  toiture:   { label: 'Toiture',      icon: 'triangle' },
-  enveloppe: { label: 'Enveloppe',    icon: 'layout-grid' },
-  structure: { label: 'Structure',    icon: 'layers' },
-  meca:      { label: 'Mécanique',    icon: 'settings-2' },
-  elec:      { label: 'Électricité',  icon: 'zap' },
-  amenage:   { label: 'Aménagement',  icon: 'trees' },
-  securite:  { label: 'Sécurité',     icon: 'shield-alert' },
+  terrain:     { label: 'Terrain et aménagement',                                  pill: 'Terrain',        icon: 'trees' },
+  structure:   { label: 'Fondation, structure et stationnements intérieurs',       pill: 'Structure',      icon: 'layers' },
+  enveloppe:   { label: 'Enveloppe du bâtiment',                                   pill: 'Enveloppe',      icon: 'layout-grid' },
+  ouvertures:  { label: 'Portes extérieures et fenêtres',                          pill: 'Portes et fenêtres', icon: 'door-open' },
+  balcons:     { label: 'Balcons, escaliers et terrasses',                         pill: 'Balcons',        icon: 'fence' },
+  interieur:   { label: 'Intérieur du bâtiment',                                   pill: 'Intérieur',      icon: 'sofa' },
+  equipements: { label: 'Appareils, installations et équipements spéciaux',        pill: 'Équipements',    icon: 'boxes' },
+  cvac:        { label: 'Systèmes de chauffage et ventilation',                    pill: 'CVAC',           icon: 'fan' },
+  electrique:  { label: 'Installations électriques',                               pill: 'Électricité',    icon: 'zap' },
+  plomberie:   { label: "Installations de plomberie, d'eau et d'égout",            pill: 'Plomberie',      icon: 'droplets' },
 };
 
-const ETATS = [
-  { label: 'Excellent', short: 'Exc.',  color: '#1F8A4E', bg: '#E6F2EB' },
-  { label: 'Bon',       short: 'Bon',   color: '#1F1F1F', bg: '#EFEFEF' },
-  { label: 'Moyen',     short: 'Moy.',  color: '#6B6B6B', bg: '#F1F1F1' },
-  { label: 'Mauvais',   short: 'Mauv.', color: '#FF8466', bg: '#FFE4DB' },
-  { label: 'Critique',  short: 'Crit.', color: '#E8492A', bg: '#FFE4DB' },
+const CAT_AUTRES = { label: 'Autres', pill: 'Autres', icon: 'box' };
+
+function catInfo(key) {
+  return CATS[key] || CAT_AUTRES;
+}
+
+/* ---------- Échelle de cote : 1-4 + na, plus le marqueur R ---------- */
+
+const RATINGS = [
+  { v: 1, label: 'Bon état',            pill: 'Bon état',        color: '#1F8A4E', bg: '#E6F2EB' },
+  { v: 2, label: 'Entretien normal',    pill: 'Entretien norm.', color: '#1F1F1F', bg: '#EFEFEF' },
+  { v: 3, label: 'Entretien requis',    pill: 'Entretien requis',color: '#FF8466', bg: '#FFE4DB' },
+  { v: 4, label: 'Remplacement requis', pill: 'Remplac. requis', color: '#E8492A', bg: '#FFE4DB' },
+];
+
+const RATING_NA = { v: null, key: 'na', label: 'Non applicable', pill: 'na', color: '#6B6B6B', bg: '#EFEFEF' };
+
+function ratingInfo(v) {
+  return RATINGS.find(r => r.v === v) || null;
+}
+
+/* ---------- Facettes ---------- */
+
+const POSITIONS = [
+  { v: 'AV',  label: 'Avant' },
+  { v: 'GA',  label: 'Gauche' },
+  { v: 'ARR', label: 'Arrière' },
+  { v: 'DR',  label: 'Droite' },
+];
+
+const EMPLACEMENTS = [
+  { v: 'corridors',    label: 'Corridors' },
+  { v: 'escaliers',    label: 'Escaliers' },
+  { v: 'stationnement',label: 'Stationnement' },
+];
+
+const DELAIS = ['à court terme', 'dans les 5 ans', 'à planifier', 'aucun suivi particulier'];
+
+const ATTR_SUGGESTIONS = ['Année', 'Marque', 'Modèle', 'Capacité', 'Nombre', "D'origine"];
+
+/* ---------- Fiche d'immeuble ---------- */
+
+const IMM_DOCS = [
+  ['declaration_copropriete',   'Déclaration de copropriété'],
+  ['certificat_localisation',   'Certificat de localisation'],
+  ['plans_construction',        'Plans de construction'],
+  ['plans_structure',           'Plans de structure'],
+  ['plans_mecaniques',          'Plans mécaniques'],
+  ['plan_amenagement_ext',      "Plan d'aménagement extérieur"],
+  ['rapports_inspection',       "Rapports d'inspection / déficiences"],
+  ['rapports_travaux',          'Rapports de travaux « grands projets »'],
+  ['carnet_entretien',          "Carnet d'entretien"],
+];
+
+const IMM_CARACS = [
+  { k: 'annee_construction',      q: 'Année de construction',                                       type: 'year' },
+  { k: 'date_conversion',         q: 'Date de conversion (immeuble converti en copropriété)',       type: 'year' },
+  { k: 'nb_stationnements_int',   q: "Combien y a-t-il d'espaces de stationnement intérieurs ?",     type: 'number' },
+  { k: 'gicleurs',                q: "Y a-t-il présence d'un système de gicleurs ?",                 type: 'ouinon' },
+  { k: 'gicleurs_ou',             q: 'Où ? (stationnement, RDC, étages)',                            type: 'text', sub: true },
+  { k: 'unites_gicleurs',         q: 'Les unités sont-elles protégées par un système de gicleurs ?', type: 'ouinon' },
+  { k: 'nb_ascenseurs',           q: "Combien y a-t-il de systèmes d'ascenseur ?",                   type: 'number' },
+  { k: 'generatrice',             q: 'Y a-t-il une génératrice ?',                                   type: 'ouinon' },
+  { k: 'generatrice_carburant',   q: 'Carburant de la génératrice',                                  type: 'choice', sub: true, choices: [['mazout', 'Mazout'], ['gaz_naturel', 'Gaz naturel']] },
+  { k: 'piscine_interieure',      q: 'Y a-t-il une piscine intérieure ?',                             type: 'ouinon' },
+  { k: 'piscine_exterieure',      q: 'Y a-t-il une piscine extérieure ?',                             type: 'ouinon' },
+  { k: 'nb_terrasses_toiture',    q: 'Combien y a-t-il de terrasses au niveau toiture ?',            type: 'number' },
+  { k: 'fenetres_privatives',     q: 'Les fenêtres sont-elles considérées privatives ?',             type: 'ouinon' },
+  { k: 'portes_privatives',       q: 'Les portes sont-elles considérées privatives ?',               type: 'ouinon' },
+  { k: 'portes_patio_privatives', q: 'Les portes-patio sont-elles considérées privatives ?',         type: 'ouinon' },
+  { k: 'balcons_privatifs',       q: 'Les balcons sont-ils considérés privatifs ?',                  type: 'ouinon' },
+  { k: 'elements_pcur',           q: 'Y a-t-il des éléments considérés PCUR ?',                      type: 'ouinon' },
+  { k: 'cles_repartition_pcur',   q: 'Les clés de répartition PCUR sont-elles disponibles ?',        type: 'ouinon' },
+  { k: 'acces_toiture',           q: 'Y a-t-il un accès sécuritaire à la toiture ?',                 type: 'ouinon' },
+];
+
+const IMM_REMPLACEMENTS = [
+  ['pavage',            'Pavage'],
+  ['revetement_toiture','Revêtement de toiture'],
+  ['portes',            'Portes'],
+  ['portes_patio',      'Portes-patio'],
+  ['fenetres',          'Fenêtres'],
+  ['calfeutrant',       'Calfeutrant'],
+  ['balcons',           'Balcons'],
+  ['revetement_ext_1',  'Revêtement extérieur 1'],
+  ['revetement_ext_2',  'Revêtement extérieur 2'],
+  ['autre_revetement',  'Autre revêtement'],
+  ['autre_1',           'Autre 1'],
+  ['autre_2',           'Autre 2'],
+];
+
+const IMM_ENTRETIENS = [
+  ['cvac_communs',            'Chauffage / ventilation des espaces communs'],
+  ['chauffage_stationnement', 'Chauffage des stationnements intérieurs'],
+  ['ventilation_stationnement','Ventilation des stationnements intérieurs'],
+  ['ventilation_secheuses',   'Ventilation « sorties sécheuses »'],
+  ['evacuation_plomberie',    'Évacuation — plomberie sanitaire'],
+  ['autre_systeme_1',         'Autre système 1'],
+  ['autre_systeme_2',         'Autre système 2'],
 ];
 
 const fmtCAD = new Intl.NumberFormat('fr-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
 
 const state = {
-  screen: 'loading', // loading | login | dossiers | accueil | liste | fiche | synthese
+  screen: 'loading', // loading | login | dossiers | accueil | immeuble | liste | fiche | synthese
   token: null,
   user: null,
   online: navigator.onLine,
@@ -49,6 +153,10 @@ const state = {
   ficheLoading: false,
   photoBlobUrls: {},
   uploadingPhoto: false,
+  facetsOpen: false,
+  naChosen: {},          // id -> true : « na » choisi dans la session courante
+  attrKeyDraft: '',
+  attrValDraft: '',
 
   analyzing: false,
   aiResult: null,
@@ -56,6 +164,8 @@ const state = {
   recording: false,
   speechSupported: !!(window.SpeechRecognition || window.webkitSpeechRecognition),
   noteDraft: '',
+
+  batiment: {},          // contenu de dossiers.batiment_info
 
   projection: null,
   projectionLoading: false,
@@ -79,16 +189,18 @@ function slug(s) {
   return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'dossier';
 }
 
-function residualColor(resid) {
-  return resid < 20 ? '#E8492A' : resid < 40 ? '#FF8466' : resid < 65 ? '#1F1F1F' : '#1F8A4E';
-}
-
 function formatMoneyCompact(n) {
   if (n == null || isNaN(n)) return '—';
   if (Math.abs(n) >= 1000000) {
     return (n / 1000000).toLocaleString('fr-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' M$';
   }
   return fmtCAD.format(Math.round(n));
+}
+
+function toInt(v) {
+  if (v == null || v === '') return null;
+  const n = parseInt(String(v).replace(/[^\d-]/g, ''), 10);
+  return isNaN(n) ? null : n;
 }
 
 let toastTimer = null;
@@ -104,6 +216,16 @@ function friendlyError(e) {
   if (e.message === 'OFFLINE') return 'Vous êtes hors connexion.';
   if (e.message === 'SESSION_EXPIRED') return 'Votre session a expiré.';
   return e.message || 'Une erreur est survenue.';
+}
+
+// Écrit un statut d'enregistrement sans déclencher de re-rendu (préserve la saisie en cours).
+let statusTimer = null;
+function setSaveStatus(id, txt) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = txt;
+  clearTimeout(statusTimer);
+  if (txt) statusTimer = setTimeout(() => { const e2 = document.getElementById(id); if (e2) e2.textContent = ''; }, 2200);
 }
 
 /* ============================================================
@@ -205,7 +327,7 @@ function logout() {
   Object.assign(state, {
     token: null, user: null, dossier: null, dossiers: [], components: [],
     activeComponent: null, activeId: null, projection: null, error: null,
-    loginError: null, screen: 'login',
+    batiment: {}, naChosen: {}, loginError: null, screen: 'login',
   });
   render();
 }
@@ -230,6 +352,15 @@ async function loadDossiers() {
   }
 }
 
+function parseJsonObject(raw) {
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw;
+  try {
+    const o = JSON.parse(raw);
+    return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
+  } catch (e) { return {}; }
+}
+
 async function selectDossier(id) {
   state.screen = 'loading'; render();
   try {
@@ -239,6 +370,8 @@ async function selectDossier(id) {
     ]);
     state.dossier = dossier;
     state.components = components;
+    state.batiment = parseJsonObject(dossier.batiment_info);
+    state.naChosen = {};
     state.filter = 'all'; state.search = '';
     state.screen = 'accueil';
     render();
@@ -271,10 +404,12 @@ async function openFiche(id) {
   state.activeId = id; state.screen = 'fiche'; state.aiResult = null;
   state.analyzing = false; state.recording = false; state.noteDraft = '';
   state.ficheLoading = true; state.activeComponent = null; state.error = null;
+  state.attrKeyDraft = ''; state.attrValDraft = ''; state.facetsOpen = false;
   render();
   try {
     const comp = await apiJson(`/api/components/${id}`);
     state.activeComponent = comp;
+    state.facetsOpen = !!(comp.position || comp.emplacement || comp.variante);
     state.ficheLoading = false;
     render();
     loadPhotoBlobs(comp.photos || []);
@@ -323,47 +458,104 @@ async function patchComponent(id, patch) {
   }
 }
 
-function onEtatClick(i) {
+// Enregistrement d'un champ de composante. Applique la valeur localement de façon
+// synchrone (pour qu'un re-rendu déclenché entre-temps ne perde pas la saisie),
+// puis pousse le PATCH.
+function saveCompField(field, value, opts) {
+  const id = state.activeId;
+  if (!id || !state.activeComponent) return false;
+  const force = !!(opts && opts.force);
+  const cur = state.activeComponent[field];
+  const same = (cur == null ? '' : String(cur)) === (value == null ? '' : String(value));
+  if (same && !force) return false;
+  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return false; }
+  const patch = {}; patch[field] = value;
+  applyComponentPatch(id, patch);
+  setSaveStatus('ficheStatus', 'Enregistrement…');
+  patchComponent(id, patch)
+    .then(() => setSaveStatus('ficheStatus', 'Enregistré'))
+    .catch(() => setSaveStatus('ficheStatus', ''));
+  return true;
+}
+
+function onRatingClick(raw) {
   if (!state.activeComponent) return;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
-  applyComponentPatch(state.activeId, { etat: i });
+  const isNa = raw === 'na';
+  const value = isNa ? null : toInt(raw);
+  if (isNa) state.naChosen[state.activeId] = true;
+  else delete state.naChosen[state.activeId];
+  saveCompField('rating', value, { force: true });
   render();
-  patchComponent(state.activeId, { etat: i }).catch(() => {});
 }
 
-function onResidualInput(e) {
-  const val = +e.target.value;
-  const valEl = document.getElementById('residualVal');
-  if (valEl) { valEl.textContent = val + ' %'; valEl.style.color = residualColor(val); }
+function onRflagClick() {
+  const c = state.activeComponent;
+  if (!c) return;
+  if (saveCompField('r_flag', c.r_flag ? 0 : 1, { force: true })) render();
 }
 
-function onResidualChange(e) {
-  const val = +e.target.value;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); render(); return; }
-  applyComponentPatch(state.activeId, { residual: val });
-  render();
-  patchComponent(state.activeId, { residual: val }).catch(() => {});
+function onFacetClick(field, value) {
+  const c = state.activeComponent;
+  if (!c) return;
+  const next = (c[field] === value) ? null : value;
+  if (saveCompField(field, next, { force: true })) render();
 }
 
 function onYearBlur(e) {
   if (!state.activeComponent) return;
   const v = e.target.value.trim();
-  const current = state.activeComponent.install_year != null ? String(state.activeComponent.install_year) : '';
-  if (v === current) return;
   let payload;
   if (v === '') payload = null;
   else if (/^\d{4}$/.test(v)) payload = parseInt(v, 10);
   else payload = v;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); render(); return; }
-  patchComponent(state.activeId, { install_year: payload }).then(() => render()).catch(() => {});
+  if (saveCompField('install_year', payload)) render();
 }
 
-function onQtyBlur(e) {
+function onNumberBlur(field, e) {
   if (!state.activeComponent) return;
+  const v = toInt(e.target.value);
+  if (saveCompField(field, v)) render();
+}
+
+/* ---------- attributs ---------- */
+
+function componentAttrs(c) {
+  return parseJsonObject(c && c.attributs);
+}
+
+function saveAttrs(obj) {
+  const keys = Object.keys(obj);
+  const payload = keys.length ? JSON.stringify(obj) : null;
+  return saveCompField('attributs', payload, { force: true });
+}
+
+function onAttrAdd() {
+  const c = state.activeComponent;
+  if (!c) return;
+  const k = (state.attrKeyDraft || '').trim();
+  const v = (state.attrValDraft || '').trim();
+  if (!k) { showToast('Nommez le champ à ajouter.'); return; }
+  const attrs = componentAttrs(c);
+  attrs[k] = v;
+  if (saveAttrs(attrs)) { state.attrKeyDraft = ''; state.attrValDraft = ''; render(); }
+}
+
+function onAttrDelete(key) {
+  const c = state.activeComponent;
+  if (!c) return;
+  const attrs = componentAttrs(c);
+  delete attrs[key];
+  if (saveAttrs(attrs)) render();
+}
+
+function onAttrValueBlur(key, e) {
+  const c = state.activeComponent;
+  if (!c) return;
+  const attrs = componentAttrs(c);
   const v = e.target.value;
-  if (v === (state.activeComponent.qty || '')) return;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); render(); return; }
-  patchComponent(state.activeId, { qty: v }).then(() => render()).catch(() => {});
+  if ((attrs[key] == null ? '' : String(attrs[key])) === v) return;
+  attrs[key] = v;
+  saveAttrs(attrs);
 }
 
 /* ---------- photos ---------- */
@@ -417,7 +609,7 @@ async function analyze() {
 
 function parseCostEstimate(v) {
   if (v == null) return null;
-  if (typeof v === 'number') return Math.round(v);
+  if (typeof v === 'number') return isNaN(v) ? null : Math.round(v);
   const cleaned = String(v).replace(/[^\d.,]/g, '');
   if (!cleaned) return null;
   const n = parseFloat(cleaned.replace(/\s/g, '').replace(/,(\d{3})/g, '$1').replace(',', '.'));
@@ -429,10 +621,13 @@ async function applyAi() {
   if (!state.online) { showToast('Hors connexion : impossible d’appliquer les valeurs.'); return; }
   const r = state.aiResult;
   const patch = {};
-  if (typeof r.etat === 'number') patch.etat = r.etat;
-  if (typeof r.residual === 'number') patch.residual = r.residual;
-  const parsedCost = parseCostEstimate(r.costEstimate);
-  if (parsedCost != null) patch.replacement_cost = parsedCost;
+  if (typeof r.rating === 'number' && r.rating >= 1 && r.rating <= 4) patch.rating = r.rating;
+  if (typeof r.observation === 'string' && r.observation.trim()) patch.observation = r.observation.trim();
+  if (typeof r.causePossible === 'string' && r.causePossible.trim()) patch.cause_possible = r.causePossible.trim();
+  if (typeof r.delaiSuggere === 'string' && r.delaiSuggere.trim()) patch.delai_suggere = r.delaiSuggere.trim();
+  if (typeof r.consequences === 'string' && r.consequences.trim()) patch.consequences = r.consequences.trim();
+  if (typeof r.costEstimate === 'number' && !isNaN(r.costEstimate)) patch.replacement_cost = Math.round(r.costEstimate);
+  if (!Object.keys(patch).length) { state.aiResult = null; showToast('Rien à appliquer.'); return; }
   applyComponentPatch(state.activeId, patch);
   state.aiResult = null;
   render();
@@ -507,15 +702,101 @@ async function saveFiche() {
 }
 
 /* ============================================================
+   Fiche d'immeuble
+   ============================================================ */
+
+function immGet(sec, key) {
+  const s = state.batiment && state.batiment[sec];
+  const v = s ? s[key] : null;
+  return v == null ? '' : v;
+}
+
+function immSetLocal(sec, key, val) {
+  if (!state.batiment || typeof state.batiment !== 'object') state.batiment = {};
+  if (!state.batiment[sec]) state.batiment[sec] = {};
+  if (val === '' || val == null) delete state.batiment[sec][key];
+  else state.batiment[sec][key] = val;
+  if (!Object.keys(state.batiment[sec]).length) delete state.batiment[sec];
+}
+
+async function saveBatiment() {
+  if (!state.dossier) return;
+  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
+  setSaveStatus('immStatus', 'Enregistrement…');
+  try {
+    const payload = JSON.stringify(state.batiment || {});
+    const data = await apiJson(`/api/dossiers/${state.dossier.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ batiment_info: payload }),
+    });
+    if (data && typeof data === 'object') state.dossier = Object.assign({}, state.dossier, data);
+    setSaveStatus('immStatus', 'Enregistré');
+  } catch (e) {
+    if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
+    setSaveStatus('immStatus', '');
+  }
+}
+
+function onImmChoice(sec, key, val) {
+  const cur = immGet(sec, key);
+  immSetLocal(sec, key, cur === val ? '' : val);
+  render();
+  saveBatiment();
+}
+
+function onImmTextBlur(sec, key, e) {
+  const v = e.target.value.trim();
+  if (String(immGet(sec, key)) === v) return;
+  immSetLocal(sec, key, v);
+  saveBatiment();
+}
+
+async function saveDossierField(field, value) {
+  if (!state.dossier) return;
+  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
+  setSaveStatus('immStatus', 'Enregistrement…');
+  try {
+    const patch = {}; patch[field] = value;
+    const data = await apiJson(`/api/dossiers/${state.dossier.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    state.dossier = Object.assign({}, state.dossier, patch, (data && typeof data === 'object') ? data : {});
+    setSaveStatus('immStatus', 'Enregistré');
+  } catch (e) {
+    if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
+    setSaveStatus('immStatus', '');
+  }
+}
+
+function onDossierNumberBlur(field, e) {
+  if (!state.dossier) return;
+  const v = toInt(e.target.value);
+  const cur = state.dossier[field] == null ? null : toInt(state.dossier[field]);
+  if (v === cur) return;
+  saveDossierField(field, v);
+}
+
+/* ============================================================
    Derived view data
    ============================================================ */
+
+function replacementYear(c) {
+  const yr = toInt(c && c.install_year);
+  const vu = toInt(c && c.useful_life_years);
+  if (!yr || !vu) return null;
+  const year = yr + vu;
+  return { year, delta: year - new Date().getFullYear() };
+}
 
 function computeStats() {
   const comps = state.components;
   const total = comps.length;
   const done = comps.filter(c => c.done).length;
   const todo = total - done;
-  const critical = comps.filter(c => c.done && c.etat >= 3).length;
+  const critical = comps.filter(c => c.done && c.rating >= 3).length;
   const photosTotal = comps.reduce((a, c) => a + (typeof c.photos === 'number' ? c.photos : (c.photos ? c.photos.length : 0)), 0);
   return { total, done, todo, critical, photosTotal, pct: total ? Math.round((done / total) * 100) : 0 };
 }
@@ -525,36 +806,58 @@ function filteredComponents() {
   return state.components.filter(c => {
     if (f === 'todo' && c.done) return false;
     if (f === 'done' && !c.done) return false;
-    if (f === 'crit' && !(c.done && c.etat >= 3)) return false;
-    if (q && !String(c.name || '').toLowerCase().includes(q)) return false;
+    if (f === 'action' && !(c.done && c.rating >= 3)) return false;
+    if (q) {
+      const hay = `${c.name || ''} ${c.uniformat_code || ''} ${c.variante || ''}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
     return true;
   });
 }
 
+function facetSuffix(c) {
+  const bits = [];
+  if (c.variante) bits.push(c.variante);
+  if (c.position) bits.push(c.position);
+  if (c.emplacement) {
+    const e = EMPLACEMENTS.find(x => x.v === c.emplacement);
+    bits.push(e ? e.label : c.emplacement);
+  }
+  return bits.join(' · ');
+}
+
 function rowVals(c) {
-  const catInfo = CATS[c.cat] || { label: c.cat, icon: 'box' };
-  const thumbIcon = catInfo.icon;
-  let statusLabel, statusColor, statusBg, thumbBg, thumbColor, sub;
+  const info = catInfo(c.cat);
   const photoCount = typeof c.photos === 'number' ? c.photos : (c.photos ? c.photos.length : 0);
+  let statusLabel, statusColor, statusBg, thumbBg, thumbColor, sub;
   if (c.done) {
-    const e = ETATS[c.etat != null ? c.etat : 1] || ETATS[1];
-    statusLabel = e.label; statusColor = e.color; statusBg = e.bg;
-    thumbBg = e.bg; thumbColor = e.color;
-    sub = (photoCount ? photoCount + ' photo' + (photoCount > 1 ? 's' : '') + ' · ' : '') + 'vie ' + (c.residual != null ? c.residual + '%' : '—');
+    const r = ratingInfo(c.rating) || RATING_NA;
+    statusLabel = r.pill; statusColor = r.color; statusBg = r.bg;
+    thumbBg = r.bg; thumbColor = r.color;
+    const bits = [];
+    if (photoCount) bits.push(photoCount + ' photo' + (photoCount > 1 ? 's' : ''));
+    if (c.delai_suggere) bits.push(c.delai_suggere);
+    else if (c.observation) bits.push(String(c.observation).slice(0, 48));
+    sub = bits.join(' · ') || 'Documentée';
   } else {
     statusLabel = 'À documenter'; statusColor = 'var(--ink-500)'; statusBg = 'var(--ink-100)';
     thumbBg = 'var(--ink-050)'; thumbColor = 'var(--ink-400)';
-    sub = c.qty && c.qty !== '—' ? c.qty : 'À visiter';
+    const f = facetSuffix(c);
+    sub = f || (c.qty && c.qty !== '—' ? c.qty : 'À visiter');
   }
+  const facets = c.done ? facetSuffix(c) : '';
   return {
-    id: c.id, name: c.name, sub, statusLabel, statusColor, statusBg, thumbBg, thumbColor, thumbIcon,
+    id: c.id, name: c.name, code: c.uniformat_code || '', facets,
+    sub, statusLabel, statusColor, statusBg, thumbBg, thumbColor, thumbIcon: info.icon,
+    rflag: !!c.r_flag,
     aiTag: !!(c.ai_suggested && !c.done),
   };
 }
 
 function computeGroups() {
   const fl = filteredComponents();
-  return Object.keys(CATS).map(k => {
+  const known = Object.keys(CATS);
+  const groups = known.map(k => {
     const all = state.components.filter(c => c.cat === k);
     const items = fl.filter(c => c.cat === k);
     return {
@@ -562,7 +865,17 @@ function computeGroups() {
       done: all.filter(c => c.done).length, total: all.length,
       items: items.map(rowVals),
     };
-  }).filter(g => g.items.length > 0);
+  });
+  const isOther = c => !CATS[c.cat];
+  const othersAll = state.components.filter(isOther);
+  if (othersAll.length) {
+    groups.push({
+      key: 'autres', label: CAT_AUTRES.label, icon: CAT_AUTRES.icon,
+      done: othersAll.filter(c => c.done).length, total: othersAll.length,
+      items: fl.filter(isOther).map(rowVals),
+    });
+  }
+  return groups.filter(g => g.items.length > 0);
 }
 
 function computeDecades(projection) {
@@ -620,12 +933,14 @@ async function generateReports() {
 function render() {
   const active = document.activeElement;
   const activeId = active && active.id;
+  const scrollY = window.scrollY;
   let selStart = null, selEnd = null;
   if (activeId && active && typeof active.selectionStart === 'number') {
     selStart = active.selectionStart; selEnd = active.selectionEnd;
   }
   root.innerHTML = screenHtml();
   if (window.lucide) window.lucide.createIcons();
+  if (scrollY) window.scrollTo(0, scrollY);
   if (activeId) {
     const el = document.getElementById(activeId);
     if (el) {
@@ -646,6 +961,7 @@ function bodyForScreen() {
   switch (state.screen) {
     case 'dossiers': return dossiersHtml();
     case 'accueil': return accueilHtml();
+    case 'immeuble': return immeubleHtml();
     case 'liste': return listeHtml();
     case 'fiche': return ficheHtml();
     case 'synthese': return syntheseHtml();
@@ -714,6 +1030,11 @@ function dossiersHtml() {
   </div>`;
 }
 
+function batimentFilled() {
+  const b = state.batiment || {};
+  return Object.keys(b).reduce((a, sec) => a + Object.keys(b[sec] || {}).length, 0);
+}
+
 function accueilHtml() {
   const d = state.dossier;
   if (!d) return loadingHtml();
@@ -722,6 +1043,7 @@ function accueilHtml() {
   if (d.units) facts.push(`${d.units} unités`);
   if (d.floors) facts.push(`${d.floors} étages`);
   if (d.built_year) facts.push(`construit ${d.built_year}`);
+  const immCount = batimentFilled();
   return `
   <div class="scr-accueil">
     <div class="top-row">
@@ -751,9 +1073,17 @@ function accueilHtml() {
     </div>
     <div class="stats-grid">
       <div class="stat-tile"><div class="num">${st.photosTotal}</div><div class="lbl">Photos</div></div>
-      <div class="stat-tile"><div class="num accent">${st.critical}</div><div class="lbl">Critiques</div></div>
+      <div class="stat-tile"><div class="num accent">${st.critical}</div><div class="lbl">À traiter</div></div>
       <div class="stat-tile"><div class="num">${st.todo}</div><div class="lbl">À faire</div></div>
     </div>
+    <button class="nav-card" data-action="go-immeuble">
+      <div class="icon"><i data-lucide="clipboard-list"></i></div>
+      <div class="mid">
+        <div class="t">Fiche d'immeuble</div>
+        <div class="s">${immCount ? immCount + ' réponse' + (immCount > 1 ? 's' : '') + ' consignée' + (immCount > 1 ? 's' : '') : 'Documents, caractéristiques, derniers remplacements'}</div>
+      </div>
+      <i data-lucide="chevron-right" class="go"></i>
+    </button>
     <div class="ai-banner">
       <div class="icon"><i data-lucide="sparkles"></i></div>
       <div>
@@ -766,13 +1096,120 @@ function accueilHtml() {
   </div>`;
 }
 
+/* ---------- Fiche d'immeuble ---------- */
+
+function triHtml(sec, key, choices) {
+  const cur = String(immGet(sec, key));
+  return `<div class="seg">${choices.map(ch => {
+    const on = cur === ch[0];
+    return `<button class="seg-btn ${on ? 'on' : ''}" data-action="imm-choice" data-sec="${esc(sec)}" data-key="${esc(key)}" data-val="${esc(ch[0])}">${esc(ch[1])}</button>`;
+  }).join('')}</div>`;
+}
+
+function immTextHtml(sec, key, placeholder, mode) {
+  const id = `imm_${sec}_${key}`;
+  return `<input class="imm-input" id="${id}" data-role="imm-text" data-sec="${esc(sec)}" data-key="${esc(key)}"
+    value="${esc(immGet(sec, key))}" placeholder="${esc(placeholder || '')}" ${mode ? `inputmode="${mode}"` : ''}>`;
+}
+
+function immeubleHtml() {
+  const d = state.dossier;
+  if (!d) return loadingHtml();
+  const OUI_NON_ND = [['oui', 'Oui'], ['non', 'Non'], ['nd', 'nd']];
+  const OUI_NON = [['oui', 'Oui'], ['non', 'Non']];
+
+  const docsHtml = IMM_DOCS.map(([k, label]) => `
+    <div class="imm-row">
+      <div class="imm-q">${esc(label)}</div>
+      ${triHtml('documents', k, OUI_NON_ND)}
+    </div>`).join('');
+
+  const caracsHtml = IMM_CARACS.map(cfg => {
+    let control;
+    if (cfg.type === 'ouinon') control = triHtml('caracteristiques', cfg.k, OUI_NON);
+    else if (cfg.type === 'choice') control = triHtml('caracteristiques', cfg.k, cfg.choices);
+    else if (cfg.type === 'year') control = immTextHtml('caracteristiques', cfg.k, 'AAAA', 'numeric');
+    else if (cfg.type === 'number') control = immTextHtml('caracteristiques', cfg.k, '—', 'numeric');
+    else control = immTextHtml('caracteristiques', cfg.k, '—');
+    const narrow = cfg.type === 'year' || cfg.type === 'number';
+    return `<div class="imm-row ${cfg.sub ? 'sub' : ''} ${narrow ? 'narrow' : ''}">
+      <div class="imm-q">${esc(cfg.q)}</div>
+      ${control}
+    </div>`;
+  }).join('');
+
+  const remplHtml = IMM_REMPLACEMENTS.map(([k, label]) => `
+    <div class="imm-row narrow">
+      <div class="imm-q">${esc(label)}</div>
+      ${immTextHtml('remplacements', k, 'AAAA', 'numeric')}
+    </div>`).join('');
+
+  const entrHtml = IMM_ENTRETIENS.map(([k, label]) => `
+    <div class="imm-row narrow">
+      <div class="imm-q">${esc(label)}</div>
+      ${immTextHtml('entretiens', k, 'mm/aaaa')}
+    </div>`).join('');
+
+  return `
+  <div class="scr-immeuble">
+    <div class="hdr">
+      <div class="hdr-row">
+        <button class="hdr-back" data-action="go-accueil"><i data-lucide="chevron-left"></i>Dossier</button>
+        <span class="save-status" id="immStatus"></span>
+      </div>
+      <h2>Fiche d'immeuble</h2>
+      <div class="hdr-sub">${esc(d.name)}${d.address ? ' · ' + esc(d.address) : ''}</div>
+    </div>
+    <div class="imm-body">
+      <div class="imm-section">
+        <h3><span class="n">1</span>Documents à fournir avant la visite</h3>
+        <p class="imm-hint">Chaque document : reçu, non reçu, ou non disponible.</p>
+        ${docsHtml}
+      </div>
+
+      <div class="imm-section">
+        <h3><span class="n">2</span>Caractéristiques du bâtiment</h3>
+        ${caracsHtml}
+      </div>
+
+      <div class="imm-section">
+        <h3><span class="n">3</span>Années des derniers remplacements</h3>
+        <p class="imm-hint">À compléter lors de la visite — année du dernier remplacement ou de la dernière réparation majeure.</p>
+        ${remplHtml}
+      </div>
+
+      <div class="imm-section">
+        <h3><span class="n">4</span>Dates des derniers entretiens</h3>
+        <p class="imm-hint">Si l'information est disponible (mois / année).</p>
+        ${entrHtml}
+      </div>
+
+      <div class="imm-section">
+        <h3><span class="n">5</span>Solde et cotisation annuelle — FP</h3>
+        <div class="imm-row narrow">
+          <div class="imm-q">Solde au fonds de prévoyance en début d'année</div>
+          <input class="imm-input" id="fundBalanceInput" data-role="dossier-number" data-field="current_fund_balance" inputmode="numeric" placeholder="$" value="${esc(d.current_fund_balance != null ? d.current_fund_balance : '')}">
+        </div>
+        <div class="imm-row narrow">
+          <div class="imm-q">Cotisation annuelle à ce fonds</div>
+          <input class="imm-input" id="cotisationInput" data-role="dossier-number" data-field="cotisation_annuelle" inputmode="numeric" placeholder="$" value="${esc(d.cotisation_annuelle != null ? d.cotisation_annuelle : '')}">
+        </div>
+      </div>
+
+      <div class="imm-foot">Les réponses sont enregistrées automatiquement au fil de la saisie.</div>
+    </div>
+  </div>`;
+}
+
+/* ---------- Liste des composantes ---------- */
+
 function listeHtml() {
   const st = computeStats();
   const chips = [
     { key: 'all', label: 'Tout', count: st.total },
     { key: 'todo', label: 'À faire', count: st.todo },
     { key: 'done', label: 'Fait', count: st.done },
-    { key: 'crit', label: 'Critique', count: st.critical },
+    { key: 'action', label: 'Action requise', count: st.critical },
   ];
   const chipsHtml = chips.map(c => `<button class="chip ${state.filter === c.key ? 'on' : ''}" data-action="filter" data-filter="${c.key}">${c.label} · ${c.count}</button>`).join('');
   const groups = computeGroups();
@@ -805,27 +1242,90 @@ function rowHtml(r) {
   return `<button class="comp-row" data-action="open-fiche" data-id="${esc(r.id)}">
     <div class="comp-thumb" style="background:${r.thumbBg};color:${r.thumbColor}"><i data-lucide="${r.thumbIcon}"></i></div>
     <div class="comp-mid">
-      <div class="name">${esc(r.name)}</div>
+      <div class="name">${esc(r.name)}${r.code ? `<span class="code">${esc(r.code)}</span>` : ''}</div>
+      ${r.facets ? `<div class="facets">${esc(r.facets)}</div>` : ''}
       <div class="sub">${esc(r.sub)}</div>
       ${r.aiTag ? `<div class="ai-tag">Suggéré IA</div>` : ''}
     </div>
-    <div class="comp-end"><span class="status-pill" style="background:${r.statusBg};color:${r.statusColor}">${esc(r.statusLabel)}</span></div>
+    <div class="comp-end">
+      <span class="status-pill" style="background:${r.statusBg};color:${r.statusColor}">${esc(r.statusLabel)}</span>
+      ${r.rflag ? `<span class="r-pill">R</span>` : ''}
+    </div>
   </button>`;
+}
+
+/* ---------- Fiche composante ---------- */
+
+function ratingListHtml(c) {
+  const naOn = c.rating == null && (!!state.naChosen[c.id] || !!c.done);
+  const opts = RATINGS.map(r => {
+    const on = c.rating === r.v;
+    return `<button class="rating-opt ${on ? 'on' : ''}" data-action="set-rating" data-rating="${r.v}"
+      style="${on ? `border-color:${r.color};background:${r.bg}` : ''}">
+      <span class="num" style="background:${on ? r.color : 'var(--ink-100)'};color:${on ? '#fff' : 'var(--ink-500)'}">${r.v}</span>
+      <span class="lbl" style="${on ? `color:${r.color}` : ''}">${esc(r.label)}</span>
+      ${on ? `<i data-lucide="check" style="color:${r.color}"></i>` : ''}
+    </button>`;
+  }).join('');
+  const na = `<button class="rating-opt ${naOn ? 'on' : ''}" data-action="set-rating" data-rating="na"
+      style="${naOn ? `border-color:${RATING_NA.color};background:${RATING_NA.bg}` : ''}">
+      <span class="num" style="background:${naOn ? RATING_NA.color : 'var(--ink-100)'};color:${naOn ? '#fff' : 'var(--ink-500)'}">na</span>
+      <span class="lbl">${esc(RATING_NA.label)}</span>
+      ${naOn ? `<i data-lucide="check"></i>` : ''}
+    </button>`;
+  return `<div class="rating-list">${opts}${na}</div>`;
+}
+
+function obsFieldHtml(id, role, field, label, value, placeholder) {
+  return `<div class="obs-field">
+    <label for="${id}">${esc(label)}</label>
+    <textarea id="${id}" data-role="${role}" data-field="${esc(field)}" placeholder="${esc(placeholder)}" rows="3">${esc(value || '')}</textarea>
+  </div>`;
+}
+
+function facetsHtml(c) {
+  const posHtml = POSITIONS.map(p => `<button class="seg-btn ${c.position === p.v ? 'on' : ''}" data-action="set-facet" data-field="position" data-val="${p.v}"><b>${p.v}</b><span>${esc(p.label)}</span></button>`).join('');
+  const empHtml = EMPLACEMENTS.map(p => `<button class="seg-btn ${c.emplacement === p.v ? 'on' : ''}" data-action="set-facet" data-field="emplacement" data-val="${p.v}">${esc(p.label)}</button>`).join('');
+  return `
+  <div class="facet-block">
+    <div class="facet-lbl">Position de façade</div>
+    <div class="seg seg-4">${posHtml}</div>
+  </div>
+  <div class="facet-block">
+    <div class="facet-lbl">Emplacement</div>
+    <div class="seg">${empHtml}</div>
+  </div>
+  <div class="facet-block">
+    <div class="facet-lbl">Variante de matériau ou de type</div>
+    <input id="varianteInput" class="fld-input" data-role="comp-text" data-field="variante" value="${esc(c.variante || '')}" placeholder="ex. Modules de béton, Bois traité">
+  </div>`;
+}
+
+function attributsHtml(c) {
+  const attrs = componentAttrs(c);
+  const keys = Object.keys(attrs);
+  const rows = keys.map((k, i) => `
+    <div class="attr-row">
+      <span class="k">${esc(k)}</span>
+      <input id="attrVal_${i}" class="v" data-role="attr-value" data-key="${esc(k)}" value="${esc(attrs[k])}" placeholder="—">
+      <button class="del" data-action="attr-del" data-key="${esc(k)}" aria-label="Retirer ${esc(k)}"><i data-lucide="x"></i></button>
+    </div>`).join('');
+  const sugg = ATTR_SUGGESTIONS.map(s => `<button class="quick-chip" data-action="attr-suggest" data-key="${esc(s)}">${esc(s)}</button>`).join('');
+  return `
+    ${keys.length ? `<div class="attr-list">${rows}</div>` : '<div class="attr-empty">Aucun attribut consigné.</div>'}
+    <div class="quick-chips">${sugg}</div>
+    <div class="attr-add">
+      <input id="attrKeyInput" data-role="attr-key-draft" value="${esc(state.attrKeyDraft)}" placeholder="Champ (ex. Marque)">
+      <input id="attrValInput" data-role="attr-val-draft" value="${esc(state.attrValDraft)}" placeholder="Valeur">
+      <button data-action="attr-add" aria-label="Ajouter l'attribut"><i data-lucide="plus"></i></button>
+    </div>`;
 }
 
 function ficheHtml() {
   if (state.ficheLoading || !state.activeComponent) return `<div class="scr-fiche">${loadingHtml()}</div>`;
   const c = state.activeComponent;
-  const catInfo = CATS[c.cat] || { label: c.cat, icon: 'box' };
+  const info = catInfo(c.cat);
   const photos = c.photos || [];
-  const resid = c.residual != null ? c.residual : 50;
-  const residColor = residualColor(resid);
-  const etatBtnsHtml = ETATS.map((e, i) => {
-    const on = c.etat === i;
-    return `<button class="etat-btn" data-action="set-etat" data-etat="${i}" style="border-color:${on ? e.color : 'var(--ink-200)'};background:${on ? e.bg : '#fff'};color:${on ? e.color : 'var(--ink-500)'}">
-      <span class="etat-dot" style="background:${e.color}"></span><span>${e.short}</span>
-    </button>`;
-  }).join('');
 
   const photoThumbsHtml = photos.map(p => {
     const url = state.photoBlobUrls[p.id];
@@ -845,11 +1345,24 @@ function ficheHtml() {
 
   const noteCard = c.note ? `<div class="note-card"><div class="note-card-hdr"><i data-lucide="sparkles"></i><span>Note structurée</span></div><div class="note-card-body">${esc(c.note)}</div></div>` : '';
 
+  const delaiChips = DELAIS.map(d => `<button class="quick-chip ${c.delai_suggere === d ? 'on' : ''}" data-action="pick-delai" data-val="${esc(d)}">${esc(d)}</button>`).join('');
+
+  const rep = replacementYear(c);
+  const repSub = rep
+    ? (rep.delta > 1 ? `dans ${rep.delta} ans` : rep.delta === 1 ? "l'an prochain" : rep.delta === 0 ? 'cette année' : `échu depuis ${Math.abs(rep.delta)} an${Math.abs(rep.delta) > 1 ? 's' : ''}`)
+    : 'Renseignez l’année et la durée de vie utile';
+
   return `
   <div class="scr-fiche">
     <div class="hdr">
-      <button class="hdr-back" data-action="go-liste"><i data-lucide="chevron-left"></i>Composantes</button>
-      <span class="cat-tag">${esc(catInfo.label)}</span>
+      <div class="hdr-row">
+        <button class="hdr-back" data-action="go-liste"><i data-lucide="chevron-left"></i>Composantes</button>
+        <span class="save-status" id="ficheStatus"></span>
+      </div>
+      <div class="tag-row">
+        <span class="cat-tag">${esc(info.label)}</span>
+        ${c.uniformat_code ? `<span class="code-tag">${esc(c.uniformat_code)}</span>` : ''}
+      </div>
       <h2 class="fiche-title">${esc(c.name)}</h2>
     </div>
     <div class="fiche-body">
@@ -868,19 +1381,60 @@ function ficheHtml() {
 
       ${aiCardHtml}
 
-      <div class="section-lbl" style="margin-top:22px">État de la composante</div>
-      <div class="etat-row">${etatBtnsHtml}</div>
+      <div class="sec-head" style="margin-top:24px">
+        <span class="section-lbl" style="margin:0">Cote de l'élément</span>
+        <button class="r-toggle ${c.r_flag ? 'on' : ''}" data-action="toggle-rflag" title="Marqueur R">R</button>
+      </div>
+      ${ratingListHtml(c)}
 
-      <div class="residual-row"><span class="section-lbl" style="margin:0">Vie résiduelle</span><span class="residual-val" id="residualVal" style="color:${residColor}">${resid} %</span></div>
-      <input type="range" min="0" max="100" value="${resid}" data-role="residual-slider">
-      <div class="residual-labels"><span>Fin de vie</span><span>Neuf</span></div>
+      <div class="section-lbl" style="margin-top:26px">Observations</div>
+      ${obsFieldHtml('observationInput', 'comp-textarea', 'observation', 'Observation', c.observation, 'Ce qui est constaté sur place…')}
+      ${obsFieldHtml('causeInput', 'comp-textarea', 'cause_possible', 'Cause possible', c.cause_possible, 'Origine probable du constat…')}
 
-      <div class="yr-qty-grid">
-        <div><label for="yearInput">Année install.</label><input id="yearInput" data-role="year-input" value="${esc(c.install_year != null ? c.install_year : '')}" inputmode="numeric" placeholder="—"></div>
-        <div><label for="qtyInput">Quantité</label><input id="qtyInput" data-role="qty-input" value="${esc(c.qty != null ? c.qty : '')}" placeholder="—"></div>
+      <div class="obs-field">
+        <label for="delaiInput">Délai suggéré</label>
+        <input id="delaiInput" class="fld-input" data-role="comp-text" data-field="delai_suggere" value="${esc(c.delai_suggere || '')}" placeholder="ex. à court terme">
+        <div class="quick-chips">${delaiChips}</div>
       </div>
 
-      <div class="section-lbl" style="margin-top:22px">Note vocale</div>
+      ${obsFieldHtml('consequencesInput', 'comp-textarea', 'consequences', 'Conséquences additionnelles', c.consequences, 'Si rien n’est fait…')}
+
+      <div class="sec-head" style="margin-top:26px">
+        <span class="section-lbl" style="margin:0">Précisions</span>
+        <button class="link-btn" data-action="toggle-facets">${state.facetsOpen ? 'Masquer' : 'Préciser'}</button>
+      </div>
+      ${state.facetsOpen ? `<div class="facets-wrap">${facetsHtml(c)}</div>` : `<div class="facets-summary">${esc(facetSuffix(c) || 'Position de façade, emplacement, variante — au besoin.')}</div>`}
+
+      <div class="section-lbl" style="margin-top:26px">Données techniques</div>
+      <div class="field-grid">
+        <div>
+          <label for="yearInput">Année de construction ou réparation</label>
+          <input id="yearInput" data-role="year-input" value="${esc(c.install_year != null ? c.install_year : '')}" inputmode="numeric" placeholder="AAAA">
+        </div>
+        <div>
+          <label for="lifeInput">Durée de vie utile (ans)</label>
+          <input id="lifeInput" data-role="comp-number" data-field="useful_life_years" value="${esc(c.useful_life_years != null ? c.useful_life_years : '')}" inputmode="numeric" placeholder="—">
+        </div>
+        <div>
+          <label for="qtyInput">Quantité</label>
+          <input id="qtyInput" data-role="comp-text" data-field="qty" value="${esc(c.qty != null ? c.qty : '')}" placeholder="—">
+        </div>
+        <div>
+          <label for="costInput">Coût de remplacement ($)</label>
+          <input id="costInput" data-role="comp-number" data-field="replacement_cost" value="${esc(c.replacement_cost != null ? c.replacement_cost : '')}" inputmode="numeric" placeholder="—">
+        </div>
+      </div>
+
+      <div class="derived-card ${rep && rep.delta < 0 ? 'late' : ''}">
+        <div class="k">Année anticipée de remplacement</div>
+        <div class="v">${rep ? rep.year : '—'}</div>
+        <div class="s">${esc(repSub)}</div>
+      </div>
+
+      <div class="section-lbl" style="margin-top:26px">Attributs</div>
+      ${attributsHtml(c)}
+
+      <div class="section-lbl" style="margin-top:26px">Note vocale</div>
       ${micSection}
       ${noteCard}
     </div>
@@ -891,17 +1445,24 @@ function ficheHtml() {
 }
 
 function aiResultHtml(r, c) {
-  const etatObj = typeof r.etat === 'number' ? ETATS[r.etat] : null;
+  const rInfo = ratingInfo(r.rating);
+  const label = rInfo ? rInfo.label : (r.ratingLabel || 'Non déterminée');
   const conf = r.confidence != null ? (typeof r.confidence === 'number' ? Math.round(r.confidence <= 1 ? r.confidence * 100 : r.confidence) + ' %' : r.confidence) : '';
+  const cost = r.cost != null && r.cost !== '' ? String(r.cost) : (typeof r.costEstimate === 'number' ? fmtCAD.format(Math.round(r.costEstimate)) : '—');
+  const line = (k, v) => v ? `<div class="ai-line"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>` : '';
   return `<div class="ai-card">
     <div class="ai-card-hdr"><i data-lucide="sparkles"></i><span class="lbl">Analyse IA</span>${conf ? `<span class="conf">confiance ${esc(conf)}</span>` : ''}</div>
     <div class="ai-card-body">
       <div class="ai-grid">
         <div><div class="k">Composante</div><div class="v">${esc(c.name)}</div></div>
-        <div><div class="k">État estimé</div><div class="v" style="color:${etatObj ? etatObj.color : 'var(--ink)'}">${etatObj ? esc(etatObj.label) : '—'}</div></div>
-        <div><div class="k">Vie résiduelle</div><div class="v">${r.life != null ? esc(String(r.life)) : (r.residual != null ? r.residual + ' %' : '—')}</div></div>
-        <div><div class="k">Coût remplac.</div><div class="v">${r.costEstimate != null ? esc(String(r.costEstimate)) : (r.cost != null ? esc(String(r.cost)) : '—')}</div></div>
+        <div><div class="k">Cote proposée</div><div class="v" style="color:${rInfo ? rInfo.color : 'var(--ink-500)'}">${esc(label)}</div></div>
       </div>
+      ${line('Observation', r.observation)}
+      ${line('Cause possible', r.causePossible)}
+      ${line('Délai suggéré', r.delaiSuggere)}
+      ${line('Conséquences', r.consequences)}
+      ${line('Coût de remplacement', cost)}
+      ${r.source ? `<div class="ai-source">Source : ${esc(r.source)}</div>` : ''}
       <button class="btn-apply" data-action="apply-ai">Appliquer ces valeurs</button>
     </div>
   </div>`;
@@ -911,10 +1472,10 @@ function syntheseHtml() {
   const st = computeStats();
   const missing = state.components.filter(c => !c.done);
   const missingHtml = missing.map(c => {
-    const catInfo = CATS[c.cat] || { label: c.cat, icon: 'box' };
+    const info = catInfo(c.cat);
     return `<button class="coverage-item" data-action="open-fiche" data-id="${esc(c.id)}">
-      <i data-lucide="${catInfo.icon}"></i>
-      <div class="mid"><div class="n">${esc(c.name)}</div><div class="c">${esc(catInfo.label)}</div></div>
+      <i data-lucide="${info.icon}"></i>
+      <div class="mid"><div class="n">${esc(c.name)}</div><div class="c">${esc(info.label)}</div></div>
       <span class="go">Documenter →</span>
     </button>`;
   }).join('');
@@ -932,7 +1493,7 @@ function syntheseHtml() {
       <h2>Synthèse</h2>
     </div>
     <div class="synthese-body">
-      <div class="verify-banner"><div class="icon"><i data-lucide="check"></i></div><div class="txt"><b>${st.done} composante${st.done !== 1 ? 's' : ''} documentée${st.done !== 1 ? 's' : ''}</b> sur ${st.total}</div></div>
+      <div class="verify-banner"><div class="icon"><i data-lucide="check"></i></div><div class="txt"><b>${st.done} composante${st.done !== 1 ? 's' : ''} documentée${st.done !== 1 ? 's' : ''}</b> sur ${st.total}${st.critical ? ` · <b>${st.critical}</b> en entretien ou remplacement requis` : ''}</div></div>
 
       ${missing.length ? `
       <div class="coverage-card">
@@ -986,6 +1547,7 @@ function onRootClick(e) {
   switch (action) {
     case 'select-dossier': selectDossier(t.dataset.id); break;
     case 'go-accueil': state.screen = 'accueil'; render(); break;
+    case 'go-immeuble': state.screen = 'immeuble'; render(); break;
     case 'go-liste': state.screen = 'liste'; render(); break;
     case 'go-synth': state.screen = 'synthese'; render(); break;
     case 'open-fiche': openFiche(t.dataset.id); break;
@@ -993,7 +1555,22 @@ function onRootClick(e) {
     case 'add-photo': triggerPhotoInput(); break;
     case 'analyze': analyze(); break;
     case 'apply-ai': applyAi(); break;
-    case 'set-etat': onEtatClick(+t.dataset.etat); break;
+    case 'set-rating': onRatingClick(t.dataset.rating); break;
+    case 'toggle-rflag': onRflagClick(); break;
+    case 'set-facet': onFacetClick(t.dataset.field, t.dataset.val); break;
+    case 'toggle-facets': state.facetsOpen = !state.facetsOpen; render(); break;
+    case 'pick-delai': if (saveCompField('delai_suggere', t.dataset.val, { force: true })) render(); break;
+    case 'attr-add': onAttrAdd(); break;
+    case 'attr-del': onAttrDelete(t.dataset.key); break;
+    case 'attr-suggest': {
+      state.attrKeyDraft = t.dataset.key;
+      const keyEl = document.getElementById('attrKeyInput');
+      if (keyEl) keyEl.value = state.attrKeyDraft;
+      const valEl = document.getElementById('attrValInput');
+      if (valEl) valEl.focus();
+      break;
+    }
+    case 'imm-choice': onImmChoice(t.dataset.sec, t.dataset.key, t.dataset.val); break;
     case 'toggle-voice': toggleVoice(); break;
     case 'note-fallback-send': onNoteFallbackSend(); break;
     case 'save-fiche': saveFiche(); break;
@@ -1007,30 +1584,41 @@ function onRootClick(e) {
 
 function onRootInput(e) {
   const t = e.target;
-  if (t.matches && t.matches('[data-role="search-input"]')) {
+  if (!t || !t.matches) return;
+  if (t.matches('[data-role="search-input"]')) {
     state.search = t.value;
     render();
-  } else if (t.matches && t.matches('[data-role="residual-slider"]')) {
-    onResidualInput(e);
-  } else if (t.matches && t.matches('[data-role="note-fallback-text"]')) {
+  } else if (t.matches('[data-role="note-fallback-text"]')) {
     state.noteDraft = t.value;
-  } else if (t.matches && t.matches('[data-role="login-email"]')) {
+  } else if (t.matches('[data-role="attr-key-draft"]')) {
+    state.attrKeyDraft = t.value;
+  } else if (t.matches('[data-role="attr-val-draft"]')) {
+    state.attrValDraft = t.value;
+  } else if (t.matches('[data-role="login-email"]')) {
     state.loginEmail = t.value;
-  } else if (t.matches && t.matches('[data-role="login-password"]')) {
+  } else if (t.matches('[data-role="login-password"]')) {
     state.loginPassword = t.value;
   }
 }
 
 function onRootChange(e) {
   const t = e.target;
-  if (t.matches && t.matches('[data-role="residual-slider"]')) onResidualChange(e);
   if (t.matches && t.matches('[data-role="photo-file-input"]')) onPhotoFileChange(e);
 }
 
 function onRootFocusout(e) {
   const t = e.target;
-  if (t.matches && t.matches('[data-role="year-input"]')) onYearBlur(e);
-  if (t.matches && t.matches('[data-role="qty-input"]')) onQtyBlur(e);
+  if (!t || !t.matches) return;
+  if (t.matches('[data-role="year-input"]')) { onYearBlur(e); return; }
+  if (t.matches('[data-role="comp-number"]')) { onNumberBlur(t.dataset.field, e); return; }
+  if (t.matches('[data-role="comp-text"]') || t.matches('[data-role="comp-textarea"]')) {
+    const v = t.value.trim();
+    saveCompField(t.dataset.field, v === '' ? null : v);
+    return;
+  }
+  if (t.matches('[data-role="attr-value"]')) { onAttrValueBlur(t.dataset.key, e); return; }
+  if (t.matches('[data-role="imm-text"]')) { onImmTextBlur(t.dataset.sec, t.dataset.key, e); return; }
+  if (t.matches('[data-role="dossier-number"]')) { onDossierNumberBlur(t.dataset.field, e); return; }
 }
 
 function onRootSubmit(e) {
