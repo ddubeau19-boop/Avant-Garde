@@ -576,7 +576,7 @@ function renderCompanies() {
     </form>` : ''}
     ${state.companiesLoading && state.companies.length === 0 ? spinnerBlock('Chargement des entreprises…') : `
     <div class="dossiers-table">
-      <div class="dt-row co-row co-head"><div>Entreprise</div><div>Ingénieurs</div><div>Dossiers</div><div>Créée le</div><div></div></div>
+      <div class="dt-row co-row dt-head"><div>Entreprise</div><div>Ingénieurs</div><div>Dossiers</div><div>Créée le</div><div></div></div>
       ${state.companies.length === 0 ? `<div class="empty-state">Aucune entreprise pour l'instant.</div>` : state.companies.map(c => `
       <div class="dt-row co-row">
         <div class="co-name-cell">${companyThumbHtml(c)}<div><div class="dt-name">${escapeHtml(c.name || '—')}</div><div class="dt-sub">${escapeHtml(c.slug || '')}</div></div></div>
@@ -656,7 +656,7 @@ function renderCompanyDetail() {
     </form>` : ''}
 
     <div class="dossiers-table">
-      <div class="dt-row eng-row eng-head"><div>Nom</div><div>Courriel</div><div>Rôle</div><div>Créé le</div></div>
+      <div class="dt-row eng-row dt-head"><div>Nom</div><div>Courriel</div><div>Rôle</div><div>Créé le</div></div>
       ${engineers.length === 0 ? `<div class="empty-state">Aucun ingénieur pour cette entreprise.</div>` : engineers.map(e => `
       <div class="dt-row eng-row">
         <div class="dt-name">${escapeHtml(e.name || '—')}</div>
