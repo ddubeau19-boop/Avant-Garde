@@ -2953,15 +2953,39 @@ function generateTempPassword() {
   const bytes = crypto.getRandomValues(new Uint8Array(9));
   return toBase64Url(bytes).replace(/[-_]/g, "x") + "!1";
 }
-const DEFAULT_USEFUL_LIFE_YEARS = {
-  toiture: 25,
-  enveloppe: 30,
-  structure: 50,
-  meca: 15,
-  elec: 25,
-  amenage: 20,
-  securite: 15
+const CATEGORIES = {
+  terrain: { ordre: 1, label: "Terrain et aménagement" },
+  structure: { ordre: 2, label: "Fondation, structure et stationnements intérieurs" },
+  enveloppe: { ordre: 3, label: "Enveloppe du bâtiment" },
+  ouvertures: { ordre: 4, label: "Portes extérieures et fenêtres" },
+  balcons: { ordre: 5, label: "Balcons, escaliers et terrasses" },
+  interieur: { ordre: 6, label: "Intérieur du bâtiment" },
+  equipements: { ordre: 7, label: "Appareils, installations et équipements spéciaux" },
+  cvac: { ordre: 8, label: "Systèmes de chauffage et ventilation" },
+  electrique: { ordre: 9, label: "Installations électriques" },
+  plomberie: { ordre: 10, label: "Installations de plomberie, d'eau et d'égout" }
 };
+const RATING_LABELS = {
+  1: "Bon état",
+  2: "Entretien normal",
+  3: "Entretien requis",
+  4: "Remplacement requis"
+};
+const POSITIONS = { AV: "Avant", GA: "Gauche", ARR: "Arrière", DR: "Droite" };
+const EMPLACEMENTS = { corridors: "Corridors", escaliers: "Escaliers", stationnement: "Stationnement" };
+const DEFAULT_USEFUL_LIFE_YEARS = {
+  terrain: 25,
+  structure: 20,
+  enveloppe: 25,
+  ouvertures: 40,
+  balcons: 25,
+  interieur: 20,
+  equipements: 15,
+  cvac: 25,
+  electrique: 30,
+  plomberie: 20
+};
+const ALLOCATION_USEFUL_LIFE = 10;
 const MODEL = "claude-sonnet-5";
 async function callClaude(apiKey, opts) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -2991,50 +3015,110 @@ function extractJson(text) {
   return JSON.parse(match2[0]);
 }
 const DEFAULT_CHECKLIST = [
-  { cat: "toiture", name: "Membrane élastomère (toit plat)", qty: "—" },
-  { cat: "toiture", name: "Solins & parapets", qty: "—" },
-  { cat: "toiture", name: "Drains de toit", qty: "—" },
-  { cat: "enveloppe", name: "Revêtement extérieur", qty: "—" },
-  { cat: "enveloppe", name: "Fenêtres communes", qty: "—" },
-  { cat: "enveloppe", name: "Balcons & garde-corps", qty: "—" },
-  { cat: "enveloppe", name: "Portes & portes-patio", qty: "—" },
-  { cat: "structure", name: "Dalle de garage", qty: "—" },
-  { cat: "structure", name: "Fondation", qty: "—" },
-  { cat: "meca", name: "Chauffe-eau commun", qty: "—" },
-  { cat: "meca", name: "Échangeur d'air / ventilation", qty: "—" },
-  { cat: "meca", name: "Pompe de puisard", qty: "—" },
-  { cat: "elec", name: "Panneau électrique commun", qty: "—" },
-  { cat: "elec", name: "Éclairage commun", qty: "—" },
-  { cat: "amenage", name: "Asphalte du stationnement", qty: "—" },
-  { cat: "amenage", name: "Aménagement paysager", qty: "—" },
-  { cat: "securite", name: "Alarme incendie & détecteurs", qty: "—" }
+  { cat: "terrain", name: "Aménagement paysager", code: "G40.10-50", vu: 25, qty: "—" },
+  { cat: "terrain", name: "Stationnement et voies de circulation – Pavage", code: "G10.10-30", vu: 25, qty: "—" },
+  { cat: "terrain", name: "Bordures de béton", code: "G10.10-30", vu: 35, qty: "—" },
+  { cat: "terrain", name: "Allées piétonnières", code: "G20.10-30", vu: 20, qty: "—" },
+  { cat: "terrain", name: "Garde-corps et mains courantes", code: "G20.30", vu: 40, qty: "—" },
+  { cat: "structure", name: "Murs de fondation", vu: 10, qty: "—" },
+  { cat: "structure", name: "Structure", vu: 10, qty: "—" },
+  { cat: "structure", name: "Stationnement intérieur – Dalle sur sol et dalle structurale", vu: 20, qty: "—" },
+  { cat: "enveloppe", name: "Surface de toit principal, solins", code: "B30.10-40", vu: 35, qty: "—" },
+  { cat: "enveloppe", name: "Gouttières", vu: 10, qty: "—" },
+  { cat: "enveloppe", name: "Parement extérieur – Maçonnerie", code: "B20.10", vu: 10, qty: "—" },
+  { cat: "enveloppe", name: "Parement extérieur – Scellants de rencontre", code: "B20.10", vu: 10, qty: "—" },
+  { cat: "ouvertures", name: "Portes d'entrée et imposte", code: "B40.40", vu: 45, qty: "—" },
+  { cat: "ouvertures", name: "Portes de services – Acier", code: "B40.50", vu: 35, qty: "—" },
+  { cat: "ouvertures", name: "Fenêtres", code: "B40.10", vu: 40, qty: "—" },
+  { cat: "ouvertures", name: "Scellants d'ouverture", code: "B40.10", vu: 7, qty: "—" },
+  { cat: "ouvertures", name: "Portes patios – Portes-fenêtres", code: "B40.20", vu: 40, qty: "—" },
+  { cat: "balcons", name: "Balcons – Structure", code: "B10.10-30", vu: 50, qty: "—" },
+  { cat: "balcons", name: "Garde-corps et escaliers en acier", code: "B10.80", vu: 40, qty: "—" },
+  { cat: "interieur", name: "Revêtement de placoplâtre – Peinture", code: "C10.10", vu: 15, qty: "—" },
+  { cat: "interieur", name: "Revêtement de sol – Corridors communs", code: "C30.30", vu: 20, qty: "—" },
+  { cat: "interieur", name: "Portes des unités", code: "C20.20", vu: 50, qty: "—" },
+  { cat: "equipements", name: "Système d'incendie – Éclairage d'urgence et panneau de sortie", code: "D50.40-50", vu: 10, qty: "—" },
+  { cat: "equipements", name: "Système d'incendie – Panneau d'alarme centrale, stations manuelles et avertisseurs", code: "D50.31", vu: 10, qty: "—" },
+  { cat: "equipements", name: "Détecteurs de fumée/chaleur et extincteurs portatifs", code: "D50.32", vu: 10, qty: "—" },
+  { cat: "equipements", name: "Boîtes aux lettres", vu: 20, qty: "—" },
+  { cat: "cvac", name: "Chauffage, ventilation et climatisation (CVAC) – Communs", code: "D30.45", vu: 35, qty: "—" },
+  { cat: "cvac", name: "Ventilation des salles de services", code: "D30.44", vu: 20, qty: "—" },
+  { cat: "electrique", name: "Alimentation électrique principale", code: "D50.10", vu: 10, qty: "—" },
+  { cat: "electrique", name: "Appareils d'éclairage intérieurs", code: "D50.23", vu: 35, qty: "—" },
+  { cat: "electrique", name: "Appareils d'éclairage extérieurs", code: "D50.22", vu: 25, qty: "—" },
+  { cat: "plomberie", name: "Système d'alimentation en eau potable", code: "D20.20", vu: 10, qty: "—" },
+  { cat: "plomberie", name: "Système d'évacuation sanitaire et pluvial", code: "D20.30-41", vu: 10, qty: "—" },
+  { cat: "plomberie", name: "Réservoirs d'eau chaude – Communs immeuble", code: "D20.27", vu: 25, qty: "—" }
 ];
-const JARGON_STYLE_GUIDE = `Registre attendu — inspiré de vraies études de fonds de prévoyance / plans de gestion
-d'actif québécois (noms de composantes anonymisés, à titre d'exemples de FORMULATION
-seulement, ne pas les recopier tels quels ni inventer de faits à partir d'eux) :
-- Toiture : "Restaurer ou remplacer les complexes d'étanchéité de la toiture à membrane monocouche en EPDM" ; "Remplacer la membrane d'étanchéité multicouche de feutres et d'asphalte de la marquise"
-- Enveloppe : "Restaurer les joints de mortier des murs en maçonnerie de briques" ; "Remplacer les fenêtres à cadres en PVC exposées aux intempéries (partie commune à usage restreint)" ; "Remplacer les joints de scellement du périmètre des fenêtres et portes-terrasses"
-- Structure : "Colmater les fissures et réparer les surfaces des structures en béton des escaliers" ; "Provision périodique pour sceller les fissures des murs de fondation"
-- Mécanique : "Remplacer une partie des conduits des réseaux enfouis" ; "Provision quinquennale pour remplacer des composants des systèmes de ventilation et de chauffage"
-- Électricité : "Remplacer les appareils d'éclairage des aires communes" ; "Provision pour remplacer une partie des transformateurs"
-- Aménagement : "Appliquer une nouvelle couche d'asphalte sur le revêtement de chaussée en béton bitumineux" ; "Refaire les murs de soutènement en blocs modulaires de béton"
-- Sécurité : "Remplacer le panneau d'alarme incendie" ; "Provision pour remplacer une partie des composants du réseau de détection d'incendie"
-Utilise ce niveau de précision technique (matériau, système, partie visée) plutôt que des
-termes génériques. Le sigle PCUR désigne une partie commune à usage restreint (financée par
-l'ensemble des copropriétaires mais desservant certaines unités) ; PCUG une partie commune à
-usage général — mentionne-les seulement quand c'est pertinent et clairement applicable.`;
+const JARGON_STYLE_GUIDE = `Méthode et registre de la firme (Plan de gestion de l'actif — PGA) :
+
+ÉCHELLE D'ÉTAT (obligatoire, 4 niveaux + na) :
+1 = bon état · 2 = entretien normal · 3 = entretien requis · 4 = remplacement requis.
+C'est une échelle état + action : 3 et 4 commandent une intervention. « na » si non
+applicable ou non observé. N'invente aucune autre échelle (pas de pourcentage, pas de
+lettres, pas d'indice).
+
+MODÈLE D'OBSERVATION (l'ordre est celui de la fiche de relevé) :
+observation → cause possible → délai suggéré → conséquences additionnelles.
+
+NOMMAGE DES ÉLÉMENTS : nom technique précis incluant le matériau ou le système visé
+(ex. « Parement extérieur – Maçonnerie », « Surface de toit principal, solins »,
+« Stationnement intérieur – Dalle sur sol et dalle structurale »). Les éléments parents
+portent un code Uniformat II (B20.10, D30.45, G40.10-50…). Les sous-lignes sont soit une
+variante de matériau, soit une position de façade (AV/GA/ARR/DR = avant/gauche/arrière/droite),
+soit une localisation (corridors/escaliers/stationnement).
+
+REMPLACEMENT vs ALLOCATION : un remplacement complet porte la durée de vie réelle de la
+composante ; une enveloppe budgétaire récurrente est une « allocation » et porte par défaut
+un cycle de 10 ans. Les cycles réglementaires portent leur cycle statutaire (inspection
+Loi 122 = 5 ans, inspection DAR = 1 an, nettoyage des colonnes = 5 ans).
+
+VOIX : première personne du pluriel professionnel (« nous »), modalisation constante. La
+maison privilégie « nous suggérons » plutôt que « nous recommandons ». Les travaux relevant
+d'un champ de pratique réservé sont renvoyés au corps de métier ou au professionnel visé.
+
+UNITÉS ET NOMBRES : montants arrondis à la centaine, espace comme séparateur de milliers,
+symbole $ précédé d'une espace (12 500 $). Durées de vie en années entières dans les tableaux,
+fourchettes « environ X à Y ans » en prose. Mesures en impérial d'abord avec l'équivalent
+métrique entre parenthèses.
+
+SIGLES : PCUR = partie commune à usage restreint ; PCUG = partie commune à usage général ;
+FP = fonds de prévoyance ; CE = carnet d'entretien ; VU = durée de vie utile.`;
 async function generateChecklist(apiKey, profile) {
   if (!apiKey) return DEFAULT_CHECKLIST;
   const prompt = `Tu es ingénieur en bâtiment spécialisé dans les études de fonds de prévoyance
 pour syndicats de copropriété au Québec. Pour un immeuble résidentiel de
 ${profile.units} unités${profile.floors ? `, ${profile.floors} étages` : ""}${profile.builtYear ? `, construit en ${profile.builtYear}` : ""}, propose la liste des composantes typiques à inspecter.
 
-Catégories valides (utilise exactement ces clés) : toiture, enveloppe, structure, meca, elec, amenage, securite.
+Catégories valides (utilise exactement ces clés, dans cet ordre) :
+${Object.entries(CATEGORIES).map(([k, v]) => `${v.ordre}. ${k} — ${v.label}`).join("\n")}
 
 ${JARGON_STYLE_GUIDE}
 
-Réponds UNIQUEMENT avec un tableau JSON d'objets {"cat", "name", "qty"} (qty = quantité
-approximative ou "—" si non applicable). Entre 12 et 20 composantes.`;
+Durées de vie utiles de référence (années) : pavage 25 · bordures de béton 35 · allées
+piétonnières 20 (all.) · murets de soutènement en modules de béton 40, en bois traité 25 ·
+garde-corps 40 · clôture acier grillagé 30, bois 15 · murs de fondation 10 (all.) · dalle de
+stationnement 20 (all.) · membrane de surface de roulement 35 · membrane toit-terrasse 40 ·
+inspection Loi 122 = 5 · toit plat membrane 35 · toit en pente bardeaux 25 · gouttières 10 (all.) ·
+puits de lumière 10 (all.) · marquise panneau de verre trempé 35, structure acier 50 · parement
+panneaux de béton préfabriqué 75, maçonnerie 10 (all.), linteaux 10 (all.), scellants de rencontre 10,
+métallique 15 (all.), vinyle 35, bois 15 (all.), enduit acrylique 20 (all.) · portes d'entrée 45 ·
+portes de service acier 35 · portes-patio 40 · fenêtre vinyle 40, bois 45 · scellant d'ouverture 7 ·
+porte de garage 30, moteur 10 (all.) · mur rideau 75 · balcons acier 50, pontage fibre de verre 25,
+structure de bois 25, garde-corps métallique 40 · terrasses urbaines bois traité 25 · placoplâtre
+peinture 15 (all.) · tuiles acoustiques 20 (all.) · tapis 20 · céramique 10 (all.) · vinyle 20 ·
+bois franc 40 · escaliers intérieurs 15 (all.) · portes des unités 50 · systèmes d'incendie 10 ·
+carillons 20 · CCTV 20 · boîtes aux lettres 20 (all.) · compacteur 25 · ascenseur (modernisation) 35 ·
+plinthes et aérothermes 25 · ventilation privative 3 (all.) · CVAC communs 35 · ventilation des
+salles de services 20 · détection des gaz 25 · alimentation électrique principale 10 (all.) ·
+éclairage intérieur 35, extérieur 25 · lampadaire 30 · génératrice 40 · réservoir de mazout 25 ·
+alimentation en eau potable 10 (all.) · inspection DAR 1 · évacuation sanitaire et pluviale 10 (all.) ·
+nettoyage des colonnes 5 (all.) · réservoir d'eau chaude conciergerie 10, communs 25 · gicleurs 10 (all.).
+
+Réponds UNIQUEMENT avec un tableau JSON d'objets {"cat", "name", "code", "vu", "qty"} où
+"code" est le code Uniformat II de l'élément parent (ou null si tu n'en es pas certain), "vu"
+la durée de vie utile en années, et "qty" la quantité approximative ou "—". Entre 20 et 34
+composantes, couvrant les catégories pertinentes pour cet immeuble.`;
   try {
     const text = await callClaude(apiKey, { content: prompt, maxTokens: 1500 });
     const items = extractJson(text);
@@ -3044,16 +3128,21 @@ approximative ou "—" si non applicable). Entre 12 et 20 composantes.`;
     return DEFAULT_CHECKLIST;
   }
 }
-function heuristicEstimate(installYear) {
-  const yr = installYear ?? (/* @__PURE__ */ new Date()).getFullYear() - 15;
-  const age = (/* @__PURE__ */ new Date()).getFullYear() - yr;
-  const etat = age >= 15 ? 3 : age >= 8 ? 2 : 1;
-  const residual = Math.max(5, 100 - age * 4);
-  const life = residual < 15 ? "~ 3 ans" : residual < 40 ? "~ 8 ans" : "~ 15 ans";
+function heuristicEstimate(installYear, usefulLife) {
+  const now = (/* @__PURE__ */ new Date()).getFullYear();
+  const yr = installYear ?? now - 15;
+  const age = now - yr;
+  const vu = usefulLife ?? 25;
+  const consomme = vu > 0 ? age / vu : 1;
+  const rating = consomme >= 0.95 ? 4 : consomme >= 0.75 ? 3 : consomme >= 0.4 ? 2 : 1;
   return {
-    etat,
-    residual,
-    life,
+    rating,
+    ratingLabel: RATING_LABELS[rating],
+    observation: "",
+    causePossible: "",
+    delaiSuggere: consomme >= 0.95 ? "à court terme" : consomme >= 0.75 ? "à planifier" : "aucun suivi particulier",
+    consequences: "",
+    anneeRemplacement: yr + vu,
     cost: "à estimer",
     costEstimate: null,
     confidence: "estimation par âge",
@@ -3061,7 +3150,7 @@ function heuristicEstimate(installYear) {
   };
 }
 async function analyzePhotos(apiKey, opts) {
-  if (!apiKey || opts.images.length === 0) return heuristicEstimate(opts.installYear);
+  if (!apiKey || opts.images.length === 0) return heuristicEstimate(opts.installYear, opts.usefulLife);
   const content = [
     ...opts.images.map((img) => ({
       type: "image",
@@ -3069,21 +3158,25 @@ async function analyzePhotos(apiKey, opts) {
     })),
     {
       type: "text",
-      text: `Composante inspectée : "${opts.componentName}"${opts.installYear ? ` (installée en ${opts.installYear})` : ""}. Analyse ces photos prises lors d'une inspection de fonds de prévoyance et
-estime son état.
+      text: `Composante inspectée : « ${opts.componentName} »${opts.uniformatCode ? ` (${opts.uniformatCode})` : ""}${opts.installYear ? `, dernier remplacement ou construction en ${opts.installYear}` : ""}${opts.usefulLife ? `, durée de vie utile de référence : ${opts.usefulLife} ans` : ""}.
+Tu relèves cette composante lors d'une visite de plan de gestion de l'actif. Analyse les
+photos et produis la fiche de relevé.
 
 ${JARGON_STYLE_GUIDE}
 
 Réponds UNIQUEMENT avec un objet JSON :
-{"etat": 0-4 (0=Excellent, 1=Bon, 2=Moyen, 3=Mauvais, 4=Critique), "residual": 0-100 (% de vie utile restante), "life": "estimation en années (ex: ~ 8 ans)", "cost": "coût de remplacement approximatif en $ CAD formaté (ex: '28 000 $'), ou 'à estimer' si impossible à évaluer visuellement", "costEstimate": nombre brut CAD correspondant à "cost" (ex: 28000), ou null si "cost" est "à estimer", "confidence": "pourcentage de confiance (ex: 82 %)"}`
+{"rating": 1|2|3|4 (1=bon état, 2=entretien normal, 3=entretien requis, 4=remplacement requis ; null si non observable), "observation": "ce qui est visible sur les photos, en une à trois phrases, registre professionnel", "causePossible": "cause probable du constat, ou '' si aucun défaut", "delaiSuggere": "délai d'intervention suggéré (ex: 'à court terme', 'dans les 5 ans', 'à planifier', 'aucun suivi particulier')", "consequences": "conséquences additionnelles si rien n'est fait, ou ''", "cost": "coût de remplacement approximatif en $ CAD formaté (ex: '28 500 $'), arrondi à la centaine, ou 'à estimer' si non évaluable visuellement", "costEstimate": nombre brut CAD correspondant, ou null, "confidence": "pourcentage de confiance (ex: 82 %)"}
+
+N'invente aucun défaut qui ne soit pas visible sur les photos. Si les photos ne permettent
+pas de statuer, mets "rating": null et explique-le dans "observation".`
     }
   ];
   try {
-    const text = await callClaude(apiKey, { content, maxTokens: 500 });
+    const text = await callClaude(apiKey, { content, maxTokens: 700 });
     const parsed = extractJson(text);
-    return { ...parsed, source: "ia" };
+    return { ...parsed, ratingLabel: RATING_LABELS[parsed.rating] ?? null, source: "ia" };
   } catch {
-    return heuristicEstimate(opts.installYear);
+    return heuristicEstimate(opts.installYear, opts.usefulLife);
   }
 }
 async function structureNote(apiKey, transcript) {
@@ -3158,7 +3251,19 @@ components.patch("/:id", async (c) => {
     "ai_suggested",
     "replacement_cost",
     "useful_life_years",
-    "confirmed"
+    "confirmed",
+    "rating",
+    "r_flag",
+    "observation",
+    "cause_possible",
+    "delai_suggere",
+    "consequences",
+    "uniformat_code",
+    "position",
+    "emplacement",
+    "variante",
+    "attributs",
+    "parent_id"
   ]) {
     if (key in body2) {
       fields.push(`${key} = ?${fields.length + 1}`);
@@ -3189,6 +3294,8 @@ components.post("/:id/analyze", async (c) => {
   const analysis = await analyzePhotos(c.env.ANTHROPIC_API_KEY, {
     componentName: component.name,
     installYear: component.install_year,
+    usefulLife: component.useful_life_years ?? DEFAULT_USEFUL_LIFE_YEARS[component.cat] ?? null,
+    uniformatCode: component.uniformat_code,
     images
   });
   return c.json(analysis);
@@ -3234,8 +3341,17 @@ const RESERVE_FUND_PARAMS = {
 function replacementEventsForComponent(c, params) {
   const usefulLife = c.useful_life_years ?? DEFAULT_USEFUL_LIFE_YEARS[c.cat] ?? null;
   if (!c.replacement_cost || !usefulLife || usefulLife <= 0) return [];
-  const residualPct = (c.residual ?? 0) / 100;
-  const firstReplacementYear = Math.max(1, Math.round(usefulLife * residualPct));
+  // Règle maison : l'année anticipée de remplacement est ancrée sur l'année de construction
+  // ou de dernière réparation, plus la durée de vie utile. Un remplacement déjà échu est
+  // reporté en première année de l'horizon.
+  const currentYear = (/* @__PURE__ */ new Date()).getFullYear();
+  let firstReplacementYear;
+  if (c.install_year) {
+    firstReplacementYear = Math.max(1, c.install_year + usefulLife - currentYear);
+  } else {
+    const residualPct = (c.residual ?? 0) / 100;
+    firstReplacementYear = Math.max(1, Math.round(usefulLife * residualPct));
+  }
   const events = [];
   for (let year = firstReplacementYear; year <= params.projectionYears; year += usefulLife) {
     const inflated = c.replacement_cost * Math.pow(1 + params.inflationRate, year);
@@ -21573,8 +21689,8 @@ async function generateReportDocx(ctx) {
     (c) => new TableRow({
       children: [
         cell(c.name),
-        cell(c.done ? ETAT_LABELS$1[c.etat ?? 1] ?? "—" : "non documentée"),
-        cell(c.residual != null ? `${c.residual} %` : "—"),
+        cell(c.done ? RATING_LABELS[c.rating] ?? "na" : "non documentée"),
+        cell(c.delai_suggere || "—"),
         cell(c.install_year != null ? String(c.install_year) : "—"),
         cell(c.replacement_cost != null ? money(c.replacement_cost) : "—"),
         cell(c.useful_life_years != null ? String(c.useful_life_years) : "—"),
@@ -21591,7 +21707,7 @@ async function generateReportDocx(ctx) {
           children: [
             cell("Composante", { header: true }),
             cell("État", { header: true }),
-            cell("Vie résiduelle", { header: true }),
+            cell("Délai suggéré", { header: true }),
             cell("Année", { header: true }),
             cell("Coût remplac.", { header: true }),
             cell("Vie utile", { header: true }),
@@ -41934,17 +42050,21 @@ const ETAT_LABELS = ["Excellent", "Bon", "Moyen", "Mauvais", "Critique"];
 function generateReportXlsx(ctx) {
   const { dossier, components: components2, projection } = ctx;
   const inventorySheet = utils.aoa_to_sheet([
-    ["Catégorie", "Composante", "État", "Vie résiduelle (%)", "Année install.", "Coût remplac. ($)", "Vie utile (ans)", "Photos", "Note"],
+    ["Catégorie", "Code", "Composante", "État", "Observation", "Cause possible", "Délai suggéré", "Conséquences", "Année de construction ou réparation", "Coût remplac. ($)", "Durée de vie (ans)", "Année anticipée de remplacement", "Photos"],
     ...components2.map((c) => [
-      c.cat,
+      CATEGORIES[c.cat]?.label ?? c.cat,
+      c.uniformat_code ?? "",
       c.name,
-      c.done ? ETAT_LABELS[c.etat ?? 1] ?? "" : "non documentée",
-      c.residual ?? "",
+      c.done ? RATING_LABELS[c.rating] ?? "na" : "non documentée",
+      c.observation ?? "",
+      c.cause_possible ?? "",
+      c.delai_suggere ?? "",
+      c.consequences ?? "",
       c.install_year ?? "",
       c.replacement_cost ?? "",
       c.useful_life_years ?? "",
-      c.photos,
-      c.note ?? ""
+      c.install_year != null && c.useful_life_years != null ? c.install_year + c.useful_life_years : "",
+      c.photos
     ])
   ]);
   inventorySheet["!cols"] = [
@@ -42119,7 +42239,7 @@ async function dossierStats(db, dossierId) {
     `SELECT
          COUNT(*) AS total,
          SUM(done) AS done,
-         SUM(CASE WHEN done = 1 AND etat >= 3 THEN 1 ELSE 0 END) AS critical,
+         SUM(CASE WHEN done = 1 AND rating >= 3 THEN 1 ELSE 0 END) AS critical,
          (SELECT COUNT(*) FROM photos p JOIN components c2 ON c2.id = p.component_id WHERE c2.dossier_id = ?1) AS photos_total
        FROM components WHERE dossier_id = ?1`
   ).bind(dossierId).first();
@@ -42171,11 +42291,20 @@ dossiers.post("/", async (c) => {
     builtYear: body2.built_year ?? null
   });
   const stmt = c.env.DB.prepare(
-    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)`
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)`
   );
   await c.env.DB.batch(
     items.map(
-      (item, i) => stmt.bind(newId("cmp"), id, item.cat, item.name, item.qty, i, DEFAULT_USEFUL_LIFE_YEARS[item.cat] ?? null)
+      (item, i) => stmt.bind(
+        newId("cmp"),
+        id,
+        CATEGORIES[item.cat] ? item.cat : "equipements",
+        item.name,
+        item.qty ?? "—",
+        i,
+        item.vu ?? DEFAULT_USEFUL_LIFE_YEARS[item.cat] ?? ALLOCATION_USEFUL_LIFE,
+        item.code ?? null
+      )
     )
   );
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
@@ -42257,7 +42386,9 @@ dossiers.patch("/:id", async (c) => {
     "built_year",
     "status",
     "current_fund_balance",
-    "published_at"
+    "published_at",
+    "batiment_info",
+    "cotisation_annuelle"
   ]) {
     if (key in body2) {
       fields.push(`${key} = ?${fields.length + 1}`);
