@@ -3613,7 +3613,9 @@ function etatDeterministe(component, dossier) {
   const cause = phraseFinale(component?.cause_possible);
   if (cause) parties.push(`Selon nos observations, cette situation serait possiblement en lien avec : ${cause.charAt(0).toLowerCase()}${cause.slice(1)}`);
   if (cote === "Bon") {
-    parties.push("L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée.");
+    parties.push(observation
+      ? "Dans l'ensemble, l'état observé est bon."
+      : "L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée.");
   } else if (cote === "Passable") {
     parties.push(`Dans l'ensemble, l'état observé est passable et nécessite un entretien devancé. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.`);
   } else if (cote === "Mauvais") {
@@ -22579,7 +22581,10 @@ async function generateReportDocx(ctx) {
     if (!parCategorie.has(cle)) parCategorie.set(cle, []);
     parCategorie.get(cle).push(comp);
   }
-  const fiches = await enParallele(components2, 4, (comp) => genFicheElement(comp, dossier, apiKey));
+  // Une fiche = un appel au modèle pour ÉTAT DE L'ACTIF. On les mène 6 par 6 :
+  // assez pour qu'un dossier de 30 composantes reste sous la minute, assez peu
+  // pour rester loin des limites de sous-requêtes du Worker.
+  const fiches = await enParallele(components2, 6, (comp) => genFicheElement(comp, dossier, apiKey));
   const parId = new Map(components2.map((c, i) => [c.id, fiches[i]]));
   const observation = [heading("4.0 Observation des éléments")];
   observation.push(body("Chacun des éléments est présenté suivant les quatre sous-sections décrites à la section 3.0. Les cotes employées sont celles de la légende : Bon, Passable – Nécessite un entretien, Mauvais – Requiert la planification d'un remplacement."));
