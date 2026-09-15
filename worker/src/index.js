@@ -2895,8 +2895,14 @@ async function verifySessionToken(token, secret) {
   return userId;
 }
 const auth = new Hono();
-function publicUser(u) {
-  return { id: u.id, name: u.name, email: u.email };
+async function companyBrief(db, companyId) {
+  if (!companyId) return null;
+  const co = await db.prepare("SELECT id, name, slug, logo_r2_key FROM companies WHERE id = ?1").bind(companyId).first();
+  if (!co) return null;
+  return { id: co.id, name: co.name, slug: co.slug, hasLogo: !!co.logo_r2_key };
+}
+async function publicUser(db, u) {
+  return { id: u.id, name: u.name, email: u.email, role: u.role, company: await companyBrief(db, u.company_id) };
 }
 auth.post("/login", async (c) => {
   const body2 = await c.req.json();
@@ -2908,12 +2914,12 @@ auth.post("/login", async (c) => {
   const ok = await verifyPassword(password, user.password_hash, user.password_salt);
   if (!ok) return c.json({ error: "identifiants invalides" }, 401);
   const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
-  return c.json({ token, user: publicUser(user) });
+  return c.json({ token, user: await publicUser(c.env.DB, user) });
 });
 auth.get("/me", async (c) => {
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
-  return c.json(publicUser(user));
+  return c.json(await publicUser(c.env.DB, user));
 });
 async function getCurrentUser(c) {
   const authHeader = c.req.header("Authorization");
@@ -2923,6 +2929,29 @@ async function getCurrentUser(c) {
   if (!userId) return null;
   const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(userId).first();
   return user ?? null;
+}
+function requireSuperAdmin(c, user) {
+  if (!user || user.role !== "super_admin") {
+    return c.json({ error: "accès réservé aux administrateurs" }, 403);
+  }
+  return null;
+}
+function slugify(name) {
+  return (name || "")
+    .toLowerCase()
+    .normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || "entreprise";
+}
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const bits = await pbkdf2(password, salt);
+  return { hash: toBase64Url(bits), salt: toBase64Url(salt) };
+}
+function generateTempPassword() {
+  const bytes = crypto.getRandomValues(new Uint8Array(9));
+  return toBase64Url(bytes).replace(/[-_]/g, "x") + "!1";
 }
 const DEFAULT_USEFUL_LIFE_YEARS = {
   toiture: 25,
@@ -3073,14 +3102,26 @@ async function listComponentsForDossier(db, dossierId) {
   const counts = new Map(photoCounts.results.map((r) => [r.component_id, r.n]));
   return rows.results.map((row) => ({ ...row, photos: counts.get(row.id) ?? 0 }));
 }
+async function getOwnedComponent(c, id) {
+  const user = await getCurrentUser(c);
+  if (!user) return null;
+  const component = await c.env.DB.prepare(
+    `SELECT cmp.* FROM components cmp
+       JOIN dossiers d ON d.id = cmp.dossier_id
+       WHERE cmp.id = ?1 AND d.company_id = ?2`
+  ).bind(id, user.company_id).first();
+  return component ?? null;
+}
 components.get("/:id", async (c) => {
-  const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(c.req.param("id")).first();
+  const component = await getOwnedComponent(c, c.req.param("id"));
   if (!component) return c.json({ error: "composante introuvable" }, 404);
   const photos2 = await c.env.DB.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY created_at ASC").bind(component.id).all();
   return c.json({ ...component, photos: photos2.results });
 });
 components.patch("/:id", async (c) => {
   const id = c.req.param("id");
+  const owned = await getOwnedComponent(c, id);
+  if (!owned) return c.json({ error: "composante introuvable" }, 404);
   const body2 = await c.req.json();
   const fields = [];
   const values = [];
@@ -3111,7 +3152,7 @@ components.patch("/:id", async (c) => {
   return c.json(component);
 });
 components.post("/:id/analyze", async (c) => {
-  const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(c.req.param("id")).first();
+  const component = await getOwnedComponent(c, c.req.param("id"));
   if (!component) return c.json({ error: "composante introuvable" }, 404);
   const photos2 = await c.env.DB.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY created_at DESC LIMIT 4").bind(component.id).all();
   const images = [];
@@ -3133,7 +3174,7 @@ components.post("/:id/analyze", async (c) => {
 const TAG_ORDER = ["Vue générale", "Détail", "Défaut", "Contexte"];
 components.post("/:id/photos", async (c) => {
   const componentId = c.req.param("id");
-  const component = await c.env.DB.prepare("SELECT id FROM components WHERE id = ?1").bind(componentId).first();
+  const component = await getOwnedComponent(c, componentId);
   if (!component) return c.json({ error: "composante introuvable" }, 404);
   const form = await c.req.formData();
   const file = form.get("file");
@@ -3152,6 +3193,8 @@ components.post("/:id/photos", async (c) => {
 });
 components.post("/:id/structure-note", async (c) => {
   const id = c.req.param("id");
+  const owned = await getOwnedComponent(c, id);
+  if (!owned) return c.json({ error: "composante introuvable" }, 404);
   const body2 = await c.req.json();
   if (!body2.transcript?.trim()) return c.json({ error: "transcript requis" }, 400);
   const note = await structureNote(c.env.ANTHROPIC_API_KEY, body2.transcript);
@@ -41924,10 +41967,131 @@ function generateReportXlsx(ctx) {
   utils.book_append_sheet(wb, yearlySheet, "Projection 25 ans");
   return writeSync(wb, { type: "array", bookType: "xlsx" });
 }
-const dossiers = new Hono();
 function newId(prefix) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
 }
+const companies = new Hono();
+companies.get("/", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const rows = await c.env.DB.prepare("SELECT * FROM companies ORDER BY created_at DESC").all();
+  const withCounts = await Promise.all(rows.results.map(async (co) => {
+    const engineers = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE company_id = ?1").bind(co.id).first();
+    const dossierCount = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM dossiers WHERE company_id = ?1").bind(co.id).first();
+    return { ...co, hasLogo: !!co.logo_r2_key, engineerCount: engineers?.n ?? 0, dossierCount: dossierCount?.n ?? 0 };
+  }));
+  return c.json(withCounts);
+});
+companies.post("/", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const body2 = await c.req.json();
+  if (!body2.name?.trim()) return c.json({ error: "nom requis" }, 400);
+  const id = newId("com");
+  let slug = slugify(body2.name);
+  const clash = await c.env.DB.prepare("SELECT id FROM companies WHERE slug = ?1").bind(slug).first();
+  if (clash) slug = `${slug}-${id.slice(-5)}`;
+  await c.env.DB.prepare("INSERT INTO companies (id, name, slug) VALUES (?1, ?2, ?3)").bind(id, body2.name.trim(), slug).run();
+  const company = await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(id).first();
+  return c.json({ ...company, hasLogo: false, engineerCount: 0, dossierCount: 0 }, 201);
+});
+companies.get("/:id", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const company = await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(c.req.param("id")).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  const engineers = await c.env.DB.prepare("SELECT id, name, email, role, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC").bind(company.id).all();
+  const dossierCount = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM dossiers WHERE company_id = ?1").bind(company.id).first();
+  return c.json({ ...company, hasLogo: !!company.logo_r2_key, engineers: engineers.results, dossierCount: dossierCount?.n ?? 0 });
+});
+companies.patch("/:id", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const id = c.req.param("id");
+  const body2 = await c.req.json();
+  const fields = [];
+  const values = [];
+  for (const key of ["name"]) {
+    if (key in body2) {
+      fields.push(`${key} = ?${fields.length + 1}`);
+      values.push(body2[key]);
+    }
+  }
+  if (fields.length === 0) return c.json({ error: "aucun champ à mettre à jour" }, 400);
+  values.push(id);
+  await c.env.DB.prepare(
+    `UPDATE companies SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
+  ).bind(...values).run();
+  const company = await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  return c.json({ ...company, hasLogo: !!company.logo_r2_key });
+});
+companies.post("/:id/logo", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const id = c.req.param("id");
+  const company = await c.env.DB.prepare("SELECT id FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const ext = file.type === "image/png" ? "png" : file.type === "image/svg+xml" ? "svg" : "jpg";
+  const r2Key = `company-logos/${id}.${ext}`;
+  await c.env.PHOTOS.put(r2Key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type || "image/png" } });
+  await c.env.DB.prepare(
+    "UPDATE companies SET logo_r2_key = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
+  ).bind(r2Key, id).run();
+  return c.json({ ok: true });
+});
+companies.get("/:id/logo", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "non authentifié" }, 401);
+  const id = c.req.param("id");
+  if (user.role !== "super_admin" && user.company_id !== id) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT logo_r2_key FROM companies WHERE id = ?1").bind(id).first();
+  if (!company?.logo_r2_key) return c.notFound();
+  const obj = await c.env.PHOTOS.get(company.logo_r2_key);
+  if (!obj) return c.notFound();
+  return new Response(obj.body, {
+    headers: { "content-type": obj.httpMetadata?.contentType ?? "image/png", "cache-control": "private, max-age=3600" }
+  });
+});
+companies.get("/:id/engineers", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const rows = await c.env.DB.prepare(
+    "SELECT id, name, email, role, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC"
+  ).bind(c.req.param("id")).all();
+  return c.json(rows.results);
+});
+companies.post("/:id/engineers", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const companyId = c.req.param("id");
+  const company = await c.env.DB.prepare("SELECT id FROM companies WHERE id = ?1").bind(companyId).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  const body2 = await c.req.json();
+  const email = body2.email?.trim().toLowerCase();
+  const name = body2.name?.trim();
+  if (!email || !name) return c.json({ error: "nom et courriel requis" }, 400);
+  const existing = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(email).first();
+  if (existing) return c.json({ error: "un compte existe déjà avec ce courriel" }, 409);
+  const tempPassword = generateTempPassword();
+  const { hash, salt } = await hashPassword(tempPassword);
+  const id = newId("usr");
+  await c.env.DB.prepare(
+    `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'engineer')`
+  ).bind(id, email, name, hash, salt, companyId).run();
+  return c.json({ user: { id, email, name, role: "engineer" }, tempPassword }, 201);
+});
+const dossiers = new Hono();
 async function dossierStats(db, dossierId) {
   const row = await db.prepare(
     `SELECT
@@ -41949,7 +42113,9 @@ async function dossierStats(db, dossierId) {
   };
 }
 dossiers.get("/", async (c) => {
-  const rows = await c.env.DB.prepare("SELECT * FROM dossiers ORDER BY created_at DESC").all();
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json([]);
+  const rows = await c.env.DB.prepare("SELECT * FROM dossiers WHERE company_id = ?1 ORDER BY created_at DESC").bind(user.company_id).all();
   const withStats = await Promise.all(
     rows.results.map(async (d) => ({ ...d, stats: await dossierStats(c.env.DB, d.id) }))
   );
@@ -41958,12 +42124,13 @@ dossiers.get("/", async (c) => {
 dossiers.post("/", async (c) => {
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
+  if (!user.company_id) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
   const body2 = await c.req.json();
   if (!body2.dossier_no || !body2.name) return c.json({ error: "dossier_no et name requis" }, 400);
   const id = newId("dos");
   await c.env.DB.prepare(
-    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`
+    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
   ).bind(
     id,
     body2.dossier_no,
@@ -41973,7 +42140,8 @@ dossiers.post("/", async (c) => {
     body2.units ?? 0,
     body2.floors ?? null,
     body2.built_year ?? null,
-    user.id
+    user.id,
+    user.company_id
   ).run();
   const items = await generateChecklist(c.env.ANTHROPIC_API_KEY, {
     units: body2.units ?? 0,
@@ -41991,18 +42159,25 @@ dossiers.post("/", async (c) => {
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
   return c.json({ ...dossier, stats: await dossierStats(c.env.DB, id) }, 201);
 });
+async function getOwnedDossier(c, id) {
+  const user = await getCurrentUser(c);
+  if (!user) return { user: null, dossier: null };
+  const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  if (!dossier || dossier.company_id !== user.company_id) return { user, dossier: null };
+  return { user, dossier };
+}
 dossiers.get("/:id", async (c) => {
-  const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(c.req.param("id")).first();
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json({ ...dossier, stats: await dossierStats(c.env.DB, dossier.id) });
 });
 dossiers.get("/:id/components", async (c) => {
-  const dossier = await c.env.DB.prepare("SELECT id FROM dossiers WHERE id = ?1").bind(c.req.param("id")).first();
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
 });
 async function buildReportContext(c) {
-  const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(c.req.param("id")).first();
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return null;
   const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(dossier.id).all();
   const components2 = await listComponentsForDossier(c.env.DB, dossier.id);
@@ -42010,11 +42185,10 @@ async function buildReportContext(c) {
     currentFundBalance: dossier.current_fund_balance,
     units: dossier.units
   });
-  const user = await getCurrentUser(c);
   return { dossier, components: components2, projection, engineerName: user?.name ?? "Condo Stratégis" };
 }
 dossiers.get("/:id/projection", async (c) => {
-  const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(c.req.param("id")).first();
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(dossier.id).all();
   const projection = projectReserveFund(componentsRaw.results, {
@@ -42047,6 +42221,8 @@ dossiers.get("/:id/report.xlsx", async (c) => {
 });
 dossiers.patch("/:id", async (c) => {
   const id = c.req.param("id");
+  const { dossier: owned } = await getOwnedDossier(c, id);
+  if (!owned) return c.json({ error: "dossier introuvable" }, 404);
   const body2 = await c.req.json();
   const fields = [];
   const values = [];
@@ -42076,7 +42252,14 @@ dossiers.patch("/:id", async (c) => {
 });
 const photos = new Hono();
 photos.get("/:id/file", async (c) => {
-  const photo = await c.env.DB.prepare("SELECT * FROM photos WHERE id = ?1").bind(c.req.param("id")).first();
+  const user = await getCurrentUser(c);
+  if (!user) return c.notFound();
+  const photo = await c.env.DB.prepare(
+    `SELECT p.* FROM photos p
+       JOIN components cmp ON cmp.id = p.component_id
+       JOIN dossiers d ON d.id = cmp.dossier_id
+       WHERE p.id = ?1 AND d.company_id = ?2`
+  ).bind(c.req.param("id"), user.company_id).first();
   if (!photo) return c.notFound();
   const obj = await c.env.PHOTOS.get(photo.r2_key);
   if (!obj) return c.notFound();
@@ -42099,6 +42282,7 @@ app.use("/api/*", async (c, next) => {
   return next();
 });
 app.route("/api/auth", auth);
+app.route("/api/companies", companies);
 app.route("/api/dossiers", dossiers);
 app.route("/api/components", components);
 app.route("/api/photos", photos);
