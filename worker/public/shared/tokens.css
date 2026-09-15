@@ -1,0 +1,237 @@
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800;900&family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+/* ============================================================
+   Condo Stratégis — Color tokens
+   Editorial, high-contrast. Orange is the SOLE accent —
+   used sparingly, never decorative.
+   ============================================================ */
+
+:root {
+  /* --- Brand core --- */
+  --ink:            #0A0A0A;  /* near-black, primary */
+  --paper:          #FFFFFF;  /* white background */
+  --orange:         #FF5E39;  /* sole accent — CTAs, highlights, hover */
+  --orange-tint:    #FF8466;  /* hover / lighter accent */
+  --orange-wash:    #FFE4DB;  /* soft accent fill, never text */
+
+  /* --- Ink scale (neutral, warm-black to near-white) --- */
+  --ink-900: #141414;
+  --ink-800: #1F1F1F;
+  --ink-700: #2E2E2E;
+  --ink-600: #4A4A4A;
+  --ink-500: #6B6B6B;
+  --ink-400: #969696;
+  --ink-300: #C2C2C2;
+  --ink-200: #E0E0E0;
+  --ink-100: #EFEFEF;
+  --ink-050: #F7F7F7;
+
+  /* --- Status --- */
+  --green:       #1F8A4E;  /* success / paid / active */
+  --green-wash:  #E6F2EB;
+
+  /* ============================================================
+     Semantic aliases — reference these in components
+     ============================================================ */
+
+  /* Surfaces */
+  --surface-page:    var(--paper);
+  --surface-card:    var(--paper);
+  --surface-sunken:  var(--ink-050);
+  --surface-inverse: var(--ink);        /* dark bands, footer */
+  --surface-accent:  var(--orange);     /* CTA sections */
+  --surface-wash:    var(--orange-wash);
+
+  /* Text */
+  --text-strong:   var(--ink);
+  --text-body:     var(--ink-700);
+  --text-muted:    var(--ink-500);
+  --text-faint:    var(--ink-400);
+  --text-inverse:  var(--paper);
+  --text-accent:   var(--orange);
+  --text-on-accent:var(--paper);
+
+  /* Borders / lines */
+  --line-strong:  var(--ink);
+  --line:         var(--ink-200);
+  --line-soft:    var(--ink-100);
+  --line-inverse: rgba(255,255,255,0.14);
+
+  /* Interactive */
+  --accent:        var(--orange);
+  --accent-hover:  var(--orange-tint);
+  --accent-press:  #E8492A;
+
+  /* Focus ring */
+  --focus-ring: var(--orange);
+}
+/* ============================================================
+   Condo Stratégis — Typography tokens
+   Archivo (display) · Inter Tight (body/UI) · JetBrains Mono (technical)
+   ============================================================ */
+
+:root {
+  /* --- Families --- */
+  --font-display: 'Archivo', 'Arial Narrow', sans-serif;
+  --font-body:    'Inter Tight', system-ui, -apple-system, sans-serif;
+  --font-mono:    'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+
+  /* --- Weights --- */
+  --weight-regular:  400;
+  --weight-medium:   500;
+  --weight-semibold: 600;
+  --weight-bold:     700;
+  --weight-xbold:    800;
+  --weight-black:    900;
+
+  /* --- Display scale (Archivo, uppercase, tight) --- */
+  --display-2xl: 5.5rem;   /* 88px — hero */
+  --display-xl:  4rem;     /* 64px */
+  --display-lg:  3rem;     /* 48px */
+  --display-md:  2.25rem;  /* 36px */
+  --display-sm:  1.625rem; /* 26px */
+
+  /* --- Text scale (Inter Tight) --- */
+  --text-xl:  1.375rem;  /* 22px — lead */
+  --text-lg:  1.125rem;  /* 18px */
+  --text-md:  1rem;      /* 16px — base */
+  --text-sm:  0.875rem;  /* 14px */
+  --text-xs:  0.75rem;   /* 12px */
+
+  /* --- Mono / eyebrow --- */
+  --mono-sm: 0.8125rem;  /* 13px */
+  --mono-xs: 0.6875rem;  /* 11px — eyebrow labels */
+
+  /* --- Line heights --- */
+  --leading-tight:  1.02;  /* display */
+  --leading-snug:   1.18;
+  --leading-normal: 1.5;   /* body */
+  --leading-relaxed:1.7;
+
+  /* --- Letter spacing --- */
+  --tracking-display: -0.03em;  /* tight display */
+  --tracking-tight:   -0.01em;
+  --tracking-normal:  0;
+  --tracking-wide:    0.04em;
+  --tracking-eyebrow: 0.16em;   /* uppercase mono eyebrows */
+}
+/* ============================================================
+   Condo Stratégis — Spacing & layout tokens
+   8px base grid.
+   ============================================================ */
+
+:root {
+  --space-0:  0;
+  --space-1:  4px;
+  --space-2:  8px;
+  --space-3:  12px;
+  --space-4:  16px;
+  --space-5:  24px;
+  --space-6:  32px;
+  --space-7:  48px;
+  --space-8:  64px;
+  --space-9:  96px;
+  --space-10: 128px;
+
+  /* Section rhythm */
+  --section-y:    96px;   /* vertical padding of page sections */
+  --section-y-lg: 128px;
+
+  /* Container */
+  --container:      1200px;
+  --container-wide: 1360px;
+  --gutter:         24px;
+}
+/* ============================================================
+   Condo Stratégis — Radius, shadow & border tokens
+   No soft rounded UI. Radius is restrained.
+   Shadows are subtle and dark-toned. No gradients.
+   ============================================================ */
+
+:root {
+  /* --- Radius --- */
+  --radius-sm:   8px;    /* components: buttons-as-rect, inputs, badges */
+  --radius-md:   8px;
+  --radius-card: 14px;   /* cards */
+  --radius-pill: 999px;  /* pills & buttons only */
+
+  /* --- Borders --- */
+  --border-hairline: 1px;
+  --border-strong:   1.5px;
+  --border-heavy:    2px;
+
+  /* --- Shadows (subtle, dark-toned, no color) --- */
+  --shadow-xs:  0 1px 2px rgba(10,10,10,0.06);
+  --shadow-sm:  0 2px 8px rgba(10,10,10,0.07);
+  --shadow-md:  0 8px 24px rgba(10,10,10,0.09);
+  --shadow-lg:  0 18px 48px rgba(10,10,10,0.13);
+
+  /* Inset / focus */
+  --shadow-focus: 0 0 0 3px rgba(255,94,57,0.28);
+
+  /* Backdrop blur for sticky nav */
+  --blur-nav: saturate(160%) blur(14px); /* @kind other */
+}
+/* ============================================================
+   Condo Stratégis — Base styles & primitives
+   Light reset + a few editorial defaults.
+   ============================================================ */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  font-size: var(--text-md);
+  line-height: var(--leading-normal);
+  color: var(--text-body);
+  background: var(--surface-page);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* --- Display headings --- */
+.cs-display {
+  font-family: var(--font-display);
+  font-weight: var(--weight-black);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-display);
+  line-height: var(--leading-tight);
+  color: var(--text-strong);
+  margin: 0;
+  text-wrap: balance;
+}
+
+/* --- Eyebrow (mono uppercase label) --- */
+.cs-eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--mono-xs);
+  font-weight: var(--weight-medium);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-eyebrow);
+  color: var(--text-muted);
+  margin: 0;
+}
+
+.cs-eyebrow--accent { color: var(--text-accent); }
+
+/* --- Lead paragraph --- */
+.cs-lead {
+  font-size: var(--text-xl);
+  line-height: var(--leading-snug);
+  color: var(--text-body);
+}
+
+/* --- Accent text marker --- */
+.cs-mark { color: var(--text-accent); }
+
+/* --- Container helper --- */
+.cs-container {
+  width: 100%;
+  max-width: var(--container);
+  margin-inline: auto;
+  padding-inline: var(--gutter);
+}
+
+a { color: inherit; }
+
+::selection { background: var(--orange); color: #fff; }

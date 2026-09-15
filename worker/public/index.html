@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="fr-CA">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Condo Stratégis</title>
+<link rel="icon" href="assets/logo-mark.png">
+<link rel="stylesheet" href="shared/tokens.css">
+<style>
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;background:var(--ink);color:#fff;font-family:var(--font-body)}
+  .wrap{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:48px 20px;text-align:center}
+  .brand{display:flex;align-items:center;gap:10px;margin-bottom:40px}
+  .brand img{width:30px;height:30px;object-fit:contain}
+  .brand span{font-family:var(--font-display);font-weight:800;font-size:17px;letter-spacing:-.02em;text-transform:uppercase}
+  .brand span b{color:var(--orange);font-weight:800}
+  h1{font-family:var(--font-display);font-weight:900;font-size:clamp(28px,5vw,44px);line-height:1;letter-spacing:-.03em;text-transform:uppercase;margin:0 0 14px}
+  h1 em{color:var(--orange);font-style:normal}
+  p.lead{font-size:15px;color:rgba(255,255,255,.6);max-width:440px;margin:0 0 40px;line-height:1.6}
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:16px;width:100%;max-width:640px}
+  @media (max-width:560px){.cards{grid-template-columns:1fr}}
+  .card{border:1.5px solid rgba(255,255,255,.15);border-radius:16px;padding:26px 24px;text-align:left;text-decoration:none;color:#fff;display:flex;flex-direction:column;gap:10px;transition:border-color .15s,background .15s}
+  .card:hover{border-color:var(--orange);background:rgba(255,255,255,.03)}
+  .card .eyebrow{font-family:var(--font-mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--orange)}
+  .card h2{font-family:var(--font-display);font-weight:800;font-size:20px;letter-spacing:-.02em;text-transform:uppercase;margin:0}
+  .card p{font-size:13px;color:rgba(255,255,255,.55);line-height:1.5;margin:0}
+  .card .go{margin-top:8px;font-family:var(--font-mono);font-size:11px;color:var(--orange);text-transform:uppercase;letter-spacing:.06em}
+  footer{padding:20px;text-align:center;font-family:var(--font-mono);font-size:10.5px;color:rgba(255,255,255,.3)}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand"><img src="assets/logo-mark.png" alt=""><span>Condo Strat<b>é</b>gis</span></div>
+    <h1>Des chiffres,<br>pas des <em>promesses</em></h1>
+    <p class="lead">Étude de fonds de prévoyance pour syndicats de copropriété. Choisissez votre espace de travail.</p>
+    <div class="cards">
+      <a class="card" href="/terrain/">
+        <span class="eyebrow">Application mobile</span>
+        <h2>Inspection terrain</h2>
+        <p>Visite d'immeuble hors-ligne : composantes, photos, notes vocales et analyse IA.</p>
+        <span class="go">Ouvrir →</span>
+      </a>
+      <a class="card" href="/bureau/">
+        <span class="eyebrow">Console web</span>
+        <h2>Console bureau</h2>
+        <p>Révision des données, calcul du fonds de prévoyance et publication des rapports.</p>
+        <span class="go">Ouvrir →</span>
+      </a>
+    </div>
+  </div>
+  <footer>Étude de fonds de prévoyance · Québec</footer>
+</body>
+</html>
