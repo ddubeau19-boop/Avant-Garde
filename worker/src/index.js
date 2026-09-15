@@ -3333,14 +3333,35 @@ components.post("/:id/structure-note", async (c) => {
   return c.json({ note });
 });
 const RESERVE_FUND_PARAMS = {
-  inflationRate: 0.04,
-  contingencyRate: 0.15,
-  fundReturnRate: 0.02,
-  projectionYears: 25
+  // Hypothèses sourcées (méthode Condo Stratégis) — pas des valeurs rondes.
+  inflationRate: 0.0176,
+  inflationSource: "Statistique Canada, tableau 18-10-0205-1 (indice des prix de la construction)",
+  interestRate: 0.0183,
+  interestSource: "Banque du Canada, série V122529",
+  projectionYears: 30
 };
+const CATCHUP_RAMP_5_ANS = [0, 0.15, 0.1, 0.1, 0.1, 0.1];
+function deriveCatchupRamp10Ans() {
+  const cumulative5Ans = CATCHUP_RAMP_5_ANS.slice(1).reduce((f, r) => f * (1 + r), 1);
+  const steps = 10;
+  const stepRate = Math.pow(cumulative5Ans, 1 / steps) - 1;
+  return [0, ...new Array(steps).fill(stepRate)];
+}
+const CATCHUP_RAMP_10_ANS = deriveCatchupRamp10Ans();
+const RESERVE_FUND_SCENARIOS = [
+  { code: "C1.1.1", label: "Rétablissement sur 5 ans", ramp: CATCHUP_RAMP_5_ANS, approxime: false },
+  { code: "C1.1.2", label: "Statu quo — indexation seule", ramp: [], approxime: false },
+  {
+    code: "C1.1.3",
+    label: "Rétablissement sur 10 ans",
+    ramp: CATCHUP_RAMP_10_ANS,
+    approxime: true,
+    approximationNote: "Paliers annuels dérivés par équivalence géométrique avec la rampe 5 ans (mêmes hypothèses de source de données que ci-dessus) — le classeur original de Condo Stratégis n'était pas disponible pour confirmer ses paliers exacts. À valider par la firme."
+  }
+];
 function replacementEventsForComponent(c, params) {
   const usefulLife = c.useful_life_years ?? DEFAULT_USEFUL_LIFE_YEARS[c.cat] ?? null;
-  if (!c.replacement_cost || !usefulLife || usefulLife <= 0) return [];
+  if (!c.replacement_cost || !usefulLife || usefulLife <= 0) return { events: [], futureEventYear31: null };
   // Règle maison : l'année anticipée de remplacement est ancrée sur l'année de construction
   // ou de dernière réparation, plus la durée de vie utile. Un remplacement déjà échu est
   // reporté en première année de l'horizon.
@@ -3353,20 +3374,62 @@ function replacementEventsForComponent(c, params) {
     firstReplacementYear = Math.max(1, Math.round(usefulLife * residualPct));
   }
   const events = [];
-  for (let year = firstReplacementYear; year <= params.projectionYears; year += usefulLife) {
+  let futureEventYear31 = null;
+  const horizonPlusOne = params.projectionYears + 1;
+  for (let year = firstReplacementYear; year <= horizonPlusOne; year += usefulLife) {
+    // Coût forfaitaire en dollars de l'année de base, indexé — aucun coût unitaire, quantité,
+    // contingence ou taxe distincte : tout est fondu dans le forfait saisi sur la composante.
     const inflated = c.replacement_cost * Math.pow(1 + params.inflationRate, year);
-    events.push({ year, cost: inflated * (1 + params.contingencyRate) });
+    if (year <= params.projectionYears) {
+      events.push({ year, cost: inflated });
+    } else if (year === horizonPlusOne) {
+      // Portion future : le remplacement tombe juste après l'horizon de 30 ans. Une partie du
+      // cycle de vie de la composante s'est déjà écoulée à l'intérieur de l'horizon — on
+      // provisionne cette part au prorata plutôt que d'ignorer complètement la dépense imminente.
+      const fraction = (usefulLife - 1) / usefulLife;
+      futureEventYear31 = { year, cost: inflated, fraction, portion: inflated * fraction };
+    }
   }
-  return events;
+  return { events, futureEventYear31 };
 }
-function minBalanceForCotisation(cotisation, startBalance, deboursParAn, fundReturnRate) {
+function simulateScenario(rampSteps, baseCotisation, deboursParAn, startBalance, params) {
+  const years = [];
+  let cotisation = baseCotisation;
   let balance = startBalance;
-  let min = Infinity;
-  for (const debours of deboursParAn) {
-    balance = (balance + cotisation) * (1 + fundReturnRate) - debours;
-    if (balance < min) min = balance;
+  let firstNegativeYear = null;
+  for (let y = 1; y <= params.projectionYears; y++) {
+    const stepIdx = y - 1;
+    const growth = stepIdx < rampSteps.length ? rampSteps[stepIdx] : params.inflationRate;
+    cotisation = cotisation * (1 + growth);
+    const debours = deboursParAn[y - 1] || 0;
+    const ouverture = balance;
+    // L'intérêt s'applique au solde d'ouverture et est plancher à 0 quand le solde est négatif.
+    const interet = Math.max(ouverture, 0) * params.interestRate;
+    balance = ouverture + interet + cotisation - debours;
+    if (balance < -0.005 && firstNegativeYear == null) firstNegativeYear = y;
+    years.push({ year: y, pctAugmentation: Math.round(growth * 1000) / 10, cotisation, debours, ouverture, interet, soldeFin: balance });
   }
-  return min;
+  return { years, firstNegativeYear };
+}
+function buildScenario(def, baseCotisation, deboursParAn, startBalance, params, portionFutureTotal) {
+  const { years, firstNegativeYear } = simulateScenario(def.ramp, baseCotisation, deboursParAn, startBalance, params);
+  const soldeFinAn30 = years.length ? years[years.length - 1].soldeFin : startBalance;
+  const neverNegative = firstNegativeYear == null;
+  // Double critère d'acceptation : le solde ne devient jamais négatif sur l'horizon, ET il
+  // reste positif à l'entrée de la 31e année une fois la portion future provisionnée.
+  const positiveEntering31 = soldeFinAn30 - portionFutureTotal >= -0.005;
+  return {
+    code: def.code,
+    label: def.label,
+    approxime: def.approxime,
+    approximationNote: def.approximationNote ?? null,
+    years,
+    firstNegativeYear,
+    neverNegative,
+    positiveEntering31,
+    meetsCriteria: neverNegative && positiveEntering31,
+    soldeFinAn30
+  };
 }
 function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
   const included = [];
@@ -3389,40 +3452,38 @@ function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
   }
   const deboursParAn = new Array(params.projectionYears).fill(0);
   let totalDeboursNominal = 0;
+  const portionFutureDetail = [];
   for (const c of included) {
     totalDeboursNominal += c.replacement_cost ?? 0;
-    for (const event of replacementEventsForComponent(c, params)) {
+    const { events, futureEventYear31 } = replacementEventsForComponent(c, params);
+    for (const event of events) {
       deboursParAn[event.year - 1] += event.cost;
     }
-  }
-  const totalDeboursProjete = deboursParAn.reduce((a, b) => a + b, 0);
-  const startBalance = opts.currentFundBalance ?? 0;
-  let lo = 0;
-  let hi = Math.max(totalDeboursProjete, 1);
-  for (let i = 0; i < 60; i++) {
-    const mid = (lo + hi) / 2;
-    if (minBalanceForCotisation(mid, startBalance, deboursParAn, params.fundReturnRate) >= 0) {
-      hi = mid;
-    } else {
-      lo = mid;
+    if (futureEventYear31) {
+      portionFutureDetail.push({ id: c.id, name: c.name, ...futureEventYear31 });
     }
   }
-  const annualCotisation = hi;
-  const years = [];
-  let balance = startBalance;
-  for (let y = 1; y <= params.projectionYears; y++) {
-    const debours = deboursParAn[y - 1];
-    balance = (balance + annualCotisation) * (1 + params.fundReturnRate) - debours;
-    years.push({ year: y, debours, cotisation: annualCotisation, soldeFin: balance });
-  }
+  const totalDebours30Ans = deboursParAn.reduce((a, b) => a + b, 0);
+  const portionFutureTotal = portionFutureDetail.reduce((a, d) => a + d.portion, 0);
+  const totalAvecPortionFuture = totalDebours30Ans + portionFutureTotal;
+  const startBalance = opts.currentFundBalance ?? 0;
+  const baseCotisationMissing = opts.baseCotisation == null;
+  const baseCotisation = opts.baseCotisation ?? 0;
+  const scenarios = RESERVE_FUND_SCENARIOS.map(
+    (def) => buildScenario(def, baseCotisation, deboursParAn, startBalance, params, portionFutureTotal)
+  );
+  const recommended = scenarios.find((s) => s.code === "C1.1.1" && s.meetsCriteria) ?? scenarios.find((s) => s.code === "C1.1.3" && s.meetsCriteria) ?? null;
   return {
     params,
-    annualCotisation,
-    monthlyCotisation: annualCotisation / 12,
-    monthlyCotisationPerUnit: opts.units > 0 ? annualCotisation / 12 / opts.units : null,
+    baseCotisation,
+    baseCotisationMissing,
+    currentFundBalance: startBalance,
     totalDeboursNominal,
-    totalDeboursProjete,
-    years,
+    totalDebours30Ans,
+    portionFutureAn31: { total: portionFutureTotal, detail: portionFutureDetail },
+    totalAvecPortionFuture,
+    scenarios,
+    recommendedCode: recommended ? recommended.code : null,
     includedComponentIds: included.map((c) => c.id),
     excludedComponents: excluded
   };
@@ -21661,29 +21722,75 @@ async function generateReportDocx(ctx) {
       children: [new TextRun({ text: "Condo Stratégis", color: GREY, font: FONT, size: 18 })]
     })
   ];
+  const recommended = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  const statuQuo = projection.scenarios.find((s) => s.code === "C1.1.2") ?? null;
   const methodology = [
     heading("Méthodologie"),
     body(
-      "Ce document a été généré à partir des données d'inspection recueillies sur le terrain (application Inspection Terrain) et vérifiées avant génération. L'estimation du fonds de prévoyance requis suit la méthode par composantes : chaque composante inventoriée est remplacée à intervalles réguliers correspondant à sa durée de vie utile, sur un horizon de projection donné, avec indexation à l'inflation. La cotisation recommandée est la valeur constante minimale qui maintient le solde du fonds positif à chaque année de l'horizon, compte tenu d'un rendement supposé sur le solde investi."
+      "Ce document a été généré à partir des données d'inspection recueillies sur le terrain (application Inspection Terrain) et vérifiées avant génération. L'estimation du fonds de prévoyance requis suit la méthode par composantes : chaque composante inventoriée est remplacée à intervalles réguliers correspondant à sa durée de vie utile, sur un horizon de 30 ans, à des coûts forfaitaires en dollars de l'année de base indexés à l'inflation. Pour les composantes à longue durée de vie dont le prochain remplacement tombe juste après l'horizon (31e année), une portion de ce coût futur est provisionnée au prorata du cycle déjà écoulé."
     ),
-    body(`Taux d'inflation annuel : ${(projection.params.inflationRate * 100).toFixed(0)} %`),
-    body(`Rendement annuel supposé du fonds : ${(projection.params.fundReturnRate * 100).toFixed(0)} %`),
-    body(`Marge de contingence : ${(projection.params.contingencyRate * 100).toFixed(0)} %`),
-    body(`Horizon de projection : ${projection.params.projectionYears} ans`),
+    body(`Taux d'inflation de la construction : ${(projection.params.inflationRate * 100).toFixed(2)} % — source : ${projection.params.inflationSource}`),
+    body(`Taux d'intérêt sur le solde du fonds : ${(projection.params.interestRate * 100).toFixed(2)} % — source : ${projection.params.interestSource}`),
+    body(`Horizon de projection : ${projection.params.projectionYears} ans, plus portion future de la 31e année`),
+    body(
+      "L'intérêt s'applique au solde d'ouverture de chaque année et est plancher à 0 lorsque ce solde est négatif. La cotisation recommandée n'est pas le résultat d'un solveur : elle suit une rampe de rattrapage — 0 % la première année, puis des paliers d'augmentation sur la période de rétablissement, puis une indexation à l'inflation — soumise à un double critère d'acceptation : le solde ne doit jamais devenir négatif sur l'horizon, et il doit demeurer positif à l'entrée de la 31e année une fois la portion future incluse.",
+      { color: GREY, size: 18 }
+    ),
+    ...projection.scenarios.some((s) => s.approximationNote) ? [
+      body(
+        `Note méthodologique : ${projection.scenarios.find((s) => s.approximationNote)?.approximationNote}`,
+        { color: GREY, size: 18 }
+      )
+    ] : [],
     body(
       "Ce calcul constitue une estimation basée sur les paramètres ci-dessus et les données documentées lors de la visite — il doit être révisé et validé par l'ingénieur responsable avant d'être présenté au conseil d'administration du syndicat.",
       { color: GREY, size: 18 }
     )
   ];
+  const scenarioRows = projection.scenarios.map(
+    (s) => new TableRow({
+      children: [
+        cell(`${s.code} — ${s.label}`),
+        cell(money(s.years[0]?.cotisation ?? 0)),
+        cell(money(s.soldeFinAn30)),
+        cell(s.firstNegativeYear != null ? `An ${s.firstNegativeYear}` : "—"),
+        cell(s.meetsCriteria ? "Oui" : "Non")
+      ]
+    })
+  );
   const summary = [
     heading("Sommaire financier"),
-    body(`Cotisation annuelle recommandée : ${money(projection.annualCotisation)}`, { bold: true }),
-    body(`Cotisation mensuelle recommandée : ${money(projection.monthlyCotisation)}`, { bold: true }),
     body(
-      projection.monthlyCotisationPerUnit != null ? `Cotisation mensuelle par unité : ${money(projection.monthlyCotisationPerUnit)}` : "Cotisation mensuelle par unité : — (nombre d'unités non renseigné)"
+      recommended ? `Scénario recommandé : ${recommended.code} — ${recommended.label}` : "Aucun scénario ne satisfait le double critère d'acceptation avec la cotisation actuelle — révision requise.",
+      { bold: true }
+    ),
+    body(
+      projection.baseCotisationMissing ? "Cotisation annuelle actuelle : non renseignée (utilisée comme 0 $ dans les simulations)" : `Cotisation annuelle actuelle : ${money(projection.baseCotisation)}`
     ),
     body(`Solde actuel du fonds : ${dossier.current_fund_balance != null ? money(dossier.current_fund_balance) : "non renseigné"}`),
-    body(`Total des débours projetés sur ${projection.params.projectionYears} ans (inflation + contingence) : ${money(projection.totalDeboursProjete)}`)
+    body(`Total des débours projetés sur 30 ans : ${money(projection.totalDebours30Ans)}`),
+    body(`Portion future de la 31e année (composantes à longue durée de vie) : ${money(projection.portionFutureAn31.total)}`),
+    body(`Total avec portion future : ${money(projection.totalAvecPortionFuture)}`, { bold: true }),
+    ...statuQuo ? [body(
+      statuQuo.firstNegativeYear != null ? `À titre de comparaison, le statu quo (indexation seule, sans rattrapage) devient négatif dès l'an ${statuQuo.firstNegativeYear}.` : "Le statu quo (indexation seule, sans rattrapage) demeure positif sur l'horizon complet.",
+      { color: GREY, size: 18 }
+    )] : [],
+    heading("Comparaison des scénarios"),
+    new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      rows: [
+        new TableRow({
+          children: [
+            cell("Scénario", { header: true }),
+            cell("Cotisation an 1", { header: true }),
+            cell("Solde fin an 30", { header: true }),
+            cell("1re année négative", { header: true }),
+            cell("Critères respectés", { header: true })
+          ]
+        }),
+        ...scenarioRows
+      ]
+    })
   ];
   const inventoryRows = components2.map(
     (c) => new TableRow({
@@ -21725,33 +21832,34 @@ async function generateReportDocx(ctx) {
     ),
     ...projection.excludedComponents.map((e) => body(`• ${e.name} — ${e.reason}`))
   ] : [];
-  const yearlyRows = projection.years.map(
-    (y) => new TableRow({
-      children: [
-        cell(String(y.year)),
-        cell(money(y.debours)),
-        cell(money(y.cotisation)),
-        cell(money(y.soldeFin))
-      ]
-    })
-  );
-  const yearlyTable = [
-    heading("Projection financière — année par année"),
+  const yearlyTable = projection.scenarios.flatMap((s) => [
+    heading(`Sommaire exécutif — ${s.code} (${s.label}) — année par année`),
     new Table({
       width: { size: 100, type: WidthType.PERCENTAGE },
       rows: [
         new TableRow({
           children: [
             cell("Année", { header: true }),
+            cell("Augmentation", { header: true }),
             cell("Débours prévus", { header: true }),
             cell("Cotisation", { header: true }),
             cell("Solde du fonds (fin d'année)", { header: true })
           ]
         }),
-        ...yearlyRows
+        ...s.years.map(
+          (y) => new TableRow({
+            children: [
+              cell(String(y.year)),
+              cell(`${y.pctAugmentation.toFixed(1)} %`),
+              cell(money(y.debours)),
+              cell(money(y.cotisation)),
+              cell(money(y.soldeFin))
+            ]
+          })
+        )
       ]
     })
-  ];
+  ]);
   const doc = new File$1({
     styles: {
       default: {
@@ -42078,35 +42186,51 @@ function generateReportXlsx(ctx) {
     { wch: 8 },
     { wch: 40 }
   ];
+  const recommended = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
   const summarySheet = utils.aoa_to_sheet([
     ["Étude de fonds de prévoyance", dossier.name],
     ["Dossier", dossier.dossier_no],
     ["Adresse", `${dossier.address ?? ""} ${dossier.city ?? ""}`.trim()],
     ["Unités", dossier.units],
     [],
-    ["Paramètres"],
-    ["Taux d'inflation annuel", `${(projection.params.inflationRate * 100).toFixed(0)} %`],
-    ["Rendement annuel du fonds", `${(projection.params.fundReturnRate * 100).toFixed(0)} %`],
-    ["Marge de contingence", `${(projection.params.contingencyRate * 100).toFixed(0)} %`],
-    ["Horizon de projection", `${projection.params.projectionYears} ans`],
+    ["Hypothèses"],
+    ["Taux d'inflation de la construction", `${(projection.params.inflationRate * 100).toFixed(2)} %`],
+    ["Source", projection.params.inflationSource],
+    ["Taux d'intérêt sur le solde du fonds", `${(projection.params.interestRate * 100).toFixed(2)} %`],
+    ["Source", projection.params.interestSource],
+    ["Horizon de projection", `${projection.params.projectionYears} ans + portion future an 31`],
     [],
     ["Résultats"],
+    ["Scénario recommandé", recommended ? `${recommended.code} — ${recommended.label}` : "Aucun — révision requise"],
     ["Solde actuel du fonds ($)", dossier.current_fund_balance ?? ""],
-    ["Cotisation annuelle recommandée ($)", Math.round(projection.annualCotisation)],
-    ["Cotisation mensuelle recommandée ($)", Math.round(projection.monthlyCotisation)],
-    ["Cotisation mensuelle par unité ($)", projection.monthlyCotisationPerUnit != null ? Math.round(projection.monthlyCotisationPerUnit) : ""],
-    ["Total débours projetés sur l'horizon ($)", Math.round(projection.totalDeboursProjete)]
+    ["Cotisation annuelle actuelle ($)", projection.baseCotisationMissing ? "non renseignée" : Math.round(projection.baseCotisation)],
+    ["Total débours projetés sur 30 ans ($)", Math.round(projection.totalDebours30Ans)],
+    ["Portion future an 31 ($)", Math.round(projection.portionFutureAn31.total)],
+    ["Total avec portion future ($)", Math.round(projection.totalAvecPortionFuture)],
+    [],
+    ["Comparaison des scénarios"],
+    ["Scénario", "Cotisation an 1 ($)", "Solde fin an 30 ($)", "1re année négative", "Critères respectés"],
+    ...projection.scenarios.map((s) => [
+      `${s.code} — ${s.label}`,
+      Math.round(s.years[0]?.cotisation ?? 0),
+      Math.round(s.soldeFinAn30),
+      s.firstNegativeYear ?? "—",
+      s.meetsCriteria ? "Oui" : "Non"
+    ])
   ]);
-  summarySheet["!cols"] = [{ wch: 34 }, { wch: 30 }];
-  const yearlySheet = utils.aoa_to_sheet([
-    ["Année", "Débours prévus ($)", "Cotisation ($)", "Solde du fonds en fin d'année ($)"],
-    ...projection.years.map((y) => [y.year, Math.round(y.debours), Math.round(y.cotisation), Math.round(y.soldeFin)])
-  ]);
-  yearlySheet["!cols"] = [{ wch: 8 }, { wch: 18 }, { wch: 16 }, { wch: 26 }];
+  summarySheet["!cols"] = [{ wch: 38 }, { wch: 30 }, { wch: 20 }, { wch: 20 }, { wch: 20 }];
   const wb = utils.book_new();
   utils.book_append_sheet(wb, summarySheet, "Sommaire");
   utils.book_append_sheet(wb, inventorySheet, "Inventaire");
-  utils.book_append_sheet(wb, yearlySheet, "Projection 25 ans");
+  for (const s of projection.scenarios) {
+    const sheet = utils.aoa_to_sheet([
+      [`${s.code} — ${s.label}`],
+      ["Année", "Augmentation (%)", "Débours prévus ($)", "Cotisation ($)", "Solde du fonds en fin d'année ($)"],
+      ...s.years.map((y) => [y.year, y.pctAugmentation, Math.round(y.debours), Math.round(y.cotisation), Math.round(y.soldeFin)])
+    ]);
+    sheet["!cols"] = [{ wch: 8 }, { wch: 16 }, { wch: 18 }, { wch: 16 }, { wch: 26 }];
+    utils.book_append_sheet(wb, sheet, s.code);
+  }
   return writeSync(wb, { type: "array", bookType: "xlsx" });
 }
 function newId(prefix) {
@@ -42334,6 +42458,7 @@ async function buildReportContext(c) {
   const components2 = await listComponentsForDossier(c.env.DB, dossier.id);
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
+    baseCotisation: dossier.cotisation_annuelle,
     units: dossier.units
   });
   return { dossier, components: components2, projection, engineerName: user?.name ?? "Condo Stratégis" };
@@ -42344,6 +42469,7 @@ dossiers.get("/:id/projection", async (c) => {
   const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(dossier.id).all();
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
+    baseCotisation: dossier.cotisation_annuelle,
     units: dossier.units
   });
   return c.json(projection);
