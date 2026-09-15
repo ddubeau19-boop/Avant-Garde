@@ -3009,6 +3009,20 @@ const DEFAULT_CHECKLIST = [
   { cat: "amenage", name: "Aménagement paysager", qty: "—" },
   { cat: "securite", name: "Alarme incendie & détecteurs", qty: "—" }
 ];
+const JARGON_STYLE_GUIDE = `Registre attendu — inspiré de vraies études de fonds de prévoyance / plans de gestion
+d'actif québécois (noms de composantes anonymisés, à titre d'exemples de FORMULATION
+seulement, ne pas les recopier tels quels ni inventer de faits à partir d'eux) :
+- Toiture : "Restaurer ou remplacer les complexes d'étanchéité de la toiture à membrane monocouche en EPDM" ; "Remplacer la membrane d'étanchéité multicouche de feutres et d'asphalte de la marquise"
+- Enveloppe : "Restaurer les joints de mortier des murs en maçonnerie de briques" ; "Remplacer les fenêtres à cadres en PVC exposées aux intempéries (partie commune à usage restreint)" ; "Remplacer les joints de scellement du périmètre des fenêtres et portes-terrasses"
+- Structure : "Colmater les fissures et réparer les surfaces des structures en béton des escaliers" ; "Provision périodique pour sceller les fissures des murs de fondation"
+- Mécanique : "Remplacer une partie des conduits des réseaux enfouis" ; "Provision quinquennale pour remplacer des composants des systèmes de ventilation et de chauffage"
+- Électricité : "Remplacer les appareils d'éclairage des aires communes" ; "Provision pour remplacer une partie des transformateurs"
+- Aménagement : "Appliquer une nouvelle couche d'asphalte sur le revêtement de chaussée en béton bitumineux" ; "Refaire les murs de soutènement en blocs modulaires de béton"
+- Sécurité : "Remplacer le panneau d'alarme incendie" ; "Provision pour remplacer une partie des composants du réseau de détection d'incendie"
+Utilise ce niveau de précision technique (matériau, système, partie visée) plutôt que des
+termes génériques. Le sigle PCUR désigne une partie commune à usage restreint (financée par
+l'ensemble des copropriétaires mais desservant certaines unités) ; PCUG une partie commune à
+usage général — mentionne-les seulement quand c'est pertinent et clairement applicable.`;
 async function generateChecklist(apiKey, profile) {
   if (!apiKey) return DEFAULT_CHECKLIST;
   const prompt = `Tu es ingénieur en bâtiment spécialisé dans les études de fonds de prévoyance
@@ -3016,6 +3030,8 @@ pour syndicats de copropriété au Québec. Pour un immeuble résidentiel de
 ${profile.units} unités${profile.floors ? `, ${profile.floors} étages` : ""}${profile.builtYear ? `, construit en ${profile.builtYear}` : ""}, propose la liste des composantes typiques à inspecter.
 
 Catégories valides (utilise exactement ces clés) : toiture, enveloppe, structure, meca, elec, amenage, securite.
+
+${JARGON_STYLE_GUIDE}
 
 Réponds UNIQUEMENT avec un tableau JSON d'objets {"cat", "name", "qty"} (qty = quantité
 approximative ou "—" si non applicable). Entre 12 et 20 composantes.`;
@@ -3054,7 +3070,11 @@ async function analyzePhotos(apiKey, opts) {
     {
       type: "text",
       text: `Composante inspectée : "${opts.componentName}"${opts.installYear ? ` (installée en ${opts.installYear})` : ""}. Analyse ces photos prises lors d'une inspection de fonds de prévoyance et
-estime son état. Réponds UNIQUEMENT avec un objet JSON :
+estime son état.
+
+${JARGON_STYLE_GUIDE}
+
+Réponds UNIQUEMENT avec un objet JSON :
 {"etat": 0-4 (0=Excellent, 1=Bon, 2=Moyen, 3=Mauvais, 4=Critique), "residual": 0-100 (% de vie utile restante), "life": "estimation en années (ex: ~ 8 ans)", "cost": "coût de remplacement approximatif en $ CAD formaté (ex: '28 000 $'), ou 'à estimer' si impossible à évaluer visuellement", "costEstimate": nombre brut CAD correspondant à "cost" (ex: 28000), ou null si "cost" est "à estimer", "confidence": "pourcentage de confiance (ex: 82 %)"}`
     }
   ];
@@ -3072,9 +3092,11 @@ async function structureNote(apiKey, transcript) {
   const prompt = `Voici la transcription brute d'une note vocale dictée par un ingénieur pendant
 une inspection de bâtiment (fonds de prévoyance) : "${trimmed}"
 
-Reformule-la en une note professionnelle claire et concise (2-4 phrases), en
-français, sans inventer d'information absente de la transcription. Réponds
-uniquement avec le texte de la note, sans guillemets ni préambule.`;
+Reformule-la en une note professionnelle claire et concise (2-4 phrases), dans le
+registre habituel d'une étude de fonds de prévoyance québécoise (précision technique
+sur le matériau/système visé, formulations comme "provision pour...", "réparer/restaurer/
+remplacer...", en français, sans inventer d'information absente de la transcription.
+Réponds uniquement avec le texte de la note, sans guillemets ni préambule.`;
   try {
     const text = await callClaude(apiKey, { content: prompt, maxTokens: 300 });
     return text.trim() || trimmed;
