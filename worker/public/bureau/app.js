@@ -32,6 +32,7 @@ const state = {
   loginPassword: '',
   loginLoading: false,
   loginError: null,
+  companyLogoUrl: null,
 
   filter: 'review',
   dossiers: [],
@@ -130,6 +131,21 @@ async function apiJson(path, opts) {
   return data;
 }
 
+async function loadCompanyLogo() {
+  if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
+  const co = state.user && state.user.company;
+  if (!co || !co.hasLogo) { render(); return; }
+  try {
+    const res = await apiRaw(`/api/companies/${co.id}/logo`);
+    if (!res.ok) throw new Error('logo indisponible');
+    const blob = await res.blob();
+    state.companyLogoUrl = URL.createObjectURL(blob);
+  } catch (e) {
+    state.companyLogoUrl = null;
+  }
+  render();
+}
+
 // ---------------------------------------------------------------
 // Data helpers
 // ---------------------------------------------------------------
@@ -220,6 +236,7 @@ async function boot() {
       state.screen = 'dossiers';
       render();
       loadDossiers();
+      loadCompanyLogo();
       return;
     } catch (e) {
       state.token = null;
@@ -256,6 +273,7 @@ async function doLogin(email, password) {
     state.screen = 'dossiers';
     render();
     loadDossiers();
+    loadCompanyLogo();
   } catch (e) {
     state.loginLoading = false;
     state.loginError = e.message || 'Erreur de connexion.';
@@ -266,6 +284,7 @@ async function doLogin(email, password) {
 
 function doLogout() {
   revokeReviewPhotos();
+  if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
   state.token = null;
   state.user = null;
   try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
@@ -556,7 +575,7 @@ function railHtml() {
   const initials = initialsOf(state.user && state.user.name);
   return `
   <div class="rail">
-    <div class="rail-brand"><img src="../assets/logo-mark.png" alt=""><span>Condo<br>Strat<span style="color:var(--orange)">é</span>gis</span></div>
+    <div class="rail-brand"><img src="${state.companyLogoUrl || '../assets/logo-mark.png'}" alt=""><span>${escapeHtml((state.user && state.user.company && state.user.company.name) || 'Condo Stratégis')}</span></div>
     <div class="rail-section-label">Console bureau</div>
     ${items.map(n => {
       const active = n.key === 'dossiers' && dossiersActive;

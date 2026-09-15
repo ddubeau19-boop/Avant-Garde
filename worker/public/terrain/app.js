@@ -36,6 +36,7 @@ const state = {
   loginPassword: '',
   loginLoading: false,
   loginError: null,
+  companyLogoUrl: null,
 
   dossiers: [],
   dossier: null,
@@ -141,6 +142,21 @@ async function apiJson(path, opts, config) {
   return data;
 }
 
+async function loadCompanyLogo() {
+  if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
+  const co = state.user && state.user.company;
+  if (!co || !co.hasLogo) { render(); return; }
+  try {
+    const res = await apiFetch(`/api/companies/${co.id}/logo`);
+    if (!res.ok) throw new Error('logo indisponible');
+    const blob = await res.blob();
+    state.companyLogoUrl = URL.createObjectURL(blob);
+  } catch (e) {
+    state.companyLogoUrl = null;
+  }
+  render();
+}
+
 /* ============================================================
    Boot / auth / dossiers
    ============================================================ */
@@ -151,6 +167,7 @@ async function boot() {
     render();
     try {
       state.user = await apiJson('/api/auth/me');
+      loadCompanyLogo();
       await loadDossiers();
     } catch (e) {
       if (e.message !== 'SESSION_EXPIRED') { state.screen = 'login'; render(); }
@@ -172,6 +189,7 @@ async function doLogin(email, password) {
     }, { auth: false });
     state.token = data.token; state.user = data.user;
     try { localStorage.setItem(TOKEN_KEY, data.token); } catch (e) {}
+    loadCompanyLogo();
     await loadDossiers();
   } catch (e) {
     state.loginError = friendlyError(e);
@@ -183,6 +201,7 @@ async function doLogin(email, password) {
 
 function logout() {
   try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+  if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
   Object.assign(state, {
     token: null, user: null, dossier: null, dossiers: [], components: [],
     activeComponent: null, activeId: null, projection: null, error: null,
@@ -686,7 +705,7 @@ function dossiersHtml() {
   }).join('');
   return `<div class="picker-screen">
     <div class="top-row" style="margin-bottom:20px">
-      <div class="brand"><img src="../assets/logo-mark.png" alt=""><span>Condo Strat<b>é</b>gis</span></div>
+      <div class="brand"><img src="${state.companyLogoUrl || '../assets/logo-mark.png'}" alt=""><span>${esc((state.user && state.user.company && state.user.company.name) || 'Condo Stratégis')}</span></div>
       <button data-action="logout" style="border:none;background:none;color:var(--ink-500);font-size:12px;cursor:pointer">Déconnexion</button>
     </div>
     <div class="eyebrow">Étude de fonds de prévoyance</div>
@@ -706,7 +725,7 @@ function accueilHtml() {
   return `
   <div class="scr-accueil">
     <div class="top-row">
-      <div class="brand"><img src="../assets/logo-mark.png" alt=""><span>Condo Strat<b>é</b>gis</span></div>
+      <div class="brand"><img src="${state.companyLogoUrl || '../assets/logo-mark.png'}" alt=""><span>${esc((state.user && state.user.company && state.user.company.name) || 'Condo Stratégis')}</span></div>
       <div class="net-badge ${state.online ? 'online' : 'offline'}"><i data-lucide="${state.online ? 'wifi' : 'wifi-off'}"></i>${state.online ? 'En ligne' : 'Hors connexion'}</div>
     </div>
     <div class="eyebrow">Étude de fonds de prévoyance</div>
