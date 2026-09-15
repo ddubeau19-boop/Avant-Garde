@@ -156,6 +156,7 @@ const state = {
   revisionLoading: false,
   revisionError: null,
   revisionFlashError: null,
+  selectedScenarioCode: null,
   saveStatus: 'idle', // idle | saving | saved | error
   expanded: {},            // id de composante -> panneau de détail ouvert
   batiment: {},            // contenu de dossiers.batiment_info (lecture seule ici)
@@ -616,6 +617,24 @@ async function onSoldeBlur(value) {
   render();
 }
 
+async function onCotisationBlur(value) {
+  const n = parseNum(value);
+  if (n === null) { render(); return; }
+  if (state.dossier && n === state.dossier.cotisation_annuelle) { render(); return; }
+  state.saveStatus = 'saving';
+  render();
+  try {
+    await apiJson(`/api/dossiers/${state.dossierId}`, { method: 'PATCH', body: JSON.stringify({ cotisation_annuelle: n }) });
+    state.dossier = Object.assign({}, state.dossier, { cotisation_annuelle: n });
+    await refreshProjection();
+    state.saveStatus = 'saved';
+  } catch (e) {
+    state.saveStatus = 'error';
+    state.revisionFlashError = e.message || "Échec de l'enregistrement.";
+  }
+  render();
+}
+
 function revokeReviewPhotos() {
   state.reviewObjectUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch (e) {} });
   state.reviewObjectUrls = [];
@@ -952,38 +971,39 @@ function saveIndicatorHtml() {
 
 function fundCardHtml(d, proj, params, excluded) {
   const horizon = params.projectionYears != null ? params.projectionYears : '—';
-  const annual = proj ? fmt(proj.annualCotisation) + ' $' : '—';
-  const monthlyTotal = proj ? fmt(proj.monthlyCotisation) + ' $' : '—';
-  const perUnit = proj && proj.monthlyCotisationPerUnit != null ? fmt(proj.monthlyCotisationPerUnit) + ' $' : '—';
+  // Le moteur expose désormais des scénarios de rattrapage (méthode maison) plutôt qu'une
+  // cotisation constante unique : on met en avant le scénario recommandé et sa 1re année.
+  const recommended = proj && Array.isArray(proj.scenarios) ? proj.scenarios.find(s => s.code === proj.recommendedCode) : null;
+  const headline = recommended ? `${recommended.code} — ${recommended.label}` : (proj ? 'Aucun scénario ne suffit' : '—');
+  const an1 = recommended && recommended.years && recommended.years[0] ? fmt(recommended.years[0].cotisation) + ' $' : '—';
   const soldeVal = d.current_fund_balance != null ? fmt(d.current_fund_balance) : '0';
-  // Cotisation annuelle déjà perçue par le syndicat (saisie au terrain), à comparer avec la cotisation requise.
-  const cotisVal = d.cotisation_annuelle != null ? fmt(d.cotisation_annuelle) + ' $' : '—';
+  // Cotisation annuelle déjà perçue par le syndicat, à comparer avec celle du scénario.
+  const cotisationVal = d.cotisation_annuelle != null ? fmt(d.cotisation_annuelle) : '';
   const methoTags = [
-    { label: 'Inflation', val: params.inflationRate != null ? Math.round(params.inflationRate * 1000) / 10 : '—', unit: '%' },
-    { label: 'Rendement', val: params.fundReturnRate != null ? Math.round(params.fundReturnRate * 1000) / 10 : '—', unit: '%' },
-    { label: 'Contingence', val: params.contingencyRate != null ? Math.round(params.contingencyRate * 1000) / 10 : '—', unit: '%' },
-    { label: 'Horizon', val: horizon, unit: ' ans' },
+    { label: 'Inflation construction', val: params.inflationRate != null ? Math.round(params.inflationRate * 10000) / 100 : '—', unit: '%' },
+    { label: 'Intérêt', val: params.interestRate != null ? Math.round(params.interestRate * 10000) / 100 : '—', unit: '%' },
+    { label: 'Horizon', val: horizon, unit: ' ans + portion an 31' },
   ];
   return `
   <div class="fund-card">
     <div class="fund-top">
       <div style="flex:1">
-        <div class="fund-top-eyebrow">Cotisation annuelle requise · ${horizon} ans</div>
-        <div class="fund-total">${annual}</div>
+        <div class="fund-top-eyebrow">Scénario recommandé</div>
+        <div class="fund-total" style="font-size:22px">${escapeHtml(headline)}</div>
       </div>
       <div class="fund-side">
-        <div class="fund-side-label">Cotisation</div>
-        <div class="fund-side-val">${perUnit}</div>
-        <div class="fund-side-unit">/mois/unité</div>
+        <div class="fund-side-label">Cotisation an 1</div>
+        <div class="fund-side-val">${an1}</div>
       </div>
     </div>
     <div class="fund-body">
       <div class="fund-stats-row">
-        <div><div class="fund-stat-label">Cotisation mensuelle totale</div><div class="fund-stat-val">${monthlyTotal}</div></div>
         <div><div class="fund-stat-label">Solde actuel du fonds</div>
           <div class="solde-box"><input id="soldeInput" type="text" inputmode="numeric" data-role="solde-input" value="${soldeVal}"><span>$</span></div>
         </div>
-        <div><div class="fund-stat-label">Cotisation annuelle actuelle</div><div class="fund-stat-val">${cotisVal}</div></div>
+        <div><div class="fund-stat-label">Cotisation annuelle actuelle</div>
+          <div class="solde-box"><input type="text" inputmode="numeric" data-role="cotisation-input" value="${cotisationVal}"><span>$</span></div>
+        </div>
       </div>
       ${excluded.length > 0 ? `
       <div class="excluded-banner">
@@ -991,11 +1011,75 @@ function fundCardHtml(d, proj, params, excluded) {
         <ul class="excluded-list">${excluded.map(e => `<li>${escapeHtml(e.name || 'Composante')} — ${escapeHtml(e.reason || 'raison inconnue')}</li>`).join('')}</ul>
       </div>` : ''}
       <div class="metho-section">
-        <div class="metho-label">Méthodologie · valeurs fixes du calcul</div>
+        <div class="metho-label">Hypothèses sourcées</div>
         <div class="metho-row">
           ${methoTags.map(m => `<div class="metho-tag"><div class="metho-tag-label">${m.label}</div><div class="metho-tag-val">${m.val}<span>${m.unit}</span></div></div>`).join('')}
         </div>
+        ${params.inflationSource ? `<div class="metho-source">Inflation : ${escapeHtml(params.inflationSource)}</div>` : ''}
+        ${params.interestSource ? `<div class="metho-source">Intérêt : ${escapeHtml(params.interestSource)}</div>` : ''}
       </div>
+    </div>
+  </div>`;
+}
+
+function scenarioCardsHtml(proj, selectedCode) {
+  if (!proj || !Array.isArray(proj.scenarios) || !proj.scenarios.length) return '';
+  return `
+  <div class="scenario-section">
+    <div class="comp-section-head">
+      <span class="lbl">Comparaison des scénarios</span>
+      <div class="rule"></div>
+      <span class="hint">Total débours 30 ans : ${fmt(proj.totalDebours30Ans)} $ · portion future an 31 : ${fmt(proj.portionFutureAn31.total)} $ · total : ${fmt(proj.totalAvecPortionFuture)} $</span>
+    </div>
+    <div class="scenario-cards">
+      ${proj.scenarios.map(s => {
+        const active = s.code === selectedCode;
+        return `
+        <button class="scenario-card ${active ? 'active' : ''} ${s.meetsCriteria ? 'ok' : 'fail'}" data-action="select-scenario" data-code="${s.code}">
+          <div class="scenario-card-head">
+            <span class="scenario-code">${s.code}</span>
+            <span class="scenario-badge ${s.meetsCriteria ? 'ok' : 'fail'}">${s.meetsCriteria ? 'Critères respectés' : 'Insuffisant'}</span>
+          </div>
+          <div class="scenario-label">${escapeHtml(s.label)}${s.approxime ? ' <span class="scenario-approx" title="Approximation — voir méthodologie">*</span>' : ''}</div>
+          <div class="scenario-stats">
+            <div><span class="k">An 1</span><span class="v">${fmt(s.years[0].cotisation)} $</span></div>
+            <div><span class="k">Solde an 30</span><span class="v">${fmt(s.soldeFinAn30)} $</span></div>
+            <div><span class="k">1re année négative</span><span class="v">${s.firstNegativeYear != null ? 'An ' + s.firstNegativeYear : '—'}</span></div>
+          </div>
+        </button>`;
+      }).join('')}
+    </div>
+    ${proj.scenarios.some(s => s.approximationNote) ? `<div class="scenario-approx-note">* ${escapeHtml(proj.scenarios.find(s => s.approximationNote).approximationNote)}</div>` : ''}
+  </div>`;
+}
+
+function executiveSummaryHtml(proj, selectedCode) {
+  if (!proj || !Array.isArray(proj.scenarios) || !proj.scenarios.length) return '';
+  const scenario = proj.scenarios.find(s => s.code === selectedCode) || proj.scenarios[0];
+  const rows = scenario.years.map(y => `
+    <div class="exec-row ${y.soldeFin < 0 ? 'negative' : ''}">
+      <div class="exec-cell">${y.year}</div>
+      <div class="exec-cell mono">${y.pctAugmentation.toFixed(1)} %</div>
+      <div class="exec-cell mono right">${fmt(y.debours)} $</div>
+      <div class="exec-cell mono right">${fmt(y.cotisation)} $</div>
+      <div class="exec-cell mono right">${fmt(y.soldeFin)} $</div>
+    </div>`).join('');
+  return `
+  <div class="exec-section">
+    <div class="comp-section-head">
+      <span class="lbl">Sommaire exécutif — ${scenario.code} — année par année</span>
+      <div class="rule"></div>
+      <span class="hint">Solde du fonds plancher à l'intérêt sur solde négatif</span>
+    </div>
+    <div class="exec-table">
+      <div class="exec-row exec-head">
+        <div class="exec-cell">Année</div>
+        <div class="exec-cell">Augmentation</div>
+        <div class="exec-cell right">Débours prévus</div>
+        <div class="exec-cell right">Cotisation</div>
+        <div class="exec-cell right">Solde fin d'année</div>
+      </div>
+      ${rows}
     </div>
   </div>`;
 }
@@ -1249,6 +1333,9 @@ function renderRevision() {
         ${fundCardHtml(d, proj, params, excluded)}
         ${reportsCardHtml(allConf, remaining)}
       </div>
+
+      ${scenarioCardsHtml(proj, state.selectedScenarioCode || (proj && proj.recommendedCode) || (proj && proj.scenarios && proj.scenarios[0] && proj.scenarios[0].code))}
+      ${executiveSummaryHtml(proj, state.selectedScenarioCode || (proj && proj.recommendedCode) || (proj && proj.scenarios && proj.scenarios[0] && proj.scenarios[0].code))}
 
       <button class="reviewia-cta" data-action="go-reviewia">
         <div class="reviewia-cta-icon"><i data-lucide="sparkles"></i></div>
@@ -1573,6 +1660,10 @@ function initEvents() {
         state.screen = 'publier';
         render();
         break;
+      case 'select-scenario':
+        state.selectedScenarioCode = btn.getAttribute('data-code');
+        render();
+        break;
       case 'go-reviewia':
         goReviewIA();
         break;
@@ -1655,6 +1746,7 @@ function initEvents() {
     const t = e.target;
     if (!t || !t.matches) return;
     if (t.matches('[data-role="solde-input"]')) { onSoldeBlur(t.value); return; }
+    if (t.matches('[data-role="cotisation-input"]')) { onCotisationBlur(t.value); return; }
     if (t.matches('[data-role="cost-cell"]')) { patchComponent(t.getAttribute('data-id'), { replacement_cost: parseNum(t.textContent) }, { refetchProjection: true }); return; }
     if (t.matches('[data-role="life-cell"]')) { patchComponent(t.getAttribute('data-id'), { useful_life_years: parseNum(t.textContent) }, { refetchProjection: true }); return; }
     if (t.matches('[data-role="year-cell"]')) { patchComponent(t.getAttribute('data-id'), { install_year: parseYear(t.textContent) }, { refetchProjection: true }); return; }
