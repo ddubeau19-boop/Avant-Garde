@@ -28,6 +28,8 @@ const state = {
   token: null,
   user: null,
 
+  loginEmail: '',
+  loginPassword: '',
   loginLoading: false,
   loginError: null,
 
@@ -257,6 +259,7 @@ async function doLogin(email, password) {
   } catch (e) {
     state.loginLoading = false;
     state.loginError = e.message || 'Erreur de connexion.';
+    state.loginPassword = '';
     render();
   }
 }
@@ -532,9 +535,9 @@ function renderLogin() {
         <p>Accès réservé aux ingénieurs.</p>
         ${state.loginError ? `<div class="login-error">${escapeHtml(state.loginError)}</div>` : ''}
         <label class="field-label" for="login-email">Courriel</label>
-        <div class="field-box"><i data-lucide="mail"></i><input id="login-email" name="email" type="email" autocomplete="username" placeholder="prenom.nom@condostrategis.ca" required></div>
+        <div class="field-box"><i data-lucide="mail"></i><input id="login-email" data-role="login-email" name="email" type="email" autocomplete="username" placeholder="prenom.nom@condostrategis.ca" value="${escapeHtml(state.loginEmail || '')}" required></div>
         <label class="field-label" for="login-password">Mot de passe</label>
-        <div class="field-box"><i data-lucide="lock"></i><input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="Mot de passe" required></div>
+        <div class="field-box"><i data-lucide="lock"></i><input id="login-password" data-role="login-password" name="password" type="password" autocomplete="current-password" placeholder="Mot de passe" value="${escapeHtml(state.loginPassword || '')}" required></div>
         <button type="submit" class="btn-primary" style="width:100%" ${state.loginLoading ? 'disabled' : ''}>${state.loginLoading ? 'Connexion…' : 'Se connecter'}<i data-lucide="${state.loginLoading ? 'loader-2' : 'arrow-right'}" class="${state.loginLoading ? 'spin' : ''}"></i></button>
         <div class="login-forgot">Mot de passe oublié ?</div>
       </form>
@@ -978,6 +981,16 @@ function initEvents() {
       const password = document.getElementById('login-password').value;
       doLogin(email, password);
     }
+  });
+
+  // Keep login field values in state (without re-rendering on every keystroke)
+  // so a render triggered elsewhere (e.g. loginLoading toggling) doesn't wipe
+  // what the user already typed.
+  app.addEventListener('input', (e) => {
+    const t = e.target;
+    if (!t || !t.matches) return;
+    if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
+    else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
   });
 
   app.addEventListener('click', (e) => {

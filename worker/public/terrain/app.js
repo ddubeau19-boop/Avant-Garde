@@ -32,6 +32,8 @@ const state = {
   error: null,
   toast: null,
 
+  loginEmail: '',
+  loginPassword: '',
   loginLoading: false,
   loginError: null,
 
@@ -173,6 +175,7 @@ async function doLogin(email, password) {
     await loadDossiers();
   } catch (e) {
     state.loginError = friendlyError(e);
+    state.loginPassword = '';
   } finally {
     state.loginLoading = false; render();
   }
@@ -661,8 +664,8 @@ function loginHtml() {
       ${state.loginError ? `<div class="login-error">${esc(state.loginError)}</div>` : ''}
       ${!state.online ? `<div class="login-error"><i data-lucide="wifi-off" style="width:13px;height:13px;vertical-align:-2px;margin-right:5px"></i>Vous êtes hors connexion.</div>` : ''}
       <form id="loginForm">
-        <div class="field"><label for="loginEmail">Courriel</label><input id="loginEmail" type="email" autocomplete="username" required></div>
-        <div class="field"><label for="loginPassword">Mot de passe</label><input id="loginPassword" type="password" autocomplete="current-password" required></div>
+        <div class="field"><label for="loginEmail">Courriel</label><input id="loginEmail" data-role="login-email" type="email" autocomplete="username" value="${esc(state.loginEmail || '')}" required></div>
+        <div class="field"><label for="loginPassword">Mot de passe</label><input id="loginPassword" data-role="login-password" type="password" autocomplete="current-password" value="${esc(state.loginPassword || '')}" required></div>
         <button class="btn-primary" type="submit" ${state.loginLoading || !state.online ? 'disabled' : ''}>
           ${state.loginLoading ? `<i data-lucide="loader-2" class="spin" style="width:17px;height:17px"></i>Connexion…` : `<i data-lucide="log-in" style="width:17px;height:17px"></i>Se connecter`}
         </button>
@@ -992,6 +995,10 @@ function onRootInput(e) {
     onResidualInput(e);
   } else if (t.matches && t.matches('[data-role="note-fallback-text"]')) {
     state.noteDraft = t.value;
+  } else if (t.matches && t.matches('[data-role="login-email"]')) {
+    state.loginEmail = t.value;
+  } else if (t.matches && t.matches('[data-role="login-password"]')) {
+    state.loginPassword = t.value;
   }
 }
 
