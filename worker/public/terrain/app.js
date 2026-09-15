@@ -878,9 +878,15 @@ function computeGroups() {
   return groups.filter(g => g.items.length > 0);
 }
 
+function recommendedScenario(projection) {
+  if (!projection || !Array.isArray(projection.scenarios) || !projection.scenarios.length) return null;
+  return projection.scenarios.find(s => s.code === projection.recommendedCode) || projection.scenarios[0];
+}
+
 function computeDecades(projection) {
-  if (!projection || !Array.isArray(projection.years) || !projection.years.length) return [];
-  const years = projection.years;
+  const scenario = recommendedScenario(projection);
+  if (!scenario || !Array.isArray(scenario.years) || !scenario.years.length) return [];
+  const years = scenario.years;
   const buckets = [];
   for (let i = 0; i < 5; i++) {
     const slice = years.slice(i * 5, i * 5 + 5);
@@ -1481,8 +1487,10 @@ function syntheseHtml() {
   }).join('');
 
   const proj = state.projection;
-  const fundAmount = proj ? formatMoneyCompact(proj.totalDeboursProjete) : (state.projectionLoading ? '…' : '—');
-  const monthly = proj && proj.monthlyCotisationPerUnit != null ? fmtCAD.format(Math.round(proj.monthlyCotisationPerUnit)) : null;
+  const scenario = recommendedScenario(proj);
+  const units = state.dossier ? state.dossier.units : null;
+  const fundAmount = proj ? formatMoneyCompact(proj.totalAvecPortionFuture) : (state.projectionLoading ? '…' : '—');
+  const monthly = scenario && units > 0 ? fmtCAD.format(Math.round(scenario.years[0].cotisation / 12 / units)) : null;
   const decades = computeDecades(proj);
   const decadesHtml = decades.map(d => `<div class="fund-bar-wrap"><div class="fund-bar" style="height:${d.h};background:${d.color}"></div><span>${d.label}</span></div>`).join('');
 
@@ -1505,7 +1513,7 @@ function syntheseHtml() {
       </div>` : ''}
 
       <div class="fund-card">
-        <div class="lbl">Fonds de prévoyance requis · ${proj ? proj.params.projectionYears : 25} ans</div>
+        <div class="lbl">Fonds de prévoyance requis · ${proj ? proj.params.projectionYears : 30} ans</div>
         <div class="amount">${fundAmount}</div>
         <div class="sub">Cotisation suggérée · ${monthly ? `<b>${monthly}/mois</b> par unité` : '—'}</div>
         ${decadesHtml ? `<div class="fund-chart">${decadesHtml}</div>` : (state.projectionLoading ? '<div style="font-family:var(--font-mono);font-size:11px;color:rgba(255,255,255,.5)">Calcul en cours…</div>' : '')}
