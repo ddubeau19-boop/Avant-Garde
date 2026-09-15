@@ -22513,6 +22513,7 @@ async function generateReportDocx(ctx) {
   const apiKey = ctx.apiKey ?? null;
   const signataire = ctx.signataire ?? null;
   const ordre = ordreDuSignataire(signataire);
+  const noMembreSignataire = String(signataire?.no_membre ?? "").trim() || null;
   const maintenant = /* @__PURE__ */ new Date();
   const anneeCourante = maintenant.getFullYear();
   const today = maintenant.toLocaleDateString("fr-CA");
@@ -22572,8 +22573,13 @@ async function generateReportDocx(ctx) {
   // Le moteur simule plusieurs scénarios de financement. La rédaction s'appuie
   // sur celui qu'il recommande, et se compare au statu quo (indexation seule,
   // sans rattrapage) pour trancher si la cotisation actuelle suffit.
-  const scenarioPrefere = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
   const scenarioStatuQuo = projection.scenarios.find((s) => s.code === "C1.1.2") ?? null;
+  // Le moteur ne recommande jamais le statu quo : sa recommandation est toujours un plan
+  // de rattrapage. Au rapport, on ne demande pas au syndicat de hausser sa cotisation quand
+  // celle qu'il verse déjà satisfait le double critère — dans ce cas, le scénario de
+  // préférence est le maintien, ce que dit d'ailleurs le texte de la section 6.0.
+  const scenarioRecommande = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  const scenarioPrefere = scenarioStatuQuo?.meetsCriteria ? scenarioStatuQuo : scenarioRecommande;
   const anneesScenario = scenarioPrefere?.years ?? [];
   const cotisationAnUn = scenarioPrefere?.years?.[0]?.cotisation ?? null;
   const cotisationMensuelle = cotisationAnUn != null ? cotisationAnUn / 12 : null;
@@ -22719,6 +22725,9 @@ async function generateReportDocx(ctx) {
     resultats.push(titre2(`Scénario de financement de préférence — ${scenarioPrefere.code} (${scenarioPrefere.label})`));
     resultats.push(body(`Le scénario de financement de préférence résume les besoins annuels de financement selon les exigences de la réglementation actuelle ainsi que les besoins ponctuels de remplacement des éléments du bâtiment. Nous suggérons en ${anneeCourante} une cotisation annuelle au fonds de prévoyance de ${montantMaison(cotisationAnUn) ?? "à confirmer"}${cotisationMensuelleParUnite != null ? ` (environ ${montantMaison(cotisationMensuelleParUnite) ?? "—"} par mois par copropriété)` : ""}. Ces investissements sont requis pour rencontrer les dépenses de réparations majeures et de remplacements prévues au cours des ${projection.params.projectionYears} prochaines années, ainsi que pour débuter le prochain cycle par la suite.`));
     if (scenarioPrefere.approximationNote) resultats.push(body(scenarioPrefere.approximationNote, { color: GREY, size: 18 }));
+    if (scenarioPrefere === scenarioStatuQuo && scenarioRecommande && scenarioRecommande !== scenarioStatuQuo) {
+      resultats.push(body(`La cotisation actuelle satisfait déjà le double critère d'acceptation; le maintien est donc retenu comme scénario de préférence. Le scénario ${scenarioRecommande.code} — ${scenarioRecommande.label} demeure présenté au tableau comparatif à titre d'option de capitalisation accélérée, au choix du conseil d'administration.`, { color: GREY, size: 18 }));
+    }
     resultats.push(titre2("Répartition des dépenses"));
     resultats.push(tableauMaison(
       ["Année", "Débours prévus", "Cotisation", "Solde du fonds (fin d'année)"],
@@ -22744,13 +22753,17 @@ async function generateReportDocx(ctx) {
     body(cotisationSuffisante
       ? "À la lumière des informations qui étaient disponibles, nous sommes d'opinion que la contribution périodique actuelle au fonds de prévoyance, en regard avec le solde du compte destiné au fonds, est suffisante pour couvrir les remplacements à venir à moyen et long terme. Il serait suggéré, au conseil d'administration, de maintenir le scénario de financement de préférence afin de permettre un bon entretien préventif et une conservation adéquate de l'immeuble."
       : "À la lumière des informations qui étaient disponibles, nous sommes d'opinion que la contribution périodique actuelle au fonds de prévoyance, en regard avec le solde du compte destiné au fonds, n'est pas suffisante pour couvrir les remplacements à venir à moyen et long terme. Il serait suggéré, au conseil d'administration, d'adopter le scénario de financement de préférence afin de rectifier la situation et permettre un bon entretien préventif et une conservation adéquate de l'immeuble."),
-    body("Enfin, la contribution optimale au fonds de prévoyance devrait s'établir comme suit :"),
-    puce(`Cotisation annuelle au fonds de prévoyance de ${montantMaison(cotisationAnUn) ?? "à confirmer"} dès ${anneeCourante};`),
-    puce(`Cotisation mensuelle moyenne de ${montantMaison(cotisationMensuelle) ?? "à confirmer"};`),
-    cotisationMensuelleParUnite != null
-      ? puce(`Cotisation mensuelle moyenne par copropriété de ${montantMaison(cotisationMensuelleParUnite) ?? "à confirmer"};`)
-      : puce("Cotisation mensuelle moyenne par copropriété : à établir selon les quotes-parts de la déclaration de copropriété;"),
-    puce(`Maintien de ce niveau de cotisation, indexé, jusqu'à la fin du cycle de ${projection.params.projectionYears} ans.`),
+    ...montantMaison(cotisationAnUn) != null ? [
+      body("Enfin, la contribution optimale au fonds de prévoyance devrait s'établir comme suit :"),
+      puce(`Cotisation annuelle au fonds de prévoyance de ${montantMaison(cotisationAnUn)} dès ${anneeCourante};`),
+      puce(`Cotisation mensuelle moyenne de ${montantMaison(cotisationMensuelle) ?? "à confirmer"};`),
+      cotisationMensuelleParUnite != null
+        ? puce(`Cotisation mensuelle moyenne par copropriété de ${montantMaison(cotisationMensuelleParUnite)};`)
+        : puce("Cotisation mensuelle moyenne par copropriété : à établir selon les quotes-parts de la déclaration de copropriété;"),
+      puce(`Maintien de ce niveau de cotisation, indexé, jusqu'à la fin du cycle de ${projection.params.projectionYears} ans.`)
+    ] : [
+      body("La contribution optimale au fonds de prévoyance n'a pu être arrêtée : aucun des scénarios simulés ne satisfait le double critère d'acceptation à partir des données actuelles. Les montants doivent être établis par l'ingénieur responsable à la section 5.0 avant la diffusion du rapport.", { bold: true, color: ORANGE })
+    ],
     titre2("Invitation"),
     body(cotisationSuffisante
       ? "Actuellement, l'étude démontre une saine gestion par les années passées. Malgré cette bonne situation financière, nous suggérons aux membres du syndicat une rencontre à nos bureaux afin d'optimiser l'utilisation du rapport. Voir les détails à l'offre de services. Sur place nous pourrons entre autres échanger et considérer d'autres options de scénario de financement si nécessaire."
@@ -22786,16 +22799,23 @@ async function generateReportDocx(ctx) {
     body("Je déclare avoir procédé avec diligence dans l'exercice de la profession en ce qui concerne les opinions de valeur reliées au remplacement des éléments du bâtiment en cause."),
     body("________________________"),
     body(nomSignataire, { bold: true }),
-    body(ordre ? `N° de membre de l'${ordre.sigle} : ${A_COMPLETER}` : `Ordre professionnel et n° de membre : ${A_COMPLETER}`)
+    body(ordre
+      ? `N° de membre de l'${ordre.sigle} : ${noMembreSignataire ?? A_COMPLETER}`
+      : `Ordre professionnel et n° de membre : ${noMembreSignataire ?? A_COMPLETER}`)
   ];
   if (!ordre) {
     declaration.push(body(
       "NOTE À LA RÉVISION — L'ordre professionnel du signataire n'a pas pu être déterminé à partir du dossier. La présente déclaration ne doit pas être signée tant que l'ordre professionnel et le numéro de membre ne sont pas complétés : l'attestation porte sur les normes de pratique de l'ordre auquel appartient réellement le signataire.",
       { color: ORANGE, size: 18, bold: true }
     ));
-  } else {
+  } else if (!noMembreSignataire) {
     declaration.push(body(
-      `NOTE À LA RÉVISION — L'ordre professionnel ci-dessus (${ordre.sigle}) a été dérivé du titre du signataire au dossier. Valider cette mention et compléter le numéro de membre avant signature.`,
+      `NOTE À LA RÉVISION — L'ordre professionnel ci-dessus (${ordre.sigle}) a été dérivé du titre du signataire au dossier, et son numéro de membre n'est pas renseigné. Valider la mention et compléter le numéro avant signature.`,
+      { color: GREY, size: 18 }
+    ));
+  } else if (!signataire?.ordre_professionnel) {
+    declaration.push(body(
+      `NOTE À LA RÉVISION — L'ordre professionnel ci-dessus (${ordre.sigle}) a été dérivé du titre du signataire, non saisi explicitement à son profil. Valider la mention avant signature.`,
       { color: GREY, size: 18 }
     ));
   }
@@ -22852,7 +22872,7 @@ async function generateReportDocx(ctx) {
     heading("Annexe B — Calendrier de remplacement — Scénario de financement"),
     body("Le calendrier ci-dessous présente, année par année, les débours prévus, la cotisation et le solde du fonds pour chacun des scénarios simulés. Le scénario de préférence est celui retenu à la section 5.0."),
     ...projection.scenarios.flatMap((s) => [
-      titre2(`${s.code} — ${s.label}${s.code === projection.recommendedCode ? " (scénario de préférence)" : ""}`),
+      titre2(`${s.code} — ${s.label}${scenarioPrefere && s.code === scenarioPrefere.code ? " (scénario de préférence)" : ""}`),
       ...s.approximationNote ? [body(s.approximationNote, { color: GREY, size: 18 })] : [],
       tableauMaison(
         ["Année", "Augmentation", "Débours prévus", "Cotisation", "Solde du fonds (fin d'année)"],
@@ -43295,7 +43315,7 @@ companies.get("/:id", async (c) => {
   if (deny) return deny;
   const company = await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(c.req.param("id")).first();
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
-  const engineers = await c.env.DB.prepare("SELECT id, name, email, role, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC").bind(company.id).all();
+  const engineers = await c.env.DB.prepare("SELECT id, name, email, role, title, ordre_professionnel, no_membre, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC").bind(company.id).all();
   const dossierCount = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM dossiers WHERE company_id = ?1").bind(company.id).first();
   return c.json({ ...company, hasLogo: !!company.logo_r2_key, engineers: engineers.results, dossierCount: dossierCount?.n ?? 0 });
 });
@@ -43358,7 +43378,7 @@ companies.get("/:id/engineers", async (c) => {
   const deny = requireSuperAdmin(c, user);
   if (deny) return deny;
   const rows = await c.env.DB.prepare(
-    "SELECT id, name, email, role, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC"
+    "SELECT id, name, email, role, title, ordre_professionnel, no_membre, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC"
   ).bind(c.req.param("id")).all();
   return c.json(rows.results);
 });
@@ -43373,15 +43393,20 @@ companies.post("/:id/engineers", async (c) => {
   const email = body2.email?.trim().toLowerCase();
   const name = body2.name?.trim();
   if (!email || !name) return c.json({ error: "nom et courriel requis" }, 400);
+  // Bloc de signature : repris tel quel à la section 8.0 Déclaration du rapport.
+  const title = body2.title?.trim() || null;
+  const ordreProfessionnel = body2.ordre_professionnel?.trim().toUpperCase() || null;
+  const noMembre = body2.no_membre?.trim() || null;
   const existing = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(email).first();
   if (existing) return c.json({ error: "un compte existe déjà avec ce courriel" }, 409);
   const tempPassword = generateTempPassword();
   const { hash, salt } = await hashPassword(tempPassword);
   const id = newId("usr");
   await c.env.DB.prepare(
-    `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'engineer')`
-  ).bind(id, email, name, hash, salt, companyId).run();
-  return c.json({ user: { id, email, name, role: "engineer" }, tempPassword }, 201);
+    `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role, title, ordre_professionnel, no_membre)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'engineer', ?7, ?8, ?9)`
+  ).bind(id, email, name, hash, salt, companyId, title, ordreProfessionnel, noMembre).run();
+  return c.json({ user: { id, email, name, role: "engineer", title, ordre_professionnel: ordreProfessionnel, no_membre: noMembre }, tempPassword }, 201);
 });
 const dossiers = new Hono();
 async function dossierStats(db, dossierId) {

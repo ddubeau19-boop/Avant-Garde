@@ -50,6 +50,9 @@ const state = {
   newEngineerOpen: false,
   newEngName: '',
   newEngEmail: '',
+  newEngTitle: '',
+  newEngOrdre: '',
+  newEngNoMembre: '',
   newEngLoading: false,
   newEngError: null,
 
@@ -423,12 +426,21 @@ async function submitNewEngineer(name, email) {
   render();
   try {
     const res = await apiJson(`/api/companies/${state.companyId}/engineers`, {
-      method: 'POST', body: JSON.stringify({ name: n, email: e2 }),
+      method: 'POST',
+      body: JSON.stringify({
+        name: n, email: e2,
+        title: (state.newEngTitle || '').trim(),
+        ordre_professionnel: (state.newEngOrdre || '').trim(),
+        no_membre: (state.newEngNoMembre || '').trim(),
+      }),
     });
     state.newEngLoading = false;
     state.newEngineerOpen = false;
     state.newEngName = '';
     state.newEngEmail = '';
+    state.newEngTitle = '';
+    state.newEngOrdre = '';
+    state.newEngNoMembre = '';
     state.tempPasswordInfo = {
       name: (res.user && res.user.name) || n,
       email: (res.user && res.user.email) || e2,
@@ -649,19 +661,28 @@ function renderCompanyDetail() {
       <div class="inline-form-row">
         <div class="field-box" style="flex:1;margin:0"><i data-lucide="user"></i><input type="text" data-role="new-eng-name" placeholder="Nom complet" value="${escapeHtml(state.newEngName || '')}" autofocus></div>
         <div class="field-box" style="flex:1;margin:0"><i data-lucide="mail"></i><input type="email" data-role="new-eng-email" placeholder="Courriel" value="${escapeHtml(state.newEngEmail || '')}"></div>
+      </div>
+      <div class="inline-form-row" style="margin-top:10px">
+        <div class="field-box" style="flex:1;margin:0"><i data-lucide="award"></i><input type="text" data-role="new-eng-title" placeholder="Titre (ex. ing., M.Sc.A.)" value="${escapeHtml(state.newEngTitle || '')}"></div>
+        <div class="field-box" style="width:120px;margin:0"><input type="text" data-role="new-eng-ordre" placeholder="Ordre" value="${escapeHtml(state.newEngOrdre || '')}"></div>
+        <div class="field-box" style="flex:1;margin:0"><i data-lucide="hash"></i><input type="text" data-role="new-eng-no-membre" placeholder="N° de membre" value="${escapeHtml(state.newEngNoMembre || '')}"></div>
         <button type="submit" class="btn-primary" ${state.newEngLoading ? 'disabled' : ''}>${state.newEngLoading ? 'Création…' : 'Créer le compte'}</button>
         <button type="button" class="btn-secondary" data-action="new-engineer-cancel">Annuler</button>
       </div>
+      <div class="form-hint" style="margin-top:8px;font-size:12px;color:var(--ink-500)">Ordre professionnel (OIQ, OTPQ, OAQ) et n° de membre : repris tels quels à la section 8.0 Déclaration du rapport. Sans eux, le rapport sort avec une mention « à compléter avant signature ».</div>
       ${state.newEngError ? `<div class="login-error" style="margin-top:10px">${escapeHtml(state.newEngError)}</div>` : ''}
     </form>` : ''}
 
     <div class="dossiers-table">
-      <div class="dt-row eng-row dt-head"><div>Nom</div><div>Courriel</div><div>Rôle</div><div>Créé le</div></div>
+      <div class="dt-row eng-row dt-head"><div>Nom</div><div>Courriel</div><div>Rôle</div><div>Signature</div><div>Créé le</div></div>
       ${engineers.length === 0 ? `<div class="empty-state">Aucun ingénieur pour cette entreprise.</div>` : engineers.map(e => `
       <div class="dt-row eng-row">
         <div class="dt-name">${escapeHtml(e.name || '—')}</div>
         <div class="mono-cell">${escapeHtml(e.email || '—')}</div>
         <div><span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">${e.role === 'super_admin' ? 'Admin' : 'Ingénieur'}</span></div>
+        <div>${e.ordre_professionnel && e.no_membre
+          ? `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">${escapeHtml(e.ordre_professionnel)} ${escapeHtml(e.no_membre)}</span>`
+          : `<span class="status-badge" title="La section 8.0 du rapport sortira avec « à compléter avant signature »." style="background:#FFF1EC;color:#B03A1A">Bloc incomplet</span>`}</div>
         <div class="mono-cell">${fmtDate(e.created_at)}</div>
       </div>`).join('')}
     </div>
@@ -711,6 +732,9 @@ function initEvents() {
     else if (t.matches('[data-role="edit-name-input"]')) state.editNameValue = t.value;
     else if (t.matches('[data-role="new-eng-name"]')) state.newEngName = t.value;
     else if (t.matches('[data-role="new-eng-email"]')) state.newEngEmail = t.value;
+    else if (t.matches('[data-role="new-eng-title"]')) state.newEngTitle = t.value;
+    else if (t.matches('[data-role="new-eng-ordre"]')) state.newEngOrdre = t.value;
+    else if (t.matches('[data-role="new-eng-no-membre"]')) state.newEngNoMembre = t.value;
   });
 
   app.addEventListener('change', (e) => {
