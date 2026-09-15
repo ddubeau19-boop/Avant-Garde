@@ -1,11 +1,26 @@
-name = "condo-strategis"
-compatibility_date = "2026-09-15"
+name = "vigies"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
 
 [assets]
 directory = "./public"
+binding = "ASSETS"
 not_found_handling = "404-page"
 html_handling = "auto-trailing-slash"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "stratege-fp"
+database_id = "a409a728-53d2-4344-b438-6adb9f8b5a46"
+
+[[r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "stratege-fp-photos"
 
 [[routes]]
 pattern = "pga.stratege.io"
 custom_domain = true
+
+[observability]
+enabled = true
