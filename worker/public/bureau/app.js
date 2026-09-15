@@ -1674,6 +1674,10 @@ function initEvents() {
         state.filter = btn.getAttribute('data-filter');
         render();
         break;
+      case 'select-scenario':
+        state.selectedScenarioCode = btn.getAttribute('data-code');
+        render();
+        break;
       case 'logout':
         doLogout();
         break;
