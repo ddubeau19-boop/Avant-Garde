@@ -636,3 +636,11 @@ button { font-family: inherit; }
   .prix-form { grid-template-columns: repeat(2, 1fr); }
   .prix-stats { grid-template-columns: repeat(2, 1fr); }
 }
+.prix-crm-row { display: grid; grid-template-columns: 44px 2.6fr 1.3fr .8fr .9fr .9fr; border-top: 1px solid var(--line-soft); align-items: center; }
+.prix-crm-row.choisi { background: var(--orange-wash); }
+.prix-crm-check { accent-color: var(--orange); width: 16px; height: 16px; cursor: pointer; }
+.prix-lien { border: none; background: none; padding: 0; font: inherit; color: var(--accent-press); cursor: pointer; text-decoration: underline; }
+.prix-pieces { margin-top: 8px; border-left: 2px solid var(--ink-200); padding-left: 10px; display: flex; flex-direction: column; gap: 3px; }
+.prix-pieces > div { display: flex; gap: 12px; font-size: 11px; color: var(--ink-600); }
+.prix-pieces > div > span:first-child { flex: 1; }
+.prix-pieces .mono { font-family: var(--font-mono); }

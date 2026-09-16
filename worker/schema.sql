@@ -174,3 +174,26 @@ CREATE TABLE price_observations (
 
 CREATE INDEX idx_prix_banque  ON price_observations(company_id, valide, uniformat_code);
 CREATE INDEX idx_prix_dossier ON price_observations(dossier_id);
+
+-- Les pièces du CRM derrière une observation. Une facture y est souvent
+-- fractionnée en versements — quatre lignes pour un seul toit — alors qu'une
+-- observation de prix doit représenter le travail entier : la relation est donc
+-- « une observation, plusieurs pièces ».
+--
+-- La clé primaire porte la traçabilité et la protection contre le double
+-- import : une pièce du CRM entre au plus une fois par entreprise, et rouvrir
+-- la file ne reproposera pas ce qui a déjà été versé à la banque.
+CREATE TABLE price_observation_sources (
+  observation_id TEXT NOT NULL REFERENCES price_observations(id) ON DELETE CASCADE,
+  company_id     TEXT NOT NULL REFERENCES companies(id),
+  source_type    TEXT NOT NULL,   -- 'syndicat_facture' | 'mailbox_attachment'
+  source_id      TEXT NOT NULL,
+  montant        REAL,
+  reference      TEXT,   -- no de facture, ou lien vers la pièce
+  date_piece     TEXT,
+  description    TEXT,
+  imported_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (company_id, source_type, source_id)
+);
+
+CREATE INDEX idx_prix_sources_obs ON price_observation_sources(observation_id);

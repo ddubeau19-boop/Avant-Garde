@@ -212,6 +212,15 @@ const state = {
   prixFormError: null,
   prixSaving: false,
   prixBusyId: null,          // ligne en cours de validation ou de suppression
+  prixEditId: null,          // ligne en cours de modification (sinon : saisie neuve)
+
+  prixCrm: null,             // candidats servis par /api/prix/crm
+  prixCrmDispo: true,        // false quand l'entreprise n'a pas accès au CRM
+  prixCrmLoading: false,
+  prixCrmError: null,
+  prixCrmSel: {},            // clé de candidat -> sélectionné
+  prixCrmDetail: {},         // clé de candidat -> pièces dépliées
+  prixCrmImporting: false,
 };
 
 // ---------------------------------------------------------------
@@ -537,6 +546,91 @@ async function loadPrix() {
   // Le formulaire rattache une ligne à un dossier : sans la liste, le champ
   // serait vide alors que la firme a bel et bien des dossiers.
   if (state.dossiers.length === 0 && !state.dossiersLoading) loadDossiers();
+  loadPrixCrm();
+}
+
+// Les factures que le CRM a déjà rattachées à une composante. Une entreprise
+// sans accès au CRM reçoit un 403 : ce n'est pas une panne, la section
+// n'existe simplement pas pour elle.
+async function loadPrixCrm() {
+  state.prixCrmLoading = true;
+  state.prixCrmError = null;
+  render();
+  try {
+    const res = await apiRaw('/api/prix/crm');
+    if (res.status === 403) {
+      state.prixCrmDispo = false;
+      state.prixCrm = null;
+    } else {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data && data.error ? data.error : `Erreur ${res.status}`);
+      state.prixCrmDispo = true;
+      state.prixCrm = data;
+    }
+  } catch (e) {
+    state.prixCrmError = e.message || 'Impossible de joindre le CRM.';
+  }
+  state.prixCrmLoading = false;
+  render();
+}
+
+function prixCrmSelection() {
+  return Object.keys(state.prixCrmSel).filter(k => state.prixCrmSel[k]);
+}
+
+async function importerPrixCrm() {
+  const cles = prixCrmSelection();
+  if (cles.length === 0 || state.prixCrmImporting) return;
+  state.prixCrmImporting = true;
+  state.prixCrmError = null;
+  render();
+  try {
+    await apiJson('/api/prix/crm/import', { method: 'POST', body: JSON.stringify({ cles }) });
+    state.prixCrmSel = {};
+    state.prixCrmImporting = false;
+    state.prixFilter = 'a_valider';
+    await loadPrix();
+  } catch (e) {
+    state.prixCrmImporting = false;
+    state.prixCrmError = e.message || "L'import a échoué.";
+    render();
+  }
+}
+
+// Une ligne importée arrive sans quantité : la modification est ce qui lui
+// permet d'en recevoir une, et donc de devenir un prix unitaire.
+function ouvrirPrixEdition(id) {
+  const row = state.prixRows.find(r => r.id === id);
+  if (!row) return;
+  state.prixForm = {
+    description: row.description || '',
+    cat: row.cat || '',
+    uniformat_code: row.uniformat_code || '',
+    dossier_id: row.dossier_id || '',
+    annee: row.annee == null ? '' : String(row.annee),
+    montant: row.montant == null ? '' : String(row.montant),
+    quantite: row.quantite == null ? '' : String(row.quantite),
+    unite: row.unite || 'pi2',
+    portee: row.portee || '',
+    source: row.source || 'facture',
+    negocie: row.negocie === 1,
+    fournisseur: row.fournisseur || '',
+    ville: row.ville || '',
+    source_ref: row.source_ref || '',
+    note: row.note || '',
+  };
+  state.prixEditId = id;
+  state.prixFormOpen = true;
+  state.prixFormError = null;
+  render();
+}
+
+function fermerPrixForm() {
+  state.prixFormOpen = false;
+  state.prixEditId = null;
+  state.prixFormError = null;
+  state.prixForm = Object.assign({}, PRIX_FORM_VIDE);
+  render();
 }
 
 function prixFormPayload() {
@@ -566,10 +660,15 @@ async function submitPrix() {
   state.prixSaving = true;
   state.prixFormError = null;
   render();
+  const edition = state.prixEditId;
   try {
-    await apiJson('/api/prix', { method: 'POST', body: JSON.stringify(prixFormPayload()) });
+    await apiJson(edition ? `/api/prix/${edition}` : '/api/prix', {
+      method: edition ? 'PATCH' : 'POST',
+      body: JSON.stringify(prixFormPayload()),
+    });
     state.prixForm = Object.assign({}, PRIX_FORM_VIDE);
     state.prixFormOpen = false;
+    state.prixEditId = null;
     state.prixSaving = false;
     await loadPrix();
   } catch (e) {
@@ -1168,6 +1267,8 @@ function renderPrix() {
 
     ${prixResumeHtml(r)}
 
+    ${prixCrmHtml()}
+
     <div class="comp-section-head" style="margin-top:32px">
       <span class="lbl">Lignes saisies</span><span class="rule"></span>
       <button class="btn-primary" data-action="prix-toggle-form" style="padding:8px 16px;font-size:12px">
@@ -1183,6 +1284,61 @@ function renderPrix() {
     </div>
     ${prixRowsHtml(rows)}
   </div>`;
+}
+
+function prixCrmHtml() {
+  if (!state.prixCrmDispo) return '';
+  const crm = state.prixCrm;
+  const selection = prixCrmSelection();
+  const lignes = (crm && crm.lignes) || [];
+  const corps = state.prixCrmLoading && !crm
+    ? spinnerBlock('Lecture des rattachements du CRM…')
+    : lignes.length === 0
+      ? `<div class="empty-state">Rien de neuf : toutes les factures rattachées par le CRM ont déjà été importées.</div>`
+      : `
+      <div class="prix-table">
+        <div class="prix-crm-row prix-head">
+          <div class="prix-cell"></div>
+          <div class="prix-cell">Travaux</div>
+          <div class="prix-cell">Syndicat</div>
+          <div class="prix-cell right">Période</div>
+          <div class="prix-cell right">Total</div>
+          <div class="prix-cell">Nature</div>
+        </div>
+        ${lignes.map(l => {
+          const ouvert = !!state.prixCrmDetail[l.cle];
+          const multi = l.pieces.length > 1;
+          return `
+          <div class="prix-crm-row ${state.prixCrmSel[l.cle] ? 'choisi' : ''}">
+            <div class="prix-cell"><input type="checkbox" class="prix-crm-check" data-action="prix-crm-choisir" data-cle="${escapeHtml(l.cle)}" ${state.prixCrmSel[l.cle] ? 'checked' : ''}></div>
+            <div class="prix-cell">
+              <div class="prix-name">${escapeHtml(l.description)}</div>
+              <div class="prix-sub-line">
+                <b>${escapeHtml(l.component_code || '—')}</b>
+                ${multi ? ` · <button class="prix-lien" data-action="prix-crm-detail" data-cle="${escapeHtml(l.cle)}">${l.pieces.length} versements ${ouvert ? '▲' : '▼'}</button>` : ' · 1 pièce'}
+              </div>
+              ${ouvert ? `<div class="prix-pieces">${l.pieces.map(p => `
+                <div><span>${escapeHtml(p.reference || p.source_id)}</span><span>${escapeHtml(p.date)}</span><span class="mono">${fmt(p.montant)} $</span></div>`).join('')}</div>` : ''}
+            </div>
+            <div class="prix-cell">${escapeHtml(l.syndicat || '—')}${l.units ? `<div class="prix-sub-line">${l.units} unités${l.ville ? ' · ' + escapeHtml(l.ville) : ''}</div>` : ''}</div>
+            <div class="prix-cell right mono">${escapeHtml(l.mois || '—')}</div>
+            <div class="prix-cell right mono"><b>${fmt(l.total)} $</b></div>
+            <div class="prix-cell"><span class="prix-pill">${l.source === 'facture' ? 'Facture' : 'Soumission'}</span></div>
+          </div>`;
+        }).join('')}
+      </div>`;
+  return `
+  <div class="comp-section-head" style="margin-top:32px">
+    <span class="lbl">À importer du CRM</span><span class="rule"></span>
+    ${crm ? `<span class="hint">${crm.candidats} candidat(s)${crm.pieces_deja_importees ? ` · ${crm.pieces_deja_importees} pièce(s) déjà importée(s)` : ''}${crm.pieces_sans_date ? ` · ${crm.pieces_sans_date} sans date, non importable(s)` : ''}</span>` : ''}
+    <button class="icon-btn" data-action="prix-crm-refresh" title="Relire le CRM" ${state.prixCrmLoading ? 'disabled' : ''}><i data-lucide="refresh-cw"></i></button>
+    <button class="btn-primary" data-action="prix-crm-importer" style="padding:8px 16px;font-size:12px" ${selection.length === 0 || state.prixCrmImporting ? 'disabled' : ''}>
+      ${state.prixCrmImporting ? 'Import…' : `Importer la sélection${selection.length ? ' · ' + selection.length : ''}`}
+    </button>
+  </div>
+  <p class="prix-hint" style="margin:-6px 0 14px">Le CRM ne fournit aucune quantité : une ligne importée arrive en forfait, à valider, et c'est la superficie que vous ajouterez qui en fera un prix unitaire.</p>
+  ${state.prixCrmError ? errorBanner(state.prixCrmError, 'prix-crm-refresh') : ''}
+  ${corps}`;
 }
 
 function prixResumeHtml(r) {
@@ -1236,7 +1392,7 @@ function prixRowsHtml(rows) {
       <div class="prix-obs-row ${row.valide === 1 ? 'valide' : ''}">
         <div class="prix-cell">
           <div class="prix-name">${escapeHtml(row.description || '—')}</div>
-          <div class="prix-sub-line">${[row.uniformat_code, row.cat ? catInfo(row.cat).label : null, row.fournisseur, row.ville].filter(Boolean).map(escapeHtml).join(' · ') || '—'}</div>
+          <div class="prix-sub-line">${[row.uniformat_code, row.cat ? catInfo(row.cat).label : null, row.fournisseur, row.ville].filter(Boolean).map(escapeHtml).join(' · ') || '—'}${row.pieces && row.pieces.length ? ` · <span class="prix-pill">CRM · ${row.pieces.length} pièce(s)</span>` : ''}</div>
         </div>
         <div class="prix-cell right mono">${row.annee || '—'}</div>
         <div class="prix-cell right mono">${fmt(row.montant)} $</div>
@@ -1249,6 +1405,7 @@ function prixRowsHtml(rows) {
         </div>
         <div class="prix-cell right prix-actions">
           <button class="btn-row-action ${row.valide === 1 ? '' : 'primary'}" data-action="prix-valide" data-id="${row.id}" data-valide="${row.valide === 1 ? '0' : '1'}" ${busy ? 'disabled' : ''}>${row.valide === 1 ? 'Retirer' : 'Valider'}</button>
+          <button class="icon-btn" data-action="prix-modifier" data-id="${row.id}" title="Modifier" ${busy ? 'disabled' : ''}><i data-lucide="pencil"></i></button>
           <button class="icon-btn" data-action="prix-supprimer" data-id="${row.id}" title="Supprimer" ${busy ? 'disabled' : ''}><i data-lucide="trash-2"></i></button>
         </div>
       </div>`;
@@ -1284,6 +1441,7 @@ function prixFormHtml() {
   const catOptions = CAT_ORDER.map(k => ({ v: k, label: CATS[k].label }));
   return `
   <form class="prix-form" id="prix-form" novalidate>
+    ${state.prixEditId ? `<div class="prix-field large"><span class="field-label">Modification d'une ligne existante</span></div>` : ''}
     ${state.prixFormError ? `<div class="login-error" style="grid-column:1/-1">${escapeHtml(state.prixFormError)}</div>` : ''}
     ${prixChamp('description', 'Travaux facturés', { large: true, placeholder: 'ex. Réfection complète de la toiture — membrane élastomère' })}
     ${prixChamp('cat', 'Catégorie', { options: catOptions, vide: '—' })}
@@ -2021,9 +2179,33 @@ function initEvents() {
         loadPrix();
         break;
       case 'prix-toggle-form':
-        state.prixFormOpen = !state.prixFormOpen;
+        if (state.prixFormOpen) { fermerPrixForm(); break; }
+        state.prixFormOpen = true;
         state.prixFormError = null;
         render();
+        break;
+      case 'prix-modifier':
+        ouvrirPrixEdition(btn.getAttribute('data-id'));
+        break;
+      case 'prix-crm-refresh':
+        loadPrixCrm();
+        break;
+      case 'prix-crm-detail': {
+        const cle = btn.getAttribute('data-cle');
+        if (state.prixCrmDetail[cle]) delete state.prixCrmDetail[cle];
+        else state.prixCrmDetail[cle] = true;
+        render();
+        break;
+      }
+      case 'prix-crm-choisir': {
+        const cle = btn.getAttribute('data-cle');
+        if (state.prixCrmSel[cle]) delete state.prixCrmSel[cle];
+        else state.prixCrmSel[cle] = true;
+        render();
+        break;
+      }
+      case 'prix-crm-importer':
+        importerPrixCrm();
         break;
       case 'prix-filter':
         state.prixFilter = btn.getAttribute('data-filter');

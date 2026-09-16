@@ -44303,7 +44303,25 @@ prix.get("/", async (c) => {
   ).bind(...valeurs).all();
   const anneeCible = anneeCourante();
   const taux = RESERVE_FUND_PARAMS.inflationRate;
-  return c.json(rows.results.map((r) => prixPublic(r, anneeCible, taux)));
+
+  // Les pièces du CRM derrière chaque ligne, pour que l'ingénieur voie ce qui a
+  // été fusionné avant de valider un montant.
+  const sources = await c.env.DB.prepare(
+    `SELECT s.* FROM price_observation_sources s
+       JOIN price_observations o ON o.id = s.observation_id
+      WHERE o.company_id = ?1
+      ORDER BY s.date_piece ASC`
+  ).bind(user.company_id).all();
+  const parObservation = new Map();
+  for (const s of sources.results) {
+    if (!parObservation.has(s.observation_id)) parObservation.set(s.observation_id, []);
+    parObservation.get(s.observation_id).push(s);
+  }
+
+  return c.json(rows.results.map((r) => ({
+    ...prixPublic(r, anneeCible, taux),
+    pieces: parObservation.get(r.id) ?? []
+  })));
 });
 
 // Ce que la banque sait dire aujourd'hui, par code Uniformat et par unité.
@@ -44465,6 +44483,196 @@ prix.patch("/:id", async (c) => {
 
   const row = await c.env.DB.prepare("SELECT * FROM price_observations WHERE id = ?1").bind(id).first();
   return c.json(prixPublic(row, anneeCourante(), RESERVE_FUND_PARAMS.inflationRate));
+});
+
+// ── Import depuis le CRM ─────────────────────────────────────────────────────
+// Le CRM Stratégis rattache déjà ses factures à un code de composante. On y lit
+// ces rattachements — jamais on n'y écrit — pour éviter de ressaisir à la main
+// ce qui est déjà classé. Ce que le CRM ne donne pas, c'est la quantité : une
+// ligne importée arrive donc à valider, et c'est l'ingénieur qui ajoute la
+// superficie sans laquelle il n'y a pas de prix unitaire.
+const CRM_CONFIANCE = "haute";
+const CRM_CANDIDATS_MAX = 400;
+
+// Le binding porte les factures d'une seule entreprise. Une autre firme
+// locataire de l'application ne doit pas les atteindre, binding ou pas.
+function crmRefus(c, user) {
+  if (!c.env.CRM) return "la base du CRM n'est pas liée à ce worker";
+  if (!c.env.CRM_COMPANY_ID || user.company_id !== c.env.CRM_COMPANY_ID) {
+    return "l'import depuis le CRM n'est pas ouvert à cette entreprise";
+  }
+  return null;
+}
+
+// Une facture de travaux est souvent payée en versements : quatre lignes, même
+// syndicat, même composante, le même mois, pour un seul toit. Prises une à une
+// elles donneraient quatre prix de toiture. La clé regroupe donc le travail,
+// et le détail des pièces reste visible pour qu'une fusion abusive se voie.
+function crmCle(piece) {
+  const syndicat = piece.syndicat_id ?? piece.syndicat_name ?? "sans-syndicat";
+  const mois = (piece.date ?? "").slice(0, 7);
+  return `${syndicat}|${piece.component_code}|${mois}`;
+}
+
+async function crmCandidats(c, user) {
+  const rows = await c.env.CRM.prepare(
+    `SELECT m.source_type, m.source_id, m.component_code, m.amount, m.description,
+            m.reference_url, m.document_date, m.syndicat_name,
+            f.numero_facture, f.vendor_name, f.date_facture, f.syndicat_id,
+            s.nom AS syndicat_nom, s.units, s.city
+       FROM component_cost_matches m
+       LEFT JOIN syndicat_factures f
+              ON f.id = m.source_id AND m.source_type = 'syndicat_facture'
+       LEFT JOIN syndicats s ON s.id = f.syndicat_id
+      WHERE m.confidence = ?1
+        AND m.amount > 0
+        AND (m.source_type <> 'syndicat_facture' OR f.deleted_at IS NULL)
+      ORDER BY COALESCE(f.date_facture, m.document_date) DESC
+      LIMIT ?2`
+  ).bind(CRM_CONFIANCE, CRM_CANDIDATS_MAX).all();
+
+  const dejaImportees = await c.env.DB.prepare(
+    "SELECT source_type, source_id FROM price_observation_sources WHERE company_id = ?1"
+  ).bind(user.company_id).all();
+  const vues = new Set(dejaImportees.results.map((r) => `${r.source_type}:${r.source_id}`));
+
+  const groupes = new Map();
+  let sansDate = 0, dejaVues = 0;
+
+  for (const row of rows.results) {
+    if (vues.has(`${row.source_type}:${row.source_id}`)) { dejaVues += 1; continue; }
+    const date = row.date_facture ?? row.document_date ?? null;
+    // Sans date, pas d'année de travaux — donc pas d'indexation possible.
+    if (!date) { sansDate += 1; continue; }
+    const piece = {
+      source_type: row.source_type,
+      source_id: row.source_id,
+      component_code: row.component_code,
+      montant: row.amount,
+      date: date.slice(0, 10),
+      description: row.description ?? null,
+      reference: row.numero_facture ?? row.reference_url ?? null,
+      fournisseur: row.vendor_name ?? null,
+      syndicat_id: row.syndicat_id ?? null,
+      syndicat_name: row.syndicat_nom ?? row.syndicat_name ?? null,
+      units: row.units ?? null,
+      city: row.city ?? null
+    };
+    const cle = crmCle(piece);
+    if (!groupes.has(cle)) {
+      groupes.set(cle, {
+        cle,
+        component_code: piece.component_code,
+        syndicat: piece.syndicat_name,
+        units: piece.units,
+        ville: piece.city,
+        mois: piece.date.slice(0, 7),
+        annee: Number(piece.date.slice(0, 4)),
+        pieces: []
+      });
+    }
+    const g = groupes.get(cle);
+    g.pieces.push(piece);
+    if (piece.units != null && g.units == null) g.units = piece.units;
+    if (piece.city && !g.ville) g.ville = piece.city;
+    if (piece.syndicat_name && !g.syndicat) g.syndicat = piece.syndicat_name;
+  }
+
+  const lignes = [...groupes.values()].map((g) => {
+    // Une facture payée l'emporte sur une soumission : c'est un prix conclu,
+    // pas un prix demandé.
+    const estFacture = g.pieces.some((p) => p.source_type === "syndicat_facture");
+    // La description la plus longue est celle qui dit le plus de la portée —
+    // l'objet d'un courriel dit rarement ce qui a été fait.
+    const description = g.pieces
+      .map((p) => (p.description ?? "").trim())
+      .sort((a, b) => b.length - a.length)[0] || `Travaux ${g.component_code}`;
+    return {
+      ...g,
+      total: g.pieces.reduce((s, p) => s + p.montant, 0),
+      source: estFacture ? "facture" : "soumission",
+      description: description.slice(0, 200),
+      fournisseur: g.pieces.find((p) => p.fournisseur)?.fournisseur ?? null,
+      reference: g.pieces.find((p) => p.reference)?.reference ?? null
+    };
+  }).sort((a, b) => (a.mois < b.mois ? 1 : a.mois > b.mois ? -1 : b.total - a.total));
+
+  return { lignes, sansDate, dejaVues };
+}
+
+prix.get("/crm", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const { lignes, sansDate, dejaVues } = await crmCandidats(c, user);
+  return c.json({
+    confiance: CRM_CONFIANCE,
+    candidats: lignes.length,
+    pieces_sans_date: sansDate,
+    pieces_deja_importees: dejaVues,
+    lignes
+  });
+});
+
+// L'import ne fait pas entrer un prix dans la banque : il crée une ligne à
+// valider, en forfait faute de quantité, avec ses pièces attachées.
+prix.post("/crm/import", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+
+  const body2 = await c.req.json();
+  const demandees = Array.isArray(body2.cles) ? body2.cles.map(String) : [];
+  if (demandees.length === 0) return c.json({ error: "aucun candidat demandé" }, 400);
+
+  // Les groupes sont recalculés ici : le total versé à la banque doit venir du
+  // CRM, jamais d'un montant envoyé par le navigateur.
+  const { lignes } = await crmCandidats(c, user);
+  const parCle = new Map(lignes.map((l) => [l.cle, l]));
+  const importees = [];
+  const ignorees = [];
+
+  for (const cle of demandees) {
+    const groupe = parCle.get(cle);
+    if (!groupe) { ignorees.push(cle); continue; }
+    const id = newId("prx");
+    const contexte = JSON.stringify({
+      units: groupe.units ?? null,
+      city: groupe.ville ?? null,
+      syndicat: groupe.syndicat ?? null,
+      crm_mois: groupe.mois
+    });
+    const note = `Importé du CRM — ${groupe.pieces.length} pièce(s) : ` + groupe.pieces
+      .map((p) => `${p.reference ?? p.source_id} (${Math.round(p.montant)} $, ${p.date})`)
+      .join(", ");
+
+    const instructions = [
+      c.env.DB.prepare(
+        `INSERT INTO price_observations
+           (id, company_id, uniformat_code, description, fournisseur, annee, montant,
+            quantite, unite, source, ville, contexte, source_ref, note, valide, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'forfait', ?8, ?9, ?10, ?11, ?12, 0, ?13)`
+      ).bind(
+        id, user.company_id, groupe.component_code, groupe.description,
+        groupe.fournisseur, groupe.annee, groupe.total, groupe.source,
+        groupe.ville ?? null, contexte, groupe.reference ?? null, note, user.id
+      )
+    ];
+    for (const p of groupe.pieces) {
+      instructions.push(c.env.DB.prepare(
+        `INSERT INTO price_observation_sources
+           (observation_id, company_id, source_type, source_id, montant, reference, date_piece, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+      ).bind(id, user.company_id, p.source_type, p.source_id, p.montant,
+             p.reference ?? null, p.date, p.description ?? null));
+    }
+    await c.env.DB.batch(instructions);
+    importees.push({ cle, id, montant: groupe.total, pieces: groupe.pieces.length });
+  }
+
+  return c.json({ importees: importees.length, ignorees: ignorees.length, lignes: importees }, 201);
 });
 
 prix.delete("/:id", async (c) => {
