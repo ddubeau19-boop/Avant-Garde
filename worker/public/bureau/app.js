@@ -172,6 +172,7 @@ const state = {
   redactionMissing: false, // l'endpoint n'existe pas encore (404)
   redactionCache: {},      // id de composante -> rédaction déjà servie
   attentionOpen: false,    // section « attention spéciale » inactive dépliée
+  banqueDirty: false,      // un texte vient d'être versé à la banque
 
   publishing: false,
   publishError: null,
@@ -756,6 +757,14 @@ function collectRedactionNote() {
   return parts.join('\n\n');
 }
 
+// Seul l'ÉTAT DE L'ACTIF alimente la banque : c'est la seule sous-section
+// rédigée par le modèle. Les trois autres sont déduites des données.
+function collectEtatText() {
+  const el = document.querySelector('.rvia-card [data-sec-cle="etat"]');
+  const txt = el ? el.textContent.trim() : '';
+  return txt.length >= 40 ? txt : null;
+}
+
 async function rvConfirm() {
   const list = orderedComponents();
   const comp = list[state.reviewIdx];
@@ -767,6 +776,21 @@ async function rvConfirm() {
   render();
   try {
     await apiJson(`/api/components/${comp.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+    // Confirmer, c'est l'ingénieur qui dit « ce texte est juste ». C'est cette
+    // version-là qui servira d'exemple aux études suivantes de son entreprise.
+    const etat = collectEtatText();
+    if (etat) {
+      try {
+        await apiJson(`/api/components/${comp.id}/redaction`, {
+          method: 'PATCH', body: JSON.stringify({ texte_retenu: etat, valide: true }),
+        });
+        state.banqueDirty = true;
+      } catch (e) {
+        // La banque est un confort : son échec ne doit pas faire échouer la
+        // confirmation, qui elle vient d'être enregistrée.
+        console.warn('banque de rédactions :', e && e.message);
+      }
+    }
     state.components = state.components.map(c => String(c.id) === String(comp.id) ? Object.assign({}, c, body) : c);
     state.saveStatus = 'saved';
   } catch (e) {
@@ -1488,7 +1512,7 @@ function redactionSectionHtml(sec, i) {
       ${inactive ? `<span class="rvia-inactive-tag">inactive</span>
       <button class="rvia-section-toggle" data-action="toggle-attention">${state.attentionOpen ? 'Masquer' : 'Afficher'}</button>` : ''}
     </div>
-    <p class="rvia-section-text" id="secText_${i}" contenteditable="true" data-sec-text data-sec-title="${escapeHtml(titre)}">${escapeHtml((sec && sec.texte) || '')}</p>
+    <p class="rvia-section-text" id="secText_${i}" contenteditable="true" data-sec-text data-sec-cle="${escapeHtml(cle)}" data-sec-title="${escapeHtml(titre)}">${escapeHtml((sec && sec.texte) || '')}</p>
     ${redactionTableHtml(sec && sec.tableau)}
   </div>`;
 }
@@ -1564,7 +1588,12 @@ function renderReviewIA() {
             <h2 class="rvia-card-title">${escapeHtml(titre)}</h2>
           </div>
           <div class="rvia-head-right">
-            ${source ? `<span class="src-badge ${source === 'ia' ? 'ia' : ''}"><i data-lucide="${source === 'ia' ? 'sparkles' : 'file-text'}" style="width:12px;height:12px"></i>${source === 'ia' ? 'Rédigé par l’IA' : 'Gabarit'}</span>` : ''}
+            ${source ? (() => {
+              const libelles = { 'ia': ['sparkles', 'Rédigé par l’IA'], 'ia+banque': ['library', 'IA + banque de la firme'], 'valide': ['check-circle-2', 'Validé par l’ingénieur'], 'gabarit': ['file-text', 'Gabarit'] };
+              const [ic, lib] = libelles[source] || libelles.gabarit;
+              return `<span class="src-badge ${source === 'gabarit' ? '' : 'ia'}"><i data-lucide="${ic}" style="width:12px;height:12px"></i>${lib}</span>`;
+            })() : ''}
+            ${r && r.exemples_utilises ? `<span class="src-badge" title="Textes déjà validés par votre firme, utilisés comme exemples de style — jamais comme source de faits."><i data-lucide="library" style="width:12px;height:12px"></i>${r.exemples_utilises} exemple${r.exemples_utilises > 1 ? 's' : ''}</span>` : ''}
             <span class="rvia-status-badge" style="background:${conf ? 'var(--green-wash)' : 'var(--orange-wash)'};color:${conf ? 'var(--green)' : 'var(--accent-press)'}"><i data-lucide="${conf ? 'check' : 'pencil'}" style="width:13px;height:13px"></i>${conf ? 'Confirmée' : 'À réviser'}</span>
           </div>
         </div>

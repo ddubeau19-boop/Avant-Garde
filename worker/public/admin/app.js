@@ -50,6 +50,14 @@ const state = {
   newEngineerOpen: false,
   newEngName: '',
   newEngEmail: '',
+  template: null,          // { catalogue, sections, defauts, source_filename, ... }
+  templateLoading: false,
+  templateError: null,
+  templateNote: null,
+  templateUploading: false,
+  templateOpenCle: null,   // section dépliée dans l'éditeur
+  templateEdits: {},       // clé -> texte brut en cours d'édition
+  templateSaving: false,
   newEngTitle: '',
   newEngOrdre: '',
   newEngNoMembre: '',
@@ -333,9 +341,107 @@ async function loadCompanyDetail(id) {
     state.companyLoading = false;
     render();
     loadCompanyLogo(id, !!data.hasLogo);
+    loadTemplate(id);
   } catch (e) {
     state.companyLoading = false;
     state.companyError = e.message || 'Impossible de charger cette entreprise.';
+    render();
+  }
+}
+
+async function loadTemplate(id) {
+  state.templateLoading = true;
+  state.templateError = null;
+  render();
+  try {
+    state.template = await apiJson(`/api/companies/${id}/template`);
+    state.templateEdits = {};
+  } catch (e) {
+    state.templateError = e.message || 'Impossible de charger le gabarit.';
+  }
+  state.templateLoading = false;
+  render();
+}
+
+async function uploadTemplate(file) {
+  if (!file || state.templateUploading) return;
+  state.templateUploading = true;
+  state.templateError = null;
+  state.templateNote = null;
+  render();
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await apiJson(`/api/companies/${state.companyId}/template`, { method: 'POST', body: fd });
+    const n = (res.sections_remplies || []).length;
+    const reste = (res.sections_par_defaut || []).length;
+    state.templateNote = res.note
+      || `${res.paragraphes} paragraphes lus. ${n} section${n > 1 ? 's' : ''} reprise${n > 1 ? 's' : ''} du document${reste ? `, ${reste} conservée${reste > 1 ? 's' : ''} au gabarit intégré faute de correspondance claire` : ''}. Relisez-les avant de produire un rapport.`;
+    await loadTemplate(state.companyId);
+  } catch (e) {
+    state.templateError = e.message || "L'import du gabarit a échoué.";
+  }
+  state.templateUploading = false;
+  render();
+}
+
+// Enregistre une section. Le texte saisi est renvoyé dans la forme attendue par
+// la section : une chaîne, une liste de lignes, ou des paires « terme : définition ».
+async function saveTemplateSection(cle) {
+  const sec = (state.template && state.template.catalogue || []).find(x => x.cle === cle);
+  if (!sec || state.templateSaving) return;
+  const brut = state.templateEdits[cle];
+  if (brut == null) { state.templateOpenCle = null; render(); return; }
+  let valeur;
+  const lignes = brut.split('\n').map(l => l.trim()).filter(Boolean);
+  if (sec.forme === 'texte') valeur = brut.trim();
+  else if (sec.forme === 'paires') valeur = lignes.map(l => { const i = l.indexOf(' : '); return i < 0 ? null : [l.slice(0, i).trim(), l.slice(i + 3).trim()]; }).filter(Boolean);
+  else valeur = lignes;
+
+  const sections = Object.assign({}, state.template.sections || {});
+  if ((Array.isArray(valeur) && valeur.length === 0) || (typeof valeur === 'string' && !valeur)) delete sections[cle];
+  else sections[cle] = valeur;
+
+  state.templateSaving = true;
+  render();
+  try {
+    await apiJson(`/api/companies/${state.companyId}/template`, { method: 'PATCH', body: JSON.stringify({ sections }) });
+    state.templateOpenCle = null;
+    state.templateNote = null;
+    await loadTemplate(state.companyId);
+  } catch (e) {
+    state.templateError = e.message || "L'enregistrement a échoué.";
+  }
+  state.templateSaving = false;
+  render();
+}
+
+async function clearTemplateSection(cle) {
+  const sections = Object.assign({}, state.template && state.template.sections || {});
+  delete sections[cle];
+  state.templateSaving = true;
+  render();
+  try {
+    await apiJson(`/api/companies/${state.companyId}/template`, { method: 'PATCH', body: JSON.stringify({ sections }) });
+    delete state.templateEdits[cle];
+    state.templateOpenCle = null;
+    await loadTemplate(state.companyId);
+  } catch (e) {
+    state.templateError = e.message || "L'opération a échoué.";
+  }
+  state.templateSaving = false;
+  render();
+}
+
+async function resetTemplate() {
+  if (!confirm("Remettre toutes les sections au gabarit intégré ? Le document importé reste conservé, mais son texte ne sera plus utilisé dans les rapports.")) return;
+  try {
+    await apiJson(`/api/companies/${state.companyId}/template`, { method: 'DELETE' });
+    state.templateNote = null;
+    state.templateEdits = {};
+    await loadTemplate(state.companyId);
+  } catch (e) {
+    state.templateError = e.message || "L'opération a échoué.";
     render();
   }
 }
@@ -686,6 +792,71 @@ function renderCompanyDetail() {
         <div class="mono-cell">${fmtDate(e.created_at)}</div>
       </div>`).join('')}
     </div>
+
+    ${templateCardHtml()}
+  </div>`;
+}
+
+// Aperçu d'une section : ce que la firme a fourni, ou le texte intégré.
+function apercuSection(val) {
+  if (val == null) return '';
+  if (typeof val === 'string') return val;
+  if (Array.isArray(val)) {
+    if (val.length && Array.isArray(val[0])) return val.map(pr => pr.join(' : ')).join('\n');
+    return val.join('\n');
+  }
+  if (typeof val === 'object') return Object.entries(val).map(([k, v]) => k + '\n' + apercuSection(v)).join('\n\n');
+  return String(val);
+}
+
+function templateCardHtml() {
+  const t = state.template;
+  const importe = t && t.sections ? Object.keys(t.sections) : [];
+  return `
+  <div>
+    <div class="eng-section-head">
+      <span class="lbl">Gabarit de rapport</span>
+      <div class="rule"></div>
+      <label class="btn-pill-sm">${state.templateUploading ? 'Lecture du document…' : 'Importer un .docx'}<input type="file" accept=".docx" data-role="template-file" style="display:none" ${state.templateUploading ? 'disabled' : ''}></label>
+    </div>
+    <div class="tpl-lead">Le texte de fond des rapports de cette entreprise — méthodologie, limitations légales, déclaration, lexique. Les sections non fournies gardent le gabarit intégré.</div>
+
+    ${state.templateError ? `<div class="login-error" style="margin:10px 0">${escapeHtml(state.templateError)}</div>` : ''}
+    ${state.templateNote ? `<div class="temp-pass-warn" style="margin:10px 0"><i data-lucide="info"></i><span>${escapeHtml(state.templateNote)}</span></div>` : ''}
+
+    ${state.templateLoading ? spinnerBlock('Chargement du gabarit…') : !t ? '' : `
+      <div class="tpl-lead" style="margin:10px 0 14px">
+        ${t.source_filename ? `Importé depuis <code>${escapeHtml(t.source_filename)}</code> le ${fmtDate(t.imported_at)} · ` : ''}
+        <strong>${importe.length}</strong> section${importe.length > 1 ? 's' : ''} sur ${t.catalogue.length} proviennent de cette entreprise.
+        ${importe.length ? `<button class="btn-row-action" style="margin-left:10px" data-action="template-reset">Tout remettre au gabarit intégré</button>` : ''}
+      </div>
+
+      <div class="dossiers-table">
+        ${t.catalogue.map(sec => {
+          const propre = t.sections && t.sections[sec.cle] != null;
+          const ouvert = state.templateOpenCle === sec.cle;
+          const valeur = state.templateEdits[sec.cle] != null
+            ? state.templateEdits[sec.cle]
+            : apercuSection(propre ? t.sections[sec.cle] : (t.defauts || {})[sec.cle]);
+          return `
+          <div class="dt-row tpl-row">
+            <div class="dt-name">${escapeHtml(sec.label)}</div>
+            <div>${propre
+              ? `<span class="status-badge" style="background:#E8F5E9;color:#1B5E20">Gabarit de l'entreprise</span>`
+              : `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">Gabarit intégré</span>`}</div>
+            <div><button class="btn-row-action" data-action="template-toggle" data-cle="${escapeHtml(sec.cle)}">${ouvert ? 'Fermer' : 'Voir / corriger'}</button></div>
+          </div>
+          ${ouvert ? `
+          <div class="tpl-edit">
+            <div class="tpl-lead" style="margin-bottom:8px">${sec.forme === 'paires' ? 'Une ligne par entrée, au format « terme : définition ».' : sec.forme === 'texte' ? 'Un seul bloc de texte.' : 'Une ligne par paragraphe ou par puce.'}${sec.sous ? ' Cette section contient plusieurs sous-parties : la modifier à la main est déconseillé, préférez réimporter le .docx.' : ''}</div>
+            <textarea data-role="template-text" data-cle="${escapeHtml(sec.cle)}" rows="10" ${sec.sous ? 'readonly' : ''}>${escapeHtml(valeur)}</textarea>
+            ${sec.sous ? '' : `<div class="tpl-actions">
+              <button class="btn-primary" data-action="template-save" data-cle="${escapeHtml(sec.cle)}" ${state.templateSaving ? 'disabled' : ''}>${state.templateSaving ? 'Enregistrement…' : 'Enregistrer cette section'}</button>
+              ${propre ? `<button class="btn-secondary" data-action="template-clear" data-cle="${escapeHtml(sec.cle)}">Revenir au gabarit intégré</button>` : ''}
+            </div>`}
+          </div>` : ''}`;
+        }).join('')}
+      </div>`}
   </div>`;
 }
 
@@ -735,10 +906,19 @@ function initEvents() {
     else if (t.matches('[data-role="new-eng-title"]')) state.newEngTitle = t.value;
     else if (t.matches('[data-role="new-eng-ordre"]')) state.newEngOrdre = t.value;
     else if (t.matches('[data-role="new-eng-no-membre"]')) state.newEngNoMembre = t.value;
+    // Pas de render() ici : re-dessiner le textarea à chaque frappe renverrait
+    // le curseur à la fin.
+    else if (t.matches('[data-role="template-text"]')) state.templateEdits[t.getAttribute('data-cle')] = t.value;
   });
 
   app.addEventListener('change', (e) => {
     const t = e.target;
+    if (t && t.matches && t.matches('[data-role="template-file"]')) {
+      const f = t.files && t.files[0];
+      t.value = '';
+      if (f) uploadTemplate(f);
+      return;
+    }
     if (t && t.matches && t.matches('[data-role="logo-file"]')) {
       const file = t.files && t.files[0];
       if (file) uploadLogo(file);
@@ -752,6 +932,21 @@ function initEvents() {
     switch (action) {
       case 'logout':
         doLogout();
+        break;
+      case 'template-toggle': {
+        const cle = btn.getAttribute('data-cle');
+        state.templateOpenCle = state.templateOpenCle === cle ? null : cle;
+        render();
+        break;
+      }
+      case 'template-save':
+        saveTemplateSection(btn.getAttribute('data-cle'));
+        break;
+      case 'template-clear':
+        clearTemplateSection(btn.getAttribute('data-cle'));
+        break;
+      case 'template-reset':
+        resetTemplate();
         break;
       case 'new-company-open':
         openNewCompany();
