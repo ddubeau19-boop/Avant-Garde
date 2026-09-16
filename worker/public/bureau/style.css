@@ -607,7 +607,8 @@ button { font-family: inherit; }
 .prix-stat-v { font-family: var(--font-display); font-size: 26px; font-weight: 800; color: var(--ink); line-height: 1.2; }
 .prix-table { border: 1px solid var(--ink-200); border-radius: 14px; overflow: hidden; margin-bottom: 8px; }
 .prix-resume-row { display: grid; grid-template-columns: 1.1fr 2fr .7fr 1.1fr 1.2fr .8fr; border-top: 1px solid var(--line-soft); align-items: center; }
-.prix-obs-row { display: grid; grid-template-columns: 2.4fr .6fr .9fr 1fr 1.2fr 1.3fr 1.1fr; border-top: 1px solid var(--line-soft); align-items: center; }
+.prix-obs-row { display: grid; grid-template-columns: 2.2fr .5fr .8fr .9fr 1.1fr 1fr 1.1fr 1fr; border-top: 1px solid var(--line-soft); align-items: center; }
+.prix-portes-row { display: grid; grid-template-columns: 1.1fr 1.3fr .7fr 1.1fr 1.2fr .8fr; border-top: 1px solid var(--line-soft); align-items: center; }
 .prix-table > div:first-child { border-top: none; }
 .prix-head { background: var(--ink); color: #fff; position: sticky; top: 0; }
 .prix-head .prix-cell { font-family: var(--font-mono); font-size: 10px; letter-spacing: .04em; text-transform: uppercase; }

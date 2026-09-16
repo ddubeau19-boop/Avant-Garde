@@ -151,7 +151,7 @@ function prixUniteInfo(v) { return PRIX_UNITES.find(u => u.v === v) || PRIX_UNIT
 const PRIX_FORM_VIDE = {
   description: '', cat: '', uniformat_code: '', dossier_id: '', annee: '',
   montant: '', quantite: '', unite: 'pi2', portee: 'complet', source: 'facture',
-  negocie: false, fournisseur: '', ville: '', source_ref: '', note: '',
+  negocie: false, fournisseur: '', ville: '', unites: '', source_ref: '', note: '',
 };
 
 // ---------------------------------------------------------------
@@ -616,6 +616,7 @@ function ouvrirPrixEdition(id) {
     negocie: row.negocie === 1,
     fournisseur: row.fournisseur || '',
     ville: row.ville || '',
+    unites: row.unites == null ? '' : String(row.unites),
     source_ref: row.source_ref || '',
     note: row.note || '',
   };
@@ -650,6 +651,7 @@ function prixFormPayload() {
     negocie: f.negocie ? 1 : 0,
     fournisseur: f.fournisseur || null,
     ville: f.ville || null,
+    unites: parseDecimal(f.unites),
     source_ref: f.source_ref || null,
     note: f.note || null,
   };
@@ -1267,6 +1269,8 @@ function renderPrix() {
 
     ${prixResumeHtml(r)}
 
+    ${prixPortesHtml(r)}
+
     ${prixCrmHtml()}
 
     <div class="comp-section-head" style="margin-top:32px">
@@ -1341,6 +1345,38 @@ function prixCrmHtml() {
   ${corps}`;
 }
 
+// Le coût par porte : la référence qu'on peut produire sans superficie, à
+// condition de ne comparer qu'entre immeubles de taille voisine.
+function prixPortesHtml(r) {
+  const lignes = (r && r.portes) || [];
+  if (lignes.length === 0) return '';
+  const mince = r.echantillon_mince || 5;
+  return `
+  <div class="comp-section-head" style="margin-top:28px">
+    <span class="lbl">Au coût par porte</span><span class="rule"></span>
+    <span class="hint">Utile quand la superficie manque — solide pour ce qui va par immeuble ou par porte, trompeur pour une toiture.</span>
+  </div>
+  <div class="prix-table">
+    <div class="prix-portes-row prix-head">
+      <div class="prix-cell">Code · catégorie</div>
+      <div class="prix-cell">Taille d'immeuble</div>
+      <div class="prix-cell right">n</div>
+      <div class="prix-cell right">Médiane par porte</div>
+      <div class="prix-cell right">Plage P25 – P75</div>
+      <div class="prix-cell right">Années</div>
+    </div>
+    ${lignes.map(l => `
+    <div class="prix-portes-row">
+      <div class="prix-cell"><b>${escapeHtml(l.uniformat_code || '—')}</b>${l.cat ? `<span class="prix-sub">${escapeHtml(catInfo(l.cat).label)}</span>` : ''}</div>
+      <div class="prix-cell">${escapeHtml(l.tranche_label || '—')}</div>
+      <div class="prix-cell right mono">${l.n}${l.mince ? `<span class="prix-warn" title="Moins de ${mince} observations : médiane indicative, pas une référence">indicatif</span>` : ''}</div>
+      <div class="prix-cell right mono"><b>${fmtPrix(l.mediane)} $</b><span class="prix-sub">/ porte</span></div>
+      <div class="prix-cell right mono">${fmtPrix(l.p25)} – ${fmtPrix(l.p75)} $</div>
+      <div class="prix-cell right mono">${l.annee_min === l.annee_max ? l.annee_min : `${l.annee_min}–${l.annee_max}`}</div>
+    </div>`).join('')}
+  </div>`;
+}
+
 function prixResumeHtml(r) {
   const lignes = (r && r.lignes) || [];
   if (lignes.length === 0) {
@@ -1381,6 +1417,7 @@ function prixRowsHtml(rows) {
       <div class="prix-cell right">Montant</div>
       <div class="prix-cell right">Quantité</div>
       <div class="prix-cell right">Prix unitaire indexé</div>
+      <div class="prix-cell right">Par porte</div>
       <div class="prix-cell">Nature</div>
       <div class="prix-cell right"></div>
     </div>
@@ -1398,6 +1435,7 @@ function prixRowsHtml(rows) {
         <div class="prix-cell right mono">${fmt(row.montant)} $</div>
         <div class="prix-cell right mono">${row.quantite != null ? `${fmtPrix(row.quantite)} ${escapeHtml(row.unite_label || '')}` : '—'}</div>
         <div class="prix-cell right mono">${row.prix_unitaire_indexe != null ? `<b>${fmtPrix(row.prix_unitaire_indexe)} $</b><span class="prix-sub">/ ${escapeHtml(row.unite_label || '')}</span>` : '—'}</div>
+        <div class="prix-cell right mono">${row.prix_par_porte_indexe != null ? `${fmtPrix(row.prix_par_porte_indexe)} $<span class="prix-sub">/ ${row.unites} portes</span>` : '—'}</div>
         <div class="prix-cell">
           <span class="prix-pill">${escapeHtml(source ? source.label : (row.source || '—'))}</span>
           ${portee ? `<span class="prix-pill">${escapeHtml(portee.label)}</span>` : ''}
@@ -1457,6 +1495,7 @@ function prixFormHtml() {
     ${prixChamp('source', 'Source', { options: PRIX_SOURCES })}
     ${prixChamp('fournisseur', 'Entrepreneur', { placeholder: 'ex. Toitures X inc.' })}
     ${prixChamp('ville', 'Ville', { placeholder: 'ex. Longueuil' })}
+    ${prixChamp('unites', 'Portes de l\'immeuble', { placeholder: 'ex. 48', hint: 'Donne un coût par porte même sans superficie.' })}
     ${prixChamp('source_ref', 'Pièce', { placeholder: 'no de facture' })}
     ${prixChamp('note', 'Note', { large: true, textarea: true, placeholder: "Ce qui a été retiré du montant, accès difficile, portée particulière…" })}
     <div class="prix-form-foot">

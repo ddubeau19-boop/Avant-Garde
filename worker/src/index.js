@@ -44174,6 +44174,25 @@ const PRIX_PORTEES = {
 const PRIX_SOURCES = { facture: "Facture", soumission: "Soumission" };
 const PRIX_ECHANTILLON_MINCE = 5;   // en deçà, la médiane est indicative, pas une référence
 
+// Le coût par porte est le dénominateur qu'on possède toujours : le nombre
+// d'unités est connu de chaque syndicat, alors qu'une superficie de toit ne
+// l'est presque jamais. Il ne remplace pas le prix au pi² — la surface d'un toit
+// ne suit pas le nombre de portes — mais pour tout ce qui va par immeuble
+// (ascenseur, chaufferie, interphone) ou par porte, il se compare directement.
+//
+// Encore faut-il comparer ce qui se compare : un ascenseur dans un 8 portes et
+// dans un 120 portes n'est pas le même ouvrage. D'où les tranches.
+const PRIX_TRANCHES = [
+  { cle: "petit", label: "Moins de 12 portes", min: 1, max: 11 },
+  { cle: "moyen", label: "12 à 49 portes", min: 12, max: 49 },
+  { cle: "grand", label: "50 portes et plus", min: 50, max: null }
+];
+
+function trancheDe(unites) {
+  if (!unites || unites <= 0) return null;
+  return PRIX_TRANCHES.find((t) => unites >= t.min && (t.max == null || unites <= t.max)) ?? null;
+}
+
 function anneeCourante() {
   return new Date().getUTCFullYear();
 }
@@ -44205,10 +44224,16 @@ function quantile(triees, q) {
 
 function prixPublic(row, anneeCible, taux) {
   const unitaire = prixUnitaire(row);
+  const parPorte = row.unites > 0 ? row.montant / row.unites : null;
+  const tranche = trancheDe(row.unites);
   return {
     ...row,
     prix_unitaire: unitaire,
     prix_unitaire_indexe: prixIndexe(unitaire, row.annee, anneeCible, taux),
+    prix_par_porte: parPorte,
+    prix_par_porte_indexe: prixIndexe(parPorte, row.annee, anneeCible, taux),
+    tranche: tranche?.cle ?? null,
+    tranche_label: tranche?.label ?? null,
     unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite
   };
 }
@@ -44248,6 +44273,11 @@ function lirePrixBody(body2, { partiel = false } = {}) {
   if (!partiel || presence("quantite")) {
     v.quantite = nombreOuNull(body2.quantite);
     if (v.quantite != null && v.quantite <= 0) return { erreur: "quantité invalide" };
+  }
+  if (presence("unites")) {
+    const unites = nombreOuNull(body2.unites);
+    if (unites != null && unites <= 0) return { erreur: "nombre de portes invalide" };
+    v.unites = unites == null ? null : Math.round(unites);
   }
   if (presence("portee")) {
     const portee = body2.portee ? String(body2.portee) : null;
@@ -44338,52 +44368,74 @@ prix.get("/resume", async (c) => {
 
   const anneeCible = anneeCourante();
   const taux = RESERVE_FUND_PARAMS.inflationRate;
-  const groupes = /* @__PURE__ */ new Map();
-  let total = 0, valides = 0, negociesEcartes = 0, sansPrix = 0;
+  const parUnite = new Map();
+  const parPorte = new Map();
+  let total = 0, valides = 0, negociesEcartes = 0, sansPrix = 0, sansPortes = 0;
+
+  const ajouter = (index, cle, base, valeur, annee) => {
+    if (!index.has(cle)) index.set(cle, { ...base, cle, prix: [], annees: [] });
+    const g = index.get(cle);
+    g.prix.push(valeur);
+    g.annees.push(annee);
+  };
 
   for (const row of rows.results) {
     total += 1;
     if (row.valide !== 1) continue;
     valides += 1;
     if (row.negocie === 1 && !inclureNegocies) { negociesEcartes += 1; continue; }
+    const code = row.uniformat_code ?? row.cat ?? "—";
+
     const indexe = prixIndexe(prixUnitaire(row), row.annee, anneeCible, taux);
-    if (indexe == null) { sansPrix += 1; continue; }
-    const cle = `${row.uniformat_code ?? row.cat ?? "—"}|${row.unite}`;
-    if (!groupes.has(cle)) {
-      groupes.set(cle, {
-        cle,
-        uniformat_code: row.uniformat_code ?? null,
-        cat: row.cat ?? null,
-        unite: row.unite,
-        unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite,
-        exemple: row.description,
-        prix: [],
-        annees: []
-      });
-    }
-    const g = groupes.get(cle);
-    g.prix.push(indexe);
-    g.annees.push(row.annee);
+    if (indexe == null) sansPrix += 1;
+    else ajouter(parUnite, `${code}|${row.unite}`, {
+      uniformat_code: row.uniformat_code ?? null,
+      cat: row.cat ?? null,
+      unite: row.unite,
+      unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite,
+      exemple: row.description
+    }, indexe, row.annee);
+
+    // Le coût par porte se calcule sur le montant entier, quelle que soit
+    // l'unité : c'est ce que l'immeuble a déboursé, divisé par ses portes.
+    const tranche = trancheDe(row.unites);
+    const porte = tranche ? prixIndexe(row.montant / row.unites, row.annee, anneeCible, taux) : null;
+    if (porte == null) sansPortes += 1;
+    else ajouter(parPorte, `${code}|${tranche.cle}`, {
+      uniformat_code: row.uniformat_code ?? null,
+      cat: row.cat ?? null,
+      tranche: tranche.cle,
+      tranche_label: tranche.label,
+      exemple: row.description
+    }, porte, row.annee);
   }
 
-  const lignes = [...groupes.values()].map((g) => {
+  const statistiques = (index) => [...index.values()].map((g) => {
     const triees = g.prix.slice().sort((a, b) => a - b);
+    const { prix, annees, ...reste } = g;
     return {
-      cle: g.cle,
-      uniformat_code: g.uniformat_code,
-      cat: g.cat,
-      unite: g.unite,
-      unite_label: g.unite_label,
-      exemple: g.exemple,
+      ...reste,
       n: triees.length,
       mince: triees.length < PRIX_ECHANTILLON_MINCE,
       mediane: quantile(triees, 0.5),
       p25: quantile(triees, 0.25),
       p75: quantile(triees, 0.75),
-      annee_min: Math.min(...g.annees),
-      annee_max: Math.max(...g.annees)
+      annee_min: Math.min(...annees),
+      annee_max: Math.max(...annees)
     };
-  }).sort((a, b) => b.n - a.n);
+  });
+
+  // Les références au pi² se lisent par volume d'échantillon ; celles par porte
+  // se lisent par composante, pour que les trois tailles d'immeuble se suivent
+  // et que l'économie d'échelle saute aux yeux.
+  const ordreTranche = new Map(PRIX_TRANCHES.map((t, i) => [t.cle, i]));
+  const parVolume = (a, b) => b.n - a.n;
+  const parComposante = (a, b) => {
+    const codeA = a.uniformat_code ?? a.cat ?? "";
+    const codeB = b.uniformat_code ?? b.cat ?? "";
+    if (codeA !== codeB) return codeA.localeCompare(codeB);
+    return (ordreTranche.get(a.tranche) ?? 0) - (ordreTranche.get(b.tranche) ?? 0);
+  };
 
   return c.json({
     total,
@@ -44391,11 +44443,14 @@ prix.get("/resume", async (c) => {
     a_valider: total - valides,
     negocies_ecartes: negociesEcartes,
     sans_prix_unitaire: sansPrix,
+    sans_cout_par_porte: sansPortes,
     annee_reference: anneeCible,
     taux_indexation: taux,
     source_indexation: RESERVE_FUND_PARAMS.inflationSource,
     echantillon_mince: PRIX_ECHANTILLON_MINCE,
-    lignes
+    tranches: PRIX_TRANCHES.map((t) => ({ cle: t.cle, label: t.label })),
+    lignes: statistiques(parUnite).sort(parVolume),
+    portes: statistiques(parPorte).sort(parComposante)
   });
 });
 
@@ -44424,21 +44479,24 @@ prix.post("/", async (c) => {
       city: dossier.city ?? null
     });
     if (!valeurs.ville) valeurs.ville = dossier.city ?? null;
+    // Le nombre de portes du dossier devient le dénominateur de la ligne, sauf
+    // si l'ingénieur en a saisi un autre — c'est lui qui a la facture sous les yeux.
+    if (valeurs.unites == null) valeurs.unites = dossier.units || null;
   }
 
   const id = newId("prx");
   await c.env.DB.prepare(
     `INSERT INTO price_observations
        (id, company_id, dossier_id, cat, uniformat_code, description, fournisseur, annee,
-        montant, quantite, unite, portee, source, negocie, ville, contexte, source_ref, note,
+        montant, quantite, unite, portee, source, negocie, ville, unites, contexte, source_ref, note,
         valide, created_by)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)`
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)`
   ).bind(
     id, user.company_id, valeurs.dossier_id ?? null, valeurs.cat ?? null, valeurs.uniformat_code ?? null,
     valeurs.description, valeurs.fournisseur ?? null, valeurs.annee, valeurs.montant,
     valeurs.quantite ?? null, valeurs.unite, valeurs.portee ?? null, valeurs.source,
-    valeurs.negocie ?? 0, valeurs.ville ?? null, contexte, valeurs.source_ref ?? null,
-    valeurs.note ?? null, valeurs.valide ?? 0, user.id
+    valeurs.negocie ?? 0, valeurs.ville ?? null, valeurs.unites ?? null, contexte,
+    valeurs.source_ref ?? null, valeurs.note ?? null, valeurs.valide ?? 0, user.id
   ).run();
 
   const row = await c.env.DB.prepare("SELECT * FROM price_observations WHERE id = ?1").bind(id).first();
@@ -44652,12 +44710,13 @@ prix.post("/crm/import", async (c) => {
       c.env.DB.prepare(
         `INSERT INTO price_observations
            (id, company_id, uniformat_code, description, fournisseur, annee, montant,
-            quantite, unite, source, ville, contexte, source_ref, note, valide, created_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'forfait', ?8, ?9, ?10, ?11, ?12, 0, ?13)`
+            quantite, unite, source, ville, unites, contexte, source_ref, note, valide, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'forfait', ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14)`
       ).bind(
         id, user.company_id, groupe.component_code, groupe.description,
         groupe.fournisseur, groupe.annee, groupe.total, groupe.source,
-        groupe.ville ?? null, contexte, groupe.reference ?? null, note, user.id
+        groupe.ville ?? null, groupe.units ?? null, contexte, groupe.reference ?? null,
+        note, user.id
       )
     ];
     for (const p of groupe.pieces) {

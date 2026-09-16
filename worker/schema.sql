@@ -163,6 +163,7 @@ CREATE TABLE price_observations (
   source         TEXT NOT NULL DEFAULT 'facture',  -- facture | soumission
   negocie        INTEGER NOT NULL DEFAULT 0,  -- prix de portefeuille, pas un prix de marché
   ville          TEXT,
+  unites         INTEGER,   -- portes de l'immeuble : le dénominateur qu'on a toujours, quand la superficie manque
   contexte       TEXT,      -- JSON : unités, étages, année de construction du bâtiment
   source_ref     TEXT,      -- no de facture ou renvoi à la pièce
   note           TEXT,      -- ce qui a été retiré du montant, particularités d'accès
