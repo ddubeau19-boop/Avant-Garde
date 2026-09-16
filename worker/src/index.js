@@ -3655,7 +3655,105 @@ function faitsElement(component, dossier, ligne) {
   ];
   return faits.filter(Boolean).join("\n");
 }
-async function etatDeLActif(component, dossier, apiKey, ligne) {
+// ===========================================================================
+// BANQUE DE RÉDACTIONS
+// ---------------------------------------------------------------------------
+// Chaque texte d'ÉTAT DE L'ACTIF produit est consigné ; celui que l'ingénieur
+// corrige et valide devient un exemple pour les études suivantes de la MÊME
+// entreprise. Deux choix structurants :
+//   — Cloisonnement par entreprise : la formulation d'une firme ne nourrit
+//     jamais les rapports d'une autre firme hébergée.
+//   — Seul le texte validé sert d'exemple. Réinjecter du texte non relu ferait
+//     réapprendre au modèle ses propres approximations, cycle après cycle, sans
+//     que personne ne s'en aperçoive avant plusieurs études.
+// ===========================================================================
+
+const BANQUE_TAILLE = 80;      // lignes validées chargées par dossier
+const BANQUE_EXEMPLES_MAX = 3; // exemples injectés par composante
+
+// Textes déjà validés par l'ingénieur pour les composantes de CE dossier.
+async function textesValidesPour(db, dossierId) {
+  const parComposante = {};
+  if (!db || !dossierId) return parComposante;
+  try {
+    const res = await db.prepare(
+      `SELECT component_id, texte_retenu
+         FROM redactions
+        WHERE dossier_id = ?1 AND valide = 1 AND texte_retenu IS NOT NULL AND TRIM(texte_retenu) <> ''
+        ORDER BY updated_at ASC`
+    ).bind(dossierId).all();
+    for (const r of res.results ?? []) parComposante[r.component_id] = r.texte_retenu;
+  } catch {
+    return parComposante;
+  }
+  return parComposante;
+}
+
+async function banquePour(db, companyId) {
+  if (!db || !companyId) return [];
+  try {
+    const res = await db.prepare(
+      `SELECT cat, uniformat_code, name, rating, observation, texte_retenu
+         FROM redactions
+        WHERE company_id = ?1 AND valide = 1 AND texte_retenu IS NOT NULL AND TRIM(texte_retenu) <> ''
+        ORDER BY updated_at DESC
+        LIMIT ?2`
+    ).bind(companyId, BANQUE_TAILLE).all();
+    return res.results ?? [];
+  } catch {
+    // La banque est un confort, pas une dépendance : son absence ne doit jamais
+    // empêcher de rédiger.
+    return [];
+  }
+}
+
+// Classement : même code Uniformat d'abord, puis même catégorie, en préférant
+// une cote identique — un exemple « bon état » ne montre pas comment écrire un
+// remplacement requis.
+function exemplesPour(banque, component, max = BANQUE_EXEMPLES_MAX) {
+  if (!Array.isArray(banque) || banque.length === 0) return [];
+  const code = String(component?.uniformat_code ?? "").trim();
+  const note = (r) => {
+    let n = 0;
+    if (code && r.uniformat_code && r.uniformat_code.trim() === code) n += 100;
+    if (r.cat && component?.cat && r.cat === component.cat) n += 40;
+    if (r.rating != null && component?.rating != null && r.rating === component.rating) n += 15;
+    if (r.name && component?.name && r.name.trim().toLowerCase() === String(component.name).trim().toLowerCase()) n += 25;
+    return n;
+  };
+  return banque
+    .map((r) => ({ r, n: note(r) }))
+    .filter((x) => x.n > 0)
+    .sort((a, b) => b.n - a.n)
+    .slice(0, max)
+    .map((x) => x.r);
+}
+
+function blocExemples(exemples) {
+  if (!exemples || exemples.length === 0) return "";
+  const corps = exemples.map((e, i) => {
+    const entete = [e.name, e.uniformat_code, e.rating != null ? `cote ${e.rating}` : null]
+      .filter(Boolean).join(" · ");
+    const notes = String(e.observation ?? "").trim();
+    return `EXEMPLE ${i + 1} — ${entete}
+Note de terrain : ${notes || "(aucune)"}
+Texte retenu par l'ingénieur :
+${e.texte_retenu}`;
+  }).join("\n\n");
+  return `
+EXEMPLES DÉJÀ VALIDÉS PAR LA FIRME (études antérieures) :
+${corps}
+
+CE QUE TU PRENDS DANS CES EXEMPLES : la manière — l'ordre des informations, les
+tournures, le niveau de modalisation, la longueur, le vocabulaire technique.
+CE QUE TU N'EN PRENDS JAMAIS : les faits. Aucune année, aucun matériau, aucune
+dimension, aucun défaut de ces exemples ne doit apparaître dans ton texte s'il
+ne figure pas dans les FAITS DU RELEVÉ ci-dessous. Ces exemples portent sur
+d'autres immeubles : en importer un détail serait une faute dans un rapport signé.
+`;
+}
+
+async function etatDeLActif(component, dossier, apiKey, ligne, exemples) {
   const repli = etatDeterministe(component, dossier);
   const sansDonnees = !String(component?.observation ?? "").trim() && component?.rating == null;
   if (!apiKey || sansDonnees) return { texte: repli, source: "gabarit" };
@@ -3686,6 +3784,7 @@ RÈGLES ABSOLUES :
 - Français du Québec. Aucun titre, aucune puce, aucun gras : 3 à 6 phrases en prose suivie.
 - N'écris aucune note de rédaction interne, aucune mention d'un autre dossier, aucun « ??? ».
 
+${blocExemples(exemples)}
 FAITS DU RELEVÉ :
 ${faitsElement(component, dossier, ligne)}
 
@@ -3694,7 +3793,7 @@ Réponds uniquement par le texte de la sous-section.`;
     const brut = await callClaude(apiKey, { content: prompt, maxTokens: 700 });
     const texte = sansNotesInternes(brut);
     if (texte.length < 40) return { texte: repli, source: "gabarit" };
-    return { texte, source: "ia" };
+    return { texte, source: exemples && exemples.length ? "ia+banque" : "ia" };
   } catch {
     return { texte: repli, source: "gabarit" };
   }
@@ -3747,11 +3846,16 @@ function attentionSpeciale(component) {
 // ----------------------------------------------------------------------------
 // LE GÉNÉRATEUR — un seul, deux consommateurs.
 // ----------------------------------------------------------------------------
-async function genFicheElement(component, dossier, apiKey) {
+async function genFicheElement(component, dossier, apiKey, opts = {}) {
   const nom = sansNotesInternes(component?.name ?? "Élément");
   const code = sansNotesInternes(component?.uniformat_code ?? "");
   const ligne = ligneDureeVie(component, dossier);
-  const etat = await etatDeLActif(component, dossier, apiKey, ligne);
+  // Un texte validé par l'ingénieur fait foi : le rapport doit imprimer sa
+  // correction, pas une nouvelle génération qui la contredirait.
+  const retenu = String(opts.texteRetenu ?? "").trim();
+  const etat = retenu
+    ? { texte: retenu, source: "valide" }
+    : await etatDeLActif(component, dossier, apiKey, ligne, opts.exemples);
   const attention = attentionSpeciale(component);
   const carnet = phraseCarnet(dossier);
   return {
@@ -3942,11 +4046,101 @@ components.post("/:id/structure-note", async (c) => {
 // dossier et filtre sur company_id, un locataire ne peut donc jamais lire la
 // composante d'un autre.
 components.post("/:id/redaction", async (c) => {
+  const user = await getCurrentUser(c);
   const component = await getOwnedComponent(c, c.req.param("id"));
   if (!component) return c.json({ error: "composante introuvable" }, 404);
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(component.dossier_id).first();
-  const fiche = await genFicheElement(component, dossier, c.env.ANTHROPIC_API_KEY);
-  return c.json(fiche);
+
+  // Un texte déjà validé pour cette composante fait foi : on le ressert tel
+  // quel plutôt que d'en produire un nouveau qui contredirait la correction.
+  const dejaValide = await c.env.DB.prepare(
+    `SELECT id, texte_retenu FROM redactions
+      WHERE component_id = ?1 AND valide = 1 AND texte_retenu IS NOT NULL AND TRIM(texte_retenu) <> ''
+      ORDER BY updated_at DESC LIMIT 1`
+  ).bind(component.id).first();
+
+  const banque = dejaValide ? [] : await banquePour(c.env.DB, user?.company_id);
+  const exemples = dejaValide ? [] : exemplesPour(banque, component);
+  const fiche = await genFicheElement(component, dossier, c.env.ANTHROPIC_API_KEY, {
+    exemples,
+    texteRetenu: dejaValide?.texte_retenu
+  });
+
+  const etat = fiche.sections.find((x) => x.cle === "etat");
+  let redactionId = dejaValide?.id ?? null;
+  if (!dejaValide && etat) {
+    // On consigne le texte produit même non relu : c'est la moitié du couple
+    // (produit, retenu) qui rendra la correction de l'ingénieur exploitable.
+    redactionId = newId("red");
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO redactions (id, company_id, dossier_id, component_id, cat, uniformat_code, name, rating, observation, texte_genere)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+      ).bind(
+        redactionId, user.company_id, component.dossier_id, component.id,
+        component.cat ?? null, component.uniformat_code ?? null, component.name ?? null,
+        component.rating ?? null, component.observation ?? null, etat.texte
+      ).run();
+    } catch {
+      redactionId = null;
+    }
+  }
+
+  return c.json({
+    ...fiche,
+    redaction_id: redactionId,
+    valide: !!dejaValide,
+    exemples_utilises: exemples.length
+  });
+});
+
+// L'ingénieur corrige le texte et le valide. C'est cette version-là, et elle
+// seule, qui alimentera les études suivantes de son entreprise.
+components.patch("/:id/redaction", async (c) => {
+  const user = await getCurrentUser(c);
+  const component = await getOwnedComponent(c, c.req.param("id"));
+  if (!component) return c.json({ error: "composante introuvable" }, 404);
+  const body2 = await c.req.json();
+  const texte = String(body2.texte_retenu ?? "").trim();
+  if (!texte) return c.json({ error: "texte_retenu requis" }, 400);
+  const valide = body2.valide === false ? 0 : 1;
+
+  const existante = await c.env.DB.prepare(
+    "SELECT id FROM redactions WHERE component_id = ?1 ORDER BY updated_at DESC LIMIT 1"
+  ).bind(component.id).first();
+
+  if (existante) {
+    await c.env.DB.prepare(
+      `UPDATE redactions SET texte_retenu = ?1, valide = ?2, rating = ?3, observation = ?4,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?5`
+    ).bind(texte, valide, component.rating ?? null, component.observation ?? null, existante.id).run();
+    return c.json({ ok: true, redaction_id: existante.id, valide: !!valide });
+  }
+
+  const id = newId("red");
+  await c.env.DB.prepare(
+    `INSERT INTO redactions (id, company_id, dossier_id, component_id, cat, uniformat_code, name, rating, observation, texte_genere, texte_retenu, valide)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11)`
+  ).bind(
+    id, user.company_id, component.dossier_id, component.id,
+    component.cat ?? null, component.uniformat_code ?? null, component.name ?? null,
+    component.rating ?? null, component.observation ?? null, texte, valide
+  ).run();
+  return c.json({ ok: true, redaction_id: id, valide: !!valide });
+});
+
+// État de la banque, pour que la firme voie ce qu'elle a accumulé.
+components.get("/banque/etat", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "non authentifié" }, 401);
+  const row = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS total,
+            SUM(CASE WHEN valide = 1 AND texte_retenu IS NOT NULL THEN 1 ELSE 0 END) AS valides,
+            COUNT(DISTINCT uniformat_code) AS codes
+       FROM redactions WHERE company_id = ?1`
+  ).bind(user.company_id).first();
+  return c.json({ total: row?.total ?? 0, valides: row?.valides ?? 0, codes: row?.codes ?? 0 });
 });
 const RESERVE_FUND_PARAMS = {
   // Hypothèses sourcées (méthode Condo Stratégis) — pas des valeurs rondes.
@@ -22477,6 +22671,244 @@ const TEXTE_MAISON = {
     "Orientation : afin de se situer, le lecteur doit se placer dans la rue face à l'immeuble pour identifier la façade avant, les côtés et l'arrière."
   ]
 };
+
+// ===========================================================================
+// GABARIT D'ENTREPRISE
+// ---------------------------------------------------------------------------
+// TEXTE_MAISON est le gabarit de Condo Stratégis. Une firme hébergée qui
+// arrive avec le sien surcharge ces sections ; celle qui n'en a pas hérite du
+// gabarit intégré. Sans cela, toutes les firmes de la plateforme publieraient
+// le texte d'une seule d'entre elles.
+// ===========================================================================
+
+// Les 13 sections surchargeables, avec la forme attendue de chacune. La forme
+// compte : rendre une chaîne là où le rapport attend une liste de puces ne
+// plante pas, ça produit un rapport silencieusement mal formé.
+const SECTIONS_GABARIT = [
+  { cle: "etendue", label: "2.1 Étendue du travail réalisé", forme: "paragraphes" },
+  { cle: "famillesEtudiees", label: "2.1 Familles d'éléments étudiées", forme: "puces" },
+  { cle: "objetChamp", label: "2.3 Objet et champ d'application", forme: "texte" },
+  { cle: "contexteEconomique", label: "2.4 Contexte économique", forme: "paragraphes" },
+  { cle: "exigencesLoi", label: "2.5 Exigences de la loi sur les copropriétés", forme: "texte" },
+  { cle: "quotesParts", label: "2.6 Valeurs relatives des quotes-parts", forme: "texte" },
+  { cle: "lireRapport", label: "3.0 Comment lire ce rapport", forme: "objet", sous: [
+    { cle: "intro", forme: "texte" },
+    { cle: "etat", forme: "paragraphes" },
+    { cle: "dureeVie", forme: "paragraphes" },
+    { cle: "entretien", forme: "texte" },
+    { cle: "attention", forme: "paragraphes" },
+    { cle: "annexes", forme: "paragraphes" }
+  ] },
+  { cle: "resultats", label: "5.0 Résultats — introduction", forme: "texte" },
+  { cle: "limitations", label: "7.0 Limitations légales", forme: "objet", sous: [
+    { cle: "mandant", forme: "paragraphes" },
+    { cle: "visite", forme: "paragraphes" },
+    { cle: "financement", forme: "paragraphes" },
+    { cle: "tableur", forme: "paragraphes" },
+    { cle: "services", forme: "paragraphes" },
+    { cle: "complementaire", forme: "paragraphes" }
+  ] },
+  { cle: "declaration", label: "8.0 Déclaration — attestations", forme: "puces" },
+  { cle: "suiviEntretien", label: "9.0 Suivi de l'entretien", forme: "objet", sous: [
+    { cle: "loi16", forme: "paragraphes" },
+    { cle: "actions", forme: "puces" },
+    { cle: "niveaux", forme: "puces" },
+    { cle: "experience", forme: "paragraphes" }
+  ] },
+  { cle: "lexique", label: "Annexe — Lexique", forme: "paires" },
+  { cle: "legendes", label: "Annexe — Légendes", forme: "puces" }
+];
+
+function fusionnerGabarit(base, sur) {
+  if (!sur || typeof sur !== "object") return base;
+  const sortie = Array.isArray(base) ? [...base] : { ...base };
+  for (const [cle, val] of Object.entries(sur)) {
+    if (val == null) continue;
+    if (Array.isArray(val)) {
+      // Une liste fournie remplace la liste maison en entier. Entrelacer les
+      // limitations légales de deux firmes produirait un texte que ni l'une ni
+      // l'autre n'assume devant son ordre professionnel.
+      if (val.length > 0) sortie[cle] = val;
+    } else if (typeof val === "object") {
+      sortie[cle] = fusionnerGabarit(base?.[cle] ?? {}, val);
+    } else if (typeof val === "string" && val.trim()) {
+      sortie[cle] = val;
+    }
+  }
+  return sortie;
+}
+
+// Ne laisse passer que les clés connues, dans la forme attendue. Le contenu
+// vient d'un document importé puis trié par un modèle : rien de tout cela n'a
+// à décider de la structure du rapport.
+function nettoyerSections(brut) {
+  const propre = {};
+  if (!brut || typeof brut !== "object") return propre;
+  const texte = (v) => typeof v === "string" && v.trim() ? v.trim() : null;
+  const liste = (v) => Array.isArray(v)
+    ? v.map((x) => texte(x)).filter(Boolean)
+    : (texte(v) ? [texte(v)] : []);
+  for (const section of SECTIONS_GABARIT) {
+    const val = brut[section.cle];
+    if (val == null) continue;
+    if (section.forme === "objet") {
+      const sous = {};
+      for (const s of section.sous) {
+        const v = val?.[s.cle];
+        if (v == null) continue;
+        if (s.forme === "texte") { const t = texte(v); if (t) sous[s.cle] = t; }
+        else { const l = liste(v); if (l.length) sous[s.cle] = l; }
+      }
+      if (Object.keys(sous).length) propre[section.cle] = sous;
+    } else if (section.forme === "texte") {
+      const t = texte(val);
+      if (t) propre[section.cle] = t;
+    } else if (section.forme === "paires") {
+      const paires = Array.isArray(val)
+        ? val.map((p) => Array.isArray(p) ? [texte(p[0]), texte(p[1])] : null)
+             .filter((p) => p && p[0] && p[1])
+        : [];
+      if (paires.length) propre[section.cle] = paires;
+    } else {
+      const l = liste(val);
+      if (l.length) propre[section.cle] = l;
+    }
+  }
+  return propre;
+}
+
+async function texteMaisonPour(db, companyId) {
+  if (!db || !companyId) return TEXTE_MAISON;
+  let ligne = null;
+  try {
+    ligne = await db.prepare("SELECT sections FROM company_templates WHERE company_id = ?1").bind(companyId).first();
+  } catch {
+    return TEXTE_MAISON;
+  }
+  if (!ligne?.sections) return TEXTE_MAISON;
+  try {
+    return fusionnerGabarit(TEXTE_MAISON, nettoyerSections(JSON.parse(ligne.sections)));
+  } catch {
+    // Un gabarit illisible ne doit jamais empêcher de produire un rapport.
+    return TEXTE_MAISON;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lecture d'un .docx importé
+// ---------------------------------------------------------------------------
+// Un .docx est une archive ZIP. On y cherche word/document.xml et on le
+// décompresse avec DecompressionStream, disponible nativement dans les Workers
+// — plutôt que d'aller chercher l'inflate enfoui dans la librairie xlsx, dont
+// rien ne garantit la stabilité d'une version à l'autre.
+async function lireDocx(buffer) {
+  const vue = new DataView(buffer);
+  const octets = new Uint8Array(buffer);
+  if (octets.length < 22) throw new Error("fichier trop court pour être un .docx");
+  let eocd = -1;
+  const plancher = Math.max(0, octets.length - 65558);
+  for (let i = octets.length - 22; i >= plancher; i--) {
+    if (vue.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("ce fichier n'est pas une archive .docx lisible");
+  const nbEntrees = vue.getUint16(eocd + 10, true);
+  let p = vue.getUint32(eocd + 16, true);
+  const decodeur = new TextDecoder();
+  for (let n = 0; n < nbEntrees; n++) {
+    if (p + 46 > octets.length || vue.getUint32(p, true) !== 0x02014b50) break;
+    const methode = vue.getUint16(p + 10, true);
+    const tailleCompressee = vue.getUint32(p + 20, true);
+    const lgNom = vue.getUint16(p + 28, true);
+    const lgExtra = vue.getUint16(p + 30, true);
+    const lgComm = vue.getUint16(p + 32, true);
+    const offsetLocal = vue.getUint32(p + 42, true);
+    const nom = decodeur.decode(octets.subarray(p + 46, p + 46 + lgNom));
+    if (nom === "word/document.xml") {
+      // Les longueurs nom/extra de l'en-tête local diffèrent de celles du
+      // répertoire central : il faut relire celles-là, pas réutiliser celles-ci.
+      const lgNomLocal = vue.getUint16(offsetLocal + 26, true);
+      const lgExtraLocal = vue.getUint16(offsetLocal + 28, true);
+      const debut = offsetLocal + 30 + lgNomLocal + lgExtraLocal;
+      const donnees = octets.subarray(debut, debut + tailleCompressee);
+      if (methode === 0) return decodeur.decode(donnees);
+      if (methode !== 8) throw new Error(`compression ZIP non gérée (méthode ${methode})`);
+      const flux = new Blob([donnees]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+      return await new Response(flux).text();
+    }
+    p += 46 + lgNom + lgExtra + lgComm;
+  }
+  throw new Error("word/document.xml introuvable dans l'archive");
+}
+
+function decodeEntitesXml(s) {
+  return s
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&amp;/g, "&");
+}
+
+function paragraphesDocx(xml) {
+  const paras = [];
+  for (const p of xml.matchAll(/<w:p[ >][\s\S]*?<\/w:p>|<w:p\/>/g)) {
+    const morceaux = [...p[0].matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)].map((m) => m[1]);
+    const texte = decodeEntitesXml(morceaux.join("")).replace(/\s+/g, " ").trim();
+    if (texte) paras.push(texte);
+  }
+  return paras;
+}
+
+// Répartit le texte importé sur les sections du rapport. Le modèle trie ; il ne
+// réécrit pas : c'est le texte de la firme qui doit ressortir, pas une
+// paraphrase.
+async function sectionsDepuisTexte(apiKey, paragraphes) {
+  if (!apiKey) {
+    return { sections: {}, note: "Aucune clé API n'est configurée : le texte a été extrait et conservé, mais il faut le répartir à la main dans les sections." };
+  }
+  const corpus = paragraphes.join("\n").slice(0, 60000);
+  const catalogue = SECTIONS_GABARIT.map((s) => {
+    if (s.forme === "objet") {
+      return `"${s.cle}" — ${s.label} — objet contenant : ${s.sous.map((x) => `"${x.cle}" (${x.forme})`).join(", ")}`;
+    }
+    return `"${s.cle}" — ${s.label} — ${s.forme}`;
+  }).join("\n");
+  const prompt = `Voici le texte d'un gabarit d'étude de fonds de prévoyance d'une firme québécoise.
+Répartis-le dans les sections normalisées ci-dessous.
+
+RÈGLE ABSOLUE : reprends le texte de la firme MOT POUR MOT. Tu tries, tu ne
+réécris pas, tu ne résumes pas, tu ne corriges pas le style. C'est la voix de
+cette firme qui doit ressortir dans ses rapports.
+
+Omets simplement toute section pour laquelle le document ne contient rien de
+clairement correspondant — une section absente garde le texte par défaut, ce qui
+vaut mieux qu'un texte mal rangé. N'invente jamais de contenu.
+
+Formes attendues :
+- "texte" : une seule chaîne de caractères.
+- "paragraphes" et "puces" : un tableau de chaînes, une par paragraphe ou par puce.
+- "paires" : un tableau de [terme, définition].
+
+Sections :
+${catalogue}
+
+Ignore tout ce qui est propre à un immeuble donné (nom du syndicat, adresse,
+montants, observations d'éléments) : on ne cherche ici que le texte de fond,
+celui qui se répète d'une étude à l'autre.
+
+TEXTE DU GABARIT :
+${corpus}
+
+Réponds UNIQUEMENT avec un objet JSON dont les clés sont prises dans la liste ci-dessus.`;
+  const brut = await callClaude(apiKey, { content: prompt, maxTokens: 16000 });
+  return { sections: nettoyerSections(extractJson(brut)), note: null };
+}
+
+function peutGererEntreprise(user, companyId) {
+  if (!user) return false;
+  if (user.role === "super_admin") return true;
+  return user.company_id === companyId;
+}
 function titre2(text) {
   return new Paragraph({
     spacing: { before: 240, after: 100 },
@@ -22510,6 +22942,10 @@ function pourcent(taux) {
 }
 async function generateReportDocx(ctx) {
   const { dossier, components: components2, projection } = ctx;
+  // Gabarit de la firme propriétaire du dossier, ou le gabarit intégré si elle
+  // n'en a pas importé. Résolu en amont (buildReportContext) : la génération ne
+  // doit pas dépendre d'un accès à la base au milieu de la rédaction.
+  const T = ctx.texteMaison ?? TEXTE_MAISON;
   const apiKey = ctx.apiKey ?? null;
   const signataire = ctx.signataire ?? null;
   const ordre = ordreDuSignataire(signataire);
@@ -22616,42 +23052,42 @@ async function generateReportDocx(ctx) {
   const methodologie = [
     heading("2.0 Méthodologie"),
     titre2("2.1 Étendue du travail réalisé"),
-    ...TEXTE_MAISON.etendue.map((t) => body(t)),
-    ...TEXTE_MAISON.famillesEtudiees.map((t) => puce(t)),
+    ...T.etendue.map((t) => body(t)),
+    ...T.famillesEtudiees.map((t) => puce(t)),
     body(`Les estimations de coût prévu et le calendrier des travaux de remplacement qui seront requis au cours des ${projection.params.projectionYears} prochaines années sont décrits en format tableau simplifié dans le document joint à l'ANNEXE A – Sommaire des travaux, et en format tableau détaillé à l'ANNEXE B – Calendrier de remplacement – Scénario de financement.`),
     titre2("2.2 Mise à jour"),
     body(`En raison du nombre de facteurs qui peuvent influer sur la contribution annuelle requise, nous recommandons que l'étude du fonds de prévoyance soit mise à jour au minimum tous les cinq (5) ans, comme prévue au projet de loi 16. Cette mise à jour devra être planifiée dès ${anneeCourante + 5}.`),
     titre2("2.3 Objet et champ d'application du rapport"),
-    body(TEXTE_MAISON.objetChamp),
+    body(T.objetChamp),
     titre2("2.4 Contexte économique"),
-    ...TEXTE_MAISON.contexteEconomique.map((t) => body(t)),
+    ...T.contexteEconomique.map((t) => body(t)),
     body(`Ainsi, nous avons préparé des scénarios de financement sur un cycle de ${projection.params.projectionYears} ans pour les besoins du syndicat de la copropriété. Dans ceux-ci, nous avons supposé que les intérêts sont gagnés à un taux de ${pourcent(projection.params.interestRate)}, qu'ils sont non imposables et sont réinvestis dans le fonds, et que le taux d'inflation annuel des coûts de la construction est de ${pourcent(projection.params.inflationRate)}.`),
     body(`Sources des hypothèses économiques retenues — taux d'intérêt : ${projection.params.interestSource}; inflation des coûts de la construction : ${projection.params.inflationSource}.`, { color: GREY, size: 18 }),
     body("Les intérêts sont appliqués au solde d'ouverture de chaque année et sont ramenés à zéro lorsque ce solde est négatif. Une cotisation n'est retenue que si elle satisfait un double critère : le solde du fonds ne devient jamais négatif sur l'horizon, et il demeure positif à l'entrée de la 31e année une fois provisionnée la portion des remplacements à longue durée de vie qui suivent immédiatement l'horizon.", { color: GREY, size: 18 }),
     titre2("2.5 Exigences de la loi sur les copropriétés"),
-    body(TEXTE_MAISON.exigencesLoi),
+    body(T.exigencesLoi),
     titre2("2.6 Valeurs relatives des quotes-parts"),
-    body(TEXTE_MAISON.quotesParts)
+    body(T.quotesParts)
   ];
   // ---- 3.0 Comment lire ce rapport ---------------------------------------
   const commentLire = [
     heading("3.0 Comment lire ce rapport"),
     titre2("Présentation des éléments et composantes de l'immeuble — le carnet d'entretien"),
-    body(TEXTE_MAISON.lireRapport.intro),
+    body(T.lireRapport.intro),
     puce("ÉTAT DE L'ACTIF"),
     puce("DURÉE DE VIE ET REMPLACEMENT"),
     puce("COMMENTAIRES D'ENTRETIEN"),
     puce("ATTENTION SPÉCIALE"),
     titre2("État de l'actif"),
-    ...TEXTE_MAISON.lireRapport.etat.map((t) => body(t)),
+    ...T.lireRapport.etat.map((t) => body(t)),
     titre2("Présentation des estimations de coût de remplacement des composantes — durée de vie et coût de remplacement"),
-    ...TEXTE_MAISON.lireRapport.dureeVie.map((t) => body(t)),
+    ...T.lireRapport.dureeVie.map((t) => body(t)),
     titre2("Commentaires d'entretien"),
-    body(TEXTE_MAISON.lireRapport.entretien),
+    body(T.lireRapport.entretien),
     titre2("Présentation des réparations majeures et des remplacements à prévoir — attention spéciale"),
-    ...TEXTE_MAISON.lireRapport.attention.map((t) => body(t)),
+    ...T.lireRapport.attention.map((t) => body(t)),
     titre2("Annexes"),
-    ...TEXTE_MAISON.lireRapport.annexes.map((t) => body(t))
+    ...T.lireRapport.annexes.map((t) => body(t))
   ];
   // ---- 4.0 Observation des éléments --------------------------------------
   const ordreCategories = Object.entries(CATEGORIES).sort((a, b) => a[1].ordre - b[1].ordre).map(([cle]) => cle);
@@ -22664,7 +23100,12 @@ async function generateReportDocx(ctx) {
   // Une fiche = un appel au modèle pour ÉTAT DE L'ACTIF. On les mène 6 par 6 :
   // assez pour qu'un dossier de 30 composantes reste sous la minute, assez peu
   // pour rester loin des limites de sous-requêtes du Worker.
-  const fiches = await enParallele(components2, 6, (comp) => genFicheElement(comp, dossier, apiKey));
+  const banque = ctx.banque ?? [];
+  const valides = ctx.textesValides ?? {};
+  const fiches = await enParallele(components2, 6, (comp) => genFicheElement(comp, dossier, apiKey, {
+    exemples: exemplesPour(banque, comp),
+    texteRetenu: valides[comp.id]
+  }));
   const parId = new Map(components2.map((c, i) => [c.id, fiches[i]]));
   const observation = [heading("4.0 Observation des éléments")];
   observation.push(body("Chacun des éléments est présenté suivant les quatre sous-sections décrites à la section 3.0. Les cotes employées sont celles de la légende : Bon, Passable – Nécessite un entretien, Mauvais – Requiert la planification d'un remplacement."));
@@ -22697,7 +23138,7 @@ async function generateReportDocx(ctx) {
   const cotisationSuffisante = scenarioStatuQuo != null && scenarioStatuQuo.meetsCriteria;
   const resultats = [
     heading("5.0 Résultats et scénarios de financement"),
-    body(TEXTE_MAISON.resultats),
+    body(T.resultats),
     body("ANNEXE A – SOMMAIRE DES TRAVAUX"),
     body("ANNEXE B – CALENDRIER DE REMPLACEMENT – SCÉNARIO DE FINANCEMENT"),
     titre2("Portrait financier de départ"),
@@ -22774,23 +23215,23 @@ async function generateReportDocx(ctx) {
   const limitations = [
     heading("7.0 Limitations légales"),
     titre2("Mandant"),
-    ...TEXTE_MAISON.limitations.mandant.map((t) => body(t)),
+    ...T.limitations.mandant.map((t) => body(t)),
     titre2("Visite et observation"),
-    ...TEXTE_MAISON.limitations.visite.map((t) => body(t)),
+    ...T.limitations.visite.map((t) => body(t)),
     titre2("Étude et calcul de financement"),
-    ...TEXTE_MAISON.limitations.financement.map((t) => body(t)),
+    ...T.limitations.financement.map((t) => body(t)),
     titre2("Tableur suivi d'entretien"),
-    ...TEXTE_MAISON.limitations.tableur.map((t) => body(t)),
+    ...T.limitations.tableur.map((t) => body(t)),
     titre2("Services professionnels"),
-    ...TEXTE_MAISON.limitations.services.map((t) => body(t)),
+    ...T.limitations.services.map((t) => body(t)),
     titre2("Complémentaire"),
-    ...TEXTE_MAISON.limitations.complementaire.map((t) => body(t))
+    ...T.limitations.complementaire.map((t) => body(t))
   ];
   // ---- 8.0 Déclaration ----------------------------------------------------
   const declaration = [
     heading("8.0 Déclaration"),
     body("Je, soussigné, atteste par la présente, au meilleur de ma connaissance et de ma conviction, que :"),
-    ...TEXTE_MAISON.declaration.map((t) => puce(t)),
+    ...T.declaration.map((t) => puce(t)),
     puce(ordre
       ? `J'ai rédigé mes analyses, opinions et conclusions de même que le présent rapport en conformité avec les règlements et normes de pratique de l'${ordre.nom} (${ordre.sigle});`
       : `J'ai rédigé mes analyses, opinions et conclusions de même que le présent rapport en conformité avec les règlements et normes de pratique de ${A_COMPLETER} — ordre professionnel du signataire;`),
@@ -22823,20 +23264,20 @@ async function generateReportDocx(ctx) {
   const suivi = [
     heading("9.0 Informations relatives au suivi de l'entretien"),
     titre2("9.1 La loi 16"),
-    ...TEXTE_MAISON.suiviEntretien.loi16.map((t) => body(t)),
+    ...T.suiviEntretien.loi16.map((t) => body(t)),
     titre2("9.2 Les grandes questions"),
     body("Comment devons-nous procéder ? Les actions générales attendues du conseil d'administration sont les suivantes :"),
-    ...TEXTE_MAISON.suiviEntretien.actions.map((t) => puce(t)),
+    ...T.suiviEntretien.actions.map((t) => puce(t)),
     body("Devons-nous respecter la planification ? Trois niveaux d'intervention sont à distinguer :"),
-    ...TEXTE_MAISON.suiviEntretien.niveaux.map((t) => puce(t)),
+    ...T.suiviEntretien.niveaux.map((t) => puce(t)),
     titre2("Notre expérience"),
-    ...TEXTE_MAISON.suiviEntretien.experience.map((t) => body(t))
+    ...T.suiviEntretien.experience.map((t) => body(t))
   ];
   // ---- Annexes -------------------------------------------------------------
   const lexique = [
     heading("Annexe — Lexique et légendes"),
     body("Voici la définition de quelques termes utilisés en contexte de copropriété :"),
-    ...TEXTE_MAISON.lexique.flatMap(([terme, definition]) => [
+    ...T.lexique.flatMap(([terme, definition]) => [
       new Paragraph({
         spacing: { after: 100 },
         children: [
@@ -22846,7 +23287,7 @@ async function generateReportDocx(ctx) {
       })
     ]),
     titre2("Légendes"),
-    ...TEXTE_MAISON.legendes.map((t) => puce(t))
+    ...T.legendes.map((t) => puce(t))
   ];
   const annexeA = [
     heading("Annexe A — Sommaire des travaux"),
@@ -43360,6 +43801,109 @@ companies.post("/:id/logo", async (c) => {
   ).bind(r2Key, id).run();
   return c.json({ ok: true });
 });
+companies.get("/:id/template", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const ligne = await c.env.DB.prepare(
+    "SELECT sections, source_filename, source_extrait, imported_at, updated_at FROM company_templates WHERE company_id = ?1"
+  ).bind(id).first();
+  let sections = {};
+  try {
+    sections = ligne?.sections ? nettoyerSections(JSON.parse(ligne.sections)) : {};
+  } catch {
+    sections = {};
+  }
+  return c.json({
+    catalogue: SECTIONS_GABARIT,
+    sections,
+    defauts: TEXTE_MAISON,
+    source_filename: ligne?.source_filename ?? null,
+    imported_at: ligne?.imported_at ?? null,
+    updated_at: ligne?.updated_at ?? null,
+    extrait: ligne?.source_extrait ? ligne.source_extrait.slice(0, 4000) : null
+  });
+});
+
+companies.post("/:id/template", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT id FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 20 * 1024 * 1024) return c.json({ error: "gabarit trop volumineux (max 20 Mo)" }, 413);
+  let paragraphes;
+  try {
+    paragraphes = paragraphesDocx(await lireDocx(buffer));
+  } catch (e) {
+    return c.json({ error: `lecture du .docx impossible : ${e.message}` }, 400);
+  }
+  if (paragraphes.length === 0) return c.json({ error: "aucun texte trouvé dans ce document" }, 400);
+
+  // On conserve le .docx d'origine et le texte brut extrait : si la répartition
+  // se trompe, la firme doit pouvoir remonter à sa source sans réimporter.
+  const r2Key = `company-templates/${id}.docx`;
+  await c.env.PHOTOS.put(r2Key, buffer, {
+    httpMetadata: { contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+  });
+  const extrait = paragraphes.join("\n");
+
+  let sections = {};
+  let note = null;
+  try {
+    const res = await sectionsDepuisTexte(c.env.ANTHROPIC_API_KEY, paragraphes);
+    sections = res.sections;
+    note = res.note;
+  } catch (e) {
+    note = `La répartition automatique a échoué (${e.message}). Le texte est conservé : les sections peuvent être remplies à la main.`;
+  }
+
+  await c.env.DB.prepare(
+    `INSERT INTO company_templates (company_id, sections, source_r2_key, source_filename, source_extrait, imported_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+     ON CONFLICT(company_id) DO UPDATE SET
+       sections = excluded.sections,
+       source_r2_key = excluded.source_r2_key,
+       source_filename = excluded.source_filename,
+       source_extrait = excluded.source_extrait,
+       imported_at = excluded.imported_at,
+       updated_at = excluded.updated_at`
+  ).bind(id, JSON.stringify(sections), r2Key, file.name ?? "gabarit.docx", extrait).run();
+
+  return c.json({
+    ok: true,
+    paragraphes: paragraphes.length,
+    sections_remplies: Object.keys(sections),
+    sections_par_defaut: SECTIONS_GABARIT.map((s) => s.cle).filter((k) => !(k in sections)),
+    note
+  });
+});
+
+companies.patch("/:id/template", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const body2 = await c.req.json();
+  const sections = nettoyerSections(body2.sections);
+  await c.env.DB.prepare(
+    `INSERT INTO company_templates (company_id, sections, updated_at)
+     VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+     ON CONFLICT(company_id) DO UPDATE SET sections = excluded.sections, updated_at = excluded.updated_at`
+  ).bind(id, JSON.stringify(sections)).run();
+  return c.json({ ok: true, sections_remplies: Object.keys(sections) });
+});
+
+companies.delete("/:id/template", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  await c.env.DB.prepare("DELETE FROM company_templates WHERE company_id = ?1").bind(id).run();
+  return c.json({ ok: true, retour: "gabarit intégré" });
+});
 companies.get("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
@@ -43516,6 +44060,9 @@ async function buildReportContext(c) {
     dossier,
     components: components2,
     projection,
+    texteMaison: await texteMaisonPour(c.env.DB, dossier.company_id),
+    banque: await banquePour(c.env.DB, dossier.company_id),
+    textesValides: await textesValidesPour(c.env.DB, dossier.id),
     engineerName: user?.name ?? "Condo Stratégis",
     signataire: user ?? null,
     apiKey: c.env.ANTHROPIC_API_KEY ?? null

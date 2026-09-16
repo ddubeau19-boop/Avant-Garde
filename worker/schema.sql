@@ -94,3 +94,42 @@ CREATE TABLE photos (
 
 CREATE INDEX idx_components_dossier ON components(dossier_id);
 CREATE INDEX idx_photos_component   ON photos(component_id);
+
+-- Gabarit de rapport propre à une entreprise. Les firmes qui arrivent avec leur
+-- propre gabarit d'étude surchargent ici les sections de TEXTE_MAISON ; celles
+-- qui n'en ont pas héritent du gabarit intégré. Le .docx d'origine est conservé
+-- en R2 pour qu'on puisse toujours remonter à la source d'un texte.
+CREATE TABLE company_templates (
+  company_id      TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+  sections        TEXT,   -- JSON : surcharges, clé par clé, de TEXTE_MAISON
+  source_r2_key   TEXT,
+  source_filename TEXT,
+  source_extrait  TEXT,   -- texte brut extrait du .docx, conservé tel quel
+  imported_at     TEXT,
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- Banque de rédactions : le texte produit pour chaque composante, étude après
+-- étude. Cloisonnée par entreprise — la formulation d'une firme ne nourrit
+-- jamais les rapports d'une autre. Seules les lignes valide = 1 servent
+-- d'exemple : apprendre du texte non relu ferait réapprendre au modèle ses
+-- propres approximations.
+CREATE TABLE redactions (
+  id             TEXT PRIMARY KEY,
+  company_id     TEXT NOT NULL REFERENCES companies(id),
+  dossier_id     TEXT REFERENCES dossiers(id) ON DELETE CASCADE,
+  component_id   TEXT REFERENCES components(id) ON DELETE CASCADE,
+  cat            TEXT,
+  uniformat_code TEXT,
+  name           TEXT,
+  rating         INTEGER,
+  observation    TEXT,      -- la note de terrain qui a produit le texte
+  texte_genere   TEXT,      -- ce que le modèle a produit
+  texte_retenu   TEXT,      -- ce que l'ingénieur a gardé après correction
+  valide         INTEGER NOT NULL DEFAULT 0,
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX idx_redactions_banque    ON redactions(company_id, valide, uniformat_code);
+CREATE INDEX idx_redactions_component ON redactions(component_id);
