@@ -44154,6 +44154,329 @@ photos.get("/:id/file", async (c) => {
     }
   });
 });
+// ── Banque de prix ───────────────────────────────────────────────────────────
+// Ce que la firme a réellement payé, ramené à un prix unitaire indexé. La
+// collecte seulement : aucune de ces routes n'écrit dans components — le coût
+// de remplacement reste saisi à la main tant qu'on n'aura pas vu ce que la
+// banque vaut sur un échantillon réel.
+const prix = new Hono();
+const PRIX_UNITES = {
+  pi2: { label: "pi²", quantifie: true },
+  pi_lin: { label: "pi lin.", quantifie: true },
+  unite: { label: "unité", quantifie: true },
+  forfait: { label: "forfait", quantifie: false }
+};
+const PRIX_PORTEES = {
+  complet: "Remplacement complet",
+  partiel: "Remplacement partiel",
+  reparation: "Réparation"
+};
+const PRIX_SOURCES = { facture: "Facture", soumission: "Soumission" };
+const PRIX_ECHANTILLON_MINCE = 5;   // en deçà, la médiane est indicative, pas une référence
+
+function anneeCourante() {
+  return new Date().getUTCFullYear();
+}
+
+// Prix unitaire en dollars de l'année des travaux. Un forfait n'a pas de
+// quantité : son prix unitaire est le montant lui-même.
+function prixUnitaire(row) {
+  if (!PRIX_UNITES[row.unite]?.quantifie) return row.montant;
+  if (!row.quantite || row.quantite <= 0) return null;
+  return row.montant / row.quantite;
+}
+
+// Ramené en dollars d'aujourd'hui au même taux que la projection du fonds : un
+// prix de 2019 comparé tel quel à un prix de 2025 sous-estime le remplacement.
+// Taux constant — approximation assumée, l'indice réel varie d'une année à l'autre.
+function prixIndexe(montant, annee, anneeCible, taux) {
+  if (montant == null || !annee) return null;
+  return montant * Math.pow(1 + taux, anneeCible - annee);
+}
+
+function quantile(triees, q) {
+  if (triees.length === 0) return null;
+  const pos = (triees.length - 1) * q;
+  const bas = Math.floor(pos);
+  const haut = Math.ceil(pos);
+  if (bas === haut) return triees[bas];
+  return triees[bas] + (triees[haut] - triees[bas]) * (pos - bas);
+}
+
+function prixPublic(row, anneeCible, taux) {
+  const unitaire = prixUnitaire(row);
+  return {
+    ...row,
+    prix_unitaire: unitaire,
+    prix_unitaire_indexe: prixIndexe(unitaire, row.annee, anneeCible, taux),
+    unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite
+  };
+}
+
+function nombreOuNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Valide et normalise ce qui arrive du formulaire. Renvoie { erreur } ou { valeurs }.
+function lirePrixBody(body2, { partiel = false } = {}) {
+  const v = {};
+  const presence = (cle) => cle in body2;
+
+  if (!partiel || presence("description")) {
+    const description = String(body2.description ?? "").trim();
+    if (!description) return { erreur: "description requise" };
+    v.description = description;
+  }
+  if (!partiel || presence("annee")) {
+    const annee = nombreOuNull(body2.annee);
+    const max = anneeCourante() + 1;
+    if (annee == null || annee < 1980 || annee > max) return { erreur: `année des travaux invalide (1980 à ${max})` };
+    v.annee = Math.round(annee);
+  }
+  if (!partiel || presence("montant")) {
+    const montant = nombreOuNull(body2.montant);
+    if (montant == null || montant <= 0) return { erreur: "montant des travaux requis" };
+    v.montant = montant;
+  }
+  if (!partiel || presence("unite")) {
+    const unite = String(body2.unite ?? "").trim();
+    if (!PRIX_UNITES[unite]) return { erreur: "unité inconnue" };
+    v.unite = unite;
+  }
+  if (!partiel || presence("quantite")) {
+    v.quantite = nombreOuNull(body2.quantite);
+    if (v.quantite != null && v.quantite <= 0) return { erreur: "quantité invalide" };
+  }
+  if (presence("portee")) {
+    const portee = body2.portee ? String(body2.portee) : null;
+    if (portee && !PRIX_PORTEES[portee]) return { erreur: "portée inconnue" };
+    v.portee = portee;
+  }
+  if (!partiel || presence("source")) {
+    const source = String(body2.source ?? "facture");
+    if (!PRIX_SOURCES[source]) return { erreur: "source inconnue" };
+    v.source = source;
+  }
+  if (presence("negocie")) v.negocie = body2.negocie ? 1 : 0;
+  if (presence("valide")) v.valide = body2.valide ? 1 : 0;
+  for (const cle of ["cat", "uniformat_code", "fournisseur", "ville", "source_ref", "note", "dossier_id"]) {
+    if (!partiel || presence(cle)) {
+      const brut = body2[cle];
+      v[cle] = brut === null || brut === undefined || String(brut).trim() === "" ? null : String(brut).trim();
+    }
+  }
+  return { valeurs: v };
+}
+
+// Une unité quantifiée sans quantité ne donne aucun prix unitaire : la ligne
+// serait dans la banque sans pouvoir servir. On la refuse à la saisie.
+function quantiteManquante(unite, quantite) {
+  return PRIX_UNITES[unite]?.quantifie && (quantite == null || quantite <= 0);
+}
+
+async function prixCompany(c) {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return null;
+  return user;
+}
+
+prix.get("/", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const filtres = ["company_id = ?1"];
+  const valeurs = [user.company_id];
+  const valide = c.req.query("valide");
+  if (valide === "1" || valide === "0") {
+    filtres.push(`valide = ?${valeurs.length + 1}`);
+    valeurs.push(Number(valide));
+  }
+  const code = c.req.query("code");
+  if (code) {
+    filtres.push(`uniformat_code = ?${valeurs.length + 1}`);
+    valeurs.push(code);
+  }
+  const rows = await c.env.DB.prepare(
+    `SELECT * FROM price_observations WHERE ${filtres.join(" AND ")}
+      ORDER BY created_at DESC LIMIT 500`
+  ).bind(...valeurs).all();
+  const anneeCible = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+  return c.json(rows.results.map((r) => prixPublic(r, anneeCible, taux)));
+});
+
+// Ce que la banque sait dire aujourd'hui, par code Uniformat et par unité.
+// Les prix négociés sont écartés par défaut : un prix de portefeuille n'est pas
+// la juste valeur marchande qu'une étude doit retenir. On les compte quand même,
+// pour que la firme voie ce qui a été mis de côté.
+prix.get("/resume", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const inclureNegocies = c.req.query("negocie") === "inclus";
+  const rows = await c.env.DB.prepare(
+    "SELECT * FROM price_observations WHERE company_id = ?1"
+  ).bind(user.company_id).all();
+
+  const anneeCible = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+  const groupes = /* @__PURE__ */ new Map();
+  let total = 0, valides = 0, negociesEcartes = 0, sansPrix = 0;
+
+  for (const row of rows.results) {
+    total += 1;
+    if (row.valide !== 1) continue;
+    valides += 1;
+    if (row.negocie === 1 && !inclureNegocies) { negociesEcartes += 1; continue; }
+    const indexe = prixIndexe(prixUnitaire(row), row.annee, anneeCible, taux);
+    if (indexe == null) { sansPrix += 1; continue; }
+    const cle = `${row.uniformat_code ?? row.cat ?? "—"}|${row.unite}`;
+    if (!groupes.has(cle)) {
+      groupes.set(cle, {
+        cle,
+        uniformat_code: row.uniformat_code ?? null,
+        cat: row.cat ?? null,
+        unite: row.unite,
+        unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite,
+        exemple: row.description,
+        prix: [],
+        annees: []
+      });
+    }
+    const g = groupes.get(cle);
+    g.prix.push(indexe);
+    g.annees.push(row.annee);
+  }
+
+  const lignes = [...groupes.values()].map((g) => {
+    const triees = g.prix.slice().sort((a, b) => a - b);
+    return {
+      cle: g.cle,
+      uniformat_code: g.uniformat_code,
+      cat: g.cat,
+      unite: g.unite,
+      unite_label: g.unite_label,
+      exemple: g.exemple,
+      n: triees.length,
+      mince: triees.length < PRIX_ECHANTILLON_MINCE,
+      mediane: quantile(triees, 0.5),
+      p25: quantile(triees, 0.25),
+      p75: quantile(triees, 0.75),
+      annee_min: Math.min(...g.annees),
+      annee_max: Math.max(...g.annees)
+    };
+  }).sort((a, b) => b.n - a.n);
+
+  return c.json({
+    total,
+    valides,
+    a_valider: total - valides,
+    negocies_ecartes: negociesEcartes,
+    sans_prix_unitaire: sansPrix,
+    annee_reference: anneeCible,
+    taux_indexation: taux,
+    source_indexation: RESERVE_FUND_PARAMS.inflationSource,
+    echantillon_mince: PRIX_ECHANTILLON_MINCE,
+    lignes
+  });
+});
+
+prix.post("/", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const { erreur, valeurs } = lirePrixBody(await c.req.json());
+  if (erreur) return c.json({ error: erreur }, 400);
+  if (quantiteManquante(valeurs.unite, valeurs.quantite)) {
+    return c.json({ error: "quantité requise pour cette unité" }, 400);
+  }
+
+  // Le dossier donne le contexte du bâtiment — un prix au pi² de toiture ne se
+  // compare qu'entre immeubles comparables. On en fige une copie : le dossier
+  // peut changer, la facture, elle, a été payée dans ce contexte-là.
+  let contexte = null;
+  if (valeurs.dossier_id) {
+    const dossier = await c.env.DB.prepare(
+      "SELECT * FROM dossiers WHERE id = ?1 AND company_id = ?2"
+    ).bind(valeurs.dossier_id, user.company_id).first();
+    if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+    contexte = JSON.stringify({
+      units: dossier.units ?? null,
+      floors: dossier.floors ?? null,
+      built_year: dossier.built_year ?? null,
+      city: dossier.city ?? null
+    });
+    if (!valeurs.ville) valeurs.ville = dossier.city ?? null;
+  }
+
+  const id = newId("prx");
+  await c.env.DB.prepare(
+    `INSERT INTO price_observations
+       (id, company_id, dossier_id, cat, uniformat_code, description, fournisseur, annee,
+        montant, quantite, unite, portee, source, negocie, ville, contexte, source_ref, note,
+        valide, created_by)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)`
+  ).bind(
+    id, user.company_id, valeurs.dossier_id ?? null, valeurs.cat ?? null, valeurs.uniformat_code ?? null,
+    valeurs.description, valeurs.fournisseur ?? null, valeurs.annee, valeurs.montant,
+    valeurs.quantite ?? null, valeurs.unite, valeurs.portee ?? null, valeurs.source,
+    valeurs.negocie ?? 0, valeurs.ville ?? null, contexte, valeurs.source_ref ?? null,
+    valeurs.note ?? null, valeurs.valide ?? 0, user.id
+  ).run();
+
+  const row = await c.env.DB.prepare("SELECT * FROM price_observations WHERE id = ?1").bind(id).first();
+  return c.json(prixPublic(row, anneeCourante(), RESERVE_FUND_PARAMS.inflationRate), 201);
+});
+
+// Correction d'une ligne, et validation : c'est ce geste-là qui la fait entrer
+// dans la banque.
+prix.patch("/:id", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const id = c.req.param("id");
+  const existante = await c.env.DB.prepare(
+    "SELECT * FROM price_observations WHERE id = ?1 AND company_id = ?2"
+  ).bind(id, user.company_id).first();
+  if (!existante) return c.json({ error: "ligne introuvable" }, 404);
+
+  const { erreur, valeurs } = lirePrixBody(await c.req.json(), { partiel: true });
+  if (erreur) return c.json({ error: erreur }, 400);
+  const cles = Object.keys(valeurs);
+  if (cles.length === 0) return c.json({ error: "aucun champ à mettre à jour" }, 400);
+
+  const fusionnee = { ...existante, ...valeurs };
+  if (quantiteManquante(fusionnee.unite, fusionnee.quantite)) {
+    return c.json({ error: "quantité requise pour cette unité" }, 400);
+  }
+  if (valeurs.dossier_id) {
+    const dossier = await c.env.DB.prepare(
+      "SELECT id FROM dossiers WHERE id = ?1 AND company_id = ?2"
+    ).bind(valeurs.dossier_id, user.company_id).first();
+    if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  }
+
+  const bind = cles.map((cle, i) => `${cle} = ?${i + 1}`);
+  const args = cles.map((cle) => valeurs[cle]);
+  args.push(id);
+  await c.env.DB.prepare(
+    `UPDATE price_observations SET ${bind.join(", ")},
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?${args.length}`
+  ).bind(...args).run();
+
+  const row = await c.env.DB.prepare("SELECT * FROM price_observations WHERE id = ?1").bind(id).first();
+  return c.json(prixPublic(row, anneeCourante(), RESERVE_FUND_PARAMS.inflationRate));
+});
+
+prix.delete("/:id", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const res = await c.env.DB.prepare(
+    "DELETE FROM price_observations WHERE id = ?1 AND company_id = ?2"
+  ).bind(c.req.param("id"), user.company_id).run();
+  if (!res.meta?.changes) return c.json({ error: "ligne introuvable" }, 404);
+  return c.json({ ok: true });
+});
+
 globalThis.process = _process;
 globalThis.console = workerdConsole;
 const app = new Hono();
@@ -44170,6 +44493,7 @@ app.route("/api/companies", companies);
 app.route("/api/dossiers", dossiers);
 app.route("/api/components", components);
 app.route("/api/photos", photos);
+app.route("/api/prix", prix);
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 const index = {
   fetch: app.fetch

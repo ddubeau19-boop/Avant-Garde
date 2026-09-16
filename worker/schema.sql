@@ -133,3 +133,44 @@ CREATE TABLE redactions (
 
 CREATE INDEX idx_redactions_banque    ON redactions(company_id, valide, uniformat_code);
 CREATE INDEX idx_redactions_component ON redactions(component_id);
+
+-- Banque de prix : une ligne par travail réellement facturé (ou soumissionné),
+-- ramené à un prix unitaire. Cloisonnée par entreprise comme la banque de
+-- rédactions — les prix qu'une firme a payés ne nourrissent jamais les études
+-- d'une autre.
+--
+-- On conserve le montant et la quantité plutôt que le seul prix unitaire : le
+-- chiffre reste remontable à la facture, et une quantité corrigée corrige le
+-- prix sans qu'on ait à ressaisir la ligne. « montant » est le coût des travaux
+-- seuls — taxes, honoraires, permis et contingence retirés à la saisie, sans
+-- quoi on comparerait des portées différentes.
+--
+-- Seules les lignes valide = 1 servent de référence : une extraction non relue
+-- ferait entrer dans la banque des quantités devinées.
+CREATE TABLE price_observations (
+  id             TEXT PRIMARY KEY,
+  company_id     TEXT NOT NULL REFERENCES companies(id),
+  dossier_id     TEXT REFERENCES dossiers(id) ON DELETE SET NULL,
+  cat            TEXT,      -- clé de CATEGORIES, comme components.cat
+  uniformat_code TEXT,
+  description    TEXT NOT NULL,
+  fournisseur    TEXT,
+  annee          INTEGER NOT NULL,   -- année des travaux : sert à indexer le prix
+  montant        REAL NOT NULL,      -- $ des travaux seuls, avant taxes et honoraires
+  quantite       REAL,               -- nulle pour un forfait
+  unite          TEXT NOT NULL,      -- pi2 | pi_lin | unite | forfait
+  portee         TEXT,               -- complet | partiel | reparation
+  source         TEXT NOT NULL DEFAULT 'facture',  -- facture | soumission
+  negocie        INTEGER NOT NULL DEFAULT 0,  -- prix de portefeuille, pas un prix de marché
+  ville          TEXT,
+  contexte       TEXT,      -- JSON : unités, étages, année de construction du bâtiment
+  source_ref     TEXT,      -- no de facture ou renvoi à la pièce
+  note           TEXT,      -- ce qui a été retiré du montant, particularités d'accès
+  valide         INTEGER NOT NULL DEFAULT 0,
+  created_by     TEXT REFERENCES users(id),
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX idx_prix_banque  ON price_observations(company_id, valide, uniformat_code);
+CREATE INDEX idx_prix_dossier ON price_observations(dossier_id);

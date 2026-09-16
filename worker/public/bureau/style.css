@@ -599,3 +599,40 @@ button { font-family: inherit; }
 .exec-cell.right { text-align: right; }
 .exec-cell.mono { font-family: var(--font-mono); }
 .exec-row.negative .exec-cell.mono.right:last-child { color: var(--accent-press); font-weight: 700; }
+
+/* banque de prix */
+.prix-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 18px; }
+.prix-stat { border: 1px solid var(--ink-200); border-radius: 14px; padding: 14px 16px; background: #fff; }
+.prix-stat-k { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-400); }
+.prix-stat-v { font-family: var(--font-display); font-size: 26px; font-weight: 800; color: var(--ink); line-height: 1.2; }
+.prix-table { border: 1px solid var(--ink-200); border-radius: 14px; overflow: hidden; margin-bottom: 8px; }
+.prix-resume-row { display: grid; grid-template-columns: 1.1fr 2fr .7fr 1.1fr 1.2fr .8fr; border-top: 1px solid var(--line-soft); align-items: center; }
+.prix-obs-row { display: grid; grid-template-columns: 2.4fr .6fr .9fr 1fr 1.2fr 1.3fr 1.1fr; border-top: 1px solid var(--line-soft); align-items: center; }
+.prix-table > div:first-child { border-top: none; }
+.prix-head { background: var(--ink); color: #fff; position: sticky; top: 0; }
+.prix-head .prix-cell { font-family: var(--font-mono); font-size: 10px; letter-spacing: .04em; text-transform: uppercase; }
+.prix-cell { padding: 10px 12px; font-size: 12.5px; min-width: 0; }
+.prix-cell.right { text-align: right; }
+.prix-cell.mono { font-family: var(--font-mono); }
+.prix-obs-row.valide { background: var(--green-wash); }
+.prix-name { font-weight: 600; color: var(--ink-800); }
+.prix-sub-line { font-size: 11px; color: var(--ink-500); margin-top: 2px; }
+.prix-sub { font-family: var(--font-body); font-size: 10.5px; color: var(--ink-500); margin-left: 4px; }
+.prix-warn { display: inline-block; margin-left: 6px; font-family: var(--font-body); font-size: 10px; color: var(--accent-press); cursor: help; }
+.prix-pill { display: inline-block; border: 1px solid var(--ink-200); border-radius: 999px; padding: 2px 8px; font-size: 10.5px; color: var(--ink-600); margin: 1px 3px 1px 0; white-space: nowrap; }
+.prix-pill.neg { border-color: var(--orange); color: var(--accent-press); background: var(--orange-wash); }
+.prix-actions { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
+.prix-actions .icon-btn { width: 30px; height: 30px; }
+.prix-actions .icon-btn i { width: 14px; height: 14px; }
+.prix-form { border: 1px solid var(--ink-200); border-radius: 14px; padding: 18px; background: var(--ink-050); display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+.prix-field { min-width: 0; }
+.prix-field.large { grid-column: 1 / -1; }
+.prix-field .field-label { display: block; margin-bottom: 5px; }
+.prix-hint { font-size: 10.5px; color: var(--ink-500); margin-top: 4px; line-height: 1.4; }
+.prix-form-foot { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.prix-check { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-600); cursor: pointer; }
+.prix-check input { accent-color: var(--orange); width: 15px; height: 15px; }
+@media (max-width: 1100px) {
+  .prix-form { grid-template-columns: repeat(2, 1fr); }
+  .prix-stats { grid-template-columns: repeat(2, 1fr); }
+}
