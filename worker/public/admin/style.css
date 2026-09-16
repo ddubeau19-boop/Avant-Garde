@@ -166,7 +166,10 @@ code { font-family: var(--font-mono); }
   font-size: 13px; color: var(--ink-500); background: var(--ink-100);
 }
 
-.eng-row { grid-template-columns: 1.4fr 1.5fr .7fr 1fr .9fr; }
+.eng-row { grid-template-columns: 1.3fr 1.4fr .6fr .9fr .8fr 1.3fr; }
+.eng-row.eng-inactif { opacity: .55; }
+.eng-actions { display: flex; gap: 6px; justify-content: flex-end; align-items: center; flex-wrap: wrap; }
+.eng-note { font-size: 11px; color: var(--ink-400); font-style: italic; }
 
 /* ---------- company detail ---------- */
 .co-detail-head { display: flex; align-items: center; gap: 24px; margin-bottom: 26px; flex-wrap: wrap; }

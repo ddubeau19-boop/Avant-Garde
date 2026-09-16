@@ -27,7 +27,11 @@ CREATE TABLE users (
   -- Bloc de signature, repris tel quel à la section 8.0 Déclaration du rapport.
   title               TEXT,  -- ex. « ing., M.Sc.A. », « T.P. »
   ordre_professionnel TEXT,  -- ex. « OIQ », « OTPQ », « OAQ »
-  no_membre           TEXT
+  no_membre           TEXT,
+  -- Départ de la firme : l'accès est coupé sans supprimer le compte, sinon les
+  -- dossiers qu'il a créés perdraient leur auteur. Un compte désactivé ne peut
+  -- plus ouvrir de session, et ses jetons encore valides cessent d'être acceptés.
+  disabled_at         TEXT
 );
 
 CREATE TABLE dossiers (

@@ -65,6 +65,8 @@ const state = {
   newEngError: null,
 
   tempPasswordInfo: null, // { name, email, tempPassword }
+  engBusyId: null,        // compte en cours de réinitialisation ou de bascule
+  engError: null,
 };
 
 // ---------------------------------------------------------------
@@ -517,6 +519,54 @@ function openNewEngineer() {
   state.newEngError = null;
   render();
 }
+// Le mot de passe régénéré s'affiche une seule fois, comme à la création :
+// personne ne peut le relire ensuite, pas même l'administrateur.
+async function reinitialiserMotDePasse(userId, nom) {
+  if (state.engBusyId) return;
+  if (!window.confirm(`Réinitialiser le mot de passe de ${nom || 'ce compte'} ? L'ancien cessera immédiatement de fonctionner.`)) return;
+  state.engBusyId = userId;
+  state.engError = null;
+  render();
+  try {
+    const res = await apiJson(`/api/companies/${state.companyId}/engineers/${userId}/password`, { method: 'POST' });
+    state.engBusyId = null;
+    state.tempPasswordInfo = {
+      name: (res.user && res.user.name) || nom,
+      email: (res.user && res.user.email) || '',
+      tempPassword: res.tempPassword,
+    };
+    render();
+  } catch (e) {
+    state.engBusyId = null;
+    state.engError = e.message || 'Impossible de réinitialiser le mot de passe.';
+    render();
+  }
+}
+
+async function basculerAcces(userId, nom, actif) {
+  if (state.engBusyId) return;
+  const retirer = actif;
+  const question = retirer
+    ? `Retirer l'accès de ${nom || 'ce compte'} ? Ses sessions ouvertes cesseront de fonctionner immédiatement. Le compte est conservé et reste l'auteur de ses dossiers.`
+    : `Rétablir l'accès de ${nom || 'ce compte'} ?`;
+  if (!window.confirm(question)) return;
+  state.engBusyId = userId;
+  state.engError = null;
+  render();
+  try {
+    await apiJson(`/api/companies/${state.companyId}/engineers/${userId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ disabled: retirer }),
+    });
+    state.engBusyId = null;
+    await loadCompanyDetail(state.companyId);
+  } catch (e) {
+    state.engBusyId = null;
+    state.engError = e.message || "Impossible de modifier l'accès.";
+    render();
+  }
+}
+
 function cancelNewEngineer() {
   state.newEngineerOpen = false;
   state.newEngError = null;
@@ -780,17 +830,26 @@ function renderCompanyDetail() {
     </form>` : ''}
 
     <div class="dossiers-table">
-      <div class="dt-row eng-row dt-head"><div>Nom</div><div>Courriel</div><div>Rôle</div><div>Signature</div><div>Créé le</div></div>
-      ${engineers.length === 0 ? `<div class="empty-state">Aucun ingénieur pour cette entreprise.</div>` : engineers.map(e => `
-      <div class="dt-row eng-row">
-        <div class="dt-name">${escapeHtml(e.name || '—')}</div>
+      <div class="dt-row eng-row dt-head"><div>Nom</div><div>Courriel</div><div>Rôle</div><div>Signature</div><div>Créé le</div><div></div></div>
+      ${engineers.length === 0 ? `<div class="empty-state">Aucun ingénieur pour cette entreprise.</div>` : engineers.map(e => {
+        const inactif = !!e.disabled_at;
+        const soiMeme = state.user && state.user.id === e.id;
+        return `
+      <div class="dt-row eng-row ${inactif ? 'eng-inactif' : ''}">
+        <div class="dt-name">${escapeHtml(e.name || '—')}${inactif ? ' <span class="status-badge" style="background:var(--ink-100);color:var(--ink-500)">Accès retiré</span>' : ''}</div>
         <div class="mono-cell">${escapeHtml(e.email || '—')}</div>
         <div><span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">${e.role === 'super_admin' ? 'Admin' : 'Ingénieur'}</span></div>
         <div>${e.ordre_professionnel && e.no_membre
           ? `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">${escapeHtml(e.ordre_professionnel)} ${escapeHtml(e.no_membre)}</span>`
           : `<span class="status-badge" title="La section 8.0 du rapport sortira avec « à compléter avant signature »." style="background:#FFF1EC;color:#B03A1A">Bloc incomplet</span>`}</div>
         <div class="mono-cell">${fmtDate(e.created_at)}</div>
-      </div>`).join('')}
+        <div class="eng-actions">
+          <button class="btn-row-action" data-action="reinit-mdp" data-id="${e.id}" data-nom="${escapeHtml(e.name || '')}" ${state.engBusyId === e.id ? 'disabled' : ''}>Réinitialiser</button>
+          ${soiMeme
+            ? `<span class="eng-note" title="Se désactiver soi-même fermerait la porte de l'extérieur.">votre compte</span>`
+            : `<button class="btn-row-action" data-action="basculer-acces" data-id="${e.id}" data-nom="${escapeHtml(e.name || '')}" data-actif="${inactif ? '0' : '1'}" ${state.engBusyId === e.id ? 'disabled' : ''}>${inactif ? 'Rétablir' : "Retirer l'accès"}</button>`}
+        </div>
+      </div>`; }).join('')}
     </div>
 
     ${templateCardHtml()}
@@ -932,6 +991,12 @@ function initEvents() {
     switch (action) {
       case 'logout':
         doLogout();
+        break;
+      case 'reinit-mdp':
+        reinitialiserMotDePasse(btn.getAttribute('data-id'), btn.getAttribute('data-nom'));
+        break;
+      case 'basculer-acces':
+        basculerAcces(btn.getAttribute('data-id'), btn.getAttribute('data-nom'), btn.getAttribute('data-actif') === '1');
         break;
       case 'template-toggle': {
         const cle = btn.getAttribute('data-cle');

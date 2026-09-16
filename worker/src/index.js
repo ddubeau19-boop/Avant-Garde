@@ -2913,6 +2913,9 @@ auth.post("/login", async (c) => {
   if (!user) return c.json({ error: "identifiants invalides" }, 401);
   const ok = await verifyPassword(password, user.password_hash, user.password_salt);
   if (!ok) return c.json({ error: "identifiants invalides" }, 401);
+  // Même message que pour un mauvais mot de passe : un compte désactivé ne doit
+  // pas se distinguer d'un compte inexistant.
+  if (user.disabled_at) return c.json({ error: "identifiants invalides" }, 401);
   const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
   return c.json({ token, user: await publicUser(c.env.DB, user) });
 });
@@ -2928,7 +2931,10 @@ async function getCurrentUser(c) {
   const userId = await verifySessionToken(token, c.env.SESSION_SECRET);
   if (!userId) return null;
   const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(userId).first();
-  return user ?? null;
+  // La désactivation vaut aussi pour les jetons déjà émis : sans cette
+  // vérification, un départ resterait connecté jusqu'à l'expiration, 30 jours.
+  if (!user || user.disabled_at) return null;
+  return user;
 }
 function requireSuperAdmin(c, user) {
   if (!user || user.role !== "super_admin") {
@@ -3987,6 +3993,20 @@ components.patch("/:id", async (c) => {
   const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
   return c.json(component);
 });
+// Retirer une composante que le modèle a inventée, ou qui n'existe pas dans cet
+// immeuble. Les photos suivent par cascade ; la rédaction aussi.
+components.delete("/:id", async (c) => {
+  const id = c.req.param("id");
+  const owned = await getOwnedComponent(c, id);
+  if (!owned) return c.json({ error: "composante introuvable" }, 404);
+  const photos2 = await c.env.DB.prepare("SELECT r2_key FROM photos WHERE component_id = ?1").bind(id).all();
+  await c.env.DB.prepare("DELETE FROM components WHERE id = ?1").bind(id).run();
+  // La cascade nettoie la base ; les objets R2, eux, resteraient à payer.
+  for (const photo of photos2.results) {
+    try { await c.env.PHOTOS.delete(photo.r2_key); } catch { /* l'objet a déjà disparu */ }
+  }
+  return c.json({ ok: true });
+});
 components.post("/:id/analyze", async (c) => {
   const component = await getOwnedComponent(c, c.req.param("id"));
   if (!component) return c.json({ error: "composante introuvable" }, 404);
@@ -4169,20 +4189,37 @@ const RESERVE_FUND_SCENARIOS = [
     approximationNote: "Paliers annuels dérivés par équivalence géométrique avec la rampe 5 ans (mêmes hypothèses de source de données que ci-dessus) — le classeur original de Condo Stratégis n'était pas disponible pour confirmer ses paliers exacts. À valider par la firme."
   }
 ];
-function replacementEventsForComponent(c, params) {
+// Règle maison : l'année anticipée de remplacement est ancrée sur l'année de
+// construction ou de dernière réparation, plus la durée de vie utile. Un
+// remplacement déjà échu est reporté en première année de l'horizon.
+//
+// À défaut d'année d'installation, on prend la vie résiduelle si elle a été
+// saisie, puis l'année de construction de l'immeuble — la même chaîne que
+// ligneDureeVie, qui écrit l'Annexe A. Sans cet alignement, les deux annexes du
+// même rapport affichaient des années différentes pour la composante.
+//
+// Quand rien n'est connu, la composante n'est pas planifiée : renvoyer null la
+// fait exclure avec un motif. L'ancienne valeur de repli plaçait le
+// remplacement en année 1, ce qui faisait porter tout son coût au fonds dès la
+// première année et gonflait la cotisation exigée sans que rien ne le signale.
+function premiereAnneeRemplacement(c, dossier, usefulLife, currentYear) {
+  const anneeInstall = anneeMaison(c?.install_year);
+  if (anneeInstall != null) return Math.max(1, anneeInstall + usefulLife - currentYear);
+  const residuel = Number(c?.residual);
+  if (Number.isFinite(residuel) && residuel > 0) {
+    return Math.max(1, Math.round(usefulLife * (residuel / 100)));
+  }
+  const info = infoBatiment(dossier);
+  const anneeImmeuble = anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier?.built_year);
+  if (anneeImmeuble != null) return Math.max(1, anneeImmeuble + usefulLife - currentYear);
+  return null;
+}
+function replacementEventsForComponent(c, params, dossier) {
   const usefulLife = c.useful_life_years ?? DEFAULT_USEFUL_LIFE_YEARS[c.cat] ?? null;
   if (!c.replacement_cost || !usefulLife || usefulLife <= 0) return { events: [], futureEventYear31: null };
-  // Règle maison : l'année anticipée de remplacement est ancrée sur l'année de construction
-  // ou de dernière réparation, plus la durée de vie utile. Un remplacement déjà échu est
-  // reporté en première année de l'horizon.
   const currentYear = (/* @__PURE__ */ new Date()).getFullYear();
-  let firstReplacementYear;
-  if (c.install_year) {
-    firstReplacementYear = Math.max(1, c.install_year + usefulLife - currentYear);
-  } else {
-    const residualPct = (c.residual ?? 0) / 100;
-    firstReplacementYear = Math.max(1, Math.round(usefulLife * residualPct));
-  }
+  const firstReplacementYear = premiereAnneeRemplacement(c, dossier, usefulLife, currentYear);
+  if (firstReplacementYear == null) return { events: [], futureEventYear31: null };
   const events = [];
   let futureEventYear31 = null;
   const horizonPlusOne = params.projectionYears + 1;
@@ -4242,6 +4279,7 @@ function buildScenario(def, baseCotisation, deboursParAn, startBalance, params, 
   };
 }
 function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
+  const currentYear = (/* @__PURE__ */ new Date()).getFullYear();
   const included = [];
   const excluded = [];
   for (const c of components2) {
@@ -4258,6 +4296,16 @@ function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
       excluded.push({ id: c.id, name: c.name, reason: "durée de vie utile inconnue" });
       continue;
     }
+    // Sans année de référence, l'année de remplacement serait inventée. Mieux
+    // vaut que la composante paraisse aux exclusions, où l'ingénieur la verra.
+    if (premiereAnneeRemplacement(c, opts.dossier, usefulLife, currentYear) == null) {
+      excluded.push({
+        id: c.id,
+        name: c.name,
+        reason: "année de remplacement indéterminable — ni année d'installation, ni vie résiduelle, ni année de construction de l'immeuble"
+      });
+      continue;
+    }
     included.push(c);
   }
   const deboursParAn = new Array(params.projectionYears).fill(0);
@@ -4265,7 +4313,7 @@ function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
   const portionFutureDetail = [];
   for (const c of included) {
     totalDeboursNominal += c.replacement_cost ?? 0;
-    const { events, futureEventYear31 } = replacementEventsForComponent(c, params);
+    const { events, futureEventYear31 } = replacementEventsForComponent(c, params, opts.dossier);
     for (const event of events) {
       deboursParAn[event.year - 1] += event.cost;
     }
@@ -23165,7 +23213,11 @@ async function generateReportDocx(ctx) {
   if (scenarioPrefere) {
     resultats.push(titre2(`Scénario de financement de préférence — ${scenarioPrefere.code} (${scenarioPrefere.label})`));
     resultats.push(body(`Le scénario de financement de préférence résume les besoins annuels de financement selon les exigences de la réglementation actuelle ainsi que les besoins ponctuels de remplacement des éléments du bâtiment. Nous suggérons en ${anneeCourante} une cotisation annuelle au fonds de prévoyance de ${montantMaison(cotisationAnUn) ?? "à confirmer"}${cotisationMensuelleParUnite != null ? ` (environ ${montantMaison(cotisationMensuelleParUnite) ?? "—"} par mois par copropriété)` : ""}. Ces investissements sont requis pour rencontrer les dépenses de réparations majeures et de remplacements prévues au cours des ${projection.params.projectionYears} prochaines années, ainsi que pour débuter le prochain cycle par la suite.`));
-    if (scenarioPrefere.approximationNote) resultats.push(body(scenarioPrefere.approximationNote, { color: GREY, size: 18 }));
+    // approximationNote reste délibérément hors du livrable : elle dit à la
+    // firme que ses propres paliers n'ont pas été confirmés contre le classeur
+    // d'origine. C'est une note de validation interne, pas une divulgation due
+    // au syndicat, et elle s'affiche à la console de révision où l'ingénieur la
+    // traite avant de publier.
     if (scenarioPrefere === scenarioStatuQuo && scenarioRecommande && scenarioRecommande !== scenarioStatuQuo) {
       resultats.push(body(`La cotisation actuelle satisfait déjà le double critère d'acceptation; le maintien est donc retenu comme scénario de préférence. Le scénario ${scenarioRecommande.code} — ${scenarioRecommande.label} demeure présenté au tableau comparatif à titre d'option de capitalisation accélérée, au choix du conseil d'administration.`, { color: GREY, size: 18 }));
     }
@@ -23314,7 +23366,6 @@ async function generateReportDocx(ctx) {
     body("Le calendrier ci-dessous présente, année par année, les débours prévus, la cotisation et le solde du fonds pour chacun des scénarios simulés. Le scénario de préférence est celui retenu à la section 5.0."),
     ...projection.scenarios.flatMap((s) => [
       titre2(`${s.code} — ${s.label}${scenarioPrefere && s.code === scenarioPrefere.code ? " (scénario de préférence)" : ""}`),
-      ...s.approximationNote ? [body(s.approximationNote, { color: GREY, size: 18 })] : [],
       tableauMaison(
         ["Année", "Augmentation", "Débours prévus", "Cotisation", "Solde du fonds (fin d'année)"],
         s.years.map((y) => [
@@ -43922,9 +43973,59 @@ companies.get("/:id/engineers", async (c) => {
   const deny = requireSuperAdmin(c, user);
   if (deny) return deny;
   const rows = await c.env.DB.prepare(
-    "SELECT id, name, email, role, title, ordre_professionnel, no_membre, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC"
+    "SELECT id, name, email, role, title, ordre_professionnel, no_membre, created_at, disabled_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC"
   ).bind(c.req.param("id")).all();
   return c.json(rows.results);
+});
+
+// Un compte de l'entreprise visée, jamais d'une autre : le paramètre d'URL ne
+// suffit pas à désigner qui l'on modifie.
+async function membreDeLEntreprise(db, companyId, userId) {
+  return await db.prepare(
+    "SELECT * FROM users WHERE id = ?1 AND company_id = ?2"
+  ).bind(userId, companyId).first();
+}
+
+// Aucun courriel n'est envoyé par l'application et il n'existe pas de
+// récupération en libre-service : sans cette route, un mot de passe perdu se
+// réglait par une intervention directe en base de données.
+companies.post("/:id/engineers/:userId/password", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const membre = await membreDeLEntreprise(c.env.DB, c.req.param("id"), c.req.param("userId"));
+  if (!membre) return c.json({ error: "compte introuvable" }, 404);
+  const tempPassword = generateTempPassword();
+  const { hash, salt } = await hashPassword(tempPassword);
+  await c.env.DB.prepare(
+    "UPDATE users SET password_hash = ?1, password_salt = ?2 WHERE id = ?3"
+  ).bind(hash, salt, membre.id).run();
+  return c.json({ user: { id: membre.id, name: membre.name, email: membre.email }, tempPassword });
+});
+
+// Départ de la firme. On désactive plutôt que de supprimer : le compte reste
+// l'auteur des dossiers qu'il a créés.
+companies.patch("/:id/engineers/:userId", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const membre = await membreDeLEntreprise(c.env.DB, c.req.param("id"), c.req.param("userId"));
+  if (!membre) return c.json({ error: "compte introuvable" }, 404);
+  const body2 = await c.req.json();
+  if (!("disabled" in body2)) return c.json({ error: "champ 'disabled' requis" }, 400);
+  const desactiver = !!body2.disabled;
+  // Se désactiver soi-même fermerait la porte de l'extérieur : plus personne
+  // pour rouvrir, puisque seul un super_admin le peut.
+  if (desactiver && membre.id === user.id) {
+    return c.json({ error: "impossible de désactiver son propre compte" }, 400);
+  }
+  await c.env.DB.prepare(
+    `UPDATE users SET disabled_at = ${desactiver ? "strftime('%Y-%m-%dT%H:%M:%fZ','now')" : "NULL"} WHERE id = ?1`
+  ).bind(membre.id).run();
+  const maj = await c.env.DB.prepare(
+    "SELECT id, name, email, role, disabled_at FROM users WHERE id = ?1"
+  ).bind(membre.id).first();
+  return c.json(maj);
 });
 companies.post("/:id/engineers", async (c) => {
   const user = await getCurrentUser(c);
@@ -44046,6 +44147,38 @@ dossiers.get("/:id/components", async (c) => {
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
 });
+
+// L'inventaire de départ vient d'un seul appel au modèle, à la création du
+// dossier. Il passe forcément à côté de ce qui fait la particularité d'un
+// immeuble. Sans cette route, une composante oubliée par le modèle ne pouvait
+// plus entrer dans l'étude — et une composante inventée ne pouvait plus en
+// sortir.
+dossiers.post("/:id/components", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json();
+  const name = String(body2.name ?? "").trim();
+  if (!name) return c.json({ error: "nom de la composante requis" }, 400);
+  const cat = CATEGORIES[body2.cat] ? body2.cat : "equipements";
+  const dernier = await c.env.DB.prepare(
+    "SELECT MAX(sort_order) AS rang FROM components WHERE dossier_id = ?1"
+  ).bind(dossier.id).first();
+  const id = newId("cmp");
+  await c.env.DB.prepare(
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code, install_year, note)
+     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10)`
+  ).bind(
+    id, dossier.id, cat, name,
+    body2.qty ?? "—",
+    (dernier?.rang ?? -1) + 1,
+    body2.useful_life_years ?? DEFAULT_USEFUL_LIFE_YEARS[cat] ?? ALLOCATION_USEFUL_LIFE,
+    body2.uniformat_code ?? null,
+    body2.install_year ?? null,
+    body2.note ?? null
+  ).run();
+  const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
+  return c.json({ ...component, photos: 0 }, 201);
+});
 async function buildReportContext(c) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return null;
@@ -44054,7 +44187,8 @@ async function buildReportContext(c) {
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
-    units: dossier.units
+    units: dossier.units,
+    dossier
   });
   return {
     dossier,
@@ -44075,7 +44209,8 @@ dossiers.get("/:id/projection", async (c) => {
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
-    units: dossier.units
+    units: dossier.units,
+    dossier
   });
   return c.json(projection);
 });

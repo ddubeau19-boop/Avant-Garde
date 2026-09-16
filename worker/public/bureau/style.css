@@ -645,3 +645,17 @@ button { font-family: inherit; }
 .prix-pieces > div { display: flex; gap: 12px; font-size: 11px; color: var(--ink-600); }
 .prix-pieces > div > span:first-child { flex: 1; }
 .prix-pieces .mono { font-family: var(--font-mono); }
+
+/* création de dossier, ajout et retrait de composante */
+.page-title-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.btn-danger {
+  border: 1.5px solid var(--accent-press); background: #fff; color: var(--accent-press); border-radius: 999px;
+  padding: 8px 16px; font-family: var(--font-body); font-size: 12px; font-weight: 600; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 7px;
+}
+.btn-danger:hover { background: var(--orange-wash); }
+.btn-danger:disabled { opacity: .5; cursor: not-allowed; }
+.btn-danger i { width: 14px; height: 14px; }
+.comp-danger { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line-soft); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.comp-danger span { font-size: 11px; color: var(--ink-500); }
+.login-forgot { line-height: 1.5; }

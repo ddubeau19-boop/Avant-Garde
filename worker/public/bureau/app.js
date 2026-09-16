@@ -221,6 +221,17 @@ const state = {
   prixCrmSel: {},            // clé de candidat -> sélectionné
   prixCrmDetail: {},         // clé de candidat -> pièces dépliées
   prixCrmImporting: false,
+
+  compAddOpen: false,        // formulaire d'ajout d'une composante
+  compAdd: { name: '', cat: 'enveloppe', qty: '', useful_life_years: '', install_year: '' },
+  compAddSaving: false,
+  compAddError: null,
+  compBusyId: null,          // composante en cours de suppression
+
+  newDossierOpen: false,
+  newDossier: { dossier_no: '', name: '', address: '', city: '', units: '', floors: '', built_year: '' },
+  newDossierSaving: false,
+  newDossierError: null,
 };
 
 // ---------------------------------------------------------------
@@ -523,6 +534,97 @@ async function loadDossiers() {
   } catch (e) {
     state.dossiersLoading = false;
     state.dossiersError = e.message || 'Impossible de charger les dossiers.';
+    render();
+  }
+}
+
+// ---------------------------------------------------------------
+// Dossiers et composantes
+// ---------------------------------------------------------------
+async function creerDossier() {
+  if (state.newDossierSaving) return;
+  const f = state.newDossier;
+  if (!f.dossier_no.trim() || !f.name.trim()) {
+    state.newDossierError = 'Le numéro de dossier et le nom du syndicat sont requis.';
+    render();
+    return;
+  }
+  state.newDossierSaving = true;
+  state.newDossierError = null;
+  render();
+  try {
+    const cree = await apiJson('/api/dossiers', {
+      method: 'POST',
+      body: JSON.stringify({
+        dossier_no: f.dossier_no.trim(),
+        name: f.name.trim(),
+        address: f.address.trim() || null,
+        city: f.city.trim() || null,
+        units: parseNum(f.units) ?? 0,
+        floors: parseNum(f.floors),
+        built_year: parseYear(f.built_year),
+      }),
+    });
+    state.newDossierSaving = false;
+    state.newDossierOpen = false;
+    state.newDossier = { dossier_no: '', name: '', address: '', city: '', units: '', floors: '', built_year: '' };
+    await loadDossiers();
+    if (cree && cree.id) openDossier(cree.id);
+  } catch (e) {
+    state.newDossierSaving = false;
+    state.newDossierError = e.message || 'Impossible de créer le dossier.';
+    render();
+  }
+}
+
+async function ajouterComposante() {
+  if (state.compAddSaving) return;
+  const f = state.compAdd;
+  if (!f.name.trim()) {
+    state.compAddError = 'Le nom de la composante est requis.';
+    render();
+    return;
+  }
+  state.compAddSaving = true;
+  state.compAddError = null;
+  render();
+  try {
+    await apiJson(`/api/dossiers/${state.dossierId}/components`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: f.name.trim(),
+        cat: f.cat,
+        qty: f.qty.trim() || null,
+        useful_life_years: parseNum(f.useful_life_years),
+        install_year: parseYear(f.install_year),
+      }),
+    });
+    state.compAddSaving = false;
+    state.compAddOpen = false;
+    state.compAdd = { name: '', cat: 'enveloppe', qty: '', useful_life_years: '', install_year: '' };
+    await loadDossierDetail(state.dossierId);
+  } catch (e) {
+    state.compAddSaving = false;
+    state.compAddError = e.message || "Impossible d'ajouter la composante.";
+    render();
+  }
+}
+
+async function supprimerComposante(id) {
+  const comp = componentById(id);
+  const quoi = comp ? `« ${comp.name} »` : 'cette composante';
+  if (!window.confirm(`Retirer ${quoi} de l'étude ? Ses photos et son texte seront supprimés avec elle. Cette action est définitive.`)) return;
+  if (state.compBusyId) return;
+  state.compBusyId = id;
+  render();
+  try {
+    await apiJson(`/api/components/${id}`, { method: 'DELETE' });
+    state.compBusyId = null;
+    delete state.expanded[id];
+    await loadDossierDetail(state.dossierId);
+  } catch (e) {
+    state.compBusyId = null;
+    state.revisionFlashError = e.message || 'Impossible de retirer la composante.';
     render();
   }
 }
@@ -1151,7 +1253,7 @@ function renderLogin() {
         <label class="field-label" for="login-password">Mot de passe</label>
         <div class="field-box"><i data-lucide="lock"></i><input id="login-password" data-role="login-password" name="password" type="password" autocomplete="current-password" placeholder="Mot de passe" value="${escapeHtml(state.loginPassword || '')}" required></div>
         <button type="submit" class="btn-primary" style="width:100%" ${state.loginLoading ? 'disabled' : ''}>${state.loginLoading ? 'Connexion…' : 'Se connecter'}<i data-lucide="${state.loginLoading ? 'loader-2' : 'arrow-right'}" class="${state.loginLoading ? 'spin' : ''}"></i></button>
-        <div class="login-forgot">Mot de passe oublié ?</div>
+        <div class="login-forgot">Mot de passe oublié ? Demandez à votre administrateur de le réinitialiser — l'application n'envoie aucun courriel.</div>
       </form>
     </div>
   </div>`;
@@ -1213,9 +1315,13 @@ function renderDossiers() {
   return `
   <div class="page-pad">
     <div class="eyebrow-orange">Tableau de bord</div>
-    <h1 class="page-title">Dossiers</h1>
+    <div class="page-title-row">
+      <h1 class="page-title">Dossiers</h1>
+      <button class="btn-primary" data-action="nouveau-dossier"><i data-lucide="${state.newDossierOpen ? 'x' : 'plus'}"></i>${state.newDossierOpen ? 'Annuler' : 'Nouveau dossier'}</button>
+    </div>
     <p class="page-lead">Révisez les données du terrain, ajustez le fonds de prévoyance et générez les rapports.</p>
     ${state.dossiersError ? errorBanner(state.dossiersError, 'retry-dossiers') : ''}
+    ${state.newDossierOpen ? nouveauDossierFormHtml() : ''}
     <div class="filters-row">
       <button class="chip ${state.filter === 'review' ? 'active' : ''}" data-action="filter" data-filter="review">Prêts pour révision · ${reviewCount}</button>
       <button class="chip ${state.filter === 'field' ? 'active' : ''}" data-action="filter" data-filter="field">En cours sur le terrain · ${fieldCount}</button>
@@ -1508,6 +1614,57 @@ function prixFormHtml() {
   </form>`;
 }
 
+function champSimple(groupe, cle, label, opts) {
+  opts = opts || {};
+  const val = state[groupe][cle] == null ? '' : String(state[groupe][cle]);
+  const id = `${groupe}-${cle}`;
+  const champ = opts.options
+    ? `<select class="detail-input" id="${id}" data-role="champ-simple" data-groupe="${groupe}" data-cle="${cle}">
+         ${opts.options.map(o => `<option value="${escapeHtml(o.v)}" ${o.v === val ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}
+       </select>`
+    : `<input class="detail-input" type="text" id="${id}" data-role="champ-simple" data-groupe="${groupe}" data-cle="${cle}"
+         value="${escapeHtml(val)}" placeholder="${escapeHtml(opts.placeholder || '')}">`;
+  return `<div class="prix-field ${opts.large ? 'large' : ''}">
+    <label class="field-label" for="${id}">${escapeHtml(label)}</label>${champ}
+  </div>`;
+}
+
+// La liste de départ vient du modèle ; ce formulaire est ce qui permet de la
+// corriger quand elle passe à côté d'une composante réelle.
+function compAddFormHtml() {
+  return `
+  <form class="prix-form" id="comp-add-form" novalidate style="margin-bottom:16px">
+    ${state.compAddError ? `<div class="login-error" style="grid-column:1/-1">${escapeHtml(state.compAddError)}</div>` : ''}
+    ${champSimple('compAdd', 'name', 'Composante', { large: true, placeholder: 'ex. Ascenseur hydraulique — cabine et machinerie' })}
+    ${champSimple('compAdd', 'cat', 'Catégorie', { options: CAT_ORDER.map(k => ({ v: k, label: CATS[k].label })) })}
+    ${champSimple('compAdd', 'qty', 'Quantité', { placeholder: 'ex. 1, 4 200 pi²' })}
+    ${champSimple('compAdd', 'useful_life_years', 'Vie utile (ans)', { placeholder: 'ex. 25' })}
+    ${champSimple('compAdd', 'install_year', 'Année constr./rép.', { placeholder: 'ex. 1998' })}
+    <div class="prix-form-foot">
+      <span class="prix-hint">Sans année de construction ni vie résiduelle, la composante sera exclue de la projection plutôt que planifiée au hasard.</span>
+      <button type="submit" class="btn-primary" ${state.compAddSaving ? 'disabled' : ''}>${state.compAddSaving ? 'Ajout…' : 'Ajouter'}<i data-lucide="${state.compAddSaving ? 'loader-2' : 'check'}" class="${state.compAddSaving ? 'spin' : ''}"></i></button>
+    </div>
+  </form>`;
+}
+
+function nouveauDossierFormHtml() {
+  return `
+  <form class="prix-form" id="new-dossier-form" novalidate style="margin-bottom:20px">
+    ${state.newDossierError ? `<div class="login-error" style="grid-column:1/-1">${escapeHtml(state.newDossierError)}</div>` : ''}
+    ${champSimple('newDossier', 'dossier_no', 'Numéro de dossier', { placeholder: 'ex. FP-2026-001' })}
+    ${champSimple('newDossier', 'name', 'Syndicat', { placeholder: 'ex. Syndicat Les Érables' })}
+    ${champSimple('newDossier', 'address', 'Adresse', { placeholder: '12 rue de la Tannerie' })}
+    ${champSimple('newDossier', 'city', 'Ville', { placeholder: 'Longueuil' })}
+    ${champSimple('newDossier', 'units', 'Portes', { placeholder: 'ex. 48' })}
+    ${champSimple('newDossier', 'floors', 'Étages', { placeholder: 'ex. 4' })}
+    ${champSimple('newDossier', 'built_year', 'Année de construction', { placeholder: 'ex. 1998' })}
+    <div class="prix-form-foot">
+      <span class="prix-hint">L'inventaire de départ est proposé par le modèle à partir de ces caractéristiques ; il reste modifiable ensuite.</span>
+      <button type="submit" class="btn-primary" ${state.newDossierSaving ? 'disabled' : ''}>${state.newDossierSaving ? 'Création…' : 'Créer le dossier'}<i data-lucide="${state.newDossierSaving ? 'loader-2' : 'arrow-right'}" class="${state.newDossierSaving ? 'spin' : ''}"></i></button>
+    </div>
+  </form>`;
+}
+
 function saveIndicatorHtml() {
   if (state.saveStatus === 'saving') return `<span class="save-indicator saving"><i data-lucide="loader-2" class="spin" style="width:14px;height:14px"></i>Enregistrement…</span>`;
   if (state.saveStatus === 'error') return `<span class="save-indicator error"><i data-lucide="alert-circle" style="width:14px;height:14px"></i>Échec de l'enregistrement</span>`;
@@ -1725,6 +1882,12 @@ function compDetailHtml(c) {
             <button class="del" data-action="attr-del" data-id="${c.id}" data-key="${escapeHtml(k)}" title="Retirer ${escapeHtml(k)}" aria-label="Retirer ${escapeHtml(k)}"><i data-lucide="x" style="width:13px;height:13px"></i></button>
           </div>`).join('')}</div>` : `<div class="attr-empty">Aucun attribut consigné au terrain.</div>`}
       </div>
+      <div class="comp-danger">
+        <button class="btn-danger" data-action="comp-supprimer" data-id="${c.id}" ${state.compBusyId === c.id ? 'disabled' : ''}>
+          <i data-lucide="trash-2"></i>${state.compBusyId === c.id ? 'Suppression…' : 'Retirer cette composante'}
+        </button>
+        <span>Elle n'existe pas dans cet immeuble, ou le modèle l'a inventée.</span>
+      </div>
     </div>
   </div>`;
 }
@@ -1900,7 +2063,9 @@ function renderRevision() {
         <span class="lbl">Composantes · ${docCount}/${total} documentées</span>
         <div class="rule"></div>
         <span class="hint">Édition directe des cellules</span>
+        <button class="btn-secondary" data-action="comp-ajouter-ouvrir" style="padding:7px 14px;font-size:12px"><i data-lucide="plus"></i>Ajouter</button>
       </div>
+      ${state.compAddOpen ? compAddFormHtml() : ''}
 
       <div class="comp-table">
         <div class="comp-grid comp-thead">
@@ -2178,6 +2343,12 @@ function initEvents() {
     } else if (e.target && e.target.id === 'prix-form') {
       e.preventDefault();
       submitPrix();
+    } else if (e.target && e.target.id === 'comp-add-form') {
+      e.preventDefault();
+      ajouterComposante();
+    } else if (e.target && e.target.id === 'new-dossier-form') {
+      e.preventDefault();
+      creerDossier();
     }
   });
 
@@ -2189,6 +2360,9 @@ function initEvents() {
     if (!t || !t.matches) return;
     if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
+    else if (t.matches('[data-role="champ-simple"]')) {
+      state[t.getAttribute('data-groupe')][t.getAttribute('data-cle')] = t.value;
+    }
     else if (t.matches('[data-role="prix-field"]')) {
       const champ = t.getAttribute('data-field');
       state.prixForm[champ] = t.type === 'checkbox' ? t.checked : t.value;
@@ -2216,6 +2390,19 @@ function initEvents() {
         break;
       case 'retry-prix':
         loadPrix();
+        break;
+      case 'nouveau-dossier':
+        state.newDossierOpen = !state.newDossierOpen;
+        state.newDossierError = null;
+        render();
+        break;
+      case 'comp-ajouter-ouvrir':
+        state.compAddOpen = !state.compAddOpen;
+        state.compAddError = null;
+        render();
+        break;
+      case 'comp-supprimer':
+        supprimerComposante(btn.getAttribute('data-id'));
         break;
       case 'prix-toggle-form':
         if (state.prixFormOpen) { fermerPrixForm(); break; }
