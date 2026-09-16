@@ -1,0 +1,87 @@
+name: CI
+
+# Le CI ne peut pas empêcher un push : il tourne après coup. Ce qu'il fait,
+# c'est rendre un état cassé visible, et — une fois ces vérifications exigées
+# dans les règles de protection de la branche — refuser la fusion tant qu'elles
+# ne passent pas. C'est la protection de branche qui bloque, le CI qui juge.
+
+on:
+  pull_request:
+  push:
+    branches: ['**']
+
+# Deux poussées coup sur coup sur la même branche : la première vérification est
+# annulée, seule la plus récente compte. Évite que deux exécutions se répondent
+# dans le désordre et qu'un vieux « vert » vienne valider un état dépassé.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verification:
+    name: Vérification du worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # src/index.js est un bundle de 42 000 lignes fusionné à la main plus
+      # d'une fois. Un marqueur oublié est syntaxiquement invalide et partirait
+      # en production sans que personne ne le voie à la relecture.
+      - name: Aucun marqueur de conflit
+        run: |
+          if git grep -nE '^(<<<<<<< |=======$|>>>>>>> )' -- worker/; then
+            echo "::error::Marqueur de conflit laissé dans worker/ — fusion non terminée."
+            exit 1
+          fi
+          echo "Aucun marqueur de conflit."
+
+      - name: Syntaxe JavaScript
+        run: |
+          for f in worker/src/index.js worker/public/*/app.js; do
+            node --check "$f" && echo "ok  $f"
+          done
+
+      # Le vrai portail : wrangler assemble le worker exactement comme au
+      # déploiement. Aucun identifiant Cloudflare requis pour --dry-run, donc
+      # rien à confier au CI.
+      - name: Build du worker (dry-run)
+        working-directory: worker
+        run: npx --yes wrangler@4 deploy --dry-run --outdir /tmp/ci-build
+
+      # schema.sql est la seule définition de la base : s'il ne s'exécute plus,
+      # la base n'est plus reproductible et personne ne s'en aperçoit avant
+      # d'en avoir besoin.
+      - name: schema.sql reste exécutable
+        run: |
+          sqlite3 /tmp/ci-schema.db < worker/schema.sql
+          tables=$(sqlite3 /tmp/ci-schema.db "SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
+          echo "$tables tables créées."
+          [ "$tables" -ge 5 ]
+
+  # Filet visible tant que la protection de branche n'est pas activée côté GitHub :
+  # une poussée directe sur le tronc laisse une trace rouge au lieu de passer
+  # inaperçue. Ne bloque rien par lui-même — seules les règles de branche le font.
+  poussee-directe:
+    name: Poussée directe sur le tronc
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Signaler si le commit n'est pas une fusion de PR
+        run: |
+          parents=$(git rev-list --parents -n 1 HEAD | wc -w)
+          if [ "$parents" -ge 3 ]; then
+            echo "Commit de fusion — arrivé par une pull request."
+            exit 0
+          fi
+          echo "::warning::Commit poussé directement sur ${{ github.ref_name }} sans passer par une pull request."
+          echo "Activez la protection de branche pour que ce chemin soit fermé, pas seulement signalé."
