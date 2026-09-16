@@ -43937,9 +43937,39 @@ function generateReportXlsx(ctx) {
     ])
   ]);
   summarySheet["!cols"] = [{ wch: 38 }, { wch: 30 }, { wch: 20 }, { wch: 20 }, { wch: 20 }];
+
+  // Le « tableur suivi d'entretien » est promis en couverture du rapport, à la
+  // section 9 et au bas de chaque fiche d'élément — et n'était produit nulle
+  // part. Il l'est ici, à partir des mêmes blocs d'entretien que le .docx, pour
+  // que les deux documents ne puissent pas se contredire.
+  const entretienSheet = utils.aoa_to_sheet([
+    ["Suivi d'entretien", dossier.name ?? ""],
+    ["Les allocations d'entretien sont des enveloppes budgétaires récurrentes ; les remplacements sont des travaux ponctuels planifiés à l'année indiquée."],
+    [],
+    ["Catégorie", "Code", "Composante", "Type de ligne", "Cycle / durée de vie (ans)", "Année anticipée", "Montant ($)", "Entretien à prévoir"],
+    ...components2.map((c) => {
+      const ligne = ligneDureeVie(c, dossier);
+      return [
+        CATEGORIES[c.cat]?.label ?? c.cat,
+        c.uniformat_code ?? "",
+        c.name,
+        ligne.allocation ? "Allocation" : "Remplacement",
+        ligne.duree ?? "",
+        ligne.annee ?? "à confirmer",
+        c.replacement_cost ?? "",
+        sansNotesInternes(texteEntretien(c))
+      ];
+    })
+  ]);
+  entretienSheet["!cols"] = [
+    { wch: 26 }, { wch: 12 }, { wch: 34 }, { wch: 14 },
+    { wch: 22 }, { wch: 16 }, { wch: 14 }, { wch: 120 }
+  ];
+
   const wb = utils.book_new();
   utils.book_append_sheet(wb, summarySheet, "Sommaire");
   utils.book_append_sheet(wb, inventorySheet, "Inventaire");
+  utils.book_append_sheet(wb, entretienSheet, "Suivi d'entretien");
   for (const s of projection.scenarios) {
     const sheet = utils.aoa_to_sheet([
       [`${s.code} — ${s.label}`],
@@ -44573,6 +44603,13 @@ dossiers.patch("/:id", async (c) => {
   const { dossier: owned } = await getOwnedDossier(c, id);
   if (!owned) return c.json({ error: "dossier introuvable" }, 404);
   const body2 = await c.req.json();
+  // Publier, c'est arrêter l'étude. Tant que le PATCH restait ouvert, un solde
+  // ou une cotisation pouvait changer après coup sans que le rapport déjà remis
+  // au syndicat en sache rien — deux documents portant le même numéro de
+  // dossier et des chiffres différents. Seule la dépublication reste permise.
+  if (owned.published_at && !("published_at" in body2)) {
+    return c.json({ error: "ce dossier est publié : dépubliez-le avant de le modifier" }, 409);
+  }
   const fields = [];
   const values = [];
   for (const key of [
