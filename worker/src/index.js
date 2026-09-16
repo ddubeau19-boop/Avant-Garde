@@ -44701,10 +44701,31 @@ function crmRefus(c, user) {
 // syndicat, même composante, le même mois, pour un seul toit. Prises une à une
 // elles donneraient quatre prix de toiture. La clé regroupe donc le travail,
 // et le détail des pièces reste visible pour qu'une fusion abusive se voie.
+//
+// Mais regrouper suppose de savoir de quel immeuble il s'agit. Une pièce jointe
+// de courriel n'a souvent aucun syndicat : les rabattre sur une même valeur
+// « sans syndicat » additionnait des travaux d'immeubles différents et
+// fabriquait un total qui n'a jamais été payé par personne. Sans syndicat, donc
+// pas de regroupement — la pièce reste seule.
 function crmCle(piece) {
-  const syndicat = piece.syndicat_id ?? piece.syndicat_name ?? "sans-syndicat";
+  const syndicat = piece.syndicat_id ?? piece.syndicat_name ?? null;
+  if (!syndicat) return `piece:${piece.source_type}:${piece.source_id}`;
   const mois = (piece.date ?? "").slice(0, 7);
   return `${syndicat}|${piece.component_code}|${mois}`;
+}
+
+// « Re: », « TR : », « Fwd: » — un même document transféré plusieurs fois
+// revient autant de fois dans la boîte, et chaque copie porte le même montant.
+// Additionnées, elles multipliaient la facture par le nombre de transferts.
+function sujetNormalise(texte) {
+  return String(texte ?? "")
+    .toLowerCase()
+    .replace(/^(?:(?:re|tr|fwd|fw|rep|rép)\s*:\s*)+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function crmCleDocument(piece) {
+  return `${piece.component_code}|${sujetNormalise(piece.description)}|${Math.round(piece.montant)}`;
 }
 
 async function crmCandidats(c, user) {
@@ -44712,7 +44733,11 @@ async function crmCandidats(c, user) {
     `SELECT m.source_type, m.source_id, m.component_code, m.amount, m.description,
             m.reference_url, m.document_date, m.syndicat_name,
             f.numero_facture, f.vendor_name, f.date_facture, f.syndicat_id,
-            s.nom AS syndicat_nom, s.units, s.city
+            s.nom AS syndicat_nom,
+            -- Une pièce jointe de courriel ne porte que le nom du syndicat.
+            -- Le retrouver donne le nombre de portes, donc un coût par porte.
+            COALESCE(s.units, (SELECT sx.units FROM syndicats sx WHERE sx.nom = m.syndicat_name LIMIT 1)) AS units,
+            COALESCE(s.city,  (SELECT sx.city  FROM syndicats sx WHERE sx.nom = m.syndicat_name LIMIT 1)) AS city
        FROM component_cost_matches m
        LEFT JOIN syndicat_factures f
               ON f.id = m.source_id AND m.source_type = 'syndicat_facture'
@@ -44730,7 +44755,8 @@ async function crmCandidats(c, user) {
   const vues = new Set(dejaImportees.results.map((r) => `${r.source_type}:${r.source_id}`));
 
   const groupes = new Map();
-  let sansDate = 0, dejaVues = 0;
+  const documents = new Set();
+  let sansDate = 0, dejaVues = 0, copies = 0;
 
   for (const row of rows.results) {
     if (vues.has(`${row.source_type}:${row.source_id}`)) { dejaVues += 1; continue; }
@@ -44751,6 +44777,9 @@ async function crmCandidats(c, user) {
       units: row.units ?? null,
       city: row.city ?? null
     };
+    const document = crmCleDocument(piece);
+    if (documents.has(document)) { copies += 1; continue; }
+    documents.add(document);
     const cle = crmCle(piece);
     if (!groupes.has(cle)) {
       groupes.set(cle, {
@@ -44790,7 +44819,7 @@ async function crmCandidats(c, user) {
     };
   }).sort((a, b) => (a.mois < b.mois ? 1 : a.mois > b.mois ? -1 : b.total - a.total));
 
-  return { lignes, sansDate, dejaVues };
+  return { lignes, sansDate, dejaVues, copies };
 }
 
 prix.get("/crm", async (c) => {
@@ -44798,12 +44827,13 @@ prix.get("/crm", async (c) => {
   if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
   const refus = crmRefus(c, user);
   if (refus) return c.json({ error: refus }, 403);
-  const { lignes, sansDate, dejaVues } = await crmCandidats(c, user);
+  const { lignes, sansDate, dejaVues, copies } = await crmCandidats(c, user);
   return c.json({
     confiance: CRM_CONFIANCE,
     candidats: lignes.length,
     pieces_sans_date: sansDate,
     pieces_deja_importees: dejaVues,
+    copies_ecartees: copies,
     lignes
   });
 });
