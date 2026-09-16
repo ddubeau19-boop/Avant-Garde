@@ -113,6 +113,38 @@ CREATE TABLE company_templates (
   updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Catalogue de composantes de l'entreprise : ce que la firme inspecte, sous
+-- quel nom, avec quelle durée de vie et quel texte type. Extrait de son gabarit
+-- de rapport, puis relu.
+--
+-- Sans ce catalogue, l'inventaire d'un dossier est inventé à chaque fois par le
+-- modèle, à partir d'un barème écrit en dur dans le code : deux immeubles
+-- semblables reçoivent deux listes différentes, et aucune composante ne porte
+-- de code Uniformat — donc la banque de prix ne peut jamais rencontrer une
+-- étude. C'est ce catalogue qui relie les deux.
+--
+-- valide = 1 est le pivot, comme pour les rédactions : une extraction non relue
+-- ne doit pas devenir la référence que la firme défendra devant un syndicat.
+CREATE TABLE company_components (
+  id             TEXT PRIMARY KEY,
+  company_id     TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  uniformat_code TEXT,
+  nom            TEXT NOT NULL,
+  cat            TEXT,      -- clé de CATEGORIES
+  duree_vie_ans  INTEGER,
+  unite_mesure   TEXT,      -- pi2 | pi_lin | unite | forfait — rend le prix unitaire automatique
+  texte_type     TEXT,      -- le texte de base que la firme écrit pour cette composante
+  entretien      TEXT,      -- tâches d'entretien, rattachées depuis le carnet
+  actif          INTEGER NOT NULL DEFAULT 1,
+  ordre          INTEGER NOT NULL DEFAULT 0,
+  source         TEXT NOT NULL DEFAULT 'gabarit',  -- gabarit | manuel
+  valide         INTEGER NOT NULL DEFAULT 0,
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX idx_catalogue_entreprise ON company_components(company_id, valide, actif);
+
 -- Banque de rédactions : le texte produit pour chaque composante, étude après
 -- étude. Cloisonnée par entreprise — la formulation d'une firme ne nourrit
 -- jamais les rapports d'une autre. Seules les lignes valide = 1 servent

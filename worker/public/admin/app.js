@@ -67,6 +67,17 @@ const state = {
   tempPasswordInfo: null, // { name, email, tempPassword }
   engBusyId: null,        // compte en cours de réinitialisation ou de bascule
   engError: null,
+
+  catalogue: null,        // { composantes, categories, unites, gabarit }
+  catalogueLoading: false,
+  catalogueError: null,
+  catalogueExtraction: false,
+  catalogueNote: null,
+  catalogueOpenId: null,  // composante dépliée pour édition
+  catalogueEdits: {},     // id -> champs en cours d'édition
+  catalogueBusyId: null,
+  catalogueAddOpen: false,
+  catalogueAdd: { nom: '', uniformat_code: '', cat: '', duree_vie_ans: '', unite_mesure: '' },
 };
 
 // ---------------------------------------------------------------
@@ -344,9 +355,109 @@ async function loadCompanyDetail(id) {
     render();
     loadCompanyLogo(id, !!data.hasLogo);
     loadTemplate(id);
+    loadCatalogue(id);
   } catch (e) {
     state.companyLoading = false;
     state.companyError = e.message || 'Impossible de charger cette entreprise.';
+    render();
+  }
+}
+
+// ---------------------------------------------------------------
+// Catalogue de composantes de l'entreprise
+// ---------------------------------------------------------------
+async function loadCatalogue(id) {
+  state.catalogueLoading = true;
+  state.catalogueError = null;
+  render();
+  try {
+    state.catalogue = await apiJson(`/api/companies/${id}/components`);
+  } catch (e) {
+    state.catalogueError = e.message || 'Impossible de charger le catalogue.';
+  }
+  state.catalogueLoading = false;
+  render();
+}
+
+// Relit le texte du gabarit déjà conservé en base : pas besoin de réimporter
+// le .docx pour réessayer une extraction.
+async function extraireCatalogue() {
+  if (state.catalogueExtraction) return;
+  state.catalogueExtraction = true;
+  state.catalogueError = null;
+  state.catalogueNote = null;
+  render();
+  try {
+    const res = await apiJson(`/api/companies/${state.companyId}/components/extraire`, { method: 'POST' });
+    state.catalogueNote = `${res.extraites} composante(s) lues dans le gabarit · ${res.ajoutees} ajoutée(s) à valider`
+      + (res.ignorees ? ` · ${res.ignorees} déjà présente(s), laissée(s) intacte(s)` : '');
+    state.catalogueExtraction = false;
+    await loadCatalogue(state.companyId);
+  } catch (e) {
+    state.catalogueExtraction = false;
+    state.catalogueError = e.message || "L'extraction a échoué.";
+    render();
+  }
+}
+
+async function patchComposante(cid, corps) {
+  if (state.catalogueBusyId) return;
+  state.catalogueBusyId = cid;
+  render();
+  try {
+    await apiJson(`/api/companies/${state.companyId}/components/${cid}`, {
+      method: 'PATCH', body: JSON.stringify(corps),
+    });
+    state.catalogueBusyId = null;
+    delete state.catalogueEdits[cid];
+    await loadCatalogue(state.companyId);
+  } catch (e) {
+    state.catalogueBusyId = null;
+    state.catalogueError = e.message || 'Impossible de mettre à jour la composante.';
+    render();
+  }
+}
+
+async function supprimerComposanteCatalogue(cid, nom) {
+  if (!window.confirm(`Retirer « ${nom} » du catalogue de l'entreprise ? Les études déjà produites ne changent pas.`)) return;
+  if (state.catalogueBusyId) return;
+  state.catalogueBusyId = cid;
+  render();
+  try {
+    await apiJson(`/api/companies/${state.companyId}/components/${cid}`, { method: 'DELETE' });
+    state.catalogueBusyId = null;
+    await loadCatalogue(state.companyId);
+  } catch (e) {
+    state.catalogueBusyId = null;
+    state.catalogueError = e.message || 'Impossible de retirer la composante.';
+    render();
+  }
+}
+
+async function ajouterComposanteCatalogue() {
+  const f = state.catalogueAdd;
+  if (!f.nom.trim()) { state.catalogueError = 'Le nom est requis.'; render(); return; }
+  if (state.catalogueBusyId) return;
+  state.catalogueBusyId = 'nouvelle';
+  render();
+  try {
+    await apiJson(`/api/companies/${state.companyId}/components`, {
+      method: 'POST',
+      body: JSON.stringify({
+        nom: f.nom.trim(),
+        uniformat_code: f.uniformat_code.trim() || null,
+        cat: f.cat || null,
+        duree_vie_ans: f.duree_vie_ans ? Number(f.duree_vie_ans) : null,
+        unite_mesure: f.unite_mesure || null,
+      }),
+    });
+    state.catalogueBusyId = null;
+    state.catalogueAddOpen = false;
+    state.catalogueAdd = { nom: '', uniformat_code: '', cat: '', duree_vie_ans: '', unite_mesure: '' };
+    await loadCatalogue(state.companyId);
+  } catch (e) {
+    state.catalogueBusyId = null;
+    state.catalogueError = e.message || "Impossible d'ajouter la composante.";
     render();
   }
 }
@@ -852,6 +963,8 @@ function renderCompanyDetail() {
       </div>`; }).join('')}
     </div>
 
+    ${catalogueCardHtml()}
+
     ${templateCardHtml()}
   </div>`;
 }
@@ -866,6 +979,103 @@ function apercuSection(val) {
   }
   if (typeof val === 'object') return Object.entries(val).map(([k, v]) => k + '\n' + apercuSection(v)).join('\n\n');
   return String(val);
+}
+
+function champCatalogue(cid, cle, label, valeur, opts) {
+  opts = opts || {};
+  const id = `cat-${cid}-${cle}`;
+  const champ = opts.options
+    ? `<select class="detail-input" id="${id}" data-role="cat-edit" data-id="${cid}" data-cle="${cle}">
+         ${[{ v: '', label: '—' }].concat(opts.options).map(o =>
+           `<option value="${escapeHtml(o.v)}" ${String(o.v) === String(valeur ?? '') ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}
+       </select>`
+    : opts.textarea
+      ? `<textarea class="detail-input" rows="4" id="${id}" data-role="cat-edit" data-id="${cid}" data-cle="${cle}" placeholder="${escapeHtml(opts.placeholder || '')}">${escapeHtml(valeur ?? '')}</textarea>`
+      : `<input class="detail-input" type="text" id="${id}" data-role="cat-edit" data-id="${cid}" data-cle="${cle}" value="${escapeHtml(valeur == null ? '' : String(valeur))}" placeholder="${escapeHtml(opts.placeholder || '')}">`;
+  return `<div class="cat-field ${opts.large ? 'large' : ''}"><label class="field-label" for="${id}">${escapeHtml(label)}</label>${champ}</div>`;
+}
+
+// Le catalogue de composantes de la firme : ce qu'elle inspecte, avec quelle
+// durée de vie et quel texte type. C'est lui qui remplace la liste inventée à
+// chaque dossier, et c'est son code Uniformat qui relie une étude aux prix payés.
+function catalogueCardHtml() {
+  const c = state.catalogue;
+  const liste = (c && c.composantes) || [];
+  const valides = liste.filter(x => x.valide === 1).length;
+  const cats = (c && c.categories) || [];
+  const unites = (c && c.unites) || [];
+  const extractible = c && c.gabarit && c.gabarit.extractible;
+
+  return `
+  <div>
+    <div class="eng-section-head">
+      <span class="lbl">Composantes de l'entreprise</span>
+      <div class="rule"></div>
+      <button class="btn-row-action" data-action="cat-ajouter-ouvrir">${state.catalogueAddOpen ? 'Annuler' : 'Ajouter'}</button>
+      <button class="btn-pill-sm" data-action="cat-extraire" ${!extractible || state.catalogueExtraction ? 'disabled' : ''} title="${extractible ? 'Relit le gabarit déjà importé' : 'Importez d\'abord un gabarit .docx'}">
+        ${state.catalogueExtraction ? 'Lecture du gabarit…' : 'Extraire du gabarit'}
+      </button>
+    </div>
+    <div class="tpl-lead">Ce que la firme inspecte, sous quel nom, avec quelle durée de vie et quel texte type. À la création d'un dossier, l'inventaire est choisi dans ce catalogue au lieu d'être inventé — et le code Uniformat relie chaque ligne à la banque de prix.</div>
+
+    ${state.catalogueError ? `<div class="login-error" style="margin:10px 0">${escapeHtml(state.catalogueError)}</div>` : ''}
+    ${state.catalogueNote ? `<div class="temp-pass-warn" style="margin:10px 0"><i data-lucide="info"></i><span>${escapeHtml(state.catalogueNote)}</span></div>` : ''}
+
+    ${state.catalogueAddOpen ? `
+    <form class="cat-form" id="cat-add-form" novalidate>
+      ${champCatalogue('add', 'nom', 'Composante', state.catalogueAdd.nom, { large: true, placeholder: 'ex. Toiture plate — membrane élastomère' })}
+      ${champCatalogue('add', 'uniformat_code', 'Code Uniformat', state.catalogueAdd.uniformat_code, { placeholder: 'ex. B30.10-40' })}
+      ${champCatalogue('add', 'cat', 'Catégorie', state.catalogueAdd.cat, { options: cats.map(x => ({ v: x.cle, label: x.label })) })}
+      ${champCatalogue('add', 'duree_vie_ans', 'Vie utile (ans)', state.catalogueAdd.duree_vie_ans, { placeholder: 'ex. 35' })}
+      ${champCatalogue('add', 'unite_mesure', 'Unité', state.catalogueAdd.unite_mesure, { options: unites.map(x => ({ v: x.cle, label: x.label })) })}
+      <div class="cat-form-foot">
+        <button type="submit" class="btn-primary" ${state.catalogueBusyId === 'nouvelle' ? 'disabled' : ''}>Ajouter au catalogue</button>
+      </div>
+    </form>` : ''}
+
+    ${state.catalogueLoading && !c ? spinnerBlock('Chargement du catalogue…') : liste.length === 0 ? `
+      <div class="empty-state">Aucune composante au catalogue. ${extractible
+        ? 'Cliquez « Extraire du gabarit » pour lire celles de votre document Word.'
+        : 'Importez d\'abord votre gabarit .docx ci-dessous, puis revenez l\'extraire.'}</div>` : `
+      <div class="tpl-lead" style="margin:10px 0 14px">
+        <strong>${valides}</strong> composante${valides > 1 ? 's' : ''} validée${valides > 1 ? 's' : ''} sur ${liste.length}.
+        ${valides === 0 ? ' Tant que rien n\'est validé, la création de dossier garde le comportement actuel.' : ''}
+      </div>
+      <div class="dossiers-table">
+        ${liste.map(x => {
+          const ouvert = state.catalogueOpenId === x.id;
+          const edits = state.catalogueEdits[x.id] || {};
+          const val = (cle) => (cle in edits ? edits[cle] : x[cle]);
+          const occupe = state.catalogueBusyId === x.id;
+          return `
+          <div class="cat-row ${x.valide === 1 ? 'valide' : ''}">
+            <div class="cat-head">
+              <button class="cat-titre" data-action="cat-ouvrir" data-id="${x.id}">
+                <i data-lucide="${ouvert ? 'chevron-down' : 'chevron-right'}"></i>
+                <span class="cat-nom">${escapeHtml(x.nom)}</span>
+                ${x.uniformat_code ? `<code class="cat-code">${escapeHtml(x.uniformat_code)}</code>` : '<span class="cat-manque">sans code</span>'}
+                ${x.duree_vie_ans ? `<span class="cat-vu">${x.duree_vie_ans} ans</span>` : '<span class="cat-manque">sans durée</span>'}
+              </button>
+              <span class="status-badge" style="background:${x.source === 'gabarit' ? 'var(--ink-100)' : '#EDF6F0'};color:var(--ink-600)">${x.source === 'gabarit' ? 'Du gabarit' : 'Ajout manuel'}</span>
+              <button class="btn-row-action ${x.valide === 1 ? '' : 'primary'}" data-action="cat-valider" data-id="${x.id}" data-valide="${x.valide === 1 ? '0' : '1'}" ${occupe ? 'disabled' : ''}>${x.valide === 1 ? 'Retirer' : 'Valider'}</button>
+              <button class="btn-row-action" data-action="cat-supprimer" data-id="${x.id}" data-nom="${escapeHtml(x.nom)}" ${occupe ? 'disabled' : ''}>Supprimer</button>
+            </div>
+            ${ouvert ? `
+            <div class="cat-detail">
+              ${champCatalogue(x.id, 'nom', 'Composante', val('nom'), { large: true })}
+              ${champCatalogue(x.id, 'uniformat_code', 'Code Uniformat', val('uniformat_code'), { placeholder: 'ex. B30.10-40' })}
+              ${champCatalogue(x.id, 'cat', 'Catégorie', val('cat'), { options: cats.map(y => ({ v: y.cle, label: y.label })) })}
+              ${champCatalogue(x.id, 'duree_vie_ans', 'Vie utile (ans)', val('duree_vie_ans'), { placeholder: 'ex. 35' })}
+              ${champCatalogue(x.id, 'unite_mesure', 'Unité', val('unite_mesure'), { options: unites.map(y => ({ v: y.cle, label: y.label })) })}
+              ${champCatalogue(x.id, 'texte_type', 'Texte type', val('texte_type'), { large: true, textarea: true, placeholder: 'Le texte de base que la firme écrit pour cette composante…' })}
+              <div class="cat-form-foot">
+                <button class="btn-primary" data-action="cat-enregistrer" data-id="${x.id}" ${occupe ? 'disabled' : ''}>${occupe ? 'Enregistrement…' : 'Enregistrer'}</button>
+              </div>
+            </div>` : ''}
+          </div>`;
+        }).join('')}
+      </div>`}
+  </div>`;
 }
 
 function templateCardHtml() {
@@ -938,6 +1148,11 @@ function initEvents() {
       submitNewCompany(state.newCompanyName);
       return;
     }
+    if (e.target && e.target.id === 'cat-add-form') {
+      e.preventDefault();
+      ajouterComposanteCatalogue();
+      return;
+    }
     if (e.target && e.target.id === 'edit-name-form') {
       e.preventDefault();
       saveCompanyName(state.editNameValue);
@@ -965,6 +1180,15 @@ function initEvents() {
     else if (t.matches('[data-role="new-eng-title"]')) state.newEngTitle = t.value;
     else if (t.matches('[data-role="new-eng-ordre"]')) state.newEngOrdre = t.value;
     else if (t.matches('[data-role="new-eng-no-membre"]')) state.newEngNoMembre = t.value;
+    else if (t.matches('[data-role="cat-edit"]')) {
+      const cid = t.getAttribute('data-id');
+      const cle = t.getAttribute('data-cle');
+      if (cid === 'add') state.catalogueAdd[cle] = t.value;
+      else {
+        if (!state.catalogueEdits[cid]) state.catalogueEdits[cid] = {};
+        state.catalogueEdits[cid][cle] = t.value;
+      }
+    }
     // Pas de render() ici : re-dessiner le textarea à chaque frappe renverrait
     // le curseur à la fin.
     else if (t.matches('[data-role="template-text"]')) state.templateEdits[t.getAttribute('data-cle')] = t.value;
@@ -991,6 +1215,33 @@ function initEvents() {
     switch (action) {
       case 'logout':
         doLogout();
+        break;
+      case 'cat-extraire':
+        extraireCatalogue();
+        break;
+      case 'cat-ouvrir': {
+        const cid = btn.getAttribute('data-id');
+        state.catalogueOpenId = state.catalogueOpenId === cid ? null : cid;
+        render();
+        break;
+      }
+      case 'cat-valider':
+        patchComposante(btn.getAttribute('data-id'), { valide: btn.getAttribute('data-valide') === '1' });
+        break;
+      case 'cat-supprimer':
+        supprimerComposanteCatalogue(btn.getAttribute('data-id'), btn.getAttribute('data-nom'));
+        break;
+      case 'cat-enregistrer': {
+        const cid = btn.getAttribute('data-id');
+        const edits = state.catalogueEdits[cid];
+        if (!edits || Object.keys(edits).length === 0) { state.catalogueOpenId = null; render(); break; }
+        patchComposante(cid, edits);
+        break;
+      }
+      case 'cat-ajouter-ouvrir':
+        state.catalogueAddOpen = !state.catalogueAddOpen;
+        state.catalogueError = null;
+        render();
         break;
       case 'reinit-mdp':
         reinitialiserMotDePasse(btn.getAttribute('data-id'), btn.getAttribute('data-nom'));

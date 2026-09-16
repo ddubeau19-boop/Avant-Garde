@@ -218,3 +218,30 @@ code { font-family: var(--font-mono); }
 }
 .tpl-edit textarea[readonly] { background: var(--ink-050); color: var(--ink-600); }
 .tpl-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* catalogue de composantes de l'entreprise */
+.cat-form { border: 1px solid var(--ink-200); border-radius: 14px; padding: 16px; background: var(--ink-050); display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 12px 0 16px; }
+.cat-field { min-width: 0; }
+.cat-field.large { grid-column: 1 / -1; }
+.cat-field .field-label { display: block; margin-bottom: 5px; }
+.cat-form-foot { grid-column: 1 / -1; display: flex; justify-content: flex-end; }
+.cat-row { border-top: 1px solid var(--line-soft); }
+.cat-row:first-child { border-top: none; }
+.cat-row.valide { background: #F6FBF8; }
+.cat-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; flex-wrap: wrap; }
+.cat-titre { flex: 1; min-width: 220px; display: flex; align-items: center; gap: 8px; border: none; background: none; padding: 0; cursor: pointer; text-align: left; font: inherit; }
+.cat-titre i { width: 14px; height: 14px; color: var(--ink-400); flex-shrink: 0; }
+.cat-nom { font-weight: 600; color: var(--ink-800); font-size: 13px; }
+.cat-code { font-family: var(--font-mono); font-size: 11px; background: var(--ink-100); padding: 2px 7px; border-radius: 999px; color: var(--ink-600); }
+.cat-vu { font-family: var(--font-mono); font-size: 11px; color: var(--ink-500); }
+.cat-manque { font-size: 11px; color: var(--accent-press); font-style: italic; }
+.cat-detail { padding: 4px 14px 16px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; border-top: 1px dashed var(--line-soft); }
+.cat-detail .cat-field.large { grid-column: 1 / -1; }
+@media (max-width: 1100px) { .cat-form, .cat-detail { grid-template-columns: repeat(2, 1fr); } }
+/* Ces deux classes viennent de la console bureau ; la feuille admin ne les
+   portait pas, donc les champs du catalogue tombaient aux styles par défaut. */
+.detail-input {
+  width: 100%; border: 1.5px solid var(--ink-200); border-radius: 9px; background: #fff; padding: 8px 10px;
+  font-family: var(--font-body); font-size: 13px; line-height: 1.5; color: var(--ink-800); resize: vertical; outline: none;
+}
+.detail-input:focus { border-color: var(--orange); background: var(--orange-wash); }

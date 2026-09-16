@@ -3090,7 +3090,65 @@ métrique entre parenthèses.
 
 SIGLES : PCUR = partie commune à usage restreint ; PCUG = partie commune à usage général ;
 FP = fonds de prévoyance ; CE = carnet d'entretien ; VU = durée de vie utile.`;
-async function generateChecklist(apiKey, profile) {
+// Quand la firme a un catalogue validé, le modèle ne propose plus des
+// composantes de son cru : il choisit dans celui-ci ce qui s'applique à
+// l'immeuble. Deux immeubles semblables reçoivent alors des inventaires
+// comparables, chaque ligne porte le code Uniformat du catalogue — ce qui la
+// relie à la banque de prix — et la durée de vie est celle que la firme assume.
+async function choisirDansCatalogue(apiKey, profile, catalogue) {
+  const liste = catalogue.map((c, i) =>
+    `${i}. ${c.nom}${c.uniformat_code ? ` [${c.uniformat_code}]` : ""}${c.cat ? ` (${c.cat})` : ""}${c.duree_vie_ans ? ` — ${c.duree_vie_ans} ans` : ""}`
+  ).join("\n");
+  const prompt = `Tu es ingénieur en bâtiment spécialisé dans les études de fonds de prévoyance
+pour syndicats de copropriété au Québec.
+
+Voici le catalogue de composantes de la firme. Pour un immeuble résidentiel de
+${profile.units} unités${profile.floors ? `, ${profile.floors} étages` : ""}${profile.builtYear ? `, construit en ${profile.builtYear}` : ""}, indique lesquelles s'appliquent.
+
+${liste}
+
+Réponds UNIQUEMENT avec un tableau JSON des numéros retenus, par exemple [0,3,7].
+Ne propose aucune composante absente de cette liste : le catalogue est la
+méthode de la firme, tu choisis dedans, tu n'y ajoutes rien. Retiens ce qui est
+plausible pour ce type d'immeuble et écarte ce qui ne peut pas s'y trouver — une
+piscine ou un ascenseur dans un immeuble qui n'en a manifestement pas.`;
+  const brut = await callClaude(apiKey, { content: prompt, maxTokens: 2000 });
+  const indices = extractJson(brut);
+  const retenus = Array.isArray(indices)
+    ? indices.map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < catalogue.length)
+    : [];
+  // Un modèle qui ne choisit rien ne doit pas produire une étude vide.
+  const source = retenus.length > 0 ? [...new Set(retenus)].map((n) => catalogue[n]) : catalogue;
+  return source.map((c) => ({
+    cat: c.cat ?? "equipements",
+    name: c.nom,
+    code: c.uniformat_code ?? null,
+    vu: c.duree_vie_ans ?? null,
+    qty: "—"
+  }));
+}
+
+async function generateChecklist(apiKey, profile, catalogue = []) {
+  if (catalogue.length > 0) {
+    if (!apiKey) {
+      // Sans clé, tout le catalogue vaut mieux qu'une liste générique : c'est
+      // au moins le vocabulaire de la firme.
+      return catalogue.map((c) => ({
+        cat: c.cat ?? "equipements", name: c.nom, code: c.uniformat_code ?? null,
+        vu: c.duree_vie_ans ?? null, qty: "—"
+      }));
+    }
+    try {
+      return await choisirDansCatalogue(apiKey, profile, catalogue);
+    } catch {
+      // Une panne d'API ne doit pas faire retomber la firme sur un barème
+      // générique alors qu'elle a un catalogue.
+      return catalogue.map((c) => ({
+        cat: c.cat ?? "equipements", name: c.nom, code: c.uniformat_code ?? null,
+        vu: c.duree_vie_ans ?? null, qty: "—"
+      }));
+    }
+  }
   if (!apiKey) return DEFAULT_CHECKLIST;
   const prompt = `Tu es ingénieur en bâtiment spécialisé dans les études de fonds de prévoyance
 pour syndicats de copropriété au Québec. Pour un immeuble résidentiel de
@@ -22950,6 +23008,97 @@ ${corpus}
 Réponds UNIQUEMENT avec un objet JSON dont les clés sont prises dans la liste ci-dessus.`;
   const brut = await callClaude(apiKey, { content: prompt, maxTokens: 16000 });
   return { sections: nettoyerSections(extractJson(brut)), note: null };
+}
+
+// Le même gabarit, lu une seconde fois pour une autre question : quelles
+// composantes cette firme inspecte-t-elle, sous quel nom, avec quelle durée de
+// vie, et quel texte écrit-elle pour chacune.
+const CATALOGUE_TAILLE_MAX = 120;
+
+function nettoyerComposantes(brut) {
+  if (!Array.isArray(brut)) return [];
+  const vues = new Set();
+  const propres = [];
+  for (const item of brut) {
+    if (!item || typeof item !== "object") continue;
+    const nom = String(item.nom ?? "").trim();
+    if (!nom) continue;
+    // Le modèle répète parfois une composante sous deux formulations voisines.
+    const empreinte = nom.toLowerCase();
+    if (vues.has(empreinte)) continue;
+    vues.add(empreinte);
+    const vu = Number(item.vu);
+    const unite = String(item.unite ?? "").trim();
+    propres.push({
+      nom: nom.slice(0, 200),
+      uniformat_code: item.code ? String(item.code).trim().slice(0, 40) : null,
+      cat: CATEGORIES[item.cat] ? item.cat : null,
+      duree_vie_ans: Number.isFinite(vu) && vu > 0 && vu <= 100 ? Math.round(vu) : null,
+      unite_mesure: PRIX_UNITES[unite] ? unite : null,
+      texte_type: item.texte ? String(item.texte).trim().slice(0, 4000) : null
+    });
+    if (propres.length >= CATALOGUE_TAILLE_MAX) break;
+  }
+  return propres;
+}
+
+async function composantesDepuisTexte(apiKey, paragraphes) {
+  if (!apiKey) {
+    return { composantes: [], note: "Aucune clé API n'est configurée : les composantes devront être saisies à la main." };
+  }
+  const corpus = paragraphes.join("\n").slice(0, 60000);
+  const cats = Object.entries(CATEGORIES).map(([k, v]) => `"${k}" — ${v.label}`).join("\n");
+  const unites = Object.entries(PRIX_UNITES).map(([k, v]) => `"${k}" (${v.label})`).join(", ");
+  const prompt = `Voici le texte d'un gabarit d'étude de fonds de prévoyance d'une firme québécoise.
+Relève les COMPOSANTES de bâtiment que cette firme traite, et pour chacune ce que
+le document en dit.
+
+RÈGLE ABSOLUE : le champ "texte" reprend le texte de la firme MOT POUR MOT. Tu
+relèves, tu ne réécris pas, tu ne résumes pas. C'est la voix de cette firme qui
+doit ressortir dans ses rapports.
+
+N'INVENTE AUCUNE DURÉE DE VIE. Si le document n'en donne pas explicitement pour
+une composante, mets "vu" à null. Une durée de vie devinée deviendrait la
+référence que la firme défendra devant un syndicat.
+
+Omets toute composante dont tu n'es pas certain qu'il s'agisse d'un élément de
+bâtiment. Ignore ce qui est propre à un immeuble donné (nom du syndicat,
+adresse, montants, observations d'un relevé précis) : on cherche le vocabulaire
+qui se répète d'une étude à l'autre.
+
+Champs attendus par composante :
+- "nom" : le nom de la composante tel que la firme l'écrit. Obligatoire.
+- "code" : le code Uniformat II s'il figure au document, sinon null.
+- "cat" : une clé prise EXACTEMENT dans cette liste, sinon null :
+${cats}
+- "vu" : durée de vie utile en années si le document la donne, sinon null.
+- "unite" : l'unité de mesure du remplacement, parmi ${unites}, sinon null.
+- "texte" : le texte de base que la firme écrit pour cette composante, mot pour
+  mot, ou null s'il n'y en a pas.
+
+TEXTE DU GABARIT :
+${corpus}
+
+Réponds UNIQUEMENT avec un tableau JSON d'objets portant ces champs.`;
+  const brut = await callClaude(apiKey, { content: prompt, maxTokens: 16000 });
+  return { composantes: nettoyerComposantes(extractJson(brut)), note: null };
+}
+
+// Le catalogue validé d'une entreprise, dans l'ordre où elle veut le voir.
+// Calqué sur texteMaisonPour : une firme sans catalogue reçoit un tableau vide,
+// et tout le reste du produit retombe alors sur ses valeurs intégrées.
+async function cataloguePour(db, companyId) {
+  if (!companyId) return [];
+  try {
+    const rows = await db.prepare(
+      `SELECT * FROM company_components
+        WHERE company_id = ?1 AND valide = 1 AND actif = 1
+        ORDER BY ordre ASC, nom ASC`
+    ).bind(companyId).all();
+    return rows.results;
+  } catch {
+    return [];
+  }
 }
 
 function peutGererEntreprise(user, companyId) {
@@ -43955,6 +44104,158 @@ companies.delete("/:id/template", async (c) => {
   await c.env.DB.prepare("DELETE FROM company_templates WHERE company_id = ?1").bind(id).run();
   return c.json({ ok: true, retour: "gabarit intégré" });
 });
+
+// ── Catalogue de composantes de l'entreprise ────────────────────────────────
+const CATALOGUE_CHAMPS = ["uniformat_code", "nom", "cat", "duree_vie_ans", "unite_mesure", "texte_type", "entretien", "actif", "ordre", "valide"];
+
+companies.get("/:id/components", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const rows = await c.env.DB.prepare(
+    "SELECT * FROM company_components WHERE company_id = ?1 ORDER BY ordre ASC, nom ASC"
+  ).bind(id).all();
+  const gabarit = await c.env.DB.prepare(
+    "SELECT source_filename, imported_at, source_extrait IS NOT NULL AS a_extrait FROM company_templates WHERE company_id = ?1"
+  ).bind(id).first();
+  return c.json({
+    composantes: rows.results,
+    categories: Object.entries(CATEGORIES).map(([cle, v]) => ({ cle, label: v.label, ordre: v.ordre })),
+    unites: Object.entries(PRIX_UNITES).map(([cle, v]) => ({ cle, label: v.label })),
+    gabarit: gabarit ? { fichier: gabarit.source_filename, importe_le: gabarit.imported_at, extractible: !!gabarit.a_extrait } : null
+  });
+});
+
+// Rejoue l'extraction sur le texte du gabarit déjà conservé en base : pas de
+// réimport nécessaire pour réessayer, et le .docx d'origine n'a pas à être relu.
+companies.post("/:id/components/extraire", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const gabarit = await c.env.DB.prepare(
+    "SELECT source_extrait FROM company_templates WHERE company_id = ?1"
+  ).bind(id).first();
+  if (!gabarit?.source_extrait) {
+    return c.json({ error: "aucun gabarit importé pour cette entreprise — importez d'abord le .docx" }, 400);
+  }
+
+  let extraites;
+  try {
+    const res = await composantesDepuisTexte(c.env.ANTHROPIC_API_KEY, gabarit.source_extrait.split("\n"));
+    if (res.note) return c.json({ error: res.note }, 503);
+    extraites = res.composantes;
+  } catch (e) {
+    return c.json({ error: `l'extraction a échoué : ${e.message}` }, 502);
+  }
+  if (extraites.length === 0) {
+    return c.json({ error: "aucune composante reconnue dans ce gabarit" }, 422);
+  }
+
+  // Une ligne déjà relue ne doit pas être écrasée par une nouvelle extraction :
+  // la correction de l'ingénieur vaut plus que ce que le modèle vient de lire.
+  const existantes = await c.env.DB.prepare(
+    "SELECT nom FROM company_components WHERE company_id = ?1"
+  ).bind(id).all();
+  const deja = new Set(existantes.results.map((r) => r.nom.toLowerCase()));
+
+  const instructions = [];
+  let ajoutees = 0;
+  extraites.forEach((comp, i) => {
+    if (deja.has(comp.nom.toLowerCase())) return;
+    ajoutees += 1;
+    instructions.push(c.env.DB.prepare(
+      `INSERT INTO company_components
+         (id, company_id, uniformat_code, nom, cat, duree_vie_ans, unite_mesure, texte_type, ordre, source, valide)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'gabarit', 0)`
+    ).bind(newId("cco"), id, comp.uniformat_code, comp.nom, comp.cat,
+           comp.duree_vie_ans, comp.unite_mesure, comp.texte_type, i));
+  });
+  if (instructions.length > 0) await c.env.DB.batch(instructions);
+
+  return c.json({ extraites: extraites.length, ajoutees, ignorees: extraites.length - ajoutees }, 201);
+});
+
+companies.post("/:id/components", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const body2 = await c.req.json();
+  const nom = String(body2.nom ?? "").trim();
+  if (!nom) return c.json({ error: "nom requis" }, 400);
+  const dernier = await c.env.DB.prepare(
+    "SELECT MAX(ordre) AS rang FROM company_components WHERE company_id = ?1"
+  ).bind(id).first();
+  const cco = newId("cco");
+  await c.env.DB.prepare(
+    `INSERT INTO company_components
+       (id, company_id, uniformat_code, nom, cat, duree_vie_ans, unite_mesure, texte_type, ordre, source, valide)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'manuel', 1)`
+  ).bind(
+    cco, id, body2.uniformat_code || null, nom,
+    CATEGORIES[body2.cat] ? body2.cat : null,
+    Number(body2.duree_vie_ans) > 0 ? Math.round(Number(body2.duree_vie_ans)) : null,
+    PRIX_UNITES[body2.unite_mesure] ? body2.unite_mesure : null,
+    body2.texte_type || null,
+    (dernier?.rang ?? -1) + 1
+  ).run();
+  const row = await c.env.DB.prepare("SELECT * FROM company_components WHERE id = ?1").bind(cco).first();
+  return c.json(row, 201);
+});
+
+companies.patch("/:id/components/:componentId", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const existante = await c.env.DB.prepare(
+    "SELECT id FROM company_components WHERE id = ?1 AND company_id = ?2"
+  ).bind(c.req.param("componentId"), id).first();
+  if (!existante) return c.json({ error: "composante introuvable" }, 404);
+
+  const body2 = await c.req.json();
+  const champs = [];
+  const valeurs = [];
+  for (const cle of CATALOGUE_CHAMPS) {
+    if (!(cle in body2)) continue;
+    let v = body2[cle];
+    if (cle === "nom") {
+      v = String(v ?? "").trim();
+      if (!v) return c.json({ error: "le nom ne peut pas être vide" }, 400);
+    } else if (cle === "cat") {
+      v = CATEGORIES[v] ? v : null;
+    } else if (cle === "unite_mesure") {
+      v = PRIX_UNITES[v] ? v : null;
+    } else if (cle === "duree_vie_ans" || cle === "ordre") {
+      const n = Number(v);
+      v = Number.isFinite(n) && n > 0 ? Math.round(n) : null;
+    } else if (cle === "actif" || cle === "valide") {
+      v = v ? 1 : 0;
+    } else if (v === "" || v === undefined) {
+      v = null;
+    }
+    champs.push(`${cle} = ?${champs.length + 1}`);
+    valeurs.push(v);
+  }
+  if (champs.length === 0) return c.json({ error: "aucun champ à mettre à jour" }, 400);
+  valeurs.push(existante.id);
+  await c.env.DB.prepare(
+    `UPDATE company_components SET ${champs.join(", ")},
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?${valeurs.length}`
+  ).bind(...valeurs).run();
+  const row = await c.env.DB.prepare("SELECT * FROM company_components WHERE id = ?1").bind(existante.id).first();
+  return c.json(row);
+});
+
+companies.delete("/:id/components/:componentId", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const res = await c.env.DB.prepare(
+    "DELETE FROM company_components WHERE id = ?1 AND company_id = ?2"
+  ).bind(c.req.param("componentId"), id).run();
+  if (!res.meta?.changes) return c.json({ error: "composante introuvable" }, 404);
+  return c.json({ ok: true });
+});
 companies.get("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
@@ -44109,7 +44410,7 @@ dossiers.post("/", async (c) => {
     units: body2.units ?? 0,
     floors: body2.floors ?? null,
     builtYear: body2.built_year ?? null
-  });
+  }, await cataloguePour(c.env.DB, user.company_id));
   const stmt = c.env.DB.prepare(
     `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)`
   );
