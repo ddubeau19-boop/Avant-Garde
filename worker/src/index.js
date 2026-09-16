@@ -3197,6 +3197,715 @@ Réponds uniquement avec le texte de la note, sans guillemets ni préambule.`;
     return trimmed;
   }
 }
+// ============================================================================
+// RÉDACTION MAISON — § 4.0 « Observation des éléments »
+// ----------------------------------------------------------------------------
+// Générateur UNIQUE des quatre sous-sections d'une fiche d'élément, dans l'ordre
+// canonique du gabarit Condo Stratégis :
+//   1. ÉTAT DE L'ACTIF · 2. DURÉE DE VIE ET REMPLACEMENT
+//   3. COMMENTAIRES D'ENTRETIEN · 4. ATTENTION SPÉCIALE
+// Deux consommateurs : POST /api/components/:id/redaction (bureau) et le .docx.
+// ============================================================================
+const NBSP = " ";
+const FERMETURE_ENTRETIEN = "Pour le détail de planification annuelle, vous référer au tableur suivi d'entretien.";
+const FERMETURE_ATTENTION = "En suivi aux observations ci-haut, nous suggérons des visites de services dans les meilleurs délais. Sur place le professionnel ou le spécialiste pourra suggérer les correctifs appropriés.";
+const CARNET_ABSENT = "Aucun ''carnet d'entretien'' ou registre des travaux antérieurs n'a été fourni. Ainsi, aucune révision d'un ''carnet d'entretien'' n'a été possible. De plus, selon les informations obtenues, aucun travaux majeurs ou projet important n'ont été reportés ou rejetés au cours des dernières années.";
+const CARNET_REVISE = "Suite à la révision du carnet d'entretien existant et selon les confirmations obtenues auprès de l'administration, aucun travaux majeurs ou projet important n'ont été reportés ou rejetés au cours des dernières années.";
+const AVIS_BUDGETAIRE = "Les valeurs présentées sont des montants budgétaires exprimés en dollars actuels, avant planifications et taxes (Loi 16).";
+// ----------------------------------------------------------------------------
+// PIÈGE 1 — le gabarit maison transporte les notes de rédaction internes de son
+// auteur (« voir fd », « Vérif durée de vie avec Benoit A. », « SECTION À
+// VÉRIFIER », « ??? », les renvois à d'autres dossiers clients : 21-331
+// St-Pierre, 24-486 Papineau…). Rien de tout cela ne doit atteindre un rapport
+// livré. Tout texte qui entre dans une fiche — sortie du modèle comme champs
+// libres saisis par l'inspecteur — passe par ce filtre, au niveau de la phrase.
+// ----------------------------------------------------------------------------
+const NOTES_INTERNES = [
+  /\bvoir\s+fd\b/i,
+  /\bfd\s*[:：]/i,
+  /section\s+[àa]\s+v[ée]rifier/i,
+  /[Vv][ée]rif(?:\.|ication|ier)?\b[^.;]{0,60}\bavec\s+(?:M\.|Mme|Monsieur|Madame|[A-ZÀ-Ý])/,
+  /\b(?:ref|réf)\s*[:：]/i,
+  /\?{2,}/,
+  /\b[àa]\s+replacer\b/i,
+  /\bpeut-[êe]tre\s+inclus\b/i,
+  /\bcapture\s+d'[ée]cran\b/i,
+  /caract[ée]ristique\s+[àa]\s+retenir/i,
+  /\bs['’]applique\s*-?\s*t\s*-?\s*il\s+[àa]\s+ce\s+mandat\b/i,
+  /\b\d{2}-\d{3}\s+(?:PGA|EFP|CE|PRRL)\b/i,
+  /\b\d{2}-\d{3}\b[\s–-]+[A-ZÀ-Ý][\wÀ-ÿ'’-]+/,
+  /\bselon\s+Fenestra\b/i,
+  /\boption\s+rare\b/i,
+  /\bà\s+compl[ée]ter\s+par\s+le\s+r[ée]dacteur\b/i
+];
+function sansNotesInternes(texte) {
+  if (texte == null) return "";
+  const brut = String(texte).replace(/\r/g, "");
+  const segments = brut.split(/\n+|(?<=[.;:!?])\s+/);
+  const gardes = [];
+  for (const seg of segments) {
+    const s = seg.trim();
+    if (!s) continue;
+    if (NOTES_INTERNES.some((re) => re.test(s))) continue;
+    gardes.push(s);
+  }
+  return gardes.join(" ").replace(/[ \t]{2,}/g, " ").trim();
+}
+function phraseFinale(texte) {
+  const t = sansNotesInternes(texte);
+  if (!t) return "";
+  return /[.;:!?»]$/.test(t) ? t : t + ".";
+}
+function assembler(parties) {
+  return parties.map((p) => (p == null ? "" : String(p).trim())).filter(Boolean).join(" ").replace(/[ \t]{2,}/g, " ").trim();
+}
+function paragraphes(parties) {
+  return parties.map((p) => (p == null ? "" : String(p).trim())).filter(Boolean).join("\n\n");
+}
+// Montants : arrondi à la centaine, espace insécable comme séparateur de
+// milliers, symbole $ précédé d'une espace (corpus § 7.1).
+function montantMaison(value) {
+  const n = Number(value);
+  if (value == null || value === "" || !Number.isFinite(n)) return null;
+  const pas = Math.abs(n) >= 1e3 ? 100 : 50;
+  const arrondi = Math.round(n / pas) * pas;
+  const chiffres = String(Math.abs(arrondi)).replace(/\B(?=(\d{3})+(?!\d))/g, NBSP);
+  return `${arrondi < 0 ? "-" : ""}${chiffres}${NBSP}$`;
+}
+function anneeMaison(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1800 || n > 2200) return null;
+  return Math.round(n);
+}
+function objetJson(raw) {
+  if (!raw) return {};
+  if (typeof raw === "object") return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+function infoBatiment(dossier) {
+  return objetJson(dossier?.batiment_info);
+}
+// ----------------------------------------------------------------------------
+// COTE AU RAPPORT — passage de l'échelle de relevé (4 niveaux, champ `rating`)
+// à la légende du RAPPORT (3 niveaux, corpus § 3.2).
+//
+//   1 « bon état »             → Bon
+//   2 « entretien normal »     → Bon
+//   3 « entretien requis »     → Passable – Nécessite un entretien
+//   4 « remplacement requis »  → Mauvais – Requiert la planification d'un remplacement
+//   null (na / non observé)    → aucune cote
+//
+// Raisonnement : la légende maison définit « Bon » comme l'état où « des défauts
+// mineurs pouvant nécessiter des réparations ou entretiens RÉGULIERS sont
+// existants. Cependant, le fonctionnement est normal et aucun suivi n'est prévu
+// d'ici 12 à 24 mois ». L'entretien régulier est donc explicitement compris dans
+// « Bon » : les cotes 1 et 2 de la fiche de relevé y tombent toutes deux, la
+// cote 2 ne désignant que l'entretien courant déjà prévu au tableur de suivi.
+// « Passable » est défini, lui, par l'entretien DEVANCÉ (§ 9.2 : « doit être
+// accompli avant terme »), ce qui est exactement la cote 3 « entretien requis ».
+// « Mauvais » est défini par la planification d'un remplacement : c'est la cote
+// 4. Enfin la maison ne cote jamais un élément qu'elle n'a pas pu observer —
+// une cote absente reste absente, elle ne devient pas « Bon » par défaut.
+// ----------------------------------------------------------------------------
+const COTES_RAPPORT = {
+  Bon: "Bon",
+  Passable: "Passable – Nécessite un entretien",
+  Mauvais: "Mauvais – Requiert la planification d'un remplacement"
+};
+function coteRapport(rating) {
+  const r = Number(rating);
+  if (r === 1 || r === 2) return "Bon";
+  if (r === 3) return "Passable";
+  if (r === 4) return "Mauvais";
+  return null;
+}
+function coteRapportLongue(rating) {
+  const cote = coteRapport(rating);
+  return cote ? COTES_RAPPORT[cote] : null;
+}
+// ----------------------------------------------------------------------------
+// COMMENTAIRES D'ENTRETIEN — blocs pré-écrits de la firme (gabarit § 2.4),
+// repris VERBATIM. Ils ne sont jamais paraphrasés ni passés au modèle : ce sont
+// les textes de la maison.
+// ----------------------------------------------------------------------------
+const ENTRETIEN_BLOCS = {
+  amenagement: "L'entretien d'un aménagement paysager consiste essentiellement à veiller au maintien des pentes positives aux abords du bâtiment afin de favoriser l'éloignement par ruissellement de l'eau des fondations. Les bandes de remblai drainant aménagées là où le niveau du sol est trop élevé doivent être nettoyées pour favoriser un drainage efficace. On doit aussi faire l'émondage de la végétation pour éviter le contact avec le parement extérieur. La végétation en contact avec les parements favorise le maintien de l'humidité et augmente les risques d'éclatement au gel. L'entretien de l'aménagement doit être fait à même le budget d'entretien.",
+  pavage: "Le pavage d'asphalte nécessite peu d'entretien. Il est cependant suggéré de colmater les fissures apparaissant au fil des ans. Les fissures permettent l'infiltration d'eau sous le pavage et peuvent provoquer un soulèvement et/ou une érosion de la sous-fondation. Plus près des portes de garage, les abords et les fosses de captation doivent être nettoyés pour prévenir l'obstruction et assurer un bon ruissellement de l'eau. Les grilles en acier bénéficieront d'une repeinte en moyenne aux 5 ans.\n\nL'entretien des bordures de béton consiste essentiellement au colmatage des fissures avec un coulis afin de prévenir la rétention d'eau dans le béton et l'éclatement au gel. Cependant notre expérience a démontré que cette pratique est plutôt un exercice esthétique.\n\nIl est recommandé de planifier annuellement le nettoyage des pavages, puis des fosses de captation. Ceci particulièrement en fin de printemps afin d'éliminer les résidus de sels déglaçant.",
+  betonCoule: "Le béton coulé nécessite peu d'entretien, cependant l'apparition de petites fissures (d'une largeur inférieure à 2mm) est normale sur une dalle de béton. Ces fissures sont généralement associées au phénomène de retrait lors du mûrissement et pourront être scellées avec un coulis pour prévenir la rétention d'eau et l'éclatement au gel. Lors de dénivelé important, la mise à niveau avec soulèvement par uréthane donne de très bons résultats. Les remplacements sont fréquemment justifiés par les finis de surface affectée par les sels déglaçant.",
+  paveBeton: "Concernant le pavage de pavé de béton, ceux-ci sont très durables. Périodiquement, une mise à niveau des surfaces sera requise afin d'éliminer les différences de niveau qui sont un risque de trébuche et de chute. Les mouvements, affaissements et soulèvements du sol sont les principales causes de ces phénomènes.",
+  muretsModulaires: "Murets modulaires : Ce type de module en bloc de béton nécessite peu d'entretien. Il est suggéré de nettoyer annuellement avec un jet sous pression et ceci en fonction de l'exposition aux sels déglaçant. Au plus long terme, il faudra prévoir les déformations et affaissements et planifier la remise à niveau.",
+  gardeCorps: "Garde-corps acier : Ceux-ci devront être repeint sur une base régulière. Idéalement, la préparation sera faite avec un sablage au jet. Le calcul d'entretien planifie pour des travaux de préparation avec ponçages rotatifs et peinture aux garde-corps en acier aux 10 à 15 ans.\n\nGarde-corps métallique : Ceux-ci sont sans entretien. L'application de peinture sur ce type d'alliage est généralement peu efficace. Lorsque la corrosion est trop présente, le remplacement est suggéré.\n\nVérifier régulièrement la solidité des bases et ancrages. Pour des raisons de sécurité, il est recommandé d'installer des garde-corps au haut des murets, lorsque ceux-ci sont de plus de 24 pouces (600mm) et d'installer une main courante aux escaliers de plus de trois contremarches.",
+  acierGalvanise: "Les structures en acier galvanisées (zinquées) sont sans entretien et considérés avoir la durée de vie de l'immeuble. Après plusieurs années, l'apparition de zones de rouilles pourra être gratté et poncées puis un produit au zinc appliqué.",
+  boisTraite: "Les structures de bois exposés mais sans contact avec le sol présentent régulièrement des durées de vie d'environ 25 ans. En contact avec le sol, celles-ci dépassent difficilement 10 à 15 ans.\n\nLes structures en bois traitées exposés mais sans contact avec le sol, ont des durées de vie pouvant atteindre 40 ans. En contact avec le sol, celles-ci dépassent difficilement 25 à 30 ans.\n\nAinsi, pour tout contextes, il est suggéré de planifier annuellement le traitement des surfaces de bois et particulièrement les parties en contact avec le sol.",
+  clotureBois: "Les clôtures de bois ont une durée de vie variant de 15 à 25 ans. L'élément le plus sensible à la détérioration demeure la base des poteaux. Nous suggérons toujours d'appliquer une teinture hydrofuge aux 3-5 ans ou selon les informations du manufacturier en s'attardant particulièrement à la base des poteaux.",
+  toitures: "Système multicouche et Membrane élastomère : Il est recommandé de planifier annuellement une inspection de la membrane ainsi que des joints de scellant d'ouverture et de contour. Les drains de toiture sont à être nettoyés annuellement afin d'assurer un bon écoulement de l'eau d'accumulation.",
+  bardeaux: "Bardeaux d'asphalte : Il est recommandé de planifier annuellement une inspection des bardeaux ainsi que des joints de scellant d'ouverture et de contour. Le système de gouttière doit être nettoyé annuellement afin d'assurer un bon écoulement de l'eau. L'installation de butoir à chaque descente facilitera l'éloignement de l'eau de la base des fondations.",
+  gouttiere: "Système de gouttière : Ces installations sont sujettes à différents phénomènes. L'accumulation de glace, le blocage par les débris, la fatigue des ancrages sont des situations qui sont à vérifier régulièrement. Plusieurs d'entre-elles affectent la solidité et l'intégrité. Sans anticiper le remplacement complet, certaines situations pourront être à corriger ponctuellement.",
+  maconnerie: "Maçonnerie : Il est recommandé de planifier une observation régulière du revêtement de maçonnerie, principalement pour tout indice de fissuration ou mortier friable. Derrière la maçonnerie, se trouve une membrane qui assure l'étanchéité de l'immeuble. C'est pourquoi, une fissure n'implique pas qu'une infiltration d'eau est active. On devra cependant documenter pour tout indice intérieur d'infiltration d'eau, particulièrement au contour des ouvertures.\n\nScellant de rencontre architecturale : Trop souvent oubliés, les scellants de rencontre entre les revêtements ou de contrôle sont à être vérifiés et corrigés annuellement. Leur bon état assure une efficacité contre les infiltrations de l'eau, du vent et des insectes. Ceux-ci sont partie intégrante de l'enveloppe de votre immeuble. Soyez attentif, les façades ensoleillées de l'immeuble pourront présenter des scellants demandant une attention avant ceux des façades ombragées.",
+  parement: "Un nettoyage doux est suggéré afin de conserver le parement en bon état esthétique. La fréquence du nettoyage sera selon l'exposition aux polluants et accumulations des poussières. Comme présenté plus haut, les scellants sont à être vérifiés et corrigés annuellement. Leur bon état assure une efficacité contre les infiltrations de l'eau, du vent et des insectes.",
+  enduitAcrylique: "Attention : Ce type de composition (aussi connu comme : système d'isolation des façades avec enduits : SIFE) demeure un risque pour l'immeuble. Déjà bien documenté au Canada, plusieurs situations ont démontré que ce produit limite la ventilation du mur extérieur lorsque la cavité de drainage est absente. Il en résulte des dommages par l'eau, pouvant inclure la dégradation avancée de la structure de bois. Les bris et fissurations de surfaces doivent être documenter afin de planifier leur réparation et/ou remplacement.",
+  portesFenetres: "Un nettoyage doux est suggéré afin de conserver les éléments en bon état esthétique. La fréquence du nettoyage sera selon l'exposition aux polluants et poussières. Une lubrification régulière des mécanismes avec un silicone en aérosol assurera un bon mouvement.\n\nToutes les portes devront être vérifiées régulièrement, les mécanismes lubrifiés, la tension du système de fermeture automatique ajusté et les coupe-froids endommagés remplacés.\n\nToutes les portes de communication devront être vérifiées, les mécanismes lubrifiés, la tension du système de fermeture automatique ajusté et les coupe-son endommagés remplacés. Ces éléments sont essentiels pour la protection contre les incendies et la propagation de la fumée.",
+  porteGarage: "Le cout d'une porte est environ 25% du coût total de maintenance et d'entretien pour sa durée de vie. Par exemple, les ressorts ont une durée de vie d'environ 10 000 cycles, ou environ une année alors que pour plusieurs composantes de levage, environ 5 ans. Ainsi les services annuels d'entretien par un entrepreneur spécialisé sont recommandés pour les composantes mécanique et électrique.",
+  pontageFibre: "Pontage de fibre de verre : Un nettoyage doux des surfaces du pontage est suggéré afin de conserver les éléments en bon état. Selon notre expérience, la durée de vie d'un pontage de fibre de verre (avec contreplaquée) est variable et d'environ 20-30 ans. Bien que de construction robuste, celui-ci demeure sensible aux rayonnements du soleil et à la dégradation lente de surface qui est fréquemment la cause des infiltrations d'eau, par exemple : son exposition au soleil, le type équipements et mobiliers qui l'occupe, le type de fixation/ancrage des gardes-corps. Un indice classique est l'apparition de traces d'eau ''jaunâtre'' sous le balcon. Ainsi la raison habituelle de leur remplacement concerne moins sa résistance structurale mais plutôt ces infiltrations d'eau et la délamination de surface. Certains produits existent qui, posés en surface semble vraisemblablement limiter l'assèchement et la porosité de la résine de polyester. Notre expérience ne peut permettre de statuer sur l'avantage coût/ durée de vie de cette pratique. Récemment, il existe sur le marché des pontages construit avec, en son centre, un panneau de plastique recyclé. Ce type, plus dispendieux, a une durée de vie estimé dépassant 25-35 ans.",
+  moellons: "Moellons : Les fondations d'époque de la construction de votre immeuble étaient construites utilisant les matériaux de la région et selon la compréhension technique du moment. Une fondation en moellon est une construction composée de pierres naturelles non taillées ou légèrement taillées, posées les unes sur les autres avec un mortier, parfois à base de chaux, pour créer une structure solide et stable. Généralement, le résultat est plutôt stable. Les joints de mortier n'ont pas de rôle porteur, la charge se transmettant entre les pierres. Le mortier ne sert qu'à combler les vides et donner une certaine étanchéité. Même si ces structures étaient connues pour leur solidités en Europe, celles-ci sont moins adaptés pour le climat du Québec. Ainsi il est fréquent que ce type de fondation nécessitent des travaux correctifs bien avant d'être centenaire. Avec les apports réguliers d'humidité et les cycles de gel et dégel, le mortier finit par se désagréger. D'importantes fissures pourraient apparaître, par exemple, lorsque l'argile (en sous-fondation) perd son contenu en eau lors d'étés secs. Ainsi, des travaux de re jointage pourraient être requis en plus de devoir replacer les pierres qui se seraient délogées. Nous suggérons de documenter toute indice de vieillissement, infiltration d'eau, dégradation, perte de stabilité en compression afin de planifier les travaux appropriés avec un professionnel. Généralement, lors de travaux importants, le remplacement de pierres fissurées ou friables ainsi que l'utilisation d'un mortier haute résistance pourra redonner à votre fondation ses capacités. En situation extrême, les fondations pourraient bénéficier de stabilisation avec pieutage ou muret de soutènement.",
+  drainFrancais: "Le drain français : Le système de drain français a une durée de vie d'environ 35 ans. Les mouvements de sols, la migration des racines et l'érosion des fines particules dans le sol, sont les raisons principales qui affectent l'efficacité de ce système. Un drain français non fonctionnel ne pourra évacuer l'eau accumulée à la base des fondations et pourra créer des situations d'infiltration d'eau.",
+  structure: "Il n'y a pas d'entretien prévu pour la structure. En prévention il sera essentiel de prévenir les risques d'infiltration d'eau au niveau de l'enveloppe, de la toiture et de la dalle du stationnement intérieur.",
+  securiteIncendie: "Ces éléments de sécurité incendie devront être vérifiés annuellement par une firme spécialisée qui émettra les attestations de conformités appropriées. Nous suggérons de planifier les correctifs particuliers dès le rapport d'inspection reçu.",
+  cameras: "Selon notre expérience, la gestion des enregistrements et leur consultation demande certaines précautions. La mise en place d'un système de caméras de surveillance doit répondre à un besoin de sécurité. L'objectif doit justifier la cueillette de renseignements qui pourraient être considérés personnels. Ainsi, aucun copropriétaire ne pourra avoir accès au captures vidéo ou images recueillies. Seules quelques personnes désignées par le conseil d'administration : un administrateur, le gestionnaire ou les personnes responsables de la sécurité de l'immeuble, devraient y avoir accès. Ces enregistrements ne devraient en aucun cas être diffusées ou transférées à un tiers, sauf aux autorités policières ou judiciaires pour identifier notamment les auteurs de vandalisme commis dans l'immeuble ou sur la propriété.",
+  finisInterieurs: "Selon notre expérience, la mise en place d'une procédure de surveillance lors des emménagements/ déménagements demeure le meilleur moyen de limiter les bris et dommages aux finis.",
+  alimentationElectrique: "L'entretien de base consiste à libérer les espaces électriques de tout remisage.\n\nPour l'entretien spécifique nous recommandons de planifier avec un électricien spécialisé. Celui-ci effectuera la vérification, dépoussiérage et thermographie des installations.\n\nLes éléments ayant une durée de vie plus courte sont les transformateurs. Malgré notre expérience d'une durée de vie dépassant les 45 ans, nous remarquons plusieurs situations inattendues de remplacement à l'intérieur de 20 ans. Ceci est inclus dans notre calcul cyclique d'allocation.",
+  chauffeEau: "La durée de vie imposé par la majorité des compagnies en assurance est de 10 ans. Des avenants d'exclusions sont à prévoir lorsque les chauffe-eaux dépassent ce délai.",
+  // Repli neutre : composé uniquement de formules maison (§ 2.7 et § 4.3 du
+  // corpus). Employé quand ni le code Uniformat ni la catégorie ne désignent un
+  // bloc pré-écrit — la maison préfère une suggestion prudente à une invention.
+  neutre: "Nous suggérons de documenter toute situation observée à cet élément afin de planifier les travaux appropriés avec un professionnel ou un entrepreneur spécialisé. La mise en place d'un programme d'entretien annuel facilite le transfert des tâches et la priorisation de celles-ci.",
+  mecanique: "Ces équipements bénéficient d'un contrat d'entretien annuel par une firme spécialisée qui assurera le suivi des suggestions du manufacturier. Nous suggérons de planifier les correctifs particuliers dès le rapport d'inspection reçu.",
+  plomberie: "Nous vous rappelons que vous avez avantage à planifier, tous les 3 à 5 ans, un nettoyage de ces conduits. Tout travail ou branchement impliquant le réseau intérieur devra être effectué par des entrepreneurs membres de la CMMTQ."
+};
+// Clé de recherche 1 — le nom (ou la variante) de l'élément. Ordre significatif :
+// du plus spécifique au plus générique, première correspondance retenue.
+const ENTRETIEN_PAR_NOM = [
+  { re: /loi\s*122|inspection\s+des\s+fa[çc]ades/i, blocs: ["maconnerie"] },
+  { re: /stationnements?\s+[ée]tag/i, blocs: ["betonCoule"] },
+  { re: /moellon|pierre\s+(?:naturelle|des\s+champs|taill)/i, blocs: ["moellons"] },
+  { re: /drain\s+fran[çc]ais/i, blocs: ["drainFrancais"] },
+  { re: /goutti[èe]re/i, blocs: ["gouttiere"] },
+  { re: /bardeau/i, blocs: ["bardeaux", "gouttiere"] },
+  { re: /pontage.{0,20}fibre\s+de\s+verre|fibre\s+de\s+verre/i, blocs: ["pontageFibre"] },
+  { re: /porte\s+de\s+garage/i, blocs: ["porteGarage", "portesFenetres"] },
+  { re: /garde-corps|main[s]?\s+courante/i, blocs: ["gardeCorps"] },
+  { re: /muret/i, blocs: ["muretsModulaires"] },
+  { re: /cl[ôo]ture[^.]{0,30}bois|cl[ôo]ture\s+de\s+bois/i, blocs: ["clotureBois"] },
+  { re: /acier\s+galvanis|zingu/i, blocs: ["acierGalvanise"] },
+  { re: /bois\s+trait/i, blocs: ["boisTraite"] },
+  { re: /enduit\s+acrylique|\bSIFE\b/i, blocs: ["enduitAcrylique", "parement"] },
+  { re: /ma[çc]onnerie|brique|scellant[s]?\s+de\s+rencontre|linteau/i, blocs: ["maconnerie"] },
+  { re: /membrane|toit(?:ure)?\s|toit\b|solin/i, blocs: ["toitures"] },
+  { re: /pav[ée]\s+(?:de\s+b[ée]ton|uni)|pav[ée]\s+modulaire/i, blocs: ["paveBeton"] },
+  { re: /pavage|asphalte|bordure|stationnement\s+ext/i, blocs: ["pavage"] },
+  { re: /all[ée]e|trottoir|dalle|b[ée]ton\s+coul/i, blocs: ["betonCoule"] },
+  { re: /am[ée]nagement\s+paysager|plate[s]?-bande|v[ée]g[ée]tation/i, blocs: ["amenagement"] },
+  { re: /cam[ée]ra|surveillance|\bCCF\b|\bCCTV\b/i, blocs: ["cameras"] },
+  { re: /chauffe-eau|r[ée]servoir[s]?\s+d['’]eau\s+chaude/i, blocs: ["chauffeEau"] },
+  { re: /incendie|gicleur|d[ée]tecteur|alarme|extincteur|[ée]clairage\s+d['’]urgence|panneau\s+de\s+sortie/i, blocs: ["securiteIncendie"] },
+  { re: /alimentation\s+[ée]lectrique|panneau\s+[ée]lectrique|transformateur|entr[ée]e\s+[ée]lectrique/i, blocs: ["alimentationElectrique"] },
+  { re: /placopl[âa]tre|gypse|tapis|c[ée]ramique|plafond|lambris|rev[êe]tement\s+de\s+sol|peinture/i, blocs: ["finisInterieurs"] },
+  { re: /colonne|[ée]vacuation\s+sanitaire|eau\s+potable|plomberie|\bDAR\b|anti-?refoulement/i, blocs: ["plomberie"] },
+  { re: /structure/i, blocs: ["structure"] },
+  { re: /fen[êe]tre|porte|scellant\s+d['’]ouverture|vitrage|mur\s+rideau/i, blocs: ["portesFenetres"] },
+  { re: /parement|rev[êe]tement\s+ext[ée]rieur|soffite|fibrociment|vinyle|agr[ée]gat|composite/i, blocs: ["parement"] }
+];
+// Clé de recherche 2 — le préfixe du code Uniformat II. Testée par longueur
+// décroissante, donc « B20.10 » l'emporte sur « B20 ».
+const ENTRETIEN_PAR_CODE = {
+  "G40": ["amenagement"],
+  "G10": ["pavage"],
+  "G20.10": ["betonCoule", "paveBeton"],
+  "G20.30": ["gardeCorps"],
+  "G20": ["betonCoule"],
+  "G30.10": ["clotureBois", "acierGalvanise"],
+  "G30.20": ["muretsModulaires"],
+  "A10": ["drainFrancais"],
+  "A30": ["betonCoule"],
+  "A40": ["betonCoule"],
+  "B10.70": ["boisTraite"],
+  "B10.80": ["gardeCorps"],
+  "B10": ["boisTraite", "gardeCorps"],
+  "B20.10": ["maconnerie"],
+  "B20.30": ["parement"],
+  "B20.40": ["parement"],
+  "B20.50": ["parement"],
+  "B20.60": ["portesFenetres"],
+  "B20": ["parement"],
+  "B30": ["toitures", "gouttiere"],
+  "B40.60": ["porteGarage", "portesFenetres"],
+  "B40": ["portesFenetres"],
+  "C10": ["portesFenetres"],
+  "C20": ["portesFenetres"],
+  "C30": ["finisInterieurs"],
+  "C40": ["gardeCorps"],
+  "D20.26": ["chauffeEau"],
+  "D20.27": ["chauffeEau"],
+  "D20": ["plomberie"],
+  "D30": ["mecanique"],
+  "D40": ["securiteIncendie"],
+  "D50.10": ["alimentationElectrique"],
+  "D50.31": ["securiteIncendie"],
+  "D50.32": ["securiteIncendie"],
+  "D50.40-50": ["securiteIncendie"],
+  "D50.6": ["mecanique"],
+  "D50": ["alimentationElectrique"],
+  "D10": ["mecanique"],
+  "E10": ["neutre"],
+  "E30": ["neutre"],
+  "F10": ["neutre"]
+};
+// Clé de recherche 3 — repli par catégorie maison (les 10 familles § 2.1).
+const ENTRETIEN_PAR_CATEGORIE = {
+  terrain: ["amenagement"],
+  structure: ["structure"],
+  enveloppe: ["parement"],
+  ouvertures: ["portesFenetres"],
+  balcons: ["gardeCorps"],
+  interieur: ["finisInterieurs"],
+  equipements: ["neutre"],
+  cvac: ["mecanique"],
+  electrique: ["alimentationElectrique"],
+  plomberie: ["plomberie"]
+};
+function blocsEntretien(component) {
+  const nom = [component?.name, component?.variante].filter(Boolean).join(" ");
+  for (const regle of ENTRETIEN_PAR_NOM) {
+    if (regle.re.test(nom)) return regle.blocs;
+  }
+  const code = String(component?.uniformat_code ?? "").trim().toUpperCase();
+  if (code) {
+    const prefixes = Object.keys(ENTRETIEN_PAR_CODE).sort((a, b) => b.length - a.length);
+    for (const prefix of prefixes) {
+      if (code.startsWith(prefix)) return ENTRETIEN_PAR_CODE[prefix];
+    }
+  }
+  return ENTRETIEN_PAR_CATEGORIE[component?.cat] ?? ["neutre"];
+}
+function texteEntretien(component) {
+  const blocs = blocsEntretien(component).map((cle) => ENTRETIEN_BLOCS[cle]).filter(Boolean);
+  const corps = paragraphes(blocs.length > 0 ? blocs : [ENTRETIEN_BLOCS.neutre]);
+  return paragraphes([corps, FERMETURE_ENTRETIEN]);
+}
+// NOTE de champ de pratique réservé, placée en tête de famille (gabarit § 2.8).
+const NOTE_CHAMP_PRATIQUE = {
+  equipements: "NOTE : Nos vérifications de certaines composantes demeurent sommaires, car ils relèvent de compétences et de champs de pratique réservés. Si une situation nous apparait préoccupante, le rapport en fera mention.",
+  cvac: "NOTE : Nos vérifications de certaines composantes en mécanique du bâtiment demeurent sommaires, car ils relèvent de compétences et de champs de pratique réservés (Corporation des maîtres électriciens du Québec, Corporation des maîtres mécaniciens en tuyauterie du Québec, Corporation des entreprises de traitement de l'air et du froid, etc.). Si une situation nous apparait préoccupante, le rapport en fera mention.",
+  electrique: "NOTE : Nos vérifications de certaines composantes en mécanique du bâtiment demeurent sommaires, car ils relèvent de compétences et de champs de pratique réservés (Corporation des maîtres électriciens du Québec, Corporation des maîtres mécaniciens en tuyauterie du Québec, Corporation des entreprises de traitement de l'air et du froid, etc.). Si une situation nous apparait préoccupante, le rapport en fera mention.",
+  plomberie: "NOTE : Nos vérifications de certaines composantes en mécanique du bâtiment demeurent sommaires, car ils relèvent de compétences et de champs de pratique réservés (Corporation des maîtres électriciens du Québec, Corporation des maîtres mécaniciens en tuyauterie du Québec, Corporation des entreprises de traitement de l'air et du froid, etc.). Si une situation nous apparait préoccupante, le rapport en fera mention."
+};
+const LIMITE_RELEVE = {
+  cvac: "Les observations des appareils sont toutefois limitées et relève d'un spécialiste en mécanique du bâtiment.",
+  electrique: "Le relevé des systèmes d'électricité est toutefois limité et relève d'un maître électricien.",
+  plomberie: "Le relevé des systèmes de plomberie est toutefois limité et relève d'un maître plombier."
+};
+// ----------------------------------------------------------------------------
+// DURÉE DE VIE ET REMPLACEMENT — déterministe.
+// Deux formats de tableau (corpus § 2.3) :
+//   A — Remplacement : Durée de vie | Année de remplacement | Coût
+//   B — Allocation   : Cycle | Débutant en | Allocation
+// Variante C pour une étude réglementaire : 3e colonne « Étude et rapport ».
+// ----------------------------------------------------------------------------
+const CYCLES_REGLEMENTAIRES = [
+  { re: /loi\s*122|inspection\s+des\s+fa[çc]ades|stationnements?\s+[ée]tag/i, cycle: 5, libelle: "Étude et rapport", texte: "Selon la loi 122, cette vérification périodique doit être reprise tous les 5 ans. Le calcul planifie pour l'étude et le rapport correspondants." },
+  { re: /\bDAR\b|anti-?refoulement/i, cycle: 1, libelle: "Allocation", texte: "La vérification du dispositif anti-refoulement (DAR) est annuelle. Le calcul planifie pour des entretiens réguliers de sécurité sur un cycle de 1 an." },
+  { re: /nettoyage\s+des\s+colonnes|colonnes?\s+(?:sanitaires?|pluviales?)/i, cycle: 5, libelle: "Allocation", texte: "Nous vous rappelons que vous avez avantage à planifier, tous les 3 à 5 ans, un nettoyage de ces conduits. Le calcul planifie pour ces travaux sur un cycle de 5 ans." }
+];
+const MARQUEURS_ALLOCATION = /allocation|entretien|inspection|nettoyage|peinture|mise\s+[àa]\s+niveau|r[ée]parations?\s+ponctuelle|cyclique/i;
+const MARQUEURS_REMPLACEMENT = /remplacement\s+complet|chauffe-eau|r[ée]servoir[s]?\s+d['’]eau\s+chaude|d[ée]tecteur/i;
+function ligneDureeVie(component, dossier) {
+  const nom = [component?.name, component?.variante].filter(Boolean).join(" ");
+  const attributs = objetJson(component?.attributs);
+  const vuDefaut = DEFAULT_USEFUL_LIFE_YEARS[component?.cat] ?? ALLOCATION_USEFUL_LIFE;
+  let duree = Number(component?.useful_life_years);
+  if (!Number.isFinite(duree) || duree <= 0) duree = vuDefaut;
+  const reglementaire = CYCLES_REGLEMENTAIRES.find((r) => r.re.test(nom)) ?? null;
+  let allocation;
+  if (reglementaire) {
+    allocation = true;
+    duree = reglementaire.cycle;
+  } else if (attributs.allocation === true || String(attributs.type ?? "").toLowerCase() === "allocation") {
+    allocation = true;
+  } else if (attributs.allocation === false || String(attributs.type ?? "").toLowerCase() === "remplacement") {
+    allocation = false;
+  } else if (MARQUEURS_REMPLACEMENT.test(nom)) {
+    allocation = false;
+  } else if (MARQUEURS_ALLOCATION.test(nom)) {
+    allocation = true;
+  } else {
+    // Convention maison : une enveloppe budgétaire récurrente porte un cycle
+    // court — par défaut 10 ans (corpus § 2.3 et § 7). Au-delà, la ligne est un
+    // remplacement complet portant la durée de vie réelle de la composante.
+    allocation = duree <= ALLOCATION_USEFUL_LIFE;
+  }
+  const info = infoBatiment(dossier);
+  const anneeInstall = anneeMaison(component?.install_year);
+  const anneeReference = anneeInstall ?? anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier?.built_year) ?? null;
+  const annee = anneeReference != null ? anneeReference + duree : null;
+  return {
+    allocation,
+    reglementaire,
+    duree,
+    anneeInstall,
+    anneeReference,
+    annee,
+    cout: component?.replacement_cost ?? null,
+    libelleMontant: reglementaire?.libelle ?? (allocation ? "Allocation" : "Coût")
+  };
+}
+function titreTableauMaison(component, ligne) {
+  const base = sansNotesInternes(component?.name ?? "Élément");
+  if (ligne.reglementaire && ligne.reglementaire.libelle === "Étude et rapport") return `${base} – Étude et inspection`;
+  return `${base} – ${ligne.allocation ? "Allocation" : "Remplacement"}`;
+}
+function tableauDureeVie(ligne) {
+  const entetes = ligne.allocation ? ["Cycle", "Débutant en", ligne.libelleMontant] : ["Durée de vie", "Année de remplacement", "Coût"];
+  const montant = montantMaison(ligne.cout) ?? `-${NBSP}$`;
+  return {
+    entetes,
+    lignes: [[String(ligne.duree), ligne.annee != null ? String(ligne.annee) : "à confirmer", montant]]
+  };
+}
+function texteDureeVie(component, ligne) {
+  const parties = [];
+  if (ligne.reglementaire) {
+    parties.push(ligne.reglementaire.texte);
+  } else if (ligne.allocation) {
+    parties.push(`Ne nécessitant généralement aucun remplacement complet en un même projet, le calcul planifie pour des réparations ponctuelles par cycle de ${ligne.duree} ans.`);
+  } else {
+    parties.push(`Selon nos références, nos observations et notre expérience avec des matériaux et systèmes similaires, la durée de vie utile retenue pour cet élément est d'environ ${ligne.duree} ans.`);
+  }
+  if (ligne.anneeInstall == null && ligne.anneeReference != null) {
+    parties.push(`Aucune information n'a permis de placer le dernier remplacement de ces éléments (considéré ${ligne.anneeReference} au calcul).`);
+  } else if (ligne.anneeInstall == null) {
+    parties.push("Aucune information obtenue ne pouvait identifier le dernier remplacement. L'année de calcul reste à confirmer auprès de l'administration.");
+  }
+  const anneeCourante = (/* @__PURE__ */ new Date()).getFullYear();
+  if (ligne.annee != null && ligne.annee <= anneeCourante && !ligne.allocation) {
+    parties.push("Ceux-ci, ayant atteint leur durée de vie utile, nous suggérons de documenter afin de planifier leur remplacement. La durée de vie prévue étant dépassée, l'année indiquée au tableau est celle du calcul.");
+  }
+  if (montantMaison(ligne.cout) == null) {
+    parties.push("Le coût budgétaire de cet élément reste à confirmer et sera intégré au calcul du scénario de financement.");
+  }
+  parties.push(AVIS_BUDGETAIRE);
+  return assembler(parties);
+}
+// ----------------------------------------------------------------------------
+// ÉTAT DE L'ACTIF
+// ----------------------------------------------------------------------------
+function localisationMaison(component) {
+  const morceaux = [];
+  const pos = POSITIONS[component?.position];
+  if (pos) morceaux.push(`partie ${pos.toLowerCase()}`);
+  const empl = EMPLACEMENTS[component?.emplacement];
+  if (empl) morceaux.push(empl.toLowerCase());
+  return morceaux.join(", ");
+}
+function phraseCarnet(dossier) {
+  const info = infoBatiment(dossier);
+  return info?.documents?.carnet_entretien === "oui" ? CARNET_REVISE : CARNET_ABSENT;
+}
+function etatDeterministe(component, dossier) {
+  const nom = sansNotesInternes(component?.name ?? "l'élément");
+  const cote = coteRapport(component?.rating);
+  const localisation = localisationMaison(component);
+  const variante = sansNotesInternes(component?.variante ?? "");
+  const parties = [];
+  const description = localisation
+    ? [`« ${nom} » a été relevé à la ${localisation} de l'immeuble`]
+    : [`« ${nom} » fait partie des parties communes de l'immeuble`];
+  if (variante) description.push(` — ${variante}`);
+  description.push(".");
+  parties.push(description.join(""));
+  if (component?.qty && component.qty !== "—") parties.push(`Quantité relevée : ${sansNotesInternes(String(component.qty))}.`);
+  const observation = phraseFinale(component?.observation);
+  if (observation) parties.push(observation);
+  const cause = phraseFinale(component?.cause_possible);
+  if (cause) parties.push(`Selon nos observations, cette situation serait possiblement en lien avec : ${cause.charAt(0).toLowerCase()}${cause.slice(1)}`);
+  if (cote === "Bon") {
+    parties.push(observation
+      ? "Dans l'ensemble, l'état observé est bon."
+      : "L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée.");
+  } else if (cote === "Passable") {
+    parties.push(`Dans l'ensemble, l'état observé est passable et nécessite un entretien devancé. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.`);
+  } else if (cote === "Mauvais") {
+    parties.push(`Dans l'ensemble, l'état observé est mauvais et requiert la planification d'un remplacement. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.`);
+  } else if (!observation) {
+    parties.push("Aucune observation n'a été consignée pour cet élément lors de la visite; son état n'a pas été apprécié dans le cadre du présent relevé.");
+  }
+  const annee = anneeMaison(component?.install_year);
+  if (annee != null) parties.push(`Celles-ci sont de ${annee}.`);
+  else parties.push("Aucune information obtenue ne pouvait identifier le dernier remplacement.");
+  if (cote === "Bon") parties.push("Autre que l'entretien régulier, aucun suivi n'est prévu cette année.");
+  const limite = LIMITE_RELEVE[component?.cat];
+  if (limite) parties.push(limite);
+  return assembler(parties);
+}
+function faitsElement(component, dossier, ligne) {
+  const info = infoBatiment(dossier);
+  const faits = [
+    `Élément : ${component?.name ?? ""}`,
+    component?.uniformat_code ? `Code Uniformat II : ${component.uniformat_code}` : null,
+    `Catégorie maison : ${CATEGORIES[component?.cat]?.label ?? component?.cat ?? "non classée"}`,
+    component?.variante ? `Variante / matériau : ${component.variante}` : null,
+    POSITIONS[component?.position] ? `Façade : ${POSITIONS[component.position]}` : null,
+    EMPLACEMENTS[component?.emplacement] ? `Emplacement : ${EMPLACEMENTS[component.emplacement]}` : null,
+    component?.qty && component.qty !== "—" ? `Quantité relevée : ${component.qty}` : null,
+    component?.rating != null ? `Cote de relevé : ${component.rating} — ${RATING_LABELS[component.rating] ?? "na"}` : "Cote de relevé : non attribuée",
+    coteRapportLongue(component?.rating) ? `Cote au rapport : ${coteRapportLongue(component.rating)}` : null,
+    anneeMaison(component?.install_year) != null ? `Année de construction ou de dernière réparation : ${anneeMaison(component.install_year)}` : "Année de construction ou de dernière réparation : inconnue",
+    `Durée de vie retenue au calcul : ${ligne.duree} ans (${ligne.allocation ? "allocation cyclique" : "remplacement complet"})`,
+    component?.observation ? `Observation de l'inspecteur (données brutes) : ${component.observation}` : null,
+    component?.cause_possible ? `Cause possible relevée : ${component.cause_possible}` : null,
+    component?.note ? `Note de visite : ${component.note}` : null,
+    component?.r_flag ? "Travaux prévus au carnet précédent et non effectués : oui" : null,
+    info?.caracteristiques?.annee_construction ? `Année de construction de l'immeuble : ${info.caracteristiques.annee_construction}` : null,
+    dossier?.built_year ? `Année de construction au dossier : ${dossier.built_year}` : null,
+    dossier?.units ? `Nombre d'unités : ${dossier.units}` : null
+  ];
+  return faits.filter(Boolean).join("\n");
+}
+// ===========================================================================
+// BANQUE DE RÉDACTIONS
+// ---------------------------------------------------------------------------
+// Chaque texte d'ÉTAT DE L'ACTIF produit est consigné ; celui que l'ingénieur
+// corrige et valide devient un exemple pour les études suivantes de la MÊME
+// entreprise. Deux choix structurants :
+//   — Cloisonnement par entreprise : la formulation d'une firme ne nourrit
+//     jamais les rapports d'une autre firme hébergée.
+//   — Seul le texte validé sert d'exemple. Réinjecter du texte non relu ferait
+//     réapprendre au modèle ses propres approximations, cycle après cycle, sans
+//     que personne ne s'en aperçoive avant plusieurs études.
+// ===========================================================================
+
+const BANQUE_TAILLE = 80;      // lignes validées chargées par dossier
+const BANQUE_EXEMPLES_MAX = 3; // exemples injectés par composante
+
+// Textes déjà validés par l'ingénieur pour les composantes de CE dossier.
+async function textesValidesPour(db, dossierId) {
+  const parComposante = {};
+  if (!db || !dossierId) return parComposante;
+  try {
+    const res = await db.prepare(
+      `SELECT component_id, texte_retenu
+         FROM redactions
+        WHERE dossier_id = ?1 AND valide = 1 AND texte_retenu IS NOT NULL AND TRIM(texte_retenu) <> ''
+        ORDER BY updated_at ASC`
+    ).bind(dossierId).all();
+    for (const r of res.results ?? []) parComposante[r.component_id] = r.texte_retenu;
+  } catch {
+    return parComposante;
+  }
+  return parComposante;
+}
+
+async function banquePour(db, companyId) {
+  if (!db || !companyId) return [];
+  try {
+    const res = await db.prepare(
+      `SELECT cat, uniformat_code, name, rating, observation, texte_retenu
+         FROM redactions
+        WHERE company_id = ?1 AND valide = 1 AND texte_retenu IS NOT NULL AND TRIM(texte_retenu) <> ''
+        ORDER BY updated_at DESC
+        LIMIT ?2`
+    ).bind(companyId, BANQUE_TAILLE).all();
+    return res.results ?? [];
+  } catch {
+    // La banque est un confort, pas une dépendance : son absence ne doit jamais
+    // empêcher de rédiger.
+    return [];
+  }
+}
+
+// Classement : même code Uniformat d'abord, puis même catégorie, en préférant
+// une cote identique — un exemple « bon état » ne montre pas comment écrire un
+// remplacement requis.
+function exemplesPour(banque, component, max = BANQUE_EXEMPLES_MAX) {
+  if (!Array.isArray(banque) || banque.length === 0) return [];
+  const code = String(component?.uniformat_code ?? "").trim();
+  const note = (r) => {
+    let n = 0;
+    if (code && r.uniformat_code && r.uniformat_code.trim() === code) n += 100;
+    if (r.cat && component?.cat && r.cat === component.cat) n += 40;
+    if (r.rating != null && component?.rating != null && r.rating === component.rating) n += 15;
+    if (r.name && component?.name && r.name.trim().toLowerCase() === String(component.name).trim().toLowerCase()) n += 25;
+    return n;
+  };
+  return banque
+    .map((r) => ({ r, n: note(r) }))
+    .filter((x) => x.n > 0)
+    .sort((a, b) => b.n - a.n)
+    .slice(0, max)
+    .map((x) => x.r);
+}
+
+function blocExemples(exemples) {
+  if (!exemples || exemples.length === 0) return "";
+  const corps = exemples.map((e, i) => {
+    const entete = [e.name, e.uniformat_code, e.rating != null ? `cote ${e.rating}` : null]
+      .filter(Boolean).join(" · ");
+    const notes = String(e.observation ?? "").trim();
+    return `EXEMPLE ${i + 1} — ${entete}
+Note de terrain : ${notes || "(aucune)"}
+Texte retenu par l'ingénieur :
+${e.texte_retenu}`;
+  }).join("\n\n");
+  return `
+EXEMPLES DÉJÀ VALIDÉS PAR LA FIRME (études antérieures) :
+${corps}
+
+CE QUE TU PRENDS DANS CES EXEMPLES : la manière — l'ordre des informations, les
+tournures, le niveau de modalisation, la longueur, le vocabulaire technique.
+CE QUE TU N'EN PRENDS JAMAIS : les faits. Aucune année, aucun matériau, aucune
+dimension, aucun défaut de ces exemples ne doit apparaître dans ton texte s'il
+ne figure pas dans les FAITS DU RELEVÉ ci-dessous. Ces exemples portent sur
+d'autres immeubles : en importer un détail serait une faute dans un rapport signé.
+`;
+}
+
+async function etatDeLActif(component, dossier, apiKey, ligne, exemples) {
+  const repli = etatDeterministe(component, dossier);
+  const sansDonnees = !String(component?.observation ?? "").trim() && component?.rating == null;
+  if (!apiKey || sansDonnees) return { texte: repli, source: "gabarit" };
+  const prompt = `Tu rédiges la sous-section « ÉTAT DE L'ACTIF » d'une fiche d'élément du
+Plan de gestion de l'actif (carnet d'entretien) de Condo Stratégis, firme québécoise en
+science du bâtiment. Tu transposes la note brute de l'inspecteur dans le registre maison.
+
+${JARGON_STYLE_GUIDE}
+
+ORDRE IMPOSÉ DE L'INFORMATION (gabarit maison) :
+1. Description matérielle et localisation, 1 à 3 phrases.
+2. Limite d'observation, seulement si les données le justifient.
+3. Appréciation d'état, avec les formules maison, par exemple :
+   « Dans l'ensemble, le parement est dans un bon état. »
+   « L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée. »
+   « Dans l'ensemble, l'état observé est passable et nécessite un entretien devancé.
+     Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE. »
+4. Année : « Celles-ci sont de <année>. » ou, à défaut, « Aucune information obtenue ne
+   pouvait identifier le dernier remplacement. » Si l'état est bon, clore par
+   « Autre que l'entretien régulier, aucun suivi n'est prévu cette année. »
+
+RÈGLES ABSOLUES :
+- N'invente AUCUN défaut, matériau, dimension, année ni quantité qui ne soit dans les faits
+  ci-dessous. Si une information manque, emploie la formule maison d'absence d'information.
+- Reste au constat : aucune cause certaine, aucun correctif prescrit, aucun coût.
+- Voix « nous » de firme, vouvoiement du client, modalisation constante
+  (semble, tout laisse croire, selon les informations obtenues).
+- Français du Québec. Aucun titre, aucune puce, aucun gras : 3 à 6 phrases en prose suivie.
+- N'écris aucune note de rédaction interne, aucune mention d'un autre dossier, aucun « ??? ».
+
+${blocExemples(exemples)}
+FAITS DU RELEVÉ :
+${faitsElement(component, dossier, ligne)}
+
+Réponds uniquement par le texte de la sous-section.`;
+  try {
+    const brut = await callClaude(apiKey, { content: prompt, maxTokens: 700 });
+    const texte = sansNotesInternes(brut);
+    if (texte.length < 40) return { texte: repli, source: "gabarit" };
+    return { texte, source: exemples && exemples.length ? "ia+banque" : "ia" };
+  } catch {
+    return { texte: repli, source: "gabarit" };
+  }
+}
+// ----------------------------------------------------------------------------
+// ATTENTION SPÉCIALE — substantielle uniquement lorsque c'est justifié.
+// Déclencheur : cote 3 (entretien requis) ou 4 (remplacement requis), ou des
+// conséquences consignées par l'inspecteur. Sinon, la variante maison « Aucun
+// commentaire ». Registre : « nous suggérons », jamais « nous exigeons ».
+// ----------------------------------------------------------------------------
+const AUCUNE_ATTENTION = "Aucun commentaire. Aucune situation pouvant affecter de façon significative la durée de vie de cet élément n'a été observée. Le suivi se limite à l'entretien régulier prévu au tableur suivi d'entretien.";
+function attentionSpeciale(component) {
+  const rating = Number(component?.rating);
+  const consequences = sansNotesInternes(component?.consequences ?? "");
+  const actif = rating >= 3 || consequences.length > 0;
+  if (!actif) return { texte: AUCUNE_ATTENTION, actif: false };
+  const parties = [];
+  if (rating >= 4) {
+    parties.push("Puis nous avons aussi remarqué des situations qui requièrent la planification d'un remplacement. Ce classement correspond à la cote « Mauvais – Requiert la planification d'un remplacement » de notre légende.");
+  } else {
+    parties.push("Cependant nous avons aussi remarqué des situations qui nécessitent un entretien devancé. Ce classement correspond à la cote « Passable – Nécessite un entretien » de notre légende.");
+  }
+  const constats = [];
+  const observation = sansNotesInternes(component?.observation ?? "");
+  if (observation) {
+    for (const seg of observation.split(/(?<=[.;])\s+/)) {
+      const s = seg.trim().replace(/[.;]$/, "");
+      if (s) constats.push(`· ${s};`);
+    }
+  }
+  const cause = sansNotesInternes(component?.cause_possible ?? "");
+  if (cause) constats.push(`· Cause possible : ${cause.replace(/[.;]$/, "")};`);
+  if (consequences) constats.push(`· ${consequences.replace(/[.;]$/, "")};`);
+  if (constats.length === 0) constats.push("· Aucun commentaire détaillé n'a été consigné au relevé pour cette situation;");
+  const suites = [];
+  const delai = sansNotesInternes(component?.delai_suggere ?? "");
+  if (delai) suites.push(`Selon notre opinion, l'intervention est à planifier ${delai.replace(/^[Àà]\s+/, "à ").replace(/[.;]$/, "")}.`);
+  if (rating >= 4) {
+    suites.push("Une inspection complémentaire ou une expertise par un professionnel, incluant un devis correctif et idéalement un processus d'appels d'offres seront requis afin d'évaluer le délai et les coûts connexes aux travaux.");
+  } else {
+    suites.push("Une inspection complémentaire par un entrepreneur spécialisé ou une expertise pourra être requise afin d'évaluer le délai et le coût de l'entretien.");
+  }
+  if (component?.r_flag) {
+    suites.push("Notez que des travaux prévus à la dernière mise à jour du carnet d'entretien n'ont pas été effectués pour cet élément.");
+  }
+  suites.push("Nous vous conseillons aussi de documenter ces informations à l'intérieur de votre tableur suivi d'entretien et d'y planifier vos prochains exercices d'observations, entretiens et/ou travaux. Pour le détail, nous vous redirigeons à la section 9.0 : Informations relatives au suivi de l'entretien.");
+  suites.push(FERMETURE_ATTENTION);
+  return { texte: paragraphes([assembler(parties), constats.join("\n"), assembler(suites)]), actif: true };
+}
+// ----------------------------------------------------------------------------
+// LE GÉNÉRATEUR — un seul, deux consommateurs.
+// ----------------------------------------------------------------------------
+async function genFicheElement(component, dossier, apiKey, opts = {}) {
+  const nom = sansNotesInternes(component?.name ?? "Élément");
+  const code = sansNotesInternes(component?.uniformat_code ?? "");
+  const ligne = ligneDureeVie(component, dossier);
+  // Un texte validé par l'ingénieur fait foi : le rapport doit imprimer sa
+  // correction, pas une nouvelle génération qui la contredirait.
+  const retenu = String(opts.texteRetenu ?? "").trim();
+  const etat = retenu
+    ? { texte: retenu, source: "valide" }
+    : await etatDeLActif(component, dossier, apiKey, ligne, opts.exemples);
+  const attention = attentionSpeciale(component);
+  const carnet = phraseCarnet(dossier);
+  return {
+    titre: code ? `${nom} (${code})` : nom,
+    coteRapport: coteRapport(component?.rating),
+    sections: [
+      {
+        cle: "etat",
+        titre: `ÉTAT DE L'ACTIF - ${nom}`,
+        texte: paragraphes([etat.texte, carnet]),
+        tableau: null,
+        actif: true
+      },
+      {
+        cle: "duree_vie",
+        titre: `DURÉE DE VIE ET REMPLACEMENT - ${nom}`,
+        texte: texteDureeVie(component, ligne),
+        tableau: tableauDureeVie(ligne),
+        actif: true
+      },
+      {
+        cle: "entretien",
+        titre: `COMMENTAIRES D'ENTRETIEN - ${nom}`,
+        texte: texteEntretien(component),
+        tableau: null,
+        actif: true
+      },
+      {
+        cle: "attention",
+        titre: `ATTENTION SPÉCIALE - ${nom}`,
+        texte: attention.texte,
+        tableau: null,
+        actif: attention.actif
+      }
+    ],
+    source: etat.source
+  };
+}
+async function enParallele(items, limite, fn) {
+  const resultats = new Array(items.length);
+  let curseur = 0;
+  const ouvriers = new Array(Math.min(limite, items.length)).fill(0).map(async () => {
+    while (curseur < items.length) {
+      const i = curseur++;
+      resultats[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(ouvriers);
+  return resultats;
+}
 const components = new Hono();
 function arrayBufferToBase64(buf) {
   const bytes = new Uint8Array(buf);
@@ -3331,6 +4040,107 @@ components.post("/:id/structure-note", async (c) => {
     `UPDATE components SET note = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2`
   ).bind(note, id).run();
   return c.json({ note });
+});
+// Rédaction maison d'une composante — même auth et même cloisonnement par
+// entreprise que les autres routes /components : getOwnedComponent joint le
+// dossier et filtre sur company_id, un locataire ne peut donc jamais lire la
+// composante d'un autre.
+components.post("/:id/redaction", async (c) => {
+  const user = await getCurrentUser(c);
+  const component = await getOwnedComponent(c, c.req.param("id"));
+  if (!component) return c.json({ error: "composante introuvable" }, 404);
+  const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(component.dossier_id).first();
+
+  // Un texte déjà validé pour cette composante fait foi : on le ressert tel
+  // quel plutôt que d'en produire un nouveau qui contredirait la correction.
+  const dejaValide = await c.env.DB.prepare(
+    `SELECT id, texte_retenu FROM redactions
+      WHERE component_id = ?1 AND valide = 1 AND texte_retenu IS NOT NULL AND TRIM(texte_retenu) <> ''
+      ORDER BY updated_at DESC LIMIT 1`
+  ).bind(component.id).first();
+
+  const banque = dejaValide ? [] : await banquePour(c.env.DB, user?.company_id);
+  const exemples = dejaValide ? [] : exemplesPour(banque, component);
+  const fiche = await genFicheElement(component, dossier, c.env.ANTHROPIC_API_KEY, {
+    exemples,
+    texteRetenu: dejaValide?.texte_retenu
+  });
+
+  const etat = fiche.sections.find((x) => x.cle === "etat");
+  let redactionId = dejaValide?.id ?? null;
+  if (!dejaValide && etat) {
+    // On consigne le texte produit même non relu : c'est la moitié du couple
+    // (produit, retenu) qui rendra la correction de l'ingénieur exploitable.
+    redactionId = newId("red");
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO redactions (id, company_id, dossier_id, component_id, cat, uniformat_code, name, rating, observation, texte_genere)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+      ).bind(
+        redactionId, user.company_id, component.dossier_id, component.id,
+        component.cat ?? null, component.uniformat_code ?? null, component.name ?? null,
+        component.rating ?? null, component.observation ?? null, etat.texte
+      ).run();
+    } catch {
+      redactionId = null;
+    }
+  }
+
+  return c.json({
+    ...fiche,
+    redaction_id: redactionId,
+    valide: !!dejaValide,
+    exemples_utilises: exemples.length
+  });
+});
+
+// L'ingénieur corrige le texte et le valide. C'est cette version-là, et elle
+// seule, qui alimentera les études suivantes de son entreprise.
+components.patch("/:id/redaction", async (c) => {
+  const user = await getCurrentUser(c);
+  const component = await getOwnedComponent(c, c.req.param("id"));
+  if (!component) return c.json({ error: "composante introuvable" }, 404);
+  const body2 = await c.req.json();
+  const texte = String(body2.texte_retenu ?? "").trim();
+  if (!texte) return c.json({ error: "texte_retenu requis" }, 400);
+  const valide = body2.valide === false ? 0 : 1;
+
+  const existante = await c.env.DB.prepare(
+    "SELECT id FROM redactions WHERE component_id = ?1 ORDER BY updated_at DESC LIMIT 1"
+  ).bind(component.id).first();
+
+  if (existante) {
+    await c.env.DB.prepare(
+      `UPDATE redactions SET texte_retenu = ?1, valide = ?2, rating = ?3, observation = ?4,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?5`
+    ).bind(texte, valide, component.rating ?? null, component.observation ?? null, existante.id).run();
+    return c.json({ ok: true, redaction_id: existante.id, valide: !!valide });
+  }
+
+  const id = newId("red");
+  await c.env.DB.prepare(
+    `INSERT INTO redactions (id, company_id, dossier_id, component_id, cat, uniformat_code, name, rating, observation, texte_genere, texte_retenu, valide)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11)`
+  ).bind(
+    id, user.company_id, component.dossier_id, component.id,
+    component.cat ?? null, component.uniformat_code ?? null, component.name ?? null,
+    component.rating ?? null, component.observation ?? null, texte, valide
+  ).run();
+  return c.json({ ok: true, redaction_id: id, valide: !!valide });
+});
+
+// État de la banque, pour que la firme voie ce qu'elle a accumulé.
+components.get("/banque/etat", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "non authentifié" }, 401);
+  const row = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS total,
+            SUM(CASE WHEN valide = 1 AND texte_retenu IS NOT NULL THEN 1 ELSE 0 END) AS valides,
+            COUNT(DISTINCT uniformat_code) AS codes
+       FROM redactions WHERE company_id = ?1`
+  ).bind(user.company_id).first();
+  return c.json({ total: row?.total ?? 0, valides: row?.valides ?? 0, codes: row?.codes ?? 0 });
 });
 const RESERVE_FUND_PARAMS = {
   // Hypothèses sourcées (méthode Condo Stratégis) — pas des valeurs rondes.
@@ -21670,9 +22480,481 @@ function cell(text, opts = {}) {
     ]
   });
 }
+// ============================================================================
+// LE RAPPORT .DOCX — plan de gestion de l'actif, ossature maison
+// 1.0 Sommaire du mandat · 2.0 Méthodologie · 3.0 Comment lire ce rapport
+// 4.0 Observation des éléments · 5.0 Résultats et scénarios de financement
+// 6.0 Conclusion et suggestions · 7.0 Limitations · 8.0 Déclaration
+// 9.0 Informations relatives au suivi de l'entretien · Annexes
+// ============================================================================
+// PIÈGE 2 — le gabarit maison invoque en § 8.0 les normes de l'Ordre des
+// technologues professionnels alors que le signataire est ingénieur (OIQ). Nous
+// ne codons en dur NI l'un NI l'autre : l'ordre est dérivé du signataire quand
+// c'est possible, sinon la déclaration porte un marqueur visible à compléter —
+// jamais une attestation fausse.
+const ORDRES_PROFESSIONNELS = [
+  { sigle: "OIQ", nom: "Ordre des ingénieurs du Québec", re: /(^|[\s,.(])ing\.?($|[\s,.)])|ing[ée]nieur/i },
+  { sigle: "OTPQ", nom: "Ordre des technologues professionnels du Québec", re: /(^|[\s,.(])(T\.?P\.?)($|[\s,.)])|[Tt]echnologue/ },
+  { sigle: "OAQ", nom: "Ordre des architectes du Québec", re: /(^|[\s,.(])arch\.?($|[\s,.)])|architecte/i }
+];
+function ordreDuSignataire(signataire) {
+  const source = [signataire?.name, signataire?.title, signataire?.ordre_professionnel, signataire?.role].filter(Boolean).join(" ");
+  if (!source.trim()) return null;
+  for (const ordre of ORDRES_PROFESSIONNELS) {
+    if (ordre.re.test(source)) return ordre;
+  }
+  return null;
+}
+const A_COMPLETER = "[À COMPLÉTER AVANT SIGNATURE]";
+const LIBELLES_DOCUMENTS = {
+  declaration_copropriete: "Déclaration de copropriété",
+  certificat_localisation: "Certificat de localisation",
+  plans_construction: "Plans de construction",
+  plans_structure: "Plans de structure",
+  plans_mecaniques: "Plans mécaniques",
+  plan_amenagement_ext: "Plan d'aménagement extérieur",
+  rapports_inspection: "Rapports d'inspection / déficiences",
+  rapports_travaux: "Rapports de travaux « grands projets »",
+  carnet_entretien: "Carnet d'entretien"
+};
+const TEXTE_MAISON = {
+  etendue: [
+    "La portée de notre travail inclut des relevés visuels par des ingénieurs, technologues professionnels, inspecteurs en bâtiment ou des techniciens et la consultation des documents fournis et identifiés dans la section ''Documents de références''.",
+    "Selon les encadrements déjà en place par la règlementation gouvernementale pour certaines études en copropriété (RPC) et à prévoir concernant les études en fonds de prévoyance (Loi 16 et Loi 31), le contexte de ces études doit être effectuée par un membre d'un ordre professionnel : Technologues professionnels (OTPQ), ingénieurs en bâtiment (OIQ) ou architectes (OAQ).",
+    "Les composantes communes et les systèmes étudiés comprennent :"
+  ],
+  famillesEtudiees: [
+    "Terrain et bâtiments utilitaires",
+    "Structure et garages intérieurs",
+    "Enveloppe du bâtiment",
+    "Portes et fenêtres",
+    "Balcons et terrasses",
+    "Intérieur du bâtiment",
+    "Appareils / installations et équipements spéciaux",
+    "Systèmes de chauffage et ventilation",
+    "Installations électriques",
+    "Installations de plomberie, d'alimentation et d'évacuation"
+  ],
+  objetChamp: "Les suggestions et les avis des coûts associés à ces suggestions, présentées dans ce rapport, sont fondés sur des portions de l'édifice qui étaient accessibles au cours de notre enquête. Certaines conditions existantes n'ont pu être observées, et par conséquent, peuvent ne pas figurer dans l'état général des éléments observés et rapportés dans ce rapport. Notez que la non-disponibilité de plan détaillé, requis en format PDF, force une appréciation subjective de certains éléments.",
+  contexteEconomique: [
+    "Les dernières années ont été marquées par des ralentissements variables des économies intérieures et mondiales, puis plus récemment les hausses reliées à l'incertitude liée à la situation du COVID 19, amènent à des considérations de prudence.",
+    "Dans ce contexte imprévisible au moyen et long terme, nous croyons judicieux de rappeler que les taux pourront varier. En tenir compte favorisera un meilleur suivi de vos planifications futures."
+  ],
+  exigencesLoi: "Selon l'article 1071 du Code civil du Québec, le syndicat de copropriété doit constituer, en fonction du coût estimé des travaux majeurs et du coût de remplacement des parties communes, un fonds de prévoyance, affecté uniquement à ces réparations et remplacements. Le syndicat a donc l'obligation de tenir à jour un dossier estimatif des coûts à venir, à moyen et à long terme. De plus, l'article 1072 précise que les copropriétaires doivent contribuer au fonds de prévoyance pour au moins 5 pour cent (5%) de leur contribution aux charges communes. Il n'y a cependant pas de limite maximale à ce sujet, afin de conserver une cohérence avec l'obligation d'y prévoir un montant estimatif basé sur les réparations majeures et le coût de remplacement à venir des parties communes.",
+  quotesParts: "Les valeurs relatives aux quotes-parts des unités, figurant à la déclaration de copropriété, sont détaillées à l'ANNEXE C – CONTRIBUTION MENSUELLE PAR COPROPRIÉTÉ.",
+  lireRapport: {
+    intro: "Votre immeuble est composé de matériaux divers regroupés en éléments (composantes ou appareils) ''les sections'' et selon la norme ASTM E 1557-02 / Uniformat II. Chacun des éléments est présenté suivant les sous-sections suivantes :",
+    etat: [
+      "La première sous-section du carnet d'entretien vise à décrire l'actif sous étude (l'élément), de le localiser par rapport à l'immeuble et de commenter avec une appréciation sommaire de l'état observé. Si possible, la description sera accompagnée de photographies générales.",
+      "Selon les informations obtenues : L'année d'installation ou du dernier du remplacement complet sera mentionnée.",
+      "Généralement l'état de l'élément sera identifié comme Bon : signifiant que des défauts mineurs pouvant nécessiter des réparations ou entretiens réguliers sont existants. Cependant, le fonctionnement est normal et aucun suivi n'est prévu d'ici 12 à 24 mois.",
+      "Lorsque l'état de l'élément observé est ''passable'' ou ''mauvais'' des informations seront fournies dans la sous-section ATTENTION SPÉCIALE.",
+      "Orientation des bâtiments : Afin de se situer, le lecteur doit se placer dans la rue face à l'immeuble pour identifier la façade avant, les côtés et l'arrière."
+    ],
+    dureeVie: [
+      "À l'aide d'un tableau, cette deuxième sous-section de l'étude indique selon notre opinion et pour fin de calcul, la durée de vie et l'année prévue de son remplacement, ainsi que le coût budgétaire estimé pour ce remplacement ajusté en dollars actuels avant planifications et taxes (Loi 16).",
+      "À l'occasion, pour les éléments ayant une grande durée de vie ou en prévision d'impondérables périodiques, des allocations cycliques seront proposées. Le tableau porte alors les colonnes Cycle | Débutant en | Allocation, plutôt que Durée de vie | Année de remplacement | Coût.",
+      "Les hypothèses sur l'espérance de vie sont basées sur les informations fournies dans la documentation des fabricants, manuels de référence comme le Marshall & Swift et divers manuels sur la dépréciation des bâtiments, nos observations des divers éléments et notre expérience avec des matériaux et systèmes similaires.",
+      "L'année de remplacement respecte la durée de vie prévue. À l'occasion, selon nos observations, cette année de remplacement pourra être ajusté. Lorsque la durée de vie prévue est dépassée et ne peut être reportée, celle-ci sera indiquée au tableau.",
+      "Les estimations de coût de remplacement sont basées sur les coûts unitaires publiés dans divers manuels de coût, des historiques d'appels d'offres et combinés avec l'expérience acquise par nos professionnels. Certains frais, tels : ingénierie et/ou architecture, appels d'offres et planification, mise en chantier, surveillance, excavations et mesures de sécurité étant très variables, seront à être évalués pour chaque projet et ajoutés aux estimations."
+    ],
+    entretien: "Cette troisième sous-section présente les généralités fréquentes qui favorisent une atteinte, voir le dépassement des durées de vie. En plus des suivis prévus au tableur suivi d'entretien, ces quelques suggestions d'expériences tenteront de susciter certaines habitudes. En copropriété, nous suggérons la mise en place d'un programme d'entretien annuel. Cette planification facilite le transfert des taches et la priorisation de celles-ci. En prévision de la mise en place d'un programme d'entretien, nous vous redirigeons à la section 9.0 : Informations relatives au Tableur suivi d'entretien.",
+    attention: [
+      "Lorsque des situations pouvant affecter de façon significative la durée de vie de l'élément sont observées, celles-ci seront mentionnées dans la sous-section ATTENTION SPÉCIALE et un classement lui sera attribué :",
+      "Passable - Nécessite un entretien : L'élément présente plusieurs défauts mineurs ou importants nécessitant des réparations ou entretiens devancés. Le fonctionnement est affecté ou à risque. Une inspection complémentaire par un entrepreneur spécialisé ou une expertise pourra être requise afin d'évaluer le délai et le coût de l'entretien. Pour le détail, nous vous redirigeons à la section 9.0 : Informations relatives au Tableur suivi d'entretien. Lorsque des travaux sont suggérés pour planification d'ici à 5 ans, l'icône suivant accompagnera la mention au texte.",
+      "Mauvais – Requiert la planification d'un remplacement : L'élément présente des défauts importants, usure excessive ou obsolescence. Le fonctionnement est à risque, anormal ou peut affecter d'autre élément. Une inspection complémentaire ou une expertise par un professionnel, incluant un devis correctif et idéalement un processus d'appels d'offres seront requis afin d'évaluer le délai et les coûts connexes aux travaux.",
+      "Le suivi recommandé sera de planifier à l'intérieur d'un projet distinct les interventions requises avec le professionnel ou spécialiste approprié et de prévoir les travaux connexes.",
+      "Rappelons que l'étude en carnet d'entretien n'est pas une d'inspection technico-légale, de recherche de déficiences, de leur causes et effets, ni des méthodes correctives à apporter. Ces demandes pourront faire l'objet d'un mandat différent. Ainsi, certaines situations non observées ou affectant peu l'élément ou relevant de la maintenance/ entretien régulier ne pourront être mentionnées. Pour le détail, vous référer à la section 7.0 Limitations légales."
+    ],
+    annexes: [
+      "SCÉNARIO DE FINANCEMENT — L'ensemble des valeurs de durée de vie, année de remplacement et des coûts associés, sont présentées à l'intérieur des tableaux à l'ANNEXE A – SOMMAIRE DES TRAVAUX et à l'ANNEXE B – CALENDRIER DE REMPLACEMENT – SCÉNARIOS DE FINANCEMENT.",
+      "TABLEUR SUIVI D'ENTRETIEN — Afin de faciliter le suivi de vos tâches d'entretien, un tableur Excel est fourni en annexe complémentaire. Structuré selon les saisons, ce document servira d'outil de suivi et de rappel des observations à effectuer pour documenter l'évolution des éléments de votre immeuble. À même ce tableur, vous pourrez inscrire vos commentaires, insérer les demandes de projets et effectuer les suivis appropriés."
+    ]
+  },
+  resultats: "Les résultats de notre étude et de nos suggestions sont résumés dans les tableaux suivants. Il convient de noter que dans tous les scénarios de financement développés, le niveau suggéré de cotisation annuelle est fondé sur l'exigence du maintien d'un solde positif du fonds de prévoyance.",
+  limitations: {
+    mandant: [
+      "Le présent rapport (rapport narratif et scénario de financement) est destiné spécifiquement à l'intention du mandant et selon les services spécifiés à l'offre de services. L'utilisation est définie à la section sommaire du mandat. L'utilisation de ce dernier par une tierce partie est interdite sans le consentement écrit au préalable du mandant ou de Condo-Stratégis. Toute réutilisation, redistribution non autorisée ou interprétation du rapport constitue un risque qui incombera uniquement au mandant et à son destinataire et pour lequel Condo-Stratégis ne pourra être tenue responsable.",
+      "La visite, l'étude et la rédaction seront effectuées selon les informations fournies et/ou disponibles en préalable à la visite. Toute information partagée suite à ce moment pourrait occasionner des frais additionnels de l'étude et la modification de l'offre de service. Certains contextes pourraient rendre l'étude irréalisable et annuler le contrat de service.",
+      "En produisant le présent rapport, Condo-Stratégis affirme être l'auteur de l'étude de la situation reliée aux éléments identifiés seulement et conformément à la section Sommaire du mandat. Le mandant assumera la responsabilité de défendre, d'indemniser ainsi que de dégager Condo-Stratégis de toute responsabilité résultant de l'interprétation des commentaires et/ou de la distribution non autorisée du rapport. Le rapport doit être pris comme un tout et doit inclure tous les plans et annexes correspondantes. Aucune partie du rapport ne peut être utilisée séparément."
+    ],
+    visite: [
+      "Les visites de relevé sont effectuées en utilisant les méthodes et les procédures qui sont conformes aux règles de l'art et effectuées par des technologues professionnels, des ingénieurs et/ou des techniciens.",
+      "La portée de notre travail lors des visites se limite à des relevés visuels des composantes visibles et accessibles de l'immeuble visant à estimer, selon leur état, leur durée de vie restante en relation avec des valeurs reconnues de durée de vie utile et selon notre opinion d'un comportement normal pour une composante similaire; à l'observation et la documentation des conditions existantes; ainsi qu'à des entretiens avec les occupants ayant des informations pertinentes.",
+      "Les relevés visuels ne peuvent pas détecter les vices et défauts cachés et ne visent pas la recherche de déficiences ou la vérification de conformité. Toutefois, dans le cas où nous observons une déficience qui peut influer de façon significative sur la durée de vie de l'élément et jugée pertinente à intégrer dans le rapport, nous le mentionnerons à titre informatif.",
+      "Observations : Le relevé visuel vise à identifier et observer les éléments de construction, des parties communes accessibles, devant être inclus au fonds de prévoyance et à retenir les déficiences et/ou situations observées pouvant affecter de façon significative la durée de vie des composantes primaires de ces éléments. L'étude ne consiste pas en une expertise technico-légale ou une inspection de type pré-achat ou une recherche de déficiences et ne comprend pas la vérification de conformité aux codes en vigueur. Aucune enquête judiciaire, analyse de sol, évaluation environnementale, calcul d'ingénierie détaillé, ou travail d'arpentage n'a été réalisé.",
+      "Commentaires : Les commentaires et suggestions formulées dans ce rapport (si applicable) sont basés sur notre compréhension au moment de la réalisation de l'étude ainsi que sur l'utilisation, le contexte et les conditions actuelles du site, de même que sur la portée du mandat accordé par le mandant. Les observations consistent en un échantillon aléatoire et ponctuel des éléments de l'immeuble. Ainsi, les commentaires et suggestions inclus sont basés sur les observations effectuées aux emplacements témoins uniquement.",
+      "L'inspecteur ne doit pas déplacer d'équipement, enlever des panneaux ou démonter des morceaux ou pièces d'équipement; de plus, aucun test destructif n'est réalisé. Les équipements électroniques, électriques, mécaniques, chauffage et climatisation, les systèmes de sécurité-incendie, les systèmes de gicleurs et autres éléments spécialisés ont bénéficié d'un constat visuel sommaire qui ne comprend pas l'utilisation d'instruments ou procédures d'essais. Ceux-ci relèvent de compétences et de champs de pratiques réservés.",
+      "Durée de vie : Les avis de l'espérance de vie résiduelle estimée des composants évalués sont basés, entre autres, sur nos observations au moment du relevé et nos expériences antérieures, puis comparés aux valeurs de durée de vie disponibles dans la documentation du fabricant lorsque disponible ou à l'intérieur de documents de références de professionnels. La date réelle de la réparation ou du remplacement des composantes communes devra être confirmée par un suivi adéquat en entretien dans l'avenir."
+    ],
+    financement: [
+      "Lors des calculs de financement, tous les efforts sont faits pour s'assurer de l'exactitude des données à la base des calculs et projections budgétaires développés dans les scénarios de financement. Les coûts de remplacement sont établis selon des références actuelles et nos données pour des travaux similaires, puis ajustés selon les conditions, le contexte et l'accessibilité. Si des estimations de travaux sont existantes, celles-ci seront intégrées aux calculs. Le calcul de projection est indexé et actualisé selon les taux en vigueur ajustés suivant l'évolution des dernières années.",
+      "Le but est d'établir une stratégie de contribution au fonds de prévoyance en fonction de l'ensemble des dépenses prévues de remplacement ou de maintien des composantes observées. C'est sur la base de ces opinions et suggestions de stratégie que le syndicat devra fixer les sommes à verser au fonds de prévoyance (loi 16 Art 1071 C.c.Q.).",
+      "La responsabilité ne peut être acceptée pour des facteurs qui nous sont inconnus ou non divulgués et qui pourraient nuire à l'exactitude de ces projections. Le calcul de financement ne traite pas les coûts de maintenance, d'entretien, d'ajustement, d'améliorations, les taxes en vigueur, etc.",
+      "Ce rapport vous sert de guide de travail afin de permettre une planification budgétaire éclairée concernant les montants de cotisations nécessaires et le moment privilégié du remplacement des éléments de l'immeuble. Les opinions des coûts pour les travaux de remplacement prévus dans le présent rapport sont uniquement destinées à des fins budgétaires globales.",
+      "Les valeurs indiquées au présent rapport sont des montants budgétaires exprimés en dollars canadiens, avant les taxes fédérales et provinciales et ce, à la date de l'estimation. Les coûts au rapport sont actuels, avant taxes. Les coûts aux tableaux sont avant taxes, cependant le cumul est indexé.",
+      "Les plans, croquis et photographies sont ajoutés purement afin de permettre la familiarisation du lecteur avec la propriété."
+    ],
+    tableur: [
+      "L'élaboration du tableur suivi d'entretien sera sous la forme d'un fichier Excel, facile d'utilisation/ adaptation et contient : un calendrier saisonnier qui identifie les moments de l'entretien préventif des équipements; des grilles de rappel avec les séquences et la description des tâches de vérification pour les composantes communes de la copropriété; la possibilité d'y documenter l'historique des interventions concernant les travaux antérieurs et futurs; des rappels pour les contrats de maintenance et d'entretien annuels.",
+      "Le tableur suivi d'entretien est un document essentiel qui s'insère dans un plan de gestion de l'entretien rigoureux de votre immeuble. Le tableur vous permettra de structurer la démarche d'entretien et le suivi prévisionnel des travaux futurs. Le tableur n'est pas un registre de l'immeuble. Mais s'insère dans le registre d'immeuble qui inclut aussi, par exemple : la déclaration de copropriété, les plans d'architecture, les contrats et garanties, le registre des copropriétaires, les projets, etc.",
+      "L'ajout de commentaires au tableur est une tâche importante en soi et demande un temps de concertation et d'organisation par l'administration. La démarche fait appel à une certaine disponibilité régulière afin de compléter les différentes vérifications, et ce au fil des saisons."
+    ],
+    services: [
+      "Lorsque des suggestions pour des services professionnels seront émises, le contexte et l'ampleur de la situation observée seront commentés à titre informatif. Les services de professionnels : technologues (OTPQ), ingénieurs (OIQ) ou architectes (OAQ) sont toujours recommandés pour la gestion de projet d'ampleur et afin de s'assurer que les conditions existantes en planification des ouvrages sont similaires à celles observées durant l'étude.",
+      "En suivi à cette étude viendra le moment de planifier et démarrer les projets retenus; ici nous recommandons que les services de professionnels soient retenus à la préparation des devis pour tout travail, réhabilitation ou processus d'appels d'offres ainsi que pour faire le suivi des travaux afin de s'assurer que les conditions existantes sont similaires à celles observées durant l'étude et que nos suggestions soient bien comprises, et ce, à toutes les étapes des travaux.",
+      "Certaines conditions, qui n'ont pas pu être observées ou prévues au moment de l'étude, pourraient être rencontrées lors de la production des devis par les professionnels ou durant les travaux. Dans l'éventualité où ces nouvelles conditions devaient différer de celles observées à l'emplacement de nos observations, nous demandons d'être immédiatement avisés par écrit afin de permettre une réévaluation de nos suggestions."
+    ],
+    complementaire: [
+      "Le rapport d'étude est remis en format PDF. Il comprend une partie narrative et des annexes présentant un scénario de financement. L'ensemble présentera une approche équilibrée (ou légèrement excédentaire) qui vise le rétablissement budgétaire à l'avenir.",
+      "L'étude et ses conclusions budgétaires représentent notre opinion et sont énoncées en fonction de la planification et de l'exécution d'un entretien adéquat dans l'avenir.",
+      "À la réception du rapport, il est suggéré de lire et d'intégrer les informations pertinentes à votre planification. L'interprétation et/ou l'utilisation divergente du contenu du rapport demeure la responsabilité du conseil d'administration.",
+      "Si des corrections sont requises, votre demande détaillée doit être acheminée par courriel dans les 30 jours de la réception du rapport.",
+      "Suivant cette étude, nous suggérons la consultation d'un gestionnaire ou d'un planificateur financier afin d'élaborer la stratégie appropriée ou la micro-gestion interne requise à votre situation financière.",
+      "Le dépôt de ce rapport n'oblige pas Condo Stratégis à témoigner devant un tribunal à moins d'une entente préalable avec l'application d'un tarif horaire.",
+      "Aucune autre garantie, expresse ou implicite, n'est faite."
+    ]
+  },
+  declaration: [
+    "Les informations contenues au présent rapport ainsi que les opinions qui en découlent sont exactes et bien fondées, mais toutefois assujetties aux limitations mentionnées au présent rapport;",
+    "Les analyses, opinions et conclusions du rapport me sont propres, elles sont neutres et objectives; elles ne sont restreintes que par les limitations que j'ai été appelé à formuler;",
+    "Je n'ai aucun intérêt présent ou futur, réel ou possible, dans la propriété qui fait l'objet de ce rapport et je n'ai aucun lien personnel ni parti pris en ce qui concerne les parties en cause;",
+    "Le soussigné ou son représentant a inspecté personnellement l'intérieur et l'extérieur de la propriété. Il a vu à l'étude des documents et informations fournis par le conseil d'administration ou son représentant susceptible d'influer sur la valeur de remplacement des éléments de la propriété;"
+  ],
+  suiviEntretien: {
+    loi16: [
+      "Selon le projet de loi 16, adoptée le 10 janvier 2020, « le conseil d'administration fait établir un carnet d'entretien de l'immeuble, lequel décrit notamment les entretiens faits et à faire ». Il tient ce carnet à jour et le fait réviser périodiquement. La forme, le contenu et les modalités de tenue et de révision du carnet d'entretien, de même que les personnes qui peuvent l'établir et le réviser, ont été déterminés dans le projet de règlement du gouvernement publié le 30 juillet 2025 (décret 991-2025) et en vigueur depuis le 14 août 2025.",
+      "(Article 1070.2 C.c.Q.) édicté par l'article 38 de la loi visant l'encadrement des inspections en bâtiment de la copropriété divise.",
+      "Afin de satisfaire les attentes prévues au Code civil, le syndicat, par l'intermédiaire de son conseil d'administration, doit en principe mandater tous les travaux à des entreprises (RBQ), corps de métiers (CMMTQ, CMEQ, etc) ou professionnels (OAQ, OIQ, OTPQ). Cette pratique assure que le personnel est couvert par une assurance erreurs et omissions ainsi qu'autorisé par les compagnies manufacturières à effectuer les travaux, ce qui valide certaines garanties applicables."
+    ],
+    actions: [
+      "Documenter les changements visuels des éléments;",
+      "Vérifier l'intégrité des éléments;",
+      "Voir à la maintenance des espaces;",
+      "Effectuer ou mandater les entretiens requis;",
+      "Documenter les travaux effectués."
+    ],
+    niveaux: [
+      "Maintenance : services ménagers, propreté des espaces communs.",
+      "Entretien régulier : prévu au tableur suivi d'entretien et effectué idéalement au moment prévu, par le personnel en place. Il est planifié de façon hebdomadaire, mensuelle ou annuelle.",
+      "Entretien devancé : il devient nécessaire lorsqu'un entretien prévu doit être accompli avant terme, parfois en urgence, afin de corriger une déficience évidente qui risque de s'aggraver ou d'affecter d'autres éléments."
+    ],
+    experience: [
+      "Chez Condo Stratégis, notre expérience nous permet d'avancer qu'investir dans l'entretien, c'est économiser. Des études ont prouvé qu'il est moins coûteux de mettre en place un plan de gestion de l'entretien que d'attendre que des situations problématiques surgissent. Un bâtiment bien entretenu, c'est le début du confort pour tous les occupants et la tranquillité d'esprit pour les administrateurs dans leur gestion des budgets de remplacement. En outre, avec un entretien régulier, les différents éléments de votre immeuble pourront atteindre leur durée de vie utile.",
+      "L'immeuble en copropriété, c'est aussi votre patrimoine et demeure un de vos investissements les plus importants. Nous vous souhaitons la meilleure des réussites."
+    ]
+  },
+  lexique: [
+    ["Le syndicat", "est une personne morale, constituée de l'ensemble des copropriétaires et est régi par le Code civil du Québec. À ce titre, celui-ci peut contracter avec des tiers afin, notamment d'assurer la défense des intérêts collectifs du patrimoine. Il a doit aussi voir à l'entretien et la conservation de l'immeuble, à l'administration des parties communes."],
+    ["Le conseil d'administration", "est un organe décisionnel constitué par des membres élus, lors de l'assemblée générale annuelle, qui administrent la copropriété et ses actifs au nom du syndicat d'immeuble."],
+    ["La déclaration de copropriété", "est un acte notarié publié au Registre foncier du Québec qui détermine, entre autres, le nombre d'administrateurs, les pouvoirs et devoir du conseil d'administration ainsi que les droits et obligations des copropriétaires."],
+    ["Le registre de copropriété", "contient l'ensemble des documents nécessaires à la bonne administration de l'immeuble et disponible pour tout copropriétaire. Il comprend par exemple : la déclaration de copropriété, le registre des copropriétaires, les procès-verbaux, les états financiers, les plans de l'immeuble, le certificat de localisation, contrats et garanties, l'étude du fonds de prévoyance, le carnet d'entretien, l'historique des entretiens, l'étude de valeur assurable, projets, études et expertises diverses, etc."],
+    ["Les charges communes", "sont les différentes sommes d'argent perçues par le syndicat qui visent le maintien et l'exploitation de la copropriété. Les termes charges communes sont les termes corrects à l'usage courant ''frais de copropriété''. Celles-ci sont réparties en fonction des quotes-parts décrites à la déclaration de copropriété."],
+    ["Les parties communes", "sont celles faisant partie du bâtiment et énumérées à l'Acte constitutif de copropriété ou, en l'absence de dispositions spécifiques dans cet acte, celles énumérées à l'article 1044 du Code Civil du Québec."],
+    ["Les parties privatives", "désignent les fractions de l'immeuble sur lesquelles les copropriétaires ont un droit de propriété exclusif. Elles sont décrites dans la partie de la déclaration de copropriété consacrée à l'état descriptif des fractions."],
+    ["Les parties communes à usage restreint", "ce sont des parties communes, mais qui sont à l'usage exclusif de certains copropriétaires. À titre d'exemple, les balcons, les toits-terrasses et la fenestration sont fréquemment désignés comme des parties communes à usage restreinte, en vertu de la déclaration de copropriété."],
+    ["Les unités modèles (loi 141)", "sont les unités de références pouvant définir l'aménagement d'origine d'une partie privative. Idéalement ces unités n'auront subi aucune amélioration."],
+    ["Le fonds de réserve / ''fonds annuels généraux''", "concerne l'ensemble des frais récurrents annuels : assurances, déneigement, entretien des pelouses, aménagements, etc."],
+    ["Les travaux de maintenance", "font références à tous les frais reliés au nettoyage et dépoussiérage général qui visent la propreté des espaces communs, lavage de fenêtres, nettoyage des planchers et tapis, sels déglaçants, etc."],
+    ["Le fonds d'auto-assurance (loi 141)", "est affecté pour le paiement des franchises prévues par les assurances. Il sera aussi utilisé pour tout frais reliés à des impondérables et sinistres dans lequel le syndicat a un intérêt assurable, lorsque le fonds de prévoyance ne peut y pallier."],
+    ["Le fonds de prévoyance (loi 16)", "– Remplacement d'élément. Comme prévu à l'article 1071 C.c.Q. le syndicat, pour donner suite aux suggestions à l'étude, doit prévoir des sommes qui devront être affecté uniquement aux réparations et remplacements."],
+    ["Le carnet d'entretien (loi 16)", "– Inventaire et description. Comme prévu à la règlementation du 11 septembre 2024, le carnet d'entretien contient un inventaire et une description des parties communes dont le syndicat est responsable de l'entretien. Celui-ci doit être tenu à jour par le conseil d'administration et révisé tous les 5 ans par un professionnel."],
+    ["Tableur suivi d'entretien", "demeure votre outil le plus important pour la tenue de votre carnet d'entretien (tâches et documentation). Celui-ci est plus qu'un rappel annuel des vérifications et suivis à effectuer. Il concerne aussi toutes les tâches d'entretien particulières à votre immeuble."],
+    ["Les projets spéciaux", "concernent tout projet qui habituellement sont non prévisibles et, étant donné leur ampleur et/ou complexité, demande l'implication d'un professionnel avant l'embauche d'un entrepreneur."]
+  ],
+  legendes: [
+    "Bon : des défauts mineurs pouvant nécessiter des réparations ou entretiens réguliers sont existants. Cependant, le fonctionnement est normal et aucun suivi n'est prévu d'ici 12 à 24 mois.",
+    "Passable – Nécessite un entretien : l'élément présente plusieurs défauts mineurs ou importants nécessitant des réparations ou entretiens devancés. Le fonctionnement est affecté ou à risque.",
+    "Mauvais – Requiert la planification d'un remplacement : l'élément présente des défauts importants, usure excessive ou obsolescence. Le fonctionnement est à risque, anormal ou peut affecter d'autre élément.",
+    "Tableaux des éléments : Durée de vie | Année de remplacement | Coût pour un remplacement complet; Cycle | Débutant en | Allocation pour une allocation cyclique.",
+    "Nomenclature des éléments : norme ASTM E 1557-02 / Uniformat II.",
+    "Orientation : afin de se situer, le lecteur doit se placer dans la rue face à l'immeuble pour identifier la façade avant, les côtés et l'arrière."
+  ]
+};
+
+// ===========================================================================
+// GABARIT D'ENTREPRISE
+// ---------------------------------------------------------------------------
+// TEXTE_MAISON est le gabarit de Condo Stratégis. Une firme hébergée qui
+// arrive avec le sien surcharge ces sections ; celle qui n'en a pas hérite du
+// gabarit intégré. Sans cela, toutes les firmes de la plateforme publieraient
+// le texte d'une seule d'entre elles.
+// ===========================================================================
+
+// Les 13 sections surchargeables, avec la forme attendue de chacune. La forme
+// compte : rendre une chaîne là où le rapport attend une liste de puces ne
+// plante pas, ça produit un rapport silencieusement mal formé.
+const SECTIONS_GABARIT = [
+  { cle: "etendue", label: "2.1 Étendue du travail réalisé", forme: "paragraphes" },
+  { cle: "famillesEtudiees", label: "2.1 Familles d'éléments étudiées", forme: "puces" },
+  { cle: "objetChamp", label: "2.3 Objet et champ d'application", forme: "texte" },
+  { cle: "contexteEconomique", label: "2.4 Contexte économique", forme: "paragraphes" },
+  { cle: "exigencesLoi", label: "2.5 Exigences de la loi sur les copropriétés", forme: "texte" },
+  { cle: "quotesParts", label: "2.6 Valeurs relatives des quotes-parts", forme: "texte" },
+  { cle: "lireRapport", label: "3.0 Comment lire ce rapport", forme: "objet", sous: [
+    { cle: "intro", forme: "texte" },
+    { cle: "etat", forme: "paragraphes" },
+    { cle: "dureeVie", forme: "paragraphes" },
+    { cle: "entretien", forme: "texte" },
+    { cle: "attention", forme: "paragraphes" },
+    { cle: "annexes", forme: "paragraphes" }
+  ] },
+  { cle: "resultats", label: "5.0 Résultats — introduction", forme: "texte" },
+  { cle: "limitations", label: "7.0 Limitations légales", forme: "objet", sous: [
+    { cle: "mandant", forme: "paragraphes" },
+    { cle: "visite", forme: "paragraphes" },
+    { cle: "financement", forme: "paragraphes" },
+    { cle: "tableur", forme: "paragraphes" },
+    { cle: "services", forme: "paragraphes" },
+    { cle: "complementaire", forme: "paragraphes" }
+  ] },
+  { cle: "declaration", label: "8.0 Déclaration — attestations", forme: "puces" },
+  { cle: "suiviEntretien", label: "9.0 Suivi de l'entretien", forme: "objet", sous: [
+    { cle: "loi16", forme: "paragraphes" },
+    { cle: "actions", forme: "puces" },
+    { cle: "niveaux", forme: "puces" },
+    { cle: "experience", forme: "paragraphes" }
+  ] },
+  { cle: "lexique", label: "Annexe — Lexique", forme: "paires" },
+  { cle: "legendes", label: "Annexe — Légendes", forme: "puces" }
+];
+
+function fusionnerGabarit(base, sur) {
+  if (!sur || typeof sur !== "object") return base;
+  const sortie = Array.isArray(base) ? [...base] : { ...base };
+  for (const [cle, val] of Object.entries(sur)) {
+    if (val == null) continue;
+    if (Array.isArray(val)) {
+      // Une liste fournie remplace la liste maison en entier. Entrelacer les
+      // limitations légales de deux firmes produirait un texte que ni l'une ni
+      // l'autre n'assume devant son ordre professionnel.
+      if (val.length > 0) sortie[cle] = val;
+    } else if (typeof val === "object") {
+      sortie[cle] = fusionnerGabarit(base?.[cle] ?? {}, val);
+    } else if (typeof val === "string" && val.trim()) {
+      sortie[cle] = val;
+    }
+  }
+  return sortie;
+}
+
+// Ne laisse passer que les clés connues, dans la forme attendue. Le contenu
+// vient d'un document importé puis trié par un modèle : rien de tout cela n'a
+// à décider de la structure du rapport.
+function nettoyerSections(brut) {
+  const propre = {};
+  if (!brut || typeof brut !== "object") return propre;
+  const texte = (v) => typeof v === "string" && v.trim() ? v.trim() : null;
+  const liste = (v) => Array.isArray(v)
+    ? v.map((x) => texte(x)).filter(Boolean)
+    : (texte(v) ? [texte(v)] : []);
+  for (const section of SECTIONS_GABARIT) {
+    const val = brut[section.cle];
+    if (val == null) continue;
+    if (section.forme === "objet") {
+      const sous = {};
+      for (const s of section.sous) {
+        const v = val?.[s.cle];
+        if (v == null) continue;
+        if (s.forme === "texte") { const t = texte(v); if (t) sous[s.cle] = t; }
+        else { const l = liste(v); if (l.length) sous[s.cle] = l; }
+      }
+      if (Object.keys(sous).length) propre[section.cle] = sous;
+    } else if (section.forme === "texte") {
+      const t = texte(val);
+      if (t) propre[section.cle] = t;
+    } else if (section.forme === "paires") {
+      const paires = Array.isArray(val)
+        ? val.map((p) => Array.isArray(p) ? [texte(p[0]), texte(p[1])] : null)
+             .filter((p) => p && p[0] && p[1])
+        : [];
+      if (paires.length) propre[section.cle] = paires;
+    } else {
+      const l = liste(val);
+      if (l.length) propre[section.cle] = l;
+    }
+  }
+  return propre;
+}
+
+async function texteMaisonPour(db, companyId) {
+  if (!db || !companyId) return TEXTE_MAISON;
+  let ligne = null;
+  try {
+    ligne = await db.prepare("SELECT sections FROM company_templates WHERE company_id = ?1").bind(companyId).first();
+  } catch {
+    return TEXTE_MAISON;
+  }
+  if (!ligne?.sections) return TEXTE_MAISON;
+  try {
+    return fusionnerGabarit(TEXTE_MAISON, nettoyerSections(JSON.parse(ligne.sections)));
+  } catch {
+    // Un gabarit illisible ne doit jamais empêcher de produire un rapport.
+    return TEXTE_MAISON;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lecture d'un .docx importé
+// ---------------------------------------------------------------------------
+// Un .docx est une archive ZIP. On y cherche word/document.xml et on le
+// décompresse avec DecompressionStream, disponible nativement dans les Workers
+// — plutôt que d'aller chercher l'inflate enfoui dans la librairie xlsx, dont
+// rien ne garantit la stabilité d'une version à l'autre.
+async function lireDocx(buffer) {
+  const vue = new DataView(buffer);
+  const octets = new Uint8Array(buffer);
+  if (octets.length < 22) throw new Error("fichier trop court pour être un .docx");
+  let eocd = -1;
+  const plancher = Math.max(0, octets.length - 65558);
+  for (let i = octets.length - 22; i >= plancher; i--) {
+    if (vue.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("ce fichier n'est pas une archive .docx lisible");
+  const nbEntrees = vue.getUint16(eocd + 10, true);
+  let p = vue.getUint32(eocd + 16, true);
+  const decodeur = new TextDecoder();
+  for (let n = 0; n < nbEntrees; n++) {
+    if (p + 46 > octets.length || vue.getUint32(p, true) !== 0x02014b50) break;
+    const methode = vue.getUint16(p + 10, true);
+    const tailleCompressee = vue.getUint32(p + 20, true);
+    const lgNom = vue.getUint16(p + 28, true);
+    const lgExtra = vue.getUint16(p + 30, true);
+    const lgComm = vue.getUint16(p + 32, true);
+    const offsetLocal = vue.getUint32(p + 42, true);
+    const nom = decodeur.decode(octets.subarray(p + 46, p + 46 + lgNom));
+    if (nom === "word/document.xml") {
+      // Les longueurs nom/extra de l'en-tête local diffèrent de celles du
+      // répertoire central : il faut relire celles-là, pas réutiliser celles-ci.
+      const lgNomLocal = vue.getUint16(offsetLocal + 26, true);
+      const lgExtraLocal = vue.getUint16(offsetLocal + 28, true);
+      const debut = offsetLocal + 30 + lgNomLocal + lgExtraLocal;
+      const donnees = octets.subarray(debut, debut + tailleCompressee);
+      if (methode === 0) return decodeur.decode(donnees);
+      if (methode !== 8) throw new Error(`compression ZIP non gérée (méthode ${methode})`);
+      const flux = new Blob([donnees]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+      return await new Response(flux).text();
+    }
+    p += 46 + lgNom + lgExtra + lgComm;
+  }
+  throw new Error("word/document.xml introuvable dans l'archive");
+}
+
+function decodeEntitesXml(s) {
+  return s
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&amp;/g, "&");
+}
+
+function paragraphesDocx(xml) {
+  const paras = [];
+  for (const p of xml.matchAll(/<w:p[ >][\s\S]*?<\/w:p>|<w:p\/>/g)) {
+    const morceaux = [...p[0].matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)].map((m) => m[1]);
+    const texte = decodeEntitesXml(morceaux.join("")).replace(/\s+/g, " ").trim();
+    if (texte) paras.push(texte);
+  }
+  return paras;
+}
+
+// Répartit le texte importé sur les sections du rapport. Le modèle trie ; il ne
+// réécrit pas : c'est le texte de la firme qui doit ressortir, pas une
+// paraphrase.
+async function sectionsDepuisTexte(apiKey, paragraphes) {
+  if (!apiKey) {
+    return { sections: {}, note: "Aucune clé API n'est configurée : le texte a été extrait et conservé, mais il faut le répartir à la main dans les sections." };
+  }
+  const corpus = paragraphes.join("\n").slice(0, 60000);
+  const catalogue = SECTIONS_GABARIT.map((s) => {
+    if (s.forme === "objet") {
+      return `"${s.cle}" — ${s.label} — objet contenant : ${s.sous.map((x) => `"${x.cle}" (${x.forme})`).join(", ")}`;
+    }
+    return `"${s.cle}" — ${s.label} — ${s.forme}`;
+  }).join("\n");
+  const prompt = `Voici le texte d'un gabarit d'étude de fonds de prévoyance d'une firme québécoise.
+Répartis-le dans les sections normalisées ci-dessous.
+
+RÈGLE ABSOLUE : reprends le texte de la firme MOT POUR MOT. Tu tries, tu ne
+réécris pas, tu ne résumes pas, tu ne corriges pas le style. C'est la voix de
+cette firme qui doit ressortir dans ses rapports.
+
+Omets simplement toute section pour laquelle le document ne contient rien de
+clairement correspondant — une section absente garde le texte par défaut, ce qui
+vaut mieux qu'un texte mal rangé. N'invente jamais de contenu.
+
+Formes attendues :
+- "texte" : une seule chaîne de caractères.
+- "paragraphes" et "puces" : un tableau de chaînes, une par paragraphe ou par puce.
+- "paires" : un tableau de [terme, définition].
+
+Sections :
+${catalogue}
+
+Ignore tout ce qui est propre à un immeuble donné (nom du syndicat, adresse,
+montants, observations d'éléments) : on ne cherche ici que le texte de fond,
+celui qui se répète d'une étude à l'autre.
+
+TEXTE DU GABARIT :
+${corpus}
+
+Réponds UNIQUEMENT avec un objet JSON dont les clés sont prises dans la liste ci-dessus.`;
+  const brut = await callClaude(apiKey, { content: prompt, maxTokens: 16000 });
+  return { sections: nettoyerSections(extractJson(brut)), note: null };
+}
+
+function peutGererEntreprise(user, companyId) {
+  if (!user) return false;
+  if (user.role === "super_admin") return true;
+  return user.company_id === companyId;
+}
+function titre2(text) {
+  return new Paragraph({
+    spacing: { before: 240, after: 100 },
+    children: [new TextRun({ text, bold: true, color: DARK, font: FONT, size: 22 })]
+  });
+}
+function titre3(text) {
+  return new Paragraph({
+    spacing: { before: 160, after: 60 },
+    children: [new TextRun({ text, bold: true, color: ORANGE, font: FONT, size: 19 })]
+  });
+}
+function paras(texte, opts = {}) {
+  if (!texte) return [];
+  return String(texte).split(/\n{2,}/).map((bloc) => bloc.trim()).filter(Boolean).flatMap((bloc) => bloc.split("\n").map((ligne) => body(ligne.trim(), opts)));
+}
+function puce(text) {
+  return body(`· ${text}`);
+}
+function tableauMaison(entetes, lignes) {
+  return new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    rows: [
+      new TableRow({ children: entetes.map((h) => cell(h, { header: true })) }),
+      ...lignes.map((ligne) => new TableRow({ children: ligne.map((v) => cell(String(v))) }))
+    ]
+  });
+}
+function pourcent(taux) {
+  return `${(taux * 100).toFixed(2).replace(".", ",").replace(/,00$/, "")}${NBSP}%`;
+}
 async function generateReportDocx(ctx) {
   const { dossier, components: components2, projection } = ctx;
-  const today = (/* @__PURE__ */ new Date()).toLocaleDateString("fr-CA");
+  // Gabarit de la firme propriétaire du dossier, ou le gabarit intégré si elle
+  // n'en a pas importé. Résolu en amont (buildReportContext) : la génération ne
+  // doit pas dépendre d'un accès à la base au milieu de la rédaction.
+  const T = ctx.texteMaison ?? TEXTE_MAISON;
+  const apiKey = ctx.apiKey ?? null;
+  const signataire = ctx.signataire ?? null;
+  const ordre = ordreDuSignataire(signataire);
+  const noMembreSignataire = String(signataire?.no_membre ?? "").trim() || null;
+  const maintenant = /* @__PURE__ */ new Date();
+  const anneeCourante = maintenant.getFullYear();
+  const today = maintenant.toLocaleDateString("fr-CA");
+  const info = infoBatiment(dossier);
+  const nomSignataire = ctx.engineerName || "Condo Stratégis";
   const cover = [
     new Paragraph({
       alignment: AlignmentType.CENTER,
@@ -21688,7 +22970,7 @@ async function generateReportDocx(ctx) {
     new Paragraph({
       alignment: AlignmentType.CENTER,
       spacing: { after: 60 },
-      children: [new TextRun({ text: "ÉTUDE DE FONDS DE PRÉVOYANCE", bold: true, color: ORANGE, font: FONT, size: 20 })]
+      children: [new TextRun({ text: "PLAN DE GESTION DE L'ACTIF", bold: true, color: ORANGE, font: FONT, size: 20 })]
     }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
@@ -21707,159 +22989,345 @@ async function generateReportDocx(ctx) {
         })
       ]
     }),
+    body("Inclus à votre Plan de gestion de l'actif : Carnet d'entretien · Étude en fonds de prévoyance · Scénario de financement · Tableur suivi d'entretien", { color: GREY, size: 18 }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
-      children: [new TextRun({ text: `Dossier ${dossier.dossier_no}`, color: GREY, font: FONT, size: 18 })]
+      children: [new TextRun({ text: `Notre dossier : ${dossier.dossier_no}`, color: GREY, font: FONT, size: 18 })]
     }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
       spacing: { after: 40 },
-      children: [new TextRun({ text: `Préparé le ${today} par ${ctx.engineerName}`, color: GREY, font: FONT, size: 18 })]
+      children: [new TextRun({ text: `Préparé le ${today} · Rédigé par ${nomSignataire}`, color: GREY, font: FONT, size: 18 })]
     }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
       spacing: { after: 600 },
-      children: [new TextRun({ text: "Condo Stratégis", color: GREY, font: FONT, size: 18 })]
+      children: [new TextRun({ text: "Condo Stratégis — 82, rue de Brésol, Montréal, Québec, H2Y 1V5 — (514) 508-6987 — info@condostrategis.ca", color: GREY, font: FONT, size: 16 })]
     })
   ];
-  const recommended = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
-  const statuQuo = projection.scenarios.find((s) => s.code === "C1.1.2") ?? null;
-  const methodology = [
-    heading("Méthodologie"),
-    body(
-      "Ce document a été généré à partir des données d'inspection recueillies sur le terrain (application Inspection Terrain) et vérifiées avant génération. L'estimation du fonds de prévoyance requis suit la méthode par composantes : chaque composante inventoriée est remplacée à intervalles réguliers correspondant à sa durée de vie utile, sur un horizon de 30 ans, à des coûts forfaitaires en dollars de l'année de base indexés à l'inflation. Pour les composantes à longue durée de vie dont le prochain remplacement tombe juste après l'horizon (31e année), une portion de ce coût futur est provisionnée au prorata du cycle déjà écoulé."
+  // ---- Lecture du moteur financier ---------------------------------------
+  // Le moteur simule plusieurs scénarios de financement. La rédaction s'appuie
+  // sur celui qu'il recommande, et se compare au statu quo (indexation seule,
+  // sans rattrapage) pour trancher si la cotisation actuelle suffit.
+  const scenarioStatuQuo = projection.scenarios.find((s) => s.code === "C1.1.2") ?? null;
+  // Le moteur ne recommande jamais le statu quo : sa recommandation est toujours un plan
+  // de rattrapage. Au rapport, on ne demande pas au syndicat de hausser sa cotisation quand
+  // celle qu'il verse déjà satisfait le double critère — dans ce cas, le scénario de
+  // préférence est le maintien, ce que dit d'ailleurs le texte de la section 6.0.
+  const scenarioRecommande = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  const scenarioPrefere = scenarioStatuQuo?.meetsCriteria ? scenarioStatuQuo : scenarioRecommande;
+  const anneesScenario = scenarioPrefere?.years ?? [];
+  const cotisationAnUn = scenarioPrefere?.years?.[0]?.cotisation ?? null;
+  const cotisationMensuelle = cotisationAnUn != null ? cotisationAnUn / 12 : null;
+  const nbUnites = Number(dossier.units);
+  const cotisationMensuelleParUnite = cotisationMensuelle != null && Number.isFinite(nbUnites) && nbUnites > 0 ? cotisationMensuelle / nbUnites : null;
+  // ---- 1.0 Sommaire du mandat -------------------------------------------
+  const anneeConstruction = anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier.built_year);
+  const sommaireMandat = [
+    heading("1.0 Sommaire du mandat"),
+    body(`Condo Stratégis a été retenue par le conseil d'administration du ${dossier.name}${dossier.address ? `, ${dossier.address}` : ""}${dossier.city ? ` à ${dossier.city}` : ""}, Qc, pour effectuer une étude du Plan de gestion de l'actif.`),
+    body("Le mandat est soumis aux particularités décrites à la section Méthodologie (2.0) et Limitations légales (7.0) et présentées à l'offre de service."),
+    titre2("1.1 Description de l'immeuble"),
+    body(assembler([
+      `Ce complexe de condominiums comprend ${dossier.units ? `${dossier.units} unités` : "un nombre d'unités à confirmer"}${dossier.floors ? `, répartis sur ${dossier.floors} étages` : ""}.`,
+      anneeConstruction != null ? `L'immeuble est d'origine construit en ${anneeConstruction}.` : "L'année de construction de l'immeuble reste à confirmer auprès de l'administration.",
+      info?.caracteristiques?.date_conversion ? `La conversion en immeuble de copropriété est survenue vers ${sansNotesInternes(String(info.caracteristiques.date_conversion))}.` : null,
+      info?.caracteristiques?.nb_stationnements_int ? `On y dénombre ${sansNotesInternes(String(info.caracteristiques.nb_stationnements_int))} espaces de stationnement intérieurs.` : null,
+      info?.caracteristiques?.nb_ascenseurs ? `L'immeuble compte ${sansNotesInternes(String(info.caracteristiques.nb_ascenseurs))} système(s) d'ascenseur.` : null
+    ])),
+    titre2("1.3 Historique"),
+    body(info?.documents?.rapports_travaux === "oui" ? "Nous avons été informés des divers travaux qui ont eu lieu au cours des dernières années. Les informations sont incluses au texte." : "Aucun historique de travaux récents n'a été obtenu. Pour fin de calcul, les années de construction ou de dernière réparation consignées au relevé ont été retenues."),
+    titre2("1.4 Documents de références"),
+    body("Voici la liste des documents qui ont été consultés pour la préparation de cette étude de fonds de prévoyance :"),
+    ...Object.entries(info?.documents ?? {}).filter(([, v]) => v === "oui").map(([k]) => puce(`${LIBELLES_DOCUMENTS[k] ?? sansNotesInternes(k.replace(/_/g, " "))};`)),
+    ...(Object.values(info?.documents ?? {}).some((v) => v === "oui") ? [] : [body("Aucun document de référence n'a été consigné comme reçu au moment de la rédaction.")]),
+    titre2("1.5 Données actuelles au fonds de prévoyance"),
+    body(`Solde du fonds de prévoyance : ${montantMaison(dossier.current_fund_balance) ?? "non disponible"}`),
+    body(`Cotisation annuelle : ${montantMaison(dossier.cotisation_annuelle) ?? "non disponible"}`),
+    titre2("1.6 Visite"),
+    body(`Inspecteur : ${nomSignataire}`),
+    body(`Préparé le : ${today}`)
+  ];
+  // ---- 2.0 Méthodologie ---------------------------------------------------
+  const methodologie = [
+    heading("2.0 Méthodologie"),
+    titre2("2.1 Étendue du travail réalisé"),
+    ...T.etendue.map((t) => body(t)),
+    ...T.famillesEtudiees.map((t) => puce(t)),
+    body(`Les estimations de coût prévu et le calendrier des travaux de remplacement qui seront requis au cours des ${projection.params.projectionYears} prochaines années sont décrits en format tableau simplifié dans le document joint à l'ANNEXE A – Sommaire des travaux, et en format tableau détaillé à l'ANNEXE B – Calendrier de remplacement – Scénario de financement.`),
+    titre2("2.2 Mise à jour"),
+    body(`En raison du nombre de facteurs qui peuvent influer sur la contribution annuelle requise, nous recommandons que l'étude du fonds de prévoyance soit mise à jour au minimum tous les cinq (5) ans, comme prévue au projet de loi 16. Cette mise à jour devra être planifiée dès ${anneeCourante + 5}.`),
+    titre2("2.3 Objet et champ d'application du rapport"),
+    body(T.objetChamp),
+    titre2("2.4 Contexte économique"),
+    ...T.contexteEconomique.map((t) => body(t)),
+    body(`Ainsi, nous avons préparé des scénarios de financement sur un cycle de ${projection.params.projectionYears} ans pour les besoins du syndicat de la copropriété. Dans ceux-ci, nous avons supposé que les intérêts sont gagnés à un taux de ${pourcent(projection.params.interestRate)}, qu'ils sont non imposables et sont réinvestis dans le fonds, et que le taux d'inflation annuel des coûts de la construction est de ${pourcent(projection.params.inflationRate)}.`),
+    body(`Sources des hypothèses économiques retenues — taux d'intérêt : ${projection.params.interestSource}; inflation des coûts de la construction : ${projection.params.inflationSource}.`, { color: GREY, size: 18 }),
+    body("Les intérêts sont appliqués au solde d'ouverture de chaque année et sont ramenés à zéro lorsque ce solde est négatif. Une cotisation n'est retenue que si elle satisfait un double critère : le solde du fonds ne devient jamais négatif sur l'horizon, et il demeure positif à l'entrée de la 31e année une fois provisionnée la portion des remplacements à longue durée de vie qui suivent immédiatement l'horizon.", { color: GREY, size: 18 }),
+    titre2("2.5 Exigences de la loi sur les copropriétés"),
+    body(T.exigencesLoi),
+    titre2("2.6 Valeurs relatives des quotes-parts"),
+    body(T.quotesParts)
+  ];
+  // ---- 3.0 Comment lire ce rapport ---------------------------------------
+  const commentLire = [
+    heading("3.0 Comment lire ce rapport"),
+    titre2("Présentation des éléments et composantes de l'immeuble — le carnet d'entretien"),
+    body(T.lireRapport.intro),
+    puce("ÉTAT DE L'ACTIF"),
+    puce("DURÉE DE VIE ET REMPLACEMENT"),
+    puce("COMMENTAIRES D'ENTRETIEN"),
+    puce("ATTENTION SPÉCIALE"),
+    titre2("État de l'actif"),
+    ...T.lireRapport.etat.map((t) => body(t)),
+    titre2("Présentation des estimations de coût de remplacement des composantes — durée de vie et coût de remplacement"),
+    ...T.lireRapport.dureeVie.map((t) => body(t)),
+    titre2("Commentaires d'entretien"),
+    body(T.lireRapport.entretien),
+    titre2("Présentation des réparations majeures et des remplacements à prévoir — attention spéciale"),
+    ...T.lireRapport.attention.map((t) => body(t)),
+    titre2("Annexes"),
+    ...T.lireRapport.annexes.map((t) => body(t))
+  ];
+  // ---- 4.0 Observation des éléments --------------------------------------
+  const ordreCategories = Object.entries(CATEGORIES).sort((a, b) => a[1].ordre - b[1].ordre).map(([cle]) => cle);
+  const parCategorie = new Map();
+  for (const comp of components2) {
+    const cle = CATEGORIES[comp.cat] ? comp.cat : "equipements";
+    if (!parCategorie.has(cle)) parCategorie.set(cle, []);
+    parCategorie.get(cle).push(comp);
+  }
+  // Une fiche = un appel au modèle pour ÉTAT DE L'ACTIF. On les mène 6 par 6 :
+  // assez pour qu'un dossier de 30 composantes reste sous la minute, assez peu
+  // pour rester loin des limites de sous-requêtes du Worker.
+  const banque = ctx.banque ?? [];
+  const valides = ctx.textesValides ?? {};
+  const fiches = await enParallele(components2, 6, (comp) => genFicheElement(comp, dossier, apiKey, {
+    exemples: exemplesPour(banque, comp),
+    texteRetenu: valides[comp.id]
+  }));
+  const parId = new Map(components2.map((c, i) => [c.id, fiches[i]]));
+  const observation = [heading("4.0 Observation des éléments")];
+  observation.push(body("Chacun des éléments est présenté suivant les quatre sous-sections décrites à la section 3.0. Les cotes employées sont celles de la légende : Bon, Passable – Nécessite un entretien, Mauvais – Requiert la planification d'un remplacement."));
+  let numeroCategorie = 0;
+  for (const cle of ordreCategories) {
+    const liste = parCategorie.get(cle);
+    if (!liste || liste.length === 0) continue;
+    numeroCategorie += 1;
+    observation.push(titre2(`4.${numeroCategorie} ${CATEGORIES[cle].label.toUpperCase()}`));
+    if (NOTE_CHAMP_PRATIQUE[cle]) observation.push(body(NOTE_CHAMP_PRATIQUE[cle], { color: GREY, size: 18 }));
+    let numeroElement = 0;
+    for (const comp of liste) {
+      const fiche = parId.get(comp.id);
+      if (!fiche) continue;
+      numeroElement += 1;
+      observation.push(titre3(`4.${numeroCategorie}.${numeroElement} ${fiche.titre}`));
+      if (fiche.coteRapport) observation.push(body(`Cote au rapport : ${COTES_RAPPORT[fiche.coteRapport]}`, { bold: true }));
+      for (const section of fiche.sections) {
+        observation.push(body(section.titre, { bold: true }));
+        observation.push(...paras(section.texte));
+        if (section.tableau) {
+          observation.push(body(titreTableauMaison(comp, ligneDureeVie(comp, dossier)), { bold: true, size: 18 }));
+          observation.push(tableauMaison(section.tableau.entetes, section.tableau.lignes));
+          observation.push(body(""));
+        }
+      }
+    }
+  }
+  // ---- 5.0 Résultats et scénarios de financement --------------------------
+  const cotisationSuffisante = scenarioStatuQuo != null && scenarioStatuQuo.meetsCriteria;
+  const resultats = [
+    heading("5.0 Résultats et scénarios de financement"),
+    body(T.resultats),
+    body("ANNEXE A – SOMMAIRE DES TRAVAUX"),
+    body("ANNEXE B – CALENDRIER DE REMPLACEMENT – SCÉNARIO DE FINANCEMENT"),
+    titre2("Portrait financier de départ"),
+    body(`Solde du fonds de prévoyance retenu au départ du calcul : ${montantMaison(dossier.current_fund_balance) ?? "non disponible"}. Cotisation annuelle actuelle : ${projection.baseCotisationMissing ? "non renseignée — traitée comme nulle aux fins de simulation" : montantMaison(projection.baseCotisation) ?? "non disponible"}.`),
+    body(`Débours projetés sur ${projection.params.projectionYears} ans : ${montantMaison(projection.totalDebours30Ans) ?? "—"}. Portion de la 31e année provisionnée pour les composantes à longue durée de vie : ${montantMaison(projection.portionFutureAn31.total) ?? "—"}. Total retenu au calcul de financement : ${montantMaison(projection.totalAvecPortionFuture) ?? "—"}.`),
+    titre2("Comparaison des scénarios"),
+    tableauMaison(
+      ["Scénario", "Cotisation an 1", `Solde fin an ${projection.params.projectionYears}`, "1re année négative", "Critères respectés"],
+      projection.scenarios.map((s) => [
+        `${s.code} — ${s.label}`,
+        montantMaison(s.years[0]?.cotisation) ?? `-${NBSP}$`,
+        montantMaison(s.soldeFinAn30) ?? `-${NBSP}$`,
+        s.firstNegativeYear != null ? `An ${s.firstNegativeYear}` : "—",
+        s.meetsCriteria ? "Oui" : "Non"
+      ])
     ),
-    body(`Taux d'inflation de la construction : ${(projection.params.inflationRate * 100).toFixed(2)} % — source : ${projection.params.inflationSource}`),
-    body(`Taux d'intérêt sur le solde du fonds : ${(projection.params.interestRate * 100).toFixed(2)} % — source : ${projection.params.interestSource}`),
-    body(`Horizon de projection : ${projection.params.projectionYears} ans, plus portion future de la 31e année`),
-    body(
-      "L'intérêt s'applique au solde d'ouverture de chaque année et est plancher à 0 lorsque ce solde est négatif. La cotisation recommandée n'est pas le résultat d'un solveur : elle suit une rampe de rattrapage — 0 % la première année, puis des paliers d'augmentation sur la période de rétablissement, puis une indexation à l'inflation — soumise à un double critère d'acceptation : le solde ne doit jamais devenir négatif sur l'horizon, et il doit demeurer positif à l'entrée de la 31e année une fois la portion future incluse.",
+    ...scenarioStatuQuo ? [body(
+      scenarioStatuQuo.firstNegativeYear != null
+        ? `À titre de comparaison, le statu quo — soit le maintien de la cotisation actuelle, indexée, sans rattrapage — épuise le fonds dès l'an ${scenarioStatuQuo.firstNegativeYear} de la projection.`
+        : "À titre de comparaison, le statu quo — soit le maintien de la cotisation actuelle, indexée, sans rattrapage — maintient un solde positif sur l'horizon complet.",
       { color: GREY, size: 18 }
-    ),
-    ...projection.scenarios.some((s) => s.approximationNote) ? [
-      body(
-        `Note méthodologique : ${projection.scenarios.find((s) => s.approximationNote)?.approximationNote}`,
-        { color: GREY, size: 18 }
-      )
-    ] : [],
-    body(
-      "Ce calcul constitue une estimation basée sur les paramètres ci-dessus et les données documentées lors de la visite — il doit être révisé et validé par l'ingénieur responsable avant d'être présenté au conseil d'administration du syndicat.",
+    )] : []
+  ];
+  if (scenarioPrefere) {
+    resultats.push(titre2(`Scénario de financement de préférence — ${scenarioPrefere.code} (${scenarioPrefere.label})`));
+    resultats.push(body(`Le scénario de financement de préférence résume les besoins annuels de financement selon les exigences de la réglementation actuelle ainsi que les besoins ponctuels de remplacement des éléments du bâtiment. Nous suggérons en ${anneeCourante} une cotisation annuelle au fonds de prévoyance de ${montantMaison(cotisationAnUn) ?? "à confirmer"}${cotisationMensuelleParUnite != null ? ` (environ ${montantMaison(cotisationMensuelleParUnite) ?? "—"} par mois par copropriété)` : ""}. Ces investissements sont requis pour rencontrer les dépenses de réparations majeures et de remplacements prévues au cours des ${projection.params.projectionYears} prochaines années, ainsi que pour débuter le prochain cycle par la suite.`));
+    if (scenarioPrefere.approximationNote) resultats.push(body(scenarioPrefere.approximationNote, { color: GREY, size: 18 }));
+    if (scenarioPrefere === scenarioStatuQuo && scenarioRecommande && scenarioRecommande !== scenarioStatuQuo) {
+      resultats.push(body(`La cotisation actuelle satisfait déjà le double critère d'acceptation; le maintien est donc retenu comme scénario de préférence. Le scénario ${scenarioRecommande.code} — ${scenarioRecommande.label} demeure présenté au tableau comparatif à titre d'option de capitalisation accélérée, au choix du conseil d'administration.`, { color: GREY, size: 18 }));
+    }
+    resultats.push(titre2("Répartition des dépenses"));
+    resultats.push(tableauMaison(
+      ["Année", "Débours prévus", "Cotisation", "Solde du fonds (fin d'année)"],
+      anneesScenario.map((y) => [
+        String(anneeCourante + y.year - 1),
+        montantMaison(y.debours) ?? `-${NBSP}$`,
+        montantMaison(y.cotisation) ?? `-${NBSP}$`,
+        montantMaison(y.soldeFin) ?? `-${NBSP}$`
+      ])
+    ));
+  } else {
+    resultats.push(titre2("Scénario de financement de préférence"));
+    resultats.push(body("Aucun des scénarios simulés ne satisfait le double critère d'acceptation à partir des données actuelles. Le calcul de financement doit être revu par l'ingénieur responsable — notamment quant au solde de départ, à la cotisation actuelle et aux coûts de remplacement retenus — avant toute présentation au conseil d'administration.", { bold: true, color: ORANGE }));
+  }
+  if (projection.excludedComponents.length > 0) {
+    resultats.push(titre2("Composantes exclues du calcul de financement"));
+    resultats.push(body("Les composantes suivantes n'ont pu être incluses à la projection, faute d'un coût de remplacement ou d'une durée de vie utile documentée. Elles demeurent au carnet d'entretien et devront être documentées afin d'être intégrées au calcul lors de la mise à jour."));
+    for (const e of projection.excludedComponents) resultats.push(puce(`${sansNotesInternes(e.name)} — ${e.reason}`));
+  }
+  // ---- 6.0 Conclusion et suggestions -------------------------------------
+  const conclusion = [
+    heading("6.0 Conclusion et suggestions"),
+    body(cotisationSuffisante
+      ? "À la lumière des informations qui étaient disponibles, nous sommes d'opinion que la contribution périodique actuelle au fonds de prévoyance, en regard avec le solde du compte destiné au fonds, est suffisante pour couvrir les remplacements à venir à moyen et long terme. Il serait suggéré, au conseil d'administration, de maintenir le scénario de financement de préférence afin de permettre un bon entretien préventif et une conservation adéquate de l'immeuble."
+      : "À la lumière des informations qui étaient disponibles, nous sommes d'opinion que la contribution périodique actuelle au fonds de prévoyance, en regard avec le solde du compte destiné au fonds, n'est pas suffisante pour couvrir les remplacements à venir à moyen et long terme. Il serait suggéré, au conseil d'administration, d'adopter le scénario de financement de préférence afin de rectifier la situation et permettre un bon entretien préventif et une conservation adéquate de l'immeuble."),
+    ...montantMaison(cotisationAnUn) != null ? [
+      body("Enfin, la contribution optimale au fonds de prévoyance devrait s'établir comme suit :"),
+      puce(`Cotisation annuelle au fonds de prévoyance de ${montantMaison(cotisationAnUn)} dès ${anneeCourante};`),
+      puce(`Cotisation mensuelle moyenne de ${montantMaison(cotisationMensuelle) ?? "à confirmer"};`),
+      cotisationMensuelleParUnite != null
+        ? puce(`Cotisation mensuelle moyenne par copropriété de ${montantMaison(cotisationMensuelleParUnite)};`)
+        : puce("Cotisation mensuelle moyenne par copropriété : à établir selon les quotes-parts de la déclaration de copropriété;"),
+      puce(`Maintien de ce niveau de cotisation, indexé, jusqu'à la fin du cycle de ${projection.params.projectionYears} ans.`)
+    ] : [
+      body("La contribution optimale au fonds de prévoyance n'a pu être arrêtée : aucun des scénarios simulés ne satisfait le double critère d'acceptation à partir des données actuelles. Les montants doivent être établis par l'ingénieur responsable à la section 5.0 avant la diffusion du rapport.", { bold: true, color: ORANGE })
+    ],
+    titre2("Invitation"),
+    body(cotisationSuffisante
+      ? "Actuellement, l'étude démontre une saine gestion par les années passées. Malgré cette bonne situation financière, nous suggérons aux membres du syndicat une rencontre à nos bureaux afin d'optimiser l'utilisation du rapport. Voir les détails à l'offre de services. Sur place nous pourrons entre autres échanger et considérer d'autres options de scénario de financement si nécessaire."
+      : "Dans le contexte où un ajustement des cotisations est nécessaire, nous suggérons aux membres du syndicat de planifier une rencontre à nos bureaux afin de mieux présenter la situation à prévoir. Voir les détails et les frais à l'offre de services. Sur place nous pourrons échanger et considérer d'autres options de scénario de financement qui tiendront compte des impératifs actuels du syndicat."),
+    body("Pour toute divergence avec le scénario de financement, ce dernier devra être considéré comme conforme à l'étude.", { bold: true })
+  ];
+  // ---- 7.0 Limitations légales -------------------------------------------
+  const limitations = [
+    heading("7.0 Limitations légales"),
+    titre2("Mandant"),
+    ...T.limitations.mandant.map((t) => body(t)),
+    titre2("Visite et observation"),
+    ...T.limitations.visite.map((t) => body(t)),
+    titre2("Étude et calcul de financement"),
+    ...T.limitations.financement.map((t) => body(t)),
+    titre2("Tableur suivi d'entretien"),
+    ...T.limitations.tableur.map((t) => body(t)),
+    titre2("Services professionnels"),
+    ...T.limitations.services.map((t) => body(t)),
+    titre2("Complémentaire"),
+    ...T.limitations.complementaire.map((t) => body(t))
+  ];
+  // ---- 8.0 Déclaration ----------------------------------------------------
+  const declaration = [
+    heading("8.0 Déclaration"),
+    body("Je, soussigné, atteste par la présente, au meilleur de ma connaissance et de ma conviction, que :"),
+    ...T.declaration.map((t) => puce(t)),
+    puce(ordre
+      ? `J'ai rédigé mes analyses, opinions et conclusions de même que le présent rapport en conformité avec les règlements et normes de pratique de l'${ordre.nom} (${ordre.sigle});`
+      : `J'ai rédigé mes analyses, opinions et conclusions de même que le présent rapport en conformité avec les règlements et normes de pratique de ${A_COMPLETER} — ordre professionnel du signataire;`),
+    puce(`La visite des lieux a été effectuée par ${nomSignataire.replace(/\.$/, "")}. Les espaces communs ont été visités.`),
+    body(`Fait le ${today}.`),
+    body("Je déclare avoir procédé avec diligence dans l'exercice de la profession en ce qui concerne les opinions de valeur reliées au remplacement des éléments du bâtiment en cause."),
+    body("________________________"),
+    body(nomSignataire, { bold: true }),
+    body(ordre
+      ? `N° de membre de l'${ordre.sigle} : ${noMembreSignataire ?? A_COMPLETER}`
+      : `Ordre professionnel et n° de membre : ${noMembreSignataire ?? A_COMPLETER}`)
+  ];
+  if (!ordre) {
+    declaration.push(body(
+      "NOTE À LA RÉVISION — L'ordre professionnel du signataire n'a pas pu être déterminé à partir du dossier. La présente déclaration ne doit pas être signée tant que l'ordre professionnel et le numéro de membre ne sont pas complétés : l'attestation porte sur les normes de pratique de l'ordre auquel appartient réellement le signataire.",
+      { color: ORANGE, size: 18, bold: true }
+    ));
+  } else if (!noMembreSignataire) {
+    declaration.push(body(
+      `NOTE À LA RÉVISION — L'ordre professionnel ci-dessus (${ordre.sigle}) a été dérivé du titre du signataire au dossier, et son numéro de membre n'est pas renseigné. Valider la mention et compléter le numéro avant signature.`,
       { color: GREY, size: 18 }
+    ));
+  } else if (!signataire?.ordre_professionnel) {
+    declaration.push(body(
+      `NOTE À LA RÉVISION — L'ordre professionnel ci-dessus (${ordre.sigle}) a été dérivé du titre du signataire, non saisi explicitement à son profil. Valider la mention avant signature.`,
+      { color: GREY, size: 18 }
+    ));
+  }
+  // ---- 9.0 Informations relatives au suivi de l'entretien ------------------
+  const suivi = [
+    heading("9.0 Informations relatives au suivi de l'entretien"),
+    titre2("9.1 La loi 16"),
+    ...T.suiviEntretien.loi16.map((t) => body(t)),
+    titre2("9.2 Les grandes questions"),
+    body("Comment devons-nous procéder ? Les actions générales attendues du conseil d'administration sont les suivantes :"),
+    ...T.suiviEntretien.actions.map((t) => puce(t)),
+    body("Devons-nous respecter la planification ? Trois niveaux d'intervention sont à distinguer :"),
+    ...T.suiviEntretien.niveaux.map((t) => puce(t)),
+    titre2("Notre expérience"),
+    ...T.suiviEntretien.experience.map((t) => body(t))
+  ];
+  // ---- Annexes -------------------------------------------------------------
+  const lexique = [
+    heading("Annexe — Lexique et légendes"),
+    body("Voici la définition de quelques termes utilisés en contexte de copropriété :"),
+    ...T.lexique.flatMap(([terme, definition]) => [
+      new Paragraph({
+        spacing: { after: 100 },
+        children: [
+          new TextRun({ text: `${terme} `, bold: true, font: FONT, size: 20, color: DARK }),
+          new TextRun({ text: definition, font: FONT, size: 20, color: DARK })
+        ]
+      })
+    ]),
+    titre2("Légendes"),
+    ...T.legendes.map((t) => puce(t))
+  ];
+  const annexeA = [
+    heading("Annexe A — Sommaire des travaux"),
+    body("Sommaire des remplacements et allocations retenus au calcul du scénario de financement. Les montants sont budgétaires, en dollars actuels, avant planifications et taxes (Loi 16)."),
+    tableauMaison(
+      ["Élément", "Code", "Cote au rapport", "Type de ligne", "Durée / cycle", "Année", "Montant"],
+      components2.map((comp) => {
+        const ligne = ligneDureeVie(comp, dossier);
+        return [
+          sansNotesInternes(comp.name),
+          sansNotesInternes(comp.uniformat_code ?? "") || "—",
+          coteRapportLongue(comp.rating) ?? (comp.done ? "non cotée" : "non documentée"),
+          ligne.allocation ? "Allocation" : "Remplacement",
+          String(ligne.duree),
+          ligne.annee != null ? String(ligne.annee) : "à confirmer",
+          montantMaison(ligne.cout) ?? `-${NBSP}$`
+        ];
+      })
     )
   ];
-  const scenarioRows = projection.scenarios.map(
-    (s) => new TableRow({
-      children: [
-        cell(`${s.code} — ${s.label}`),
-        cell(money(s.years[0]?.cotisation ?? 0)),
-        cell(money(s.soldeFinAn30)),
-        cell(s.firstNegativeYear != null ? `An ${s.firstNegativeYear}` : "—"),
-        cell(s.meetsCriteria ? "Oui" : "Non")
-      ]
-    })
-  );
-  const summary = [
-    heading("Sommaire financier"),
-    body(
-      recommended ? `Scénario recommandé : ${recommended.code} — ${recommended.label}` : "Aucun scénario ne satisfait le double critère d'acceptation avec la cotisation actuelle — révision requise.",
-      { bold: true }
-    ),
-    body(
-      projection.baseCotisationMissing ? "Cotisation annuelle actuelle : non renseignée (utilisée comme 0 $ dans les simulations)" : `Cotisation annuelle actuelle : ${money(projection.baseCotisation)}`
-    ),
-    body(`Solde actuel du fonds : ${dossier.current_fund_balance != null ? money(dossier.current_fund_balance) : "non renseigné"}`),
-    body(`Total des débours projetés sur 30 ans : ${money(projection.totalDebours30Ans)}`),
-    body(`Portion future de la 31e année (composantes à longue durée de vie) : ${money(projection.portionFutureAn31.total)}`),
-    body(`Total avec portion future : ${money(projection.totalAvecPortionFuture)}`, { bold: true }),
-    ...statuQuo ? [body(
-      statuQuo.firstNegativeYear != null ? `À titre de comparaison, le statu quo (indexation seule, sans rattrapage) devient négatif dès l'an ${statuQuo.firstNegativeYear}.` : "Le statu quo (indexation seule, sans rattrapage) demeure positif sur l'horizon complet.",
-      { color: GREY, size: 18 }
-    )] : [],
-    heading("Comparaison des scénarios"),
-    new Table({
-      width: { size: 100, type: WidthType.PERCENTAGE },
-      rows: [
-        new TableRow({
-          children: [
-            cell("Scénario", { header: true }),
-            cell("Cotisation an 1", { header: true }),
-            cell("Solde fin an 30", { header: true }),
-            cell("1re année négative", { header: true }),
-            cell("Critères respectés", { header: true })
-          ]
-        }),
-        ...scenarioRows
-      ]
-    })
+  // ---- Annexe B — Calendrier de remplacement -------------------------------
+  const annexeB = [
+    heading("Annexe B — Calendrier de remplacement — Scénario de financement"),
+    body("Le calendrier ci-dessous présente, année par année, les débours prévus, la cotisation et le solde du fonds pour chacun des scénarios simulés. Le scénario de préférence est celui retenu à la section 5.0."),
+    ...projection.scenarios.flatMap((s) => [
+      titre2(`${s.code} — ${s.label}${scenarioPrefere && s.code === scenarioPrefere.code ? " (scénario de préférence)" : ""}`),
+      ...s.approximationNote ? [body(s.approximationNote, { color: GREY, size: 18 })] : [],
+      tableauMaison(
+        ["Année", "Augmentation", "Débours prévus", "Cotisation", "Solde du fonds (fin d'année)"],
+        s.years.map((y) => [
+          String(anneeCourante + y.year - 1),
+          `${y.pctAugmentation.toFixed(1).replace(".", ",")}${NBSP}%`,
+          montantMaison(y.debours) ?? `-${NBSP}$`,
+          montantMaison(y.cotisation) ?? `-${NBSP}$`,
+          montantMaison(y.soldeFin) ?? `-${NBSP}$`
+        ])
+      ),
+      body("")
+    ])
   ];
-  const inventoryRows = components2.map(
-    (c) => new TableRow({
-      children: [
-        cell(c.name),
-        cell(c.done ? RATING_LABELS[c.rating] ?? "na" : "non documentée"),
-        cell(c.delai_suggere || "—"),
-        cell(c.install_year != null ? String(c.install_year) : "—"),
-        cell(c.replacement_cost != null ? money(c.replacement_cost) : "—"),
-        cell(c.useful_life_years != null ? String(c.useful_life_years) : "—"),
-        cell(String(c.photos))
-      ]
-    })
-  );
-  const inventory = [
-    heading("Inventaire des composantes"),
-    new Table({
-      width: { size: 100, type: WidthType.PERCENTAGE },
-      rows: [
-        new TableRow({
-          children: [
-            cell("Composante", { header: true }),
-            cell("État", { header: true }),
-            cell("Délai suggéré", { header: true }),
-            cell("Année", { header: true }),
-            cell("Coût remplac.", { header: true }),
-            cell("Vie utile", { header: true }),
-            cell("Photos", { header: true })
-          ]
-        }),
-        ...inventoryRows
-      ]
-    })
-  ];
-  const excludedSection = projection.excludedComponents.length > 0 ? [
-    heading("Composantes exclues du calcul financier"),
-    body(
-      "Les composantes suivantes n'ont pas pu être incluses dans la projection financière (coût de remplacement ou durée de vie utile manquants) :"
-    ),
-    ...projection.excludedComponents.map((e) => body(`• ${e.name} — ${e.reason}`))
-  ] : [];
-  const yearlyTable = projection.scenarios.flatMap((s) => [
-    heading(`Sommaire exécutif — ${s.code} (${s.label}) — année par année`),
-    new Table({
-      width: { size: 100, type: WidthType.PERCENTAGE },
-      rows: [
-        new TableRow({
-          children: [
-            cell("Année", { header: true }),
-            cell("Augmentation", { header: true }),
-            cell("Débours prévus", { header: true }),
-            cell("Cotisation", { header: true }),
-            cell("Solde du fonds (fin d'année)", { header: true })
-          ]
-        }),
-        ...s.years.map(
-          (y) => new TableRow({
-            children: [
-              cell(String(y.year)),
-              cell(`${y.pctAugmentation.toFixed(1)} %`),
-              cell(money(y.debours)),
-              cell(money(y.cotisation)),
-              cell(money(y.soldeFin))
-            ]
-          })
-        )
-      ]
-    })
-  ]);
   const doc = new File$1({
     styles: {
       default: {
@@ -21869,10 +23337,18 @@ async function generateReportDocx(ctx) {
     background: { color: "FFFFFF" },
     sections: [
       { children: cover },
-      { children: [...methodology, ...summary] },
-      { children: inventory },
-      ...excludedSection.length > 0 ? [{ children: excludedSection }] : [],
-      { children: yearlyTable }
+      { children: sommaireMandat },
+      { children: methodologie },
+      { children: commentLire },
+      { children: observation },
+      { children: resultats },
+      { children: conclusion },
+      { children: limitations },
+      { children: declaration },
+      { children: suivi },
+      { children: lexique },
+      { children: annexeA },
+      { children: annexeB }
     ]
   });
   return Packer.toBuffer(doc);
@@ -42158,37 +43634,48 @@ const ETAT_LABELS = ["Excellent", "Bon", "Moyen", "Mauvais", "Critique"];
 function generateReportXlsx(ctx) {
   const { dossier, components: components2, projection } = ctx;
   const inventorySheet = utils.aoa_to_sheet([
-    ["Catégorie", "Code", "Composante", "État", "Observation", "Cause possible", "Délai suggéré", "Conséquences", "Année de construction ou réparation", "Coût remplac. ($)", "Durée de vie (ans)", "Année anticipée de remplacement", "Photos"],
-    ...components2.map((c) => [
-      CATEGORIES[c.cat]?.label ?? c.cat,
-      c.uniformat_code ?? "",
-      c.name,
-      c.done ? RATING_LABELS[c.rating] ?? "na" : "non documentée",
-      c.observation ?? "",
-      c.cause_possible ?? "",
-      c.delai_suggere ?? "",
-      c.consequences ?? "",
-      c.install_year ?? "",
-      c.replacement_cost ?? "",
-      c.useful_life_years ?? "",
-      c.install_year != null && c.useful_life_years != null ? c.install_year + c.useful_life_years : "",
-      c.photos
-    ])
+    ["Catégorie", "Code", "Composante", "Cote de relevé", "Cote au rapport", "Type de ligne", "Observation", "Cause possible", "Délai suggéré", "Conséquences", "Année de construction ou réparation", "Coût remplac. ($)", "Durée de vie / cycle (ans)", "Année anticipée de remplacement", "Photos"],
+    ...components2.map((c) => {
+      const ligne = ligneDureeVie(c, dossier);
+      return [
+        CATEGORIES[c.cat]?.label ?? c.cat,
+        c.uniformat_code ?? "",
+        c.name,
+        c.done ? RATING_LABELS[c.rating] ?? "na" : "non documentée",
+        coteRapportLongue(c.rating) ?? "",
+        ligne.allocation ? "Allocation" : "Remplacement",
+        c.observation ?? "",
+        c.cause_possible ?? "",
+        c.delai_suggere ?? "",
+        c.consequences ?? "",
+        c.install_year ?? "",
+        c.replacement_cost ?? "",
+        ligne.duree,
+        ligne.annee ?? "",
+        c.photos
+      ];
+    })
   ]);
   inventorySheet["!cols"] = [
-    { wch: 12 },
     { wch: 32 },
+    { wch: 12 },
+    { wch: 40 },
+    { wch: 18 },
+    { wch: 42 },
     { wch: 14 },
+    { wch: 48 },
+    { wch: 32 },
+    { wch: 18 },
+    { wch: 32 },
+    { wch: 16 },
     { wch: 16 },
     { wch: 14 },
-    { wch: 16 },
     { wch: 14 },
-    { wch: 8 },
-    { wch: 40 }
+    { wch: 8 }
   ];
   const recommended = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
   const summarySheet = utils.aoa_to_sheet([
-    ["Étude de fonds de prévoyance", dossier.name],
+    ["Plan de gestion de l'actif — Étude du fonds de prévoyance", dossier.name],
     ["Dossier", dossier.dossier_no],
     ["Adresse", `${dossier.address ?? ""} ${dossier.city ?? ""}`.trim()],
     ["Unités", dossier.units],
@@ -42269,7 +43756,7 @@ companies.get("/:id", async (c) => {
   if (deny) return deny;
   const company = await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(c.req.param("id")).first();
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
-  const engineers = await c.env.DB.prepare("SELECT id, name, email, role, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC").bind(company.id).all();
+  const engineers = await c.env.DB.prepare("SELECT id, name, email, role, title, ordre_professionnel, no_membre, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC").bind(company.id).all();
   const dossierCount = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM dossiers WHERE company_id = ?1").bind(company.id).first();
   return c.json({ ...company, hasLogo: !!company.logo_r2_key, engineers: engineers.results, dossierCount: dossierCount?.n ?? 0 });
 });
@@ -42314,6 +43801,109 @@ companies.post("/:id/logo", async (c) => {
   ).bind(r2Key, id).run();
   return c.json({ ok: true });
 });
+companies.get("/:id/template", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const ligne = await c.env.DB.prepare(
+    "SELECT sections, source_filename, source_extrait, imported_at, updated_at FROM company_templates WHERE company_id = ?1"
+  ).bind(id).first();
+  let sections = {};
+  try {
+    sections = ligne?.sections ? nettoyerSections(JSON.parse(ligne.sections)) : {};
+  } catch {
+    sections = {};
+  }
+  return c.json({
+    catalogue: SECTIONS_GABARIT,
+    sections,
+    defauts: TEXTE_MAISON,
+    source_filename: ligne?.source_filename ?? null,
+    imported_at: ligne?.imported_at ?? null,
+    updated_at: ligne?.updated_at ?? null,
+    extrait: ligne?.source_extrait ? ligne.source_extrait.slice(0, 4000) : null
+  });
+});
+
+companies.post("/:id/template", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT id FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 20 * 1024 * 1024) return c.json({ error: "gabarit trop volumineux (max 20 Mo)" }, 413);
+  let paragraphes;
+  try {
+    paragraphes = paragraphesDocx(await lireDocx(buffer));
+  } catch (e) {
+    return c.json({ error: `lecture du .docx impossible : ${e.message}` }, 400);
+  }
+  if (paragraphes.length === 0) return c.json({ error: "aucun texte trouvé dans ce document" }, 400);
+
+  // On conserve le .docx d'origine et le texte brut extrait : si la répartition
+  // se trompe, la firme doit pouvoir remonter à sa source sans réimporter.
+  const r2Key = `company-templates/${id}.docx`;
+  await c.env.PHOTOS.put(r2Key, buffer, {
+    httpMetadata: { contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+  });
+  const extrait = paragraphes.join("\n");
+
+  let sections = {};
+  let note = null;
+  try {
+    const res = await sectionsDepuisTexte(c.env.ANTHROPIC_API_KEY, paragraphes);
+    sections = res.sections;
+    note = res.note;
+  } catch (e) {
+    note = `La répartition automatique a échoué (${e.message}). Le texte est conservé : les sections peuvent être remplies à la main.`;
+  }
+
+  await c.env.DB.prepare(
+    `INSERT INTO company_templates (company_id, sections, source_r2_key, source_filename, source_extrait, imported_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+     ON CONFLICT(company_id) DO UPDATE SET
+       sections = excluded.sections,
+       source_r2_key = excluded.source_r2_key,
+       source_filename = excluded.source_filename,
+       source_extrait = excluded.source_extrait,
+       imported_at = excluded.imported_at,
+       updated_at = excluded.updated_at`
+  ).bind(id, JSON.stringify(sections), r2Key, file.name ?? "gabarit.docx", extrait).run();
+
+  return c.json({
+    ok: true,
+    paragraphes: paragraphes.length,
+    sections_remplies: Object.keys(sections),
+    sections_par_defaut: SECTIONS_GABARIT.map((s) => s.cle).filter((k) => !(k in sections)),
+    note
+  });
+});
+
+companies.patch("/:id/template", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const body2 = await c.req.json();
+  const sections = nettoyerSections(body2.sections);
+  await c.env.DB.prepare(
+    `INSERT INTO company_templates (company_id, sections, updated_at)
+     VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+     ON CONFLICT(company_id) DO UPDATE SET sections = excluded.sections, updated_at = excluded.updated_at`
+  ).bind(id, JSON.stringify(sections)).run();
+  return c.json({ ok: true, sections_remplies: Object.keys(sections) });
+});
+
+companies.delete("/:id/template", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  await c.env.DB.prepare("DELETE FROM company_templates WHERE company_id = ?1").bind(id).run();
+  return c.json({ ok: true, retour: "gabarit intégré" });
+});
 companies.get("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
@@ -42332,7 +43922,7 @@ companies.get("/:id/engineers", async (c) => {
   const deny = requireSuperAdmin(c, user);
   if (deny) return deny;
   const rows = await c.env.DB.prepare(
-    "SELECT id, name, email, role, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC"
+    "SELECT id, name, email, role, title, ordre_professionnel, no_membre, created_at FROM users WHERE company_id = ?1 ORDER BY created_at ASC"
   ).bind(c.req.param("id")).all();
   return c.json(rows.results);
 });
@@ -42347,15 +43937,20 @@ companies.post("/:id/engineers", async (c) => {
   const email = body2.email?.trim().toLowerCase();
   const name = body2.name?.trim();
   if (!email || !name) return c.json({ error: "nom et courriel requis" }, 400);
+  // Bloc de signature : repris tel quel à la section 8.0 Déclaration du rapport.
+  const title = body2.title?.trim() || null;
+  const ordreProfessionnel = body2.ordre_professionnel?.trim().toUpperCase() || null;
+  const noMembre = body2.no_membre?.trim() || null;
   const existing = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(email).first();
   if (existing) return c.json({ error: "un compte existe déjà avec ce courriel" }, 409);
   const tempPassword = generateTempPassword();
   const { hash, salt } = await hashPassword(tempPassword);
   const id = newId("usr");
   await c.env.DB.prepare(
-    `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'engineer')`
-  ).bind(id, email, name, hash, salt, companyId).run();
-  return c.json({ user: { id, email, name, role: "engineer" }, tempPassword }, 201);
+    `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role, title, ordre_professionnel, no_membre)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'engineer', ?7, ?8, ?9)`
+  ).bind(id, email, name, hash, salt, companyId, title, ordreProfessionnel, noMembre).run();
+  return c.json({ user: { id, email, name, role: "engineer", title, ordre_professionnel: ordreProfessionnel, no_membre: noMembre }, tempPassword }, 201);
 });
 const dossiers = new Hono();
 async function dossierStats(db, dossierId) {
@@ -42461,7 +44056,17 @@ async function buildReportContext(c) {
     baseCotisation: dossier.cotisation_annuelle,
     units: dossier.units
   });
-  return { dossier, components: components2, projection, engineerName: user?.name ?? "Condo Stratégis" };
+  return {
+    dossier,
+    components: components2,
+    projection,
+    texteMaison: await texteMaisonPour(c.env.DB, dossier.company_id),
+    banque: await banquePour(c.env.DB, dossier.company_id),
+    textesValides: await textesValidesPour(c.env.DB, dossier.id),
+    engineerName: user?.name ?? "Condo Stratégis",
+    signataire: user ?? null,
+    apiKey: c.env.ANTHROPIC_API_KEY ?? null
+  };
 }
 dossiers.get("/:id/projection", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
@@ -42549,6 +44154,596 @@ photos.get("/:id/file", async (c) => {
     }
   });
 });
+// ── Banque de prix ───────────────────────────────────────────────────────────
+// Ce que la firme a réellement payé, ramené à un prix unitaire indexé. La
+// collecte seulement : aucune de ces routes n'écrit dans components — le coût
+// de remplacement reste saisi à la main tant qu'on n'aura pas vu ce que la
+// banque vaut sur un échantillon réel.
+const prix = new Hono();
+const PRIX_UNITES = {
+  pi2: { label: "pi²", quantifie: true },
+  pi_lin: { label: "pi lin.", quantifie: true },
+  unite: { label: "unité", quantifie: true },
+  forfait: { label: "forfait", quantifie: false }
+};
+const PRIX_PORTEES = {
+  complet: "Remplacement complet",
+  partiel: "Remplacement partiel",
+  reparation: "Réparation"
+};
+const PRIX_SOURCES = { facture: "Facture", soumission: "Soumission" };
+const PRIX_ECHANTILLON_MINCE = 5;   // en deçà, la médiane est indicative, pas une référence
+
+// Le coût par porte est le dénominateur qu'on possède toujours : le nombre
+// d'unités est connu de chaque syndicat, alors qu'une superficie de toit ne
+// l'est presque jamais. Il ne remplace pas le prix au pi² — la surface d'un toit
+// ne suit pas le nombre de portes — mais pour tout ce qui va par immeuble
+// (ascenseur, chaufferie, interphone) ou par porte, il se compare directement.
+//
+// Encore faut-il comparer ce qui se compare : un ascenseur dans un 8 portes et
+// dans un 120 portes n'est pas le même ouvrage. D'où les tranches.
+const PRIX_TRANCHES = [
+  { cle: "petit", label: "Moins de 12 portes", min: 1, max: 11 },
+  { cle: "moyen", label: "12 à 49 portes", min: 12, max: 49 },
+  { cle: "grand", label: "50 portes et plus", min: 50, max: null }
+];
+
+function trancheDe(unites) {
+  if (!unites || unites <= 0) return null;
+  return PRIX_TRANCHES.find((t) => unites >= t.min && (t.max == null || unites <= t.max)) ?? null;
+}
+
+function anneeCourante() {
+  return new Date().getUTCFullYear();
+}
+
+// Prix unitaire en dollars de l'année des travaux. Un forfait n'a pas de
+// quantité : son prix unitaire est le montant lui-même.
+function prixUnitaire(row) {
+  if (!PRIX_UNITES[row.unite]?.quantifie) return row.montant;
+  if (!row.quantite || row.quantite <= 0) return null;
+  return row.montant / row.quantite;
+}
+
+// Ramené en dollars d'aujourd'hui au même taux que la projection du fonds : un
+// prix de 2019 comparé tel quel à un prix de 2025 sous-estime le remplacement.
+// Taux constant — approximation assumée, l'indice réel varie d'une année à l'autre.
+function prixIndexe(montant, annee, anneeCible, taux) {
+  if (montant == null || !annee) return null;
+  return montant * Math.pow(1 + taux, anneeCible - annee);
+}
+
+function quantile(triees, q) {
+  if (triees.length === 0) return null;
+  const pos = (triees.length - 1) * q;
+  const bas = Math.floor(pos);
+  const haut = Math.ceil(pos);
+  if (bas === haut) return triees[bas];
+  return triees[bas] + (triees[haut] - triees[bas]) * (pos - bas);
+}
+
+function prixPublic(row, anneeCible, taux) {
+  const unitaire = prixUnitaire(row);
+  const parPorte = row.unites > 0 ? row.montant / row.unites : null;
+  const tranche = trancheDe(row.unites);
+  return {
+    ...row,
+    prix_unitaire: unitaire,
+    prix_unitaire_indexe: prixIndexe(unitaire, row.annee, anneeCible, taux),
+    prix_par_porte: parPorte,
+    prix_par_porte_indexe: prixIndexe(parPorte, row.annee, anneeCible, taux),
+    tranche: tranche?.cle ?? null,
+    tranche_label: tranche?.label ?? null,
+    unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite
+  };
+}
+
+function nombreOuNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Valide et normalise ce qui arrive du formulaire. Renvoie { erreur } ou { valeurs }.
+function lirePrixBody(body2, { partiel = false } = {}) {
+  const v = {};
+  const presence = (cle) => cle in body2;
+
+  if (!partiel || presence("description")) {
+    const description = String(body2.description ?? "").trim();
+    if (!description) return { erreur: "description requise" };
+    v.description = description;
+  }
+  if (!partiel || presence("annee")) {
+    const annee = nombreOuNull(body2.annee);
+    const max = anneeCourante() + 1;
+    if (annee == null || annee < 1980 || annee > max) return { erreur: `année des travaux invalide (1980 à ${max})` };
+    v.annee = Math.round(annee);
+  }
+  if (!partiel || presence("montant")) {
+    const montant = nombreOuNull(body2.montant);
+    if (montant == null || montant <= 0) return { erreur: "montant des travaux requis" };
+    v.montant = montant;
+  }
+  if (!partiel || presence("unite")) {
+    const unite = String(body2.unite ?? "").trim();
+    if (!PRIX_UNITES[unite]) return { erreur: "unité inconnue" };
+    v.unite = unite;
+  }
+  if (!partiel || presence("quantite")) {
+    v.quantite = nombreOuNull(body2.quantite);
+    if (v.quantite != null && v.quantite <= 0) return { erreur: "quantité invalide" };
+  }
+  if (presence("unites")) {
+    const unites = nombreOuNull(body2.unites);
+    if (unites != null && unites <= 0) return { erreur: "nombre de portes invalide" };
+    v.unites = unites == null ? null : Math.round(unites);
+  }
+  if (presence("portee")) {
+    const portee = body2.portee ? String(body2.portee) : null;
+    if (portee && !PRIX_PORTEES[portee]) return { erreur: "portée inconnue" };
+    v.portee = portee;
+  }
+  if (!partiel || presence("source")) {
+    const source = String(body2.source ?? "facture");
+    if (!PRIX_SOURCES[source]) return { erreur: "source inconnue" };
+    v.source = source;
+  }
+  if (presence("negocie")) v.negocie = body2.negocie ? 1 : 0;
+  if (presence("valide")) v.valide = body2.valide ? 1 : 0;
+  for (const cle of ["cat", "uniformat_code", "fournisseur", "ville", "source_ref", "note", "dossier_id"]) {
+    if (!partiel || presence(cle)) {
+      const brut = body2[cle];
+      v[cle] = brut === null || brut === undefined || String(brut).trim() === "" ? null : String(brut).trim();
+    }
+  }
+  return { valeurs: v };
+}
+
+// Une unité quantifiée sans quantité ne donne aucun prix unitaire : la ligne
+// serait dans la banque sans pouvoir servir. On la refuse à la saisie.
+function quantiteManquante(unite, quantite) {
+  return PRIX_UNITES[unite]?.quantifie && (quantite == null || quantite <= 0);
+}
+
+async function prixCompany(c) {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return null;
+  return user;
+}
+
+prix.get("/", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const filtres = ["company_id = ?1"];
+  const valeurs = [user.company_id];
+  const valide = c.req.query("valide");
+  if (valide === "1" || valide === "0") {
+    filtres.push(`valide = ?${valeurs.length + 1}`);
+    valeurs.push(Number(valide));
+  }
+  const code = c.req.query("code");
+  if (code) {
+    filtres.push(`uniformat_code = ?${valeurs.length + 1}`);
+    valeurs.push(code);
+  }
+  const rows = await c.env.DB.prepare(
+    `SELECT * FROM price_observations WHERE ${filtres.join(" AND ")}
+      ORDER BY created_at DESC LIMIT 500`
+  ).bind(...valeurs).all();
+  const anneeCible = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+
+  // Les pièces du CRM derrière chaque ligne, pour que l'ingénieur voie ce qui a
+  // été fusionné avant de valider un montant.
+  const sources = await c.env.DB.prepare(
+    `SELECT s.* FROM price_observation_sources s
+       JOIN price_observations o ON o.id = s.observation_id
+      WHERE o.company_id = ?1
+      ORDER BY s.date_piece ASC`
+  ).bind(user.company_id).all();
+  const parObservation = new Map();
+  for (const s of sources.results) {
+    if (!parObservation.has(s.observation_id)) parObservation.set(s.observation_id, []);
+    parObservation.get(s.observation_id).push(s);
+  }
+
+  return c.json(rows.results.map((r) => ({
+    ...prixPublic(r, anneeCible, taux),
+    pieces: parObservation.get(r.id) ?? []
+  })));
+});
+
+// Ce que la banque sait dire aujourd'hui, par code Uniformat et par unité.
+// Les prix négociés sont écartés par défaut : un prix de portefeuille n'est pas
+// la juste valeur marchande qu'une étude doit retenir. On les compte quand même,
+// pour que la firme voie ce qui a été mis de côté.
+prix.get("/resume", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const inclureNegocies = c.req.query("negocie") === "inclus";
+  const rows = await c.env.DB.prepare(
+    "SELECT * FROM price_observations WHERE company_id = ?1"
+  ).bind(user.company_id).all();
+
+  const anneeCible = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+  const parUnite = new Map();
+  const parPorte = new Map();
+  let total = 0, valides = 0, negociesEcartes = 0, sansPrix = 0, sansPortes = 0;
+
+  const ajouter = (index, cle, base, valeur, annee) => {
+    if (!index.has(cle)) index.set(cle, { ...base, cle, prix: [], annees: [] });
+    const g = index.get(cle);
+    g.prix.push(valeur);
+    g.annees.push(annee);
+  };
+
+  for (const row of rows.results) {
+    total += 1;
+    if (row.valide !== 1) continue;
+    valides += 1;
+    if (row.negocie === 1 && !inclureNegocies) { negociesEcartes += 1; continue; }
+    const code = row.uniformat_code ?? row.cat ?? "—";
+
+    const indexe = prixIndexe(prixUnitaire(row), row.annee, anneeCible, taux);
+    if (indexe == null) sansPrix += 1;
+    else ajouter(parUnite, `${code}|${row.unite}`, {
+      uniformat_code: row.uniformat_code ?? null,
+      cat: row.cat ?? null,
+      unite: row.unite,
+      unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite,
+      exemple: row.description
+    }, indexe, row.annee);
+
+    // Le coût par porte se calcule sur le montant entier, quelle que soit
+    // l'unité : c'est ce que l'immeuble a déboursé, divisé par ses portes.
+    const tranche = trancheDe(row.unites);
+    const porte = tranche ? prixIndexe(row.montant / row.unites, row.annee, anneeCible, taux) : null;
+    if (porte == null) sansPortes += 1;
+    else ajouter(parPorte, `${code}|${tranche.cle}`, {
+      uniformat_code: row.uniformat_code ?? null,
+      cat: row.cat ?? null,
+      tranche: tranche.cle,
+      tranche_label: tranche.label,
+      exemple: row.description
+    }, porte, row.annee);
+  }
+
+  const statistiques = (index) => [...index.values()].map((g) => {
+    const triees = g.prix.slice().sort((a, b) => a - b);
+    const { prix, annees, ...reste } = g;
+    return {
+      ...reste,
+      n: triees.length,
+      mince: triees.length < PRIX_ECHANTILLON_MINCE,
+      mediane: quantile(triees, 0.5),
+      p25: quantile(triees, 0.25),
+      p75: quantile(triees, 0.75),
+      annee_min: Math.min(...annees),
+      annee_max: Math.max(...annees)
+    };
+  });
+
+  // Les références au pi² se lisent par volume d'échantillon ; celles par porte
+  // se lisent par composante, pour que les trois tailles d'immeuble se suivent
+  // et que l'économie d'échelle saute aux yeux.
+  const ordreTranche = new Map(PRIX_TRANCHES.map((t, i) => [t.cle, i]));
+  const parVolume = (a, b) => b.n - a.n;
+  const parComposante = (a, b) => {
+    const codeA = a.uniformat_code ?? a.cat ?? "";
+    const codeB = b.uniformat_code ?? b.cat ?? "";
+    if (codeA !== codeB) return codeA.localeCompare(codeB);
+    return (ordreTranche.get(a.tranche) ?? 0) - (ordreTranche.get(b.tranche) ?? 0);
+  };
+
+  return c.json({
+    total,
+    valides,
+    a_valider: total - valides,
+    negocies_ecartes: negociesEcartes,
+    sans_prix_unitaire: sansPrix,
+    sans_cout_par_porte: sansPortes,
+    annee_reference: anneeCible,
+    taux_indexation: taux,
+    source_indexation: RESERVE_FUND_PARAMS.inflationSource,
+    echantillon_mince: PRIX_ECHANTILLON_MINCE,
+    tranches: PRIX_TRANCHES.map((t) => ({ cle: t.cle, label: t.label })),
+    lignes: statistiques(parUnite).sort(parVolume),
+    portes: statistiques(parPorte).sort(parComposante)
+  });
+});
+
+prix.post("/", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const { erreur, valeurs } = lirePrixBody(await c.req.json());
+  if (erreur) return c.json({ error: erreur }, 400);
+  if (quantiteManquante(valeurs.unite, valeurs.quantite)) {
+    return c.json({ error: "quantité requise pour cette unité" }, 400);
+  }
+
+  // Le dossier donne le contexte du bâtiment — un prix au pi² de toiture ne se
+  // compare qu'entre immeubles comparables. On en fige une copie : le dossier
+  // peut changer, la facture, elle, a été payée dans ce contexte-là.
+  let contexte = null;
+  if (valeurs.dossier_id) {
+    const dossier = await c.env.DB.prepare(
+      "SELECT * FROM dossiers WHERE id = ?1 AND company_id = ?2"
+    ).bind(valeurs.dossier_id, user.company_id).first();
+    if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+    contexte = JSON.stringify({
+      units: dossier.units ?? null,
+      floors: dossier.floors ?? null,
+      built_year: dossier.built_year ?? null,
+      city: dossier.city ?? null
+    });
+    if (!valeurs.ville) valeurs.ville = dossier.city ?? null;
+    // Le nombre de portes du dossier devient le dénominateur de la ligne, sauf
+    // si l'ingénieur en a saisi un autre — c'est lui qui a la facture sous les yeux.
+    if (valeurs.unites == null) valeurs.unites = dossier.units || null;
+  }
+
+  const id = newId("prx");
+  await c.env.DB.prepare(
+    `INSERT INTO price_observations
+       (id, company_id, dossier_id, cat, uniformat_code, description, fournisseur, annee,
+        montant, quantite, unite, portee, source, negocie, ville, unites, contexte, source_ref, note,
+        valide, created_by)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)`
+  ).bind(
+    id, user.company_id, valeurs.dossier_id ?? null, valeurs.cat ?? null, valeurs.uniformat_code ?? null,
+    valeurs.description, valeurs.fournisseur ?? null, valeurs.annee, valeurs.montant,
+    valeurs.quantite ?? null, valeurs.unite, valeurs.portee ?? null, valeurs.source,
+    valeurs.negocie ?? 0, valeurs.ville ?? null, valeurs.unites ?? null, contexte,
+    valeurs.source_ref ?? null, valeurs.note ?? null, valeurs.valide ?? 0, user.id
+  ).run();
+
+  const row = await c.env.DB.prepare("SELECT * FROM price_observations WHERE id = ?1").bind(id).first();
+  return c.json(prixPublic(row, anneeCourante(), RESERVE_FUND_PARAMS.inflationRate), 201);
+});
+
+// Correction d'une ligne, et validation : c'est ce geste-là qui la fait entrer
+// dans la banque.
+prix.patch("/:id", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const id = c.req.param("id");
+  const existante = await c.env.DB.prepare(
+    "SELECT * FROM price_observations WHERE id = ?1 AND company_id = ?2"
+  ).bind(id, user.company_id).first();
+  if (!existante) return c.json({ error: "ligne introuvable" }, 404);
+
+  const { erreur, valeurs } = lirePrixBody(await c.req.json(), { partiel: true });
+  if (erreur) return c.json({ error: erreur }, 400);
+  const cles = Object.keys(valeurs);
+  if (cles.length === 0) return c.json({ error: "aucun champ à mettre à jour" }, 400);
+
+  const fusionnee = { ...existante, ...valeurs };
+  if (quantiteManquante(fusionnee.unite, fusionnee.quantite)) {
+    return c.json({ error: "quantité requise pour cette unité" }, 400);
+  }
+  if (valeurs.dossier_id) {
+    const dossier = await c.env.DB.prepare(
+      "SELECT id FROM dossiers WHERE id = ?1 AND company_id = ?2"
+    ).bind(valeurs.dossier_id, user.company_id).first();
+    if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  }
+
+  const bind = cles.map((cle, i) => `${cle} = ?${i + 1}`);
+  const args = cles.map((cle) => valeurs[cle]);
+  args.push(id);
+  await c.env.DB.prepare(
+    `UPDATE price_observations SET ${bind.join(", ")},
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?${args.length}`
+  ).bind(...args).run();
+
+  const row = await c.env.DB.prepare("SELECT * FROM price_observations WHERE id = ?1").bind(id).first();
+  return c.json(prixPublic(row, anneeCourante(), RESERVE_FUND_PARAMS.inflationRate));
+});
+
+// ── Import depuis le CRM ─────────────────────────────────────────────────────
+// Le CRM Stratégis rattache déjà ses factures à un code de composante. On y lit
+// ces rattachements — jamais on n'y écrit — pour éviter de ressaisir à la main
+// ce qui est déjà classé. Ce que le CRM ne donne pas, c'est la quantité : une
+// ligne importée arrive donc à valider, et c'est l'ingénieur qui ajoute la
+// superficie sans laquelle il n'y a pas de prix unitaire.
+const CRM_CONFIANCE = "haute";
+const CRM_CANDIDATS_MAX = 400;
+
+// Le binding porte les factures d'une seule entreprise. Une autre firme
+// locataire de l'application ne doit pas les atteindre, binding ou pas.
+function crmRefus(c, user) {
+  if (!c.env.CRM) return "la base du CRM n'est pas liée à ce worker";
+  if (!c.env.CRM_COMPANY_ID || user.company_id !== c.env.CRM_COMPANY_ID) {
+    return "l'import depuis le CRM n'est pas ouvert à cette entreprise";
+  }
+  return null;
+}
+
+// Une facture de travaux est souvent payée en versements : quatre lignes, même
+// syndicat, même composante, le même mois, pour un seul toit. Prises une à une
+// elles donneraient quatre prix de toiture. La clé regroupe donc le travail,
+// et le détail des pièces reste visible pour qu'une fusion abusive se voie.
+function crmCle(piece) {
+  const syndicat = piece.syndicat_id ?? piece.syndicat_name ?? "sans-syndicat";
+  const mois = (piece.date ?? "").slice(0, 7);
+  return `${syndicat}|${piece.component_code}|${mois}`;
+}
+
+async function crmCandidats(c, user) {
+  const rows = await c.env.CRM.prepare(
+    `SELECT m.source_type, m.source_id, m.component_code, m.amount, m.description,
+            m.reference_url, m.document_date, m.syndicat_name,
+            f.numero_facture, f.vendor_name, f.date_facture, f.syndicat_id,
+            s.nom AS syndicat_nom, s.units, s.city
+       FROM component_cost_matches m
+       LEFT JOIN syndicat_factures f
+              ON f.id = m.source_id AND m.source_type = 'syndicat_facture'
+       LEFT JOIN syndicats s ON s.id = f.syndicat_id
+      WHERE m.confidence = ?1
+        AND m.amount > 0
+        AND (m.source_type <> 'syndicat_facture' OR f.deleted_at IS NULL)
+      ORDER BY COALESCE(f.date_facture, m.document_date) DESC
+      LIMIT ?2`
+  ).bind(CRM_CONFIANCE, CRM_CANDIDATS_MAX).all();
+
+  const dejaImportees = await c.env.DB.prepare(
+    "SELECT source_type, source_id FROM price_observation_sources WHERE company_id = ?1"
+  ).bind(user.company_id).all();
+  const vues = new Set(dejaImportees.results.map((r) => `${r.source_type}:${r.source_id}`));
+
+  const groupes = new Map();
+  let sansDate = 0, dejaVues = 0;
+
+  for (const row of rows.results) {
+    if (vues.has(`${row.source_type}:${row.source_id}`)) { dejaVues += 1; continue; }
+    const date = row.date_facture ?? row.document_date ?? null;
+    // Sans date, pas d'année de travaux — donc pas d'indexation possible.
+    if (!date) { sansDate += 1; continue; }
+    const piece = {
+      source_type: row.source_type,
+      source_id: row.source_id,
+      component_code: row.component_code,
+      montant: row.amount,
+      date: date.slice(0, 10),
+      description: row.description ?? null,
+      reference: row.numero_facture ?? row.reference_url ?? null,
+      fournisseur: row.vendor_name ?? null,
+      syndicat_id: row.syndicat_id ?? null,
+      syndicat_name: row.syndicat_nom ?? row.syndicat_name ?? null,
+      units: row.units ?? null,
+      city: row.city ?? null
+    };
+    const cle = crmCle(piece);
+    if (!groupes.has(cle)) {
+      groupes.set(cle, {
+        cle,
+        component_code: piece.component_code,
+        syndicat: piece.syndicat_name,
+        units: piece.units,
+        ville: piece.city,
+        mois: piece.date.slice(0, 7),
+        annee: Number(piece.date.slice(0, 4)),
+        pieces: []
+      });
+    }
+    const g = groupes.get(cle);
+    g.pieces.push(piece);
+    if (piece.units != null && g.units == null) g.units = piece.units;
+    if (piece.city && !g.ville) g.ville = piece.city;
+    if (piece.syndicat_name && !g.syndicat) g.syndicat = piece.syndicat_name;
+  }
+
+  const lignes = [...groupes.values()].map((g) => {
+    // Une facture payée l'emporte sur une soumission : c'est un prix conclu,
+    // pas un prix demandé.
+    const estFacture = g.pieces.some((p) => p.source_type === "syndicat_facture");
+    // La description la plus longue est celle qui dit le plus de la portée —
+    // l'objet d'un courriel dit rarement ce qui a été fait.
+    const description = g.pieces
+      .map((p) => (p.description ?? "").trim())
+      .sort((a, b) => b.length - a.length)[0] || `Travaux ${g.component_code}`;
+    return {
+      ...g,
+      total: g.pieces.reduce((s, p) => s + p.montant, 0),
+      source: estFacture ? "facture" : "soumission",
+      description: description.slice(0, 200),
+      fournisseur: g.pieces.find((p) => p.fournisseur)?.fournisseur ?? null,
+      reference: g.pieces.find((p) => p.reference)?.reference ?? null
+    };
+  }).sort((a, b) => (a.mois < b.mois ? 1 : a.mois > b.mois ? -1 : b.total - a.total));
+
+  return { lignes, sansDate, dejaVues };
+}
+
+prix.get("/crm", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const { lignes, sansDate, dejaVues } = await crmCandidats(c, user);
+  return c.json({
+    confiance: CRM_CONFIANCE,
+    candidats: lignes.length,
+    pieces_sans_date: sansDate,
+    pieces_deja_importees: dejaVues,
+    lignes
+  });
+});
+
+// L'import ne fait pas entrer un prix dans la banque : il crée une ligne à
+// valider, en forfait faute de quantité, avec ses pièces attachées.
+prix.post("/crm/import", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+
+  const body2 = await c.req.json();
+  const demandees = Array.isArray(body2.cles) ? body2.cles.map(String) : [];
+  if (demandees.length === 0) return c.json({ error: "aucun candidat demandé" }, 400);
+
+  // Les groupes sont recalculés ici : le total versé à la banque doit venir du
+  // CRM, jamais d'un montant envoyé par le navigateur.
+  const { lignes } = await crmCandidats(c, user);
+  const parCle = new Map(lignes.map((l) => [l.cle, l]));
+  const importees = [];
+  const ignorees = [];
+
+  for (const cle of demandees) {
+    const groupe = parCle.get(cle);
+    if (!groupe) { ignorees.push(cle); continue; }
+    const id = newId("prx");
+    const contexte = JSON.stringify({
+      units: groupe.units ?? null,
+      city: groupe.ville ?? null,
+      syndicat: groupe.syndicat ?? null,
+      crm_mois: groupe.mois
+    });
+    const note = `Importé du CRM — ${groupe.pieces.length} pièce(s) : ` + groupe.pieces
+      .map((p) => `${p.reference ?? p.source_id} (${Math.round(p.montant)} $, ${p.date})`)
+      .join(", ");
+
+    const instructions = [
+      c.env.DB.prepare(
+        `INSERT INTO price_observations
+           (id, company_id, uniformat_code, description, fournisseur, annee, montant,
+            quantite, unite, source, ville, unites, contexte, source_ref, note, valide, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'forfait', ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14)`
+      ).bind(
+        id, user.company_id, groupe.component_code, groupe.description,
+        groupe.fournisseur, groupe.annee, groupe.total, groupe.source,
+        groupe.ville ?? null, groupe.units ?? null, contexte, groupe.reference ?? null,
+        note, user.id
+      )
+    ];
+    for (const p of groupe.pieces) {
+      instructions.push(c.env.DB.prepare(
+        `INSERT INTO price_observation_sources
+           (observation_id, company_id, source_type, source_id, montant, reference, date_piece, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+      ).bind(id, user.company_id, p.source_type, p.source_id, p.montant,
+             p.reference ?? null, p.date, p.description ?? null));
+    }
+    await c.env.DB.batch(instructions);
+    importees.push({ cle, id, montant: groupe.total, pieces: groupe.pieces.length });
+  }
+
+  return c.json({ importees: importees.length, ignorees: ignorees.length, lignes: importees }, 201);
+});
+
+prix.delete("/:id", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const res = await c.env.DB.prepare(
+    "DELETE FROM price_observations WHERE id = ?1 AND company_id = ?2"
+  ).bind(c.req.param("id"), user.company_id).run();
+  if (!res.meta?.changes) return c.json({ error: "ligne introuvable" }, 404);
+  return c.json({ ok: true });
+});
+
 globalThis.process = _process;
 globalThis.console = workerdConsole;
 const app = new Hono();
@@ -42565,6 +44760,7 @@ app.route("/api/companies", companies);
 app.route("/api/dossiers", dossiers);
 app.route("/api/components", components);
 app.route("/api/photos", photos);
+app.route("/api/prix", prix);
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 const index = {
   fetch: app.fetch

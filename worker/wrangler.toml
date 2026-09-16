@@ -15,6 +15,19 @@ binding = "DB"
 database_name = "stratege-fp"
 database_id = "a409a728-53d2-4344-b438-6adb9f8b5a46"
 
+# La base du CRM Stratégis, où les factures des syndicats gérés sont déjà
+# rattachées à un code de composante. Lue, jamais écrite : le worker n'émet que
+# des SELECT dessus. L'accès est réservé à l'entreprise nommée par
+# CRM_COMPANY_ID — une firme locataire ne doit pas atteindre les factures d'une
+# autre, binding ou pas.
+[[d1_databases]]
+binding = "CRM"
+database_name = "stratege-crm"
+database_id = "9bcbc6e3-574a-44f5-8d30-273906128282"
+
+[vars]
+CRM_COMPANY_ID = "com_980c47a26e91493593a8"
+
 [[r2_buckets]]
 binding = "PHOTOS"
 bucket_name = "stratege-fp-photos"

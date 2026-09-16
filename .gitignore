@@ -1,0 +1,11 @@
+# Dépendances installées localement (Playwright et consorts pèsent des centaines
+# de Mo). Rien de tout cela n'a à être versionné : le worker est un bundle.
+node_modules/
+
+# Artéfacts de build et état local de wrangler
+.wrangler/
+dist/
+.dev.vars
+
+# Systèmes de fichiers
+.DS_Store
