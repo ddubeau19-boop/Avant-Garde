@@ -44,7 +44,7 @@ jobs:
 
       - name: Syntaxe JavaScript
         run: |
-          for f in worker/src/index.js worker/public/*/app.js; do
+          for f in worker/src/index.js worker/public/*/app.js worker/test/*.mjs; do
             node --check "$f" && echo "ok  $f"
           done
 
@@ -64,6 +64,26 @@ jobs:
           tables=$(sqlite3 /tmp/ci-schema.db "SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
           echo "$tables tables créées."
           [ "$tables" -ge 5 ]
+
+      # Le moteur de projection décide de la cotisation qu'un syndicat paiera
+      # pendant trente ans. Jusqu'ici rien ne le gardait : un défaut y plaçait
+      # tout remplacement d'année inconnue en année 1, gonflant la cotisation en
+      # silence, et le CI passait au vert. Ces tests exercent l'API réelle
+      # contre un worker local — le bundle n'exporte rien, donc c'est la seule
+      # prise possible sans le restructurer.
+      - name: Tests du moteur financier
+        working-directory: worker
+        run: |
+          printf 'SESSION_SECRET=ci-secret-jetable\nANTHROPIC_API_KEY=sk-ci-absente\n' > .dev.vars
+          npx --yes wrangler@4 d1 execute stratege-fp --local --file schema.sql
+          npx --yes wrangler@4 d1 execute stratege-fp --local --file test/semer.sql
+          npx --yes wrangler@4 dev --local --port 8787 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8787/api/health > /dev/null && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:8787/api/health > /dev/null || { echo "::error::le worker local n'a jamais répondu"; exit 1; }
+          node test/moteur.mjs
 
   # Filet visible tant que la protection de branche n'est pas activée côté GitHub :
   # une poussée directe sur le tronc laisse une trace rouge au lieu de passer
