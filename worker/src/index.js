@@ -3734,6 +3734,7 @@ function faitsElement(component, dossier, ligne) {
 
 const BANQUE_TAILLE = 80;      // lignes validées chargées par dossier
 const BANQUE_EXEMPLES_MAX = 3; // exemples injectés par composante
+const BANQUE_EXEMPLE_MIN = 40; // longueur sous laquelle un texte fait un mauvais exemple
 
 // Textes déjà validés par l'ingénieur pour les composantes de CE dossier.
 async function textesValidesPour(db, dossierId) {
@@ -3757,12 +3758,17 @@ async function banquePour(db, companyId) {
   if (!db || !companyId) return [];
   try {
     const res = await db.prepare(
+      // Le minimum de longueur est ici, et nulle part ailleurs : un texte court
+      // reste un texte valide pour le rapport de son dossier, il fait
+      // simplement un mauvais exemple pour les études suivantes. Ce seuil vivait
+      // autrefois à la confirmation, où il jetait le texte en silence.
       `SELECT cat, uniformat_code, name, rating, observation, texte_retenu
          FROM redactions
-        WHERE company_id = ?1 AND valide = 1 AND texte_retenu IS NOT NULL AND TRIM(texte_retenu) <> ''
+        WHERE company_id = ?1 AND valide = 1 AND texte_retenu IS NOT NULL
+          AND LENGTH(TRIM(texte_retenu)) >= ?3
         ORDER BY updated_at DESC
         LIMIT ?2`
-    ).bind(companyId, BANQUE_TAILLE).all();
+    ).bind(companyId, BANQUE_TAILLE, BANQUE_EXEMPLE_MIN).all();
     return res.results ?? [];
   } catch {
     // La banque est un confort, pas une dépendance : son absence ne doit jamais
@@ -3988,7 +3994,20 @@ async function listComponentsForDossier(db, dossierId) {
        GROUP BY component_id`
   ).bind(dossierId).all();
   const counts = new Map(photoCounts.results.map((r) => [r.component_id, r.n]));
-  return rows.results.map((row) => ({ ...row, photos: counts.get(row.id) ?? 0 }));
+  // Le rapport reprend le texte retenu quand il existe, et le fait réécrire par
+  // le modèle sinon. La console a besoin de savoir lesquelles en ont un, pour
+  // ne pas laisser publier une étude dont le §4.0 changerait au téléchargement
+  // suivant.
+  const textes = await db.prepare(
+    `SELECT component_id FROM redactions
+      WHERE dossier_id = ?1 AND valide = 1 AND texte_retenu IS NOT NULL AND TRIM(texte_retenu) <> ''`
+  ).bind(dossierId).all();
+  const retenus = new Set(textes.results.map((r) => r.component_id));
+  return rows.results.map((row) => ({
+    ...row,
+    photos: counts.get(row.id) ?? 0,
+    texte_retenu: retenus.has(row.id) ? 1 : 0
+  }));
 }
 async function getOwnedComponent(c, id) {
   const user = await getCurrentUser(c);
@@ -23306,6 +23325,18 @@ async function generateReportDocx(ctx) {
   const parId = new Map(components2.map((c, i) => [c.id, fiches[i]]));
   const observation = [heading("4.0 Observation des éléments")];
   observation.push(body("Chacun des éléments est présenté suivant les quatre sous-sections décrites à la section 3.0. Les cotes employées sont celles de la légende : Bon, Passable – Nécessite un entretien, Mauvais – Requiert la planification d'un remplacement."));
+  // Un élément sans texte retenu est rédigé par le modèle à chaque génération :
+  // le document n'est pas reproductible et personne ne l'a relu. Plutôt que de
+  // refuser le téléchargement — les brouillons de terrain en ont besoin — le
+  // document le dit lui-même. Un rapport entièrement révisé ne porte pas cette
+  // mention.
+  const sansTexteRetenu2 = components2.filter((c) => !valides[c.id]).length;
+  if (sansTexteRetenu2 > 0) {
+    observation.push(body(
+      `BROUILLON — ${sansTexteRetenu2} élément(s) sur ${components2.length} n'ont pas de texte relu et confirmé. Leur rédaction a été produite automatiquement à l'instant et sera différente à la prochaine génération. Ce document ne doit pas être remis au syndicat dans cet état.`,
+      { color: ORANGE, bold: true }
+    ));
+  }
   let numeroCategorie = 0;
   for (const cle of ordreCategories) {
     const liste = parCategorie.get(cle);

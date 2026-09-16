@@ -198,6 +198,7 @@ const state = {
   redactionCache: {},      // id de composante -> rédaction déjà servie
   attentionOpen: false,    // section « attention spéciale » inactive dépliée
   banqueDirty: false,      // un texte vient d'être versé à la banque
+  textesRetenus: {},       // id de composante -> texte enregistré pendant cette session
 
   publishing: false,
   publishError: null,
@@ -416,6 +417,14 @@ function groupedComponents() {
 }
 function confirmedCount() { return state.components.filter(c => c.confirmed === 1).length; }
 function allConfirmed() { return state.components.length > 0 && state.components.every(c => c.confirmed === 1); }
+// Une composante confirmée dont le texte n'a pas été retenu sera réécrite par
+// le modèle à chaque génération : le rapport ne serait pas reproductible, et la
+// personne qui signe la §8.0 n'aurait relu aucune des versions. Tant qu'il en
+// reste, le rapport ne se télécharge pas.
+function sansTexteRetenu() {
+  return state.components.filter(c => c.confirmed === 1 && !(c.texte_retenu === 1 || state.textesRetenus[c.id]));
+}
+function pretPourRapport() { return allConfirmed() && sansTexteRetenu().length === 0; }
 
 // Ordonne les sections servies par le générateur selon l'ordre de la feuille,
 // en conservant à la fin toute section inattendue.
@@ -1109,12 +1118,20 @@ function collectRedactionNote() {
   return parts.join('\n\n');
 }
 
-// Seul l'ÉTAT DE L'ACTIF alimente la banque : c'est la seule sous-section
-// rédigée par le modèle. Les trois autres sont déduites des données.
+// Seul l'ÉTAT DE L'ACTIF est enregistré : c'est la seule sous-section rédigée
+// par le modèle. Les trois autres sont déduites des données.
+//
+// Aucun seuil de longueur ici. Il y en avait un — 40 caractères — et un texte
+// plus court était silencieusement jeté : la composante passait quand même à
+// « confirmée », sans texte retenu, et le rapport la faisait réécrire par le
+// modèle à chaque téléchargement. Deux téléchargements donnaient deux §4.0
+// différents, dont aucun n'avait été relu par la personne qui signe la §8.0.
+// Le seuil garde un sens pour choisir quels textes servent d'exemple aux
+// études suivantes ; il est appliqué là, côté serveur, pas ici.
 function collectEtatText() {
   const el = document.querySelector('.rvia-card [data-sec-cle="etat"]');
   const txt = el ? el.textContent.trim() : '';
-  return txt.length >= 40 ? txt : null;
+  return txt || null;
 }
 
 async function rvConfirm() {
@@ -1132,16 +1149,15 @@ async function rvConfirm() {
     // version-là qui servira d'exemple aux études suivantes de son entreprise.
     const etat = collectEtatText();
     if (etat) {
-      try {
-        await apiJson(`/api/components/${comp.id}/redaction`, {
-          method: 'PATCH', body: JSON.stringify({ texte_retenu: etat, valide: true }),
-        });
-        state.banqueDirty = true;
-      } catch (e) {
-        // La banque est un confort : son échec ne doit pas faire échouer la
-        // confirmation, qui elle vient d'être enregistrée.
-        console.warn('banque de rédactions :', e && e.message);
-      }
+      // L'échec n'est plus avalé. Ce texte n'est pas un confort : c'est lui
+      // qui paraîtra au §4.0 du rapport signé. S'il n'a pas été enregistré,
+      // l'ingénieur doit le savoir maintenant, pas le découvrir dans un
+      // document que le modèle aura réécrit entre-temps.
+      await apiJson(`/api/components/${comp.id}/redaction`, {
+        method: 'PATCH', body: JSON.stringify({ texte_retenu: etat, valide: true }),
+      });
+      state.banqueDirty = true;
+      state.textesRetenus[comp.id] = true;
     }
     state.components = state.components.map(c => String(c.id) === String(comp.id) ? Object.assign({}, c, body) : c);
     state.saveStatus = 'saved';
@@ -1786,8 +1802,8 @@ function executiveSummaryHtml(proj, selectedCode) {
   </div>`;
 }
 
-function reportsCardHtml(allConf, remaining) {
-  if (allConf) {
+function reportsCardHtml(pret, remaining, manquants) {
+  if (pret) {
     return `
     <div class="reports-card">
       <div class="reports-eyebrow">Rapports finaux</div>
@@ -1801,7 +1817,9 @@ function reportsCardHtml(allConf, remaining) {
     <div class="reports-eyebrow">Rapports finaux</div>
     <div class="report-item locked"><div class="report-icon locked"><i data-lucide="file-text"></i></div><div style="flex:1"><div class="report-name muted">Étude de fonds</div><div class="report-sub muted">Word · verrouillé</div></div><i data-lucide="lock"></i></div>
     <div class="report-item locked"><div class="report-icon locked"><i data-lucide="table-2"></i></div><div style="flex:1"><div class="report-name muted">Durées de vie + carnet</div><div class="report-sub muted">Excel · verrouillé</div></div><i data-lucide="lock"></i></div>
-    <div class="reports-note locked"><i data-lucide="alert-circle"></i>Confirmez le texte des ${remaining} composante(s) restante(s) pour générer les rapports.</div>
+    <div class="reports-note locked"><i data-lucide="alert-circle"></i>${manquants > 0
+      ? `${manquants} composante(s) confirmée(s) sans texte enregistré : le modèle les réécrirait à chaque génération. Repassez-les en révision.`
+      : `Confirmez le texte des ${remaining} composante(s) restante(s) pour générer les rapports.`}</div>
   </div>`;
 }
 
@@ -2039,7 +2057,7 @@ function renderRevision() {
       ${state.revisionFlashError ? errorBanner(state.revisionFlashError) : ''}
       <div class="cards-grid">
         ${fundCardHtml(d, proj, params, excluded)}
-        ${reportsCardHtml(allConf, remaining)}
+        ${reportsCardHtml(pretPourRapport(), remaining, sansTexteRetenu().length)}
       </div>
 
       ${scenarioCardsHtml(proj, state.selectedScenarioCode || (proj && proj.recommendedCode) || (proj && proj.scenarios && proj.scenarios[0] && proj.scenarios[0].code))}
@@ -2101,6 +2119,8 @@ function renderPublier() {
   const d = state.dossier;
   if (!d) return `<div class="rev-shell"><div class="page-pad"><div class="empty-state">Dossier introuvable.</div></div></div>`;
   const allConf = allConfirmed();
+  const sansTexte = sansTexteRetenu();
+  const pret = pretPourRapport();
   const remaining = state.components.length - confirmedCount();
   const published = !!d.published_at;
   let body;
@@ -2109,22 +2129,27 @@ function renderPublier() {
     <div class="pub-published">
       <div class="pub-icon-circle green"><i data-lucide="party-popper" style="width:30px;height:30px"></i></div>
       <h2>Étude publiée</h2>
-      <p>Le syndicat ${escapeHtml(d.name || '')} a reçu l'avis par courriel. Sa plateforme est active : consultation de l'étude et suivi du carnet d'entretien.</p>
+      <p>Le dossier ${escapeHtml(d.name || '')} est marqué publié et n'accepte plus de modification. Les rapports Word et Excel restent téléchargeables depuis la révision — c'est vous qui les transmettez au syndicat.</p>
       <div style="display:flex;gap:11px;justify-content:center"><button class="btn-secondary" data-action="go-dossiers">Retour aux dossiers</button></div>
     </div>`;
-  } else if (!allConf) {
+  } else if (!pret) {
     body = `
     <div class="pub-locked">
       <div class="pub-icon-circle"><i data-lucide="lock" style="width:28px;height:28px"></i></div>
       <h2>Révision à compléter</h2>
-      <p>Les rapports Word et Excel ne sont pas générés tant que le texte de toutes les composantes n'est pas confirmé. Il reste <b>${remaining}</b> composante(s) à réviser.</p>
+      ${!allConf
+        ? `<p>Les rapports Word et Excel ne sont pas générés tant que le texte de toutes les composantes n'est pas confirmé. Il reste <b>${remaining}</b> composante(s) à réviser.</p>`
+        : `<p><b>${sansTexte.length}</b> composante(s) confirmée(s) n'ont aucun texte enregistré : le modèle les réécrirait à chaque génération, et le rapport signé ne serait pas reproductible. Repassez-les en révision pour que leur texte soit retenu.</p>
+           <p style="font-size:12.5px;color:var(--ink-500)">${sansTexte.slice(0, 6).map(c => escapeHtml(c.name)).join(' · ')}${sansTexte.length > 6 ? ` · et ${sansTexte.length - 6} autre(s)` : ''}</p>`}
       <button class="btn-primary" data-action="go-reviewia"><i data-lucide="sparkles"></i>Poursuivre la révision</button>
     </div>`;
   } else {
+    // Ne sont listés que les livrables que le produit fabrique réellement. Un
+    // « accès plateforme client » figurait ici : aucun espace syndicat n'existe,
+    // ni au schéma ni au code.
     const deliverables = [
-      { name: 'Étude de fonds de prévoyance', sub: 'Word · vérifié', icon: 'file-text', bg: 'var(--ink)', color: '#fff' },
-      { name: 'Tableur durées de vie', sub: 'Excel · ' + state.components.length + ' composantes', icon: 'table-2', bg: 'var(--green)', color: '#fff' },
-      { name: 'Accès plateforme client', sub: 'Espace syndicat en ligne', icon: 'monitor', bg: 'var(--ink-100)', color: 'var(--ink-700)' },
+      { name: 'Étude de fonds de prévoyance', sub: 'Word · à télécharger depuis la révision', icon: 'file-text', bg: 'var(--ink)', color: '#fff' },
+      { name: 'Tableur durées de vie et suivi d\'entretien', sub: 'Excel · ' + state.components.length + ' composantes', icon: 'table-2', bg: 'var(--green)', color: '#fff' },
     ];
     body = `
     <div class="pub-ready">
