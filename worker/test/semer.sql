@@ -18,3 +18,18 @@ INSERT INTO users (id, email, name, password_hash, password_salt, company_id, ro
    'pwenEEAgjG8jcwG6N3e66DMh3hUtXFXJW3Vxjy9haag',
    '91eKv9EiVmMSDKBbcSVT5w',
    'co_moteur', 'engineer');
+
+-- Une seconde entreprise, dont l'identifiant est celui de CRM_COMPANY_ID dans
+-- wrangler.toml. Le lien avec le CRM n'est ouvert qu'à cette entreprise-là :
+-- deux comptes permettent donc de vérifier les deux côtés de la cloison — que
+-- le portefeuille s'affiche pour elle, et qu'il reste fermé pour l'autre.
+--
+-- Même mot de passe, donc même sel et même empreinte : PBKDF2 est déterministe.
+INSERT INTO companies (id, name, slug) VALUES
+  ('com_980c47a26e91493593a8', 'Firme du portefeuille', 'firme-du-portefeuille');
+
+INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role) VALUES
+  ('usr_crm', 'crm@moteur.local', 'Compte portefeuille',
+   'pwenEEAgjG8jcwG6N3e66DMh3hUtXFXJW3Vxjy9haag',
+   '91eKv9EiVmMSDKBbcSVT5w',
+   'com_980c47a26e91493593a8', 'engineer');

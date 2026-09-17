@@ -32,9 +32,11 @@ function presque(a, b, tolerance = 0.5) {
 
 let jeton = null;
 async function api(chemin, options = {}) {
+  const { jeton: jetonAlt, ...reste } = options;
   const entetes = { "Content-Type": "application/json", ...(options.headers ?? {}) };
-  if (jeton) entetes.Authorization = `Bearer ${jeton}`;
-  const res = await fetch(`${BASE}${chemin}`, { ...options, headers: entetes });
+  const porteur = jetonAlt ?? jeton;
+  if (porteur) entetes.Authorization = `Bearer ${porteur}`;
+  const res = await fetch(`${BASE}${chemin}`, { ...reste, headers: entetes });
   const texte = await res.text();
   let donnees = null;
   try { donnees = JSON.parse(texte); } catch { donnees = texte; }
@@ -42,19 +44,28 @@ async function api(chemin, options = {}) {
   return donnees;
 }
 
-async function connexion() {
+async function jetonPour(courriel, motDePasse = MDP) {
   const res = await fetch(`${BASE}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email: COURRIEL, password: MDP })
+    body: JSON.stringify({ email: courriel, password: motDePasse })
   });
   if (!res.ok) {
     throw new Error(
-      `connexion impossible (${res.status}). Ces tests attendent un compte semé : ` +
-      `${COURRIEL}. Voir worker/test/semer.sql.`
+      `connexion impossible pour ${courriel} (${res.status}). Ces tests attendent des ` +
+      `comptes semés. Voir worker/test/semer.sql.`
     );
   }
-  jeton = (await res.json()).token;
+  return (await res.json()).token;
+}
+
+// Le compte du portefeuille appartient à l'entreprise nommée par
+// CRM_COMPANY_ID : elle seule voit le CRM. Le compte principal, lui, sert à
+// vérifier que la cloison tient.
+let jetonPortefeuille = null;
+async function connexion() {
+  jeton = await jetonPour(COURRIEL);
+  jetonPortefeuille = await jetonPour("crm@moteur.local");
 }
 
 // Crée un dossier directement par l'API, puis y pose des composantes. On passe
@@ -214,13 +225,125 @@ async function testCoutParPorte() {
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Portefeuille — le calendrier des révisions
+
+async function testCloisonDuPortefeuille() {
+  console.log("\nLe portefeuille reste fermé aux autres entreprises");
+  const res = await fetch(`${BASE}/api/portefeuille`, { headers: { Authorization: `Bearer ${jeton}` } });
+  verifier("une entreprise sans lien CRM reçoit un refus", res.status === 403, `statut ${res.status}`);
+}
+
+async function testStatutsDuCalendrier() {
+  console.log("\nChaque statut du calendrier vient d'un cas réel");
+  const p = await api("/api/portefeuille", { jeton: jetonPortefeuille });
+  const par = Object.fromEntries(p.lignes.map((l) => [l.syndicat_id, l]));
+
+  // Les deux copropriétés que la firme ne gère plus ne doivent pas y être :
+  // un contrat terminé et une entité remplacée par une autre.
+  verifier("le syndicat inactif est absent", !par.syn_inactif);
+  verifier("le syndicat remplacé est absent", !par.syn_remplace);
+
+  verifier("une étude de sept ans est en retard", par.syn_retard?.statut === "en_retard", par.syn_retard?.statut);
+  verifier("l'échéance tombe cinq ans après l'étude",
+    par.syn_retard?.echeance === `${Number(par.syn_retard.derniere_etude.slice(0, 4)) + 5}${par.syn_retard.derniere_etude.slice(4)}`,
+    `${par.syn_retard?.derniere_etude} → ${par.syn_retard?.echeance}`);
+  verifier("une étude d'un an est à jour", par.syn_a_jour?.statut === "a_jour", par.syn_a_jour?.statut);
+  verifier("une étude de quatre ans et demi est à prévoir", par.syn_a_prevoir?.statut === "a_prevoir", par.syn_a_prevoir?.statut);
+  verifier("un immeuble sans étude connue le dit", par.syn_inconnu?.statut === "inconnue", par.syn_inconnu?.statut);
+  verifier("le résumé compte les mêmes lignes",
+    p.resume.en_retard + p.resume.inconnue + p.resume.a_prevoir + p.resume.en_cours + p.resume.a_jour === p.total,
+    JSON.stringify(p.resume));
+}
+
+async function testEtudeConnueChangeLEcheance() {
+  console.log("\nConsigner une étude antérieure corrige l'échéance");
+  const avant = await api("/api/portefeuille", { jeton: jetonPortefeuille });
+  const cible = avant.lignes.find((l) => l.statut === "inconnue");
+  verifier("un immeuble sans étude existe pour ce test", !!cible);
+  if (!cible) return;
+
+  const etude = await api("/api/portefeuille/etudes", {
+    method: "POST",
+    jeton: jetonPortefeuille,
+    body: JSON.stringify({ crm_syndicat_id: cible.syndicat_id, date_etude: "2024-05-12", auteur: "Groupe Leblanc" })
+  });
+  const apres = await api("/api/portefeuille", { jeton: jetonPortefeuille });
+  const ligne = apres.lignes.find((l) => l.syndicat_id === cible.syndicat_id);
+  verifier("l'échéance est désormais connue", ligne?.echeance === "2029-05-12", ligne?.echeance);
+  verifier("la source est l'étude consignée", ligne?.derniere_auteur === "Groupe Leblanc", ligne?.derniere_auteur);
+
+  // Une date dans le futur n'est pas une étude passée : la route doit refuser.
+  const futur = await fetch(`${BASE}/api/portefeuille/etudes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${jetonPortefeuille}` },
+    body: JSON.stringify({ crm_syndicat_id: cible.syndicat_id, date_etude: "2099-01-01" })
+  });
+  verifier("une étude datée du futur est refusée", futur.status === 400, `statut ${futur.status}`);
+
+  await api(`/api/portefeuille/etudes/${etude.id}`, { method: "DELETE", jeton: jetonPortefeuille });
+  const retour = await api("/api/portefeuille", { jeton: jetonPortefeuille });
+  verifier("retirer l'étude ramène l'immeuble à « aucune étude »",
+    retour.lignes.find((l) => l.syndicat_id === cible.syndicat_id)?.statut === "inconnue");
+}
+
+async function testDossierRattacheAuSyndicat() {
+  console.log("\nUn dossier rattaché nourrit le calendrier");
+  const cree = await api("/api/dossiers", {
+    method: "POST",
+    jeton: jetonPortefeuille,
+    body: JSON.stringify({
+      dossier_no: `T-PF-${Date.now()}`, name: "Syndicat Du Moulin", units: 12,
+      crm_syndicat_id: "syn_nouveau", crm_syndicat_nom: "Syndicat Du Moulin"
+    })
+  });
+  verifier("le rattachement est conservé", cree.crm_syndicat_id === "syn_nouveau", cree.crm_syndicat_id);
+
+  const enCours = await api("/api/portefeuille", { jeton: jetonPortefeuille });
+  const avant = enCours.lignes.find((l) => l.syndicat_id === "syn_nouveau");
+  // Un dossier non publié n'est pas une étude : l'échéance reste inconnue.
+  verifier("un dossier non publié compte comme étude en cours", avant?.statut === "en_cours", avant?.statut);
+  verifier("il ne fabrique pas d'échéance", avant?.echeance == null, avant?.echeance);
+
+  await api(`/api/dossiers/${cree.id}`, {
+    method: "PATCH", jeton: jetonPortefeuille,
+    body: JSON.stringify({ published_at: "2026-09-01T12:00:00.000Z" })
+  });
+  const apres = await api("/api/portefeuille", { jeton: jetonPortefeuille });
+  const ligne = apres.lignes.find((l) => l.syndicat_id === "syn_nouveau");
+  verifier("publier fait de ce dossier la dernière étude", ligne?.derniere_source === "interne", ligne?.derniere_source);
+  verifier("l'échéance court à partir de la publication", ligne?.echeance === "2031-09-01", ligne?.echeance);
+
+  // Le CRM est en lecture seule et il n'existe pas de route pour supprimer un
+  // dossier : sans dépublication, ce test laisserait derrière lui une étude
+  // publiée qui ferait échouer sa propre exécution suivante sur la même base.
+  await api(`/api/dossiers/${cree.id}`, {
+    method: "PATCH", jeton: jetonPortefeuille, body: JSON.stringify({ published_at: null })
+  });
+}
+
+async function testRechercheDeSyndicat() {
+  console.log("\nLa recherche de syndicat ignore les accents");
+  const avecAccent = await api("/api/portefeuille/syndicats?q=C%C3%A8dres", { jeton: jetonPortefeuille });
+  const sansAccent = await api("/api/portefeuille/syndicats?q=cedres", { jeton: jetonPortefeuille });
+  verifier("« Cèdres » trouve la copropriété", avecAccent.length === 1, JSON.stringify(avecAccent.map((s) => s.nom)));
+  verifier("« cedres » la trouve aussi", sansAccent.length === 1, JSON.stringify(sansAccent.map((s) => s.nom)));
+}
+
+// ---------------------------------------------------------------------------
+
 const suites = [
   testAnneeAncreeSurInstallation,
   testRepliSurAnneeConstruction,
   testExclusionSansAucuneAnnee,
   testAnneeNonNumerique,
   testIndexationBanqueDePrix,
-  testCoutParPorte
+  testCoutParPorte,
+  testCloisonDuPortefeuille,
+  testStatutsDuCalendrier,
+  testEtudeConnueChangeLEcheance,
+  testDossierRattacheAuSyndicat,
+  testRechercheDeSyndicat
 ];
 
 try {

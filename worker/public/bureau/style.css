@@ -659,3 +659,19 @@ button { font-family: inherit; }
 .comp-danger { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line-soft); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .comp-danger span { font-size: 11px; color: var(--ink-500); }
 .login-forgot { line-height: 1.5; }
+
+/* ---------- portefeuille : le calendrier des révisions ---------- */
+.pf-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 18px; }
+.pf-row {
+  display: grid; grid-template-columns: 2fr .5fr 1.1fr 1.1fr .9fr 210px; gap: 14px; padding: 16px 22px;
+  align-items: center; border-top: 1px solid var(--line-soft);
+}
+.pf-head {
+  border-top: none; padding: 12px 22px; background: var(--ink-050); font-family: var(--font-mono); font-size: 10.5px;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--ink-500);
+}
+@media (max-width: 1100px) {
+  .pf-stats { grid-template-columns: repeat(2, 1fr); }
+  .pf-row { grid-template-columns: 1.6fr .6fr 1fr 1fr; }
+  .pf-row > :nth-child(5), .pf-row > :nth-child(6) { grid-column: span 2; }
+}

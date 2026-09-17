@@ -51,8 +51,18 @@ CREATE TABLE dossiers (
   cotisation_annuelle  REAL,
   published_at         TEXT,
   company_id           TEXT REFERENCES companies(id),
-  batiment_info        TEXT   -- JSON : fiche d'immeuble saisie en terrain
+  batiment_info        TEXT,  -- JSON : fiche d'immeuble saisie en terrain
+  -- L'immeuble, pas le dossier. Sans cette colonne, deux études du même
+  -- syndicat à cinq ans d'écart sont deux lignes sans aucun lien : impossible
+  -- de dire ce qui a été réalisé depuis, ni de savoir quelle copropriété du
+  -- portefeuille attend sa révision. Le syndicat vit dans la base du CRM, que
+  -- ce worker lit sans jamais y écrire — on garde donc son identifiant et son
+  -- nom, le nom servant de trace lisible si le CRM devient inaccessible.
+  crm_syndicat_id      TEXT,
+  crm_syndicat_nom     TEXT
 );
+
+CREATE INDEX idx_dossiers_syndicat ON dossiers(company_id, crm_syndicat_id);
 
 CREATE TABLE components (
   id           TEXT PRIMARY KEY,
@@ -241,3 +251,26 @@ CREATE TABLE price_observation_sources (
 );
 
 CREATE INDEX idx_prix_sources_obs ON price_observation_sources(observation_id);
+
+-- Les études que la firme connaît d'un syndicat sans les avoir produites ici :
+-- l'étude papier de 2019 signée par un concurrent, celle qu'un conseil
+-- d'administration mentionne en assemblée. Sans elles, le calendrier de
+-- révision afficherait « aucune étude » pour presque tout le portefeuille et
+-- dirait n'importe quoi sur les échéances.
+--
+-- Une étude produite dans l'application n'a rien à faire ici : elle est déjà
+-- dans `dossiers` avec sa date de publication. Le calendrier lit les deux.
+CREATE TABLE etudes_connues (
+  id              TEXT PRIMARY KEY,
+  company_id      TEXT NOT NULL REFERENCES companies(id),
+  crm_syndicat_id TEXT NOT NULL,
+  syndicat_nom    TEXT,
+  date_etude      TEXT NOT NULL,   -- AAAA-MM-JJ
+  auteur          TEXT,            -- la firme qui l'a signée
+  note            TEXT,
+  created_by      TEXT REFERENCES users(id),
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX idx_etudes_connues ON etudes_connues(company_id, crm_syndicat_id);

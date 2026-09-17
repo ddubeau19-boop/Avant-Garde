@@ -230,9 +230,22 @@ const state = {
   compBusyId: null,          // composante en cours de suppression
 
   newDossierOpen: false,
-  newDossier: { dossier_no: '', name: '', address: '', city: '', units: '', floors: '', built_year: '' },
+  newDossier: { dossier_no: '', name: '', address: '', city: '', units: '', floors: '', built_year: '', crm_syndicat_id: '' },
   newDossierSaving: false,
   newDossierError: null,
+
+  // Portefeuille — le calendrier des révisions
+  syndicats: [],             // liste du CRM, pour rattacher un dossier
+  syndicatsCharges: false,
+  syndicatsIndisponibles: null,  // raison, quand le CRM n'est pas ouvert à la firme
+  portefeuille: null,
+  portefeuilleLoading: false,
+  portefeuilleError: null,
+  portefeuilleFiltre: 'action',
+  etudeFormPour: null,       // syndicat_id dont le formulaire d'étude est ouvert
+  etudeForm: { date_etude: '', auteur: '', note: '' },
+  etudeSaving: false,
+  etudeError: null,
 };
 
 // ---------------------------------------------------------------
@@ -550,6 +563,102 @@ async function loadDossiers() {
 // ---------------------------------------------------------------
 // Dossiers et composantes
 // ---------------------------------------------------------------
+// ---------------------------------------------------------------
+// Portefeuille — le calendrier des révisions
+// ---------------------------------------------------------------
+// La liste des syndicats vient du CRM, qui n'est lisible que par la firme
+// nommée dans la configuration du worker. Une autre firme locataire reçoit un
+// 403 : on le retient une fois pour toutes plutôt que de le redemander, et on
+// cache le sélecteur au lieu d'afficher une erreur devant un formulaire qui
+// marche très bien sans lui.
+async function loadSyndicats() {
+  if (state.syndicatsCharges || state.syndicatsIndisponibles) return;
+  try {
+    state.syndicats = await apiJson('/api/portefeuille/syndicats');
+    state.syndicatsCharges = true;
+  } catch (e) {
+    state.syndicatsIndisponibles = e.message || 'Liste des syndicats indisponible.';
+  }
+  render();
+}
+
+async function loadPortefeuille() {
+  state.portefeuilleLoading = true;
+  state.portefeuilleError = null;
+  render();
+  try {
+    state.portefeuille = await apiJson('/api/portefeuille');
+  } catch (e) {
+    state.portefeuilleError = e.message || 'Impossible de charger le portefeuille.';
+  }
+  state.portefeuilleLoading = false;
+  render();
+}
+
+async function enregistrerEtudeConnue(syndicatId) {
+  if (state.etudeSaving) return;
+  const f = state.etudeForm;
+  const ligne = (state.portefeuille && state.portefeuille.lignes || []).find(l => l.syndicat_id === syndicatId);
+  state.etudeSaving = true;
+  state.etudeError = null;
+  render();
+  try {
+    await apiJson('/api/portefeuille/etudes', {
+      method: 'POST',
+      body: JSON.stringify({
+        crm_syndicat_id: syndicatId,
+        syndicat_nom: ligne ? ligne.nom : null,
+        date_etude: f.date_etude.trim(),
+        auteur: f.auteur.trim() || null,
+        note: f.note.trim() || null,
+      }),
+    });
+    state.etudeSaving = false;
+    state.etudeFormPour = null;
+    state.etudeForm = { date_etude: '', auteur: '', note: '' };
+    await loadPortefeuille();
+  } catch (e) {
+    state.etudeSaving = false;
+    state.etudeError = e.message || "Impossible d'enregistrer l'étude.";
+    render();
+  }
+}
+
+async function oublierEtudeConnue(etudeId) {
+  try {
+    await apiJson(`/api/portefeuille/etudes/${etudeId}`, { method: 'DELETE' });
+    await loadPortefeuille();
+  } catch (e) {
+    state.portefeuilleError = e.message || "Impossible de retirer l'étude.";
+    render();
+  }
+}
+
+// Depuis le calendrier, ouvrir la création de dossier déjà remplie : c'est le
+// seul geste qui fait du portefeuille autre chose qu'une liste à regarder.
+async function dossierPourSyndicat(syndicatId) {
+  const ligne = (state.portefeuille && state.portefeuille.lignes || []).find(l => l.syndicat_id === syndicatId);
+  if (!ligne) return;
+  // La liste des syndicats doit être là avant d'ouvrir le formulaire, sinon le
+  // champ s'affiche une fraction de seconde sans sa liste et paraît cassé.
+  await loadSyndicats();
+  state.newDossier = {
+    dossier_no: '',
+    name: ligne.nom || '',
+    address: ligne.adresse || '',
+    city: ligne.ville || '',
+    units: ligne.unites == null ? '' : String(ligne.unites),
+    floors: '',
+    built_year: '',
+    crm_syndicat_id: ligne.syndicat_id,
+  };
+  state.newDossierOpen = true;
+  state.newDossierError = null;
+  state.screen = 'dossiers';
+  render();
+  loadDossiers();
+}
+
 async function creerDossier() {
   if (state.newDossierSaving) return;
   const f = state.newDossier;
@@ -572,11 +681,13 @@ async function creerDossier() {
         units: parseNum(f.units) ?? 0,
         floors: parseNum(f.floors),
         built_year: parseYear(f.built_year),
+        crm_syndicat_id: f.crm_syndicat_id || null,
+        crm_syndicat_nom: f.crm_syndicat_id ? f.name.trim() : null,
       }),
     });
     state.newDossierSaving = false;
     state.newDossierOpen = false;
-    state.newDossier = { dossier_no: '', name: '', address: '', city: '', units: '', floors: '', built_year: '' };
+    state.newDossier = { dossier_no: '', name: '', address: '', city: '', units: '', floors: '', built_year: '', crm_syndicat_id: '' };
     await loadDossiers();
     if (cree && cree.id) openDossier(cree.id);
   } catch (e) {
@@ -1280,7 +1391,7 @@ function railHtml() {
   const items = [
     { key: 'dossiers', label: 'Dossiers', icon: 'folder', action: 'go-dossiers', active: dossiersActive },
     { key: 'prix', label: 'Banque de prix', icon: 'receipt', action: 'go-prix', active: state.screen === 'prix' },
-    { key: 'clients', label: 'Clients', icon: 'users', disabled: true },
+    { key: 'portefeuille', label: 'Portefeuille', icon: 'users', action: 'go-portefeuille', active: state.screen === 'portefeuille' },
     { key: 'carnet', label: "Carnet d'entretien", icon: 'calendar-clock', disabled: true },
     { key: 'modeles', label: 'Modèles', icon: 'file-stack', disabled: true },
   ];
@@ -1308,6 +1419,7 @@ function railHtml() {
 function renderShell() {
   let main = '';
   if (state.screen === 'dossiers') main = renderDossiers();
+  else if (state.screen === 'portefeuille') main = renderPortefeuille();
   else if (state.screen === 'prix') main = renderPrix();
   else if (state.screen === 'revision') main = renderRevision();
   else if (state.screen === 'publier') main = renderPublier();
@@ -1356,6 +1468,112 @@ function renderDossiers() {
         <div><span class="status-badge" style="background:${d._statusBg};color:${d._statusColor}">${d._statusLabel}</span></div>
         <div><button class="btn-row-action ${d._reviewReady ? 'primary' : ''}" data-action="open-dossier" data-id="${d.id}">${d._reviewReady ? 'Réviser' : 'Ouvrir'}</button></div>
       </div>`).join('')}
+    </div>
+  </div>`;
+}
+
+// ---------------------------------------------------------------
+// Portefeuille — rendu
+// ---------------------------------------------------------------
+// Une couleur par statut, la même partout : le rouge veut dire que l'échéance
+// est passée, le gris que personne ne sait quand la dernière étude a été faite.
+const PF_COULEURS = {
+  en_retard: { bg: 'var(--red-wash)', fg: 'var(--red)' },
+  inconnue: { bg: 'var(--ink-100)', fg: 'var(--ink-600)' },
+  a_prevoir: { bg: 'var(--orange-wash)', fg: 'var(--accent-press)' },
+  en_cours: { bg: 'var(--orange-wash)', fg: 'var(--accent-press)' },
+  a_jour: { bg: 'var(--green-wash)', fg: 'var(--green)' },
+};
+
+function delaiTexte(jours) {
+  if (jours == null) return '—';
+  if (jours < 0) {
+    const n = Math.abs(jours);
+    return n >= 365 ? `en retard de ${Math.floor(n / 365)} an${Math.floor(n / 365) > 1 ? 's' : ''}` : `en retard de ${n} jour${n > 1 ? 's' : ''}`;
+  }
+  if (jours < 60) return `dans ${jours} jour${jours > 1 ? 's' : ''}`;
+  if (jours < 730) return `dans ${Math.round(jours / 30)} mois`;
+  return `dans ${Math.floor(jours / 365)} ans`;
+}
+
+function etudeFormHtml(ligne) {
+  return `
+  <form class="prix-form" id="etude-form" novalidate style="grid-column:1/-1;margin:12px 0 4px">
+    ${state.etudeError ? `<div class="login-error" style="grid-column:1/-1">${escapeHtml(state.etudeError)}</div>` : ''}
+    ${champSimple('etudeForm', 'date_etude', "Date de l'étude", { placeholder: 'AAAA-MM-JJ' })}
+    ${champSimple('etudeForm', 'auteur', 'Signée par', { placeholder: 'ex. Groupe Leblanc ingénieurs' })}
+    ${champSimple('etudeForm', 'note', 'Note', { placeholder: 'ex. mentionnée au PV du 12 mai', large: true })}
+    <div class="prix-form-foot">
+      <span class="prix-hint">Une étude que la firme connaît sans l'avoir produite ici. Sans elle, l'échéance de ${escapeHtml(ligne.nom || '')} reste inconnue.</span>
+      <button type="submit" class="btn-primary" data-syndicat="${escapeHtml(ligne.syndicat_id)}" ${state.etudeSaving ? 'disabled' : ''}>${state.etudeSaving ? 'Enregistrement…' : 'Consigner'}<i data-lucide="${state.etudeSaving ? 'loader-2' : 'check'}" class="${state.etudeSaving ? 'spin' : ''}"></i></button>
+    </div>
+  </form>`;
+}
+
+function renderPortefeuille() {
+  if (state.portefeuilleLoading && !state.portefeuille) {
+    return `<div class="page-pad">${spinnerBlock('Chargement du portefeuille…')}</div>`;
+  }
+  const p = state.portefeuille;
+  const entete = `
+    <div class="eyebrow-orange">Portefeuille</div>
+    <h1 class="page-title">Calendrier des études</h1>
+    <p class="page-lead">Chaque copropriété gérée doit tenir une étude du fonds de prévoyance à jour, révisée tous les ${p ? p.revision_ans : 5} ans. Cet écran croise les études publiées ici, celles que le CRM connaît et celles consignées à la main.</p>`;
+
+  if (state.portefeuilleError) {
+    return `<div class="page-pad">${entete}${errorBanner(state.portefeuilleError, 'retry-portefeuille')}</div>`;
+  }
+  if (!p) return `<div class="page-pad">${entete}<div class="empty-state">Aucune donnée.</div></div>`;
+
+  const r = p.resume;
+  const filtres = [
+    { k: 'action', label: `À traiter · ${r.en_retard + r.inconnue + r.a_prevoir}` },
+    { k: 'en_retard', label: `En retard · ${r.en_retard}` },
+    { k: 'inconnue', label: `Aucune étude · ${r.inconnue}` },
+    { k: 'en_cours', label: `En cours · ${r.en_cours}` },
+    { k: 'tous', label: `Tous · ${p.total}` },
+  ];
+  const lignes = p.lignes.filter(l => {
+    if (state.portefeuilleFiltre === 'tous') return true;
+    if (state.portefeuilleFiltre === 'action') return ['en_retard', 'inconnue', 'a_prevoir'].includes(l.statut);
+    return l.statut === state.portefeuilleFiltre;
+  });
+
+  return `
+  <div class="page-pad">
+    ${entete}
+    <div class="pf-stats">
+      <div class="prix-stat"><div class="prix-stat-k">En retard</div><div class="prix-stat-v">${r.en_retard}</div></div>
+      <div class="prix-stat"><div class="prix-stat-k">Aucune étude</div><div class="prix-stat-v">${r.inconnue}</div></div>
+      <div class="prix-stat"><div class="prix-stat-k">À prévoir</div><div class="prix-stat-v">${r.a_prevoir}</div></div>
+      <div class="prix-stat"><div class="prix-stat-k">En cours</div><div class="prix-stat-v">${r.en_cours}</div></div>
+      <div class="prix-stat"><div class="prix-stat-k">À jour</div><div class="prix-stat-v">${r.a_jour}</div></div>
+    </div>
+    <div class="metho-source" style="margin:-8px 0 20px">${p.total} copropriété${p.total > 1 ? 's' : ''} active${p.total > 1 ? 's' : ''} au ${escapeHtml(p.aujourdhui)}. « Aucune étude » ne veut pas dire qu'il n'en existe pas : seulement que l'application n'en connaît aucune. Consignez celles que vous connaissez pour que l'échéance cesse d'être fausse.</div>
+    <div class="filters-row">
+      ${filtres.map(f => `<button class="chip ${state.portefeuilleFiltre === f.k ? 'active' : ''}" data-action="pf-filtre" data-filtre="${f.k}">${f.label}</button>`).join('')}
+    </div>
+    <div class="dossiers-table">
+      <div class="pf-row pf-head"><div>Copropriété</div><div>Portes</div><div>Dernière étude</div><div>Échéance</div><div>Statut</div><div></div></div>
+      ${lignes.length === 0 ? `<div class="empty-state">Aucune copropriété dans cette catégorie.</div>` : lignes.map(l => {
+        const col = PF_COULEURS[l.statut] || PF_COULEURS.inconnue;
+        const source = l.derniere_source === 'interne' ? `dossier ${escapeHtml(l.dossier_no || '')}` : (l.derniere_source === 'crm' ? 'du CRM' : (l.derniere_auteur ? escapeHtml(l.derniere_auteur) : 'consignée'));
+        return `
+      <div class="pf-row">
+        <div><div class="dt-name">${escapeHtml(l.nom || '—')}</div><div class="dt-sub">${escapeHtml(l.adresse || '')}${l.adresse && l.ville ? ' · ' : ''}${escapeHtml(l.ville || '')}</div></div>
+        <div class="dt-no">${l.unites == null ? '—' : l.unites}</div>
+        <div>${l.derniere_etude ? `<div class="dt-no">${escapeHtml(l.derniere_etude)}</div><div class="dt-sub">${source}</div>` : '<span class="dt-sub">inconnue</span>'}</div>
+        <div>${l.echeance ? `<div class="dt-no">${escapeHtml(l.echeance)}</div><div class="dt-sub">${escapeHtml(delaiTexte(l.jours_restants))}</div>` : '<span class="dt-sub">—</span>'}</div>
+        <div><span class="status-badge" style="background:${col.bg};color:${col.fg}">${escapeHtml(l.statut_label)}</span>${l.en_cours.length ? `<div class="dt-sub">${escapeHtml(l.en_cours[0].dossier_no || '')}</div>` : ''}</div>
+        <div style="display:flex;gap:6px;justify-content:flex-end">
+          ${l.en_cours.length
+            ? `<button class="btn-row-action primary" data-action="open-dossier" data-id="${escapeHtml(l.en_cours[0].dossier_id)}">Ouvrir</button>`
+            : `<button class="btn-row-action ${['en_retard', 'inconnue'].includes(l.statut) ? 'primary' : ''}" data-action="pf-nouveau" data-id="${escapeHtml(l.syndicat_id)}">Créer l'étude</button>`}
+          <button class="btn-row-action" data-action="pf-consigner" data-id="${escapeHtml(l.syndicat_id)}" title="Consigner une étude antérieure">${state.etudeFormPour === l.syndicat_id ? 'Annuler' : 'Consigner'}</button>
+        </div>
+      </div>
+      ${state.etudeFormPour === l.syndicat_id ? `<div style="padding:0 22px 14px">${etudeFormHtml(l)}</div>` : ''}`;
+      }).join('')}
     </div>
   </div>`;
 }
@@ -1663,12 +1881,36 @@ function compAddFormHtml() {
   </form>`;
 }
 
+// Rattacher l'étude à l'immeuble, et pas seulement à un nom tapé à la main.
+// C'est ce rattachement qui permet, cinq ans plus tard, de retrouver l'étude
+// précédente du même syndicat et de savoir ce qui a été réalisé entretemps.
+//
+// C'est le champ « Syndicat » lui-même, pas un champ de plus : une liste
+// déroulante à côté d'une zone de texte libre finirait par porter deux noms
+// différents pour le même immeuble. Quand le CRM n'est pas lisible par la
+// firme, le champ redevient une simple saisie et le formulaire fonctionne.
+function champSyndicatHtml() {
+  if (state.syndicatsIndisponibles || state.syndicats.length === 0) {
+    return champSimple('newDossier', 'name', 'Syndicat', { placeholder: 'ex. Syndicat Les Érables' });
+  }
+  const rattache = !!state.newDossier.crm_syndicat_id;
+  return `<div class="prix-field large">
+    <label class="field-label" for="newDossier-name">Syndicat</label>
+    <input class="detail-input" type="text" id="newDossier-name" data-role="syndicat-pick" list="syndicats-liste"
+      value="${escapeHtml(state.newDossier.name || '')}" placeholder="Tapez le nom de la copropriété" autocomplete="off">
+    <datalist id="syndicats-liste">
+      ${state.syndicats.map(sy => `<option value="${escapeHtml(sy.nom || '')}" label="${escapeHtml([sy.city, sy.units ? sy.units + ' portes' : ''].filter(Boolean).join(' · '))}"></option>`).join('')}
+    </datalist>
+    <span class="prix-hint" style="margin-top:6px;display:block">${rattache ? 'Rattaché au portefeuille — adresse, ville et portes viennent du CRM.' : 'Immeuble hors portefeuille : les études de cet immeuble ne se compareront pas entre elles.'}</span>
+  </div>`;
+}
+
 function nouveauDossierFormHtml() {
   return `
   <form class="prix-form" id="new-dossier-form" novalidate style="margin-bottom:20px">
     ${state.newDossierError ? `<div class="login-error" style="grid-column:1/-1">${escapeHtml(state.newDossierError)}</div>` : ''}
     ${champSimple('newDossier', 'dossier_no', 'Numéro de dossier', { placeholder: 'ex. FP-2026-001' })}
-    ${champSimple('newDossier', 'name', 'Syndicat', { placeholder: 'ex. Syndicat Les Érables' })}
+    ${champSyndicatHtml()}
     ${champSimple('newDossier', 'address', 'Adresse', { placeholder: '12 rue de la Tannerie' })}
     ${champSimple('newDossier', 'city', 'Ville', { placeholder: 'Longueuil' })}
     ${champSimple('newDossier', 'units', 'Portes', { placeholder: 'ex. 48' })}
@@ -2374,6 +2616,9 @@ function initEvents() {
     } else if (e.target && e.target.id === 'new-dossier-form') {
       e.preventDefault();
       creerDossier();
+    } else if (e.target && e.target.id === 'etude-form') {
+      e.preventDefault();
+      if (state.etudeFormPour) enregistrerEtudeConnue(state.etudeFormPour);
     }
   });
 
@@ -2387,6 +2632,25 @@ function initEvents() {
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
     else if (t.matches('[data-role="champ-simple"]')) {
       state[t.getAttribute('data-groupe')][t.getAttribute('data-cle')] = t.value;
+    }
+    // Reconnaître un nom du portefeuille remplit ce que le CRM sait déjà de
+    // l'immeuble : adresse, ville, nombre de portes. On ne retape pas à côté
+    // de la source. Tant que le nom ne correspond à rien, on n'interrompt pas
+    // la frappe par un re-rendu — seule la bascule rattaché / non rattaché
+    // redessine.
+    else if (t.matches('[data-role="syndicat-pick"]')) {
+      state.newDossier.name = t.value;
+      const sy = state.syndicats.find(x => String(x.nom || '').trim() === t.value.trim());
+      if (sy) {
+        state.newDossier.crm_syndicat_id = sy.id;
+        state.newDossier.address = sy.address || '';
+        state.newDossier.city = sy.city || '';
+        state.newDossier.units = sy.units == null ? '' : String(sy.units);
+        render();
+      } else if (state.newDossier.crm_syndicat_id) {
+        state.newDossier.crm_syndicat_id = '';
+        render();
+      }
     }
     else if (t.matches('[data-role="prix-field"]')) {
       const champ = t.getAttribute('data-field');
@@ -2413,6 +2677,30 @@ function initEvents() {
         render();
         loadPrix();
         break;
+      case 'go-portefeuille':
+        leaveReviewIA();
+        state.screen = 'portefeuille';
+        render();
+        loadPortefeuille();
+        break;
+      case 'retry-portefeuille':
+        loadPortefeuille();
+        break;
+      case 'pf-filtre':
+        state.portefeuilleFiltre = btn.getAttribute('data-filtre');
+        render();
+        break;
+      case 'pf-nouveau':
+        dossierPourSyndicat(btn.getAttribute('data-id'));
+        break;
+      case 'pf-consigner': {
+        const cible = btn.getAttribute('data-id');
+        state.etudeFormPour = state.etudeFormPour === cible ? null : cible;
+        state.etudeForm = { date_etude: '', auteur: '', note: '' };
+        state.etudeError = null;
+        render();
+        break;
+      }
       case 'retry-prix':
         loadPrix();
         break;
@@ -2420,6 +2708,7 @@ function initEvents() {
         state.newDossierOpen = !state.newDossierOpen;
         state.newDossierError = null;
         render();
+        if (state.newDossierOpen) loadSyndicats();
         break;
       case 'comp-ajouter-ouvrir':
         state.compAddOpen = !state.compAddOpen;

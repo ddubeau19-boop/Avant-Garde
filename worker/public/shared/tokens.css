@@ -28,6 +28,11 @@
   /* --- Status --- */
   --green:       #1F8A4E;  /* success / paid / active */
   --green-wash:  #E6F2EB;
+  /* Le rouge ne sert qu'à une échéance dépassée — une obligation légale non
+     tenue, pas une erreur de saisie. Les erreurs de formulaire restent en
+     orange : si tout est rouge, plus rien ne l'est. */
+  --red:         #B42318;
+  --red-wash:    #FDECEA;
 
   /* ============================================================
      Semantic aliases — reference these in components

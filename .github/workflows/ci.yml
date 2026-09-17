@@ -61,6 +61,7 @@ jobs:
       - name: schema.sql reste exécutable
         run: |
           sqlite3 /tmp/ci-schema.db < worker/schema.sql
+          sqlite3 /tmp/ci-crm.db < worker/test/semer-crm.sql
           tables=$(sqlite3 /tmp/ci-schema.db "SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
           echo "$tables tables créées."
           [ "$tables" -ge 5 ]
@@ -77,6 +78,9 @@ jobs:
           printf 'SESSION_SECRET=ci-secret-jetable\nANTHROPIC_API_KEY=sk-ci-absente\n' > .dev.vars
           npx --yes wrangler@4 d1 execute stratege-fp --local --file schema.sql
           npx --yes wrangler@4 d1 execute stratege-fp --local --file test/semer.sql
+          # Le portefeuille lit la base du CRM. Sans ce CRM miniature, ses
+          # tests passeraient au vert sur une base vide sans rien vérifier.
+          npx --yes wrangler@4 d1 execute stratege-crm --local --file test/semer-crm.sql
           npx --yes wrangler@4 dev --local --port 8787 &
           for i in $(seq 1 60); do
             curl -sf http://127.0.0.1:8787/api/health > /dev/null && break

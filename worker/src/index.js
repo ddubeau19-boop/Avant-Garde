@@ -44685,8 +44685,8 @@ dossiers.post("/", async (c) => {
   if (!body2.dossier_no || !body2.name) return c.json({ error: "dossier_no et name requis" }, 400);
   const id = newId("dos");
   await c.env.DB.prepare(
-    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id, crm_syndicat_id, crm_syndicat_nom)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`
   ).bind(
     id,
     body2.dossier_no,
@@ -44697,7 +44697,9 @@ dossiers.post("/", async (c) => {
     body2.floors ?? null,
     body2.built_year ?? null,
     user.id,
-    user.company_id
+    user.company_id,
+    texteOuNull(body2.crm_syndicat_id),
+    texteOuNull(body2.crm_syndicat_nom)
   ).run();
   const items = await generateChecklist(c.env.ANTHROPIC_API_KEY, {
     units: body2.units ?? 0,
@@ -44917,7 +44919,9 @@ dossiers.patch("/:id", async (c) => {
     "current_fund_balance",
     "published_at",
     "batiment_info",
-    "cotisation_annuelle"
+    "cotisation_annuelle",
+    "crm_syndicat_id",
+    "crm_syndicat_nom"
   ]) {
     if (key in body2) {
       fields.push(`${key} = ?${fields.length + 1}`);
@@ -45034,6 +45038,11 @@ function prixPublic(row, anneeCible, taux) {
     tranche_label: tranche?.label ?? null,
     unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite
   };
+}
+
+function texteOuNull(v) {
+  const t = String(v ?? "").trim();
+  return t === "" ? null : t;
 }
 
 function nombreOuNull(v) {
@@ -45583,12 +45592,292 @@ app.use("/api/*", async (c, next) => {
   if (!user) return c.json({ error: "non authentifié" }, 401);
   return next();
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Portefeuille — quelle copropriété attend son étude
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Le CRM gère 141 syndicats actifs. Chacun doit tenir une étude du fonds de
+// prévoyance à jour, révisée tous les cinq ans. Jusqu'ici l'application ne
+// savait rien de ce portefeuille : elle attendait qu'on lui crée un dossier.
+// Les échéances vivaient dans la tête des gestionnaires, donc nulle part.
+//
+// Cet écran croise trois sources, de la plus sûre à la moins sûre :
+//   1. les dossiers publiés ici même — une date de publication ne ment pas ;
+//   2. la table des études du CRM, si le CRM se met un jour à la remplir ;
+//   3. les études saisies à la main (`etudes_connues`) — l'étude papier de
+//      2019 signée par un concurrent, celle qu'un procès-verbal mentionne.
+//
+// Sans la troisième, le calendrier afficherait « aucune étude » pour presque
+// tout le portefeuille et se tromperait sur toutes les échéances.
+
+// Le règlement adopté sous la loi 16 demande que l'étude soit révisée tous les
+// cinq ans. C'est une constante nommée, pas un 5 perdu dans un calcul : le jour
+// où le délai change, il change ici.
+const ETUDE_REVISION_ANS = 5;
+// Un an d'avance : le temps de mandater, visiter et produire avant l'échéance.
+const ETUDE_PREAVIS_JOURS = 365;
+
+// « Cèdres » et « cedres » désignent le même immeuble.
+function sansAccents(texte) {
+  return String(texte ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+}
+
+function jourIso(d) {
+  return new Date(d).toISOString().slice(0, 10);
+}
+// Ajoute des années à une date AAAA-MM-JJ. Passe par Date.UTC pour qu'un
+// 29 février plus cinq ans devienne le 1er mars et non une date inexistante.
+function dateApresAnnees(dateIso, ans) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dateIso ?? ""));
+  if (!m) return null;
+  return jourIso(Date.UTC(Number(m[1]) + ans, Number(m[2]) - 1, Number(m[3])));
+}
+function joursJusqua(dateIso, aujourdhui) {
+  const cible = Date.parse(`${dateIso}T00:00:00Z`);
+  const base = Date.parse(`${aujourdhui}T00:00:00Z`);
+  if (!Number.isFinite(cible) || !Number.isFinite(base)) return null;
+  return Math.round((cible - base) / 86400000);
+}
+
+// Les statuts du calendrier. Le vocabulaire est celui du gestionnaire, pas
+// celui de la base : « en retard » veut dire que l'échéance est passée.
+const PORTEFEUILLE_STATUTS = {
+  inconnue: { label: "Aucune étude", rang: 1 },
+  en_retard: { label: "En retard", rang: 0 },
+  a_prevoir: { label: "À prévoir", rang: 2 },
+  a_jour: { label: "À jour", rang: 4 },
+  en_cours: { label: "En cours", rang: 3 }
+};
+
+// La dernière étude connue d'un syndicat, toutes sources confondues.
+function derniereEtude(candidates) {
+  let meilleure = null;
+  for (const e of candidates) {
+    if (!e || !e.date) continue;
+    if (!meilleure || e.date > meilleure.date) meilleure = e;
+  }
+  return meilleure;
+}
+
+async function portefeuilleLignes(c, user) {
+  const aujourdhui = jourIso(Date.now());
+
+  const syndicats = await c.env.CRM.prepare(
+    `SELECT id, nom, address, city, units, gestionnaire_name, date_fin_contrat
+       FROM syndicats
+      WHERE actif = 1 AND superseded_by_syndicat_id IS NULL
+      ORDER BY nom`
+  ).all();
+
+  // Les études produites ici. Un dossier non publié n'est pas une étude : il
+  // compte comme travail en cours, pas comme échéance satisfaite.
+  const nos = await c.env.DB.prepare(
+    `SELECT id, dossier_no, name, published_at, created_at, crm_syndicat_id
+       FROM dossiers
+      WHERE company_id = ?1 AND crm_syndicat_id IS NOT NULL`
+  ).bind(user.company_id).all();
+
+  // Les études saisies à la main pour ce qui n'est pas passé par ici.
+  const connues = await c.env.DB.prepare(
+    `SELECT id, crm_syndicat_id, date_etude, auteur, note
+       FROM etudes_connues
+      WHERE company_id = ?1`
+  ).bind(user.company_id).all();
+
+  // Le CRM tient sa propre table d'études, avec sa date et son échéance. Elle
+  // est vide aujourd'hui ; la lire ne coûte rien et le calendrier se remplira
+  // tout seul le jour où le CRM s'en servira.
+  let duCrm = { results: [] };
+  try {
+    duCrm = await c.env.CRM.prepare(
+      `SELECT syndicat_id, study_date, expires_at
+         FROM syndicat_reserve_fund_studies
+        WHERE is_current = 1`
+    ).all();
+  } catch (e) {
+    // Table absente d'une version antérieure du CRM : le calendrier tient
+    // debout sans elle, il perd seulement une source.
+  }
+
+  const parSyndicat = new Map();
+  const ligne = (id) => {
+    if (!parSyndicat.has(id)) parSyndicat.set(id, { nos: [], connues: [], crm: [], enCours: [] });
+    return parSyndicat.get(id);
+  };
+  for (const d of nos.results) {
+    const l = ligne(d.crm_syndicat_id);
+    if (d.published_at) l.nos.push({ date: d.published_at.slice(0, 10), source: "interne", dossier_id: d.id, dossier_no: d.dossier_no });
+    else l.enCours.push({ dossier_id: d.id, dossier_no: d.dossier_no, depuis: d.created_at });
+  }
+  for (const e of connues.results) {
+    ligne(e.crm_syndicat_id).connues.push({ date: String(e.date_etude).slice(0, 10), source: "connue", etude_id: e.id, auteur: e.auteur, note: e.note });
+  }
+  for (const e of duCrm.results) {
+    if (!e.study_date) continue;
+    ligne(e.syndicat_id).crm.push({ date: String(e.study_date).slice(0, 10), source: "crm" });
+  }
+
+  const lignes = syndicats.results.map((s) => {
+    const l = parSyndicat.get(s.id) || { nos: [], connues: [], crm: [], enCours: [] };
+    const derniere = derniereEtude([...l.nos, ...l.connues, ...l.crm]);
+    const echeance = derniere ? dateApresAnnees(derniere.date, ETUDE_REVISION_ANS) : null;
+    const jours = echeance ? joursJusqua(echeance, aujourdhui) : null;
+    let statut;
+    if (!derniere) statut = l.enCours.length ? "en_cours" : "inconnue";
+    else if (jours != null && jours < 0) statut = "en_retard";
+    else if (l.enCours.length) statut = "en_cours";
+    else if (jours != null && jours <= ETUDE_PREAVIS_JOURS) statut = "a_prevoir";
+    else statut = "a_jour";
+    return {
+      syndicat_id: s.id,
+      nom: s.nom,
+      adresse: s.address,
+      ville: s.city,
+      unites: s.units,
+      gestionnaire: s.gestionnaire_name,
+      derniere_etude: derniere ? derniere.date : null,
+      derniere_source: derniere ? derniere.source : null,
+      derniere_auteur: derniere && derniere.auteur ? derniere.auteur : null,
+      etude_id: derniere && derniere.etude_id ? derniere.etude_id : null,
+      dossier_id: derniere && derniere.dossier_id ? derniere.dossier_id : null,
+      dossier_no: derniere && derniere.dossier_no ? derniere.dossier_no : null,
+      echeance,
+      jours_restants: jours,
+      en_cours: l.enCours,
+      etudes_connues: l.connues.length,
+      statut,
+      statut_label: PORTEFEUILLE_STATUTS[statut].label
+    };
+  });
+
+  lignes.sort((a, b) => {
+    const ra = PORTEFEUILLE_STATUTS[a.statut].rang;
+    const rb = PORTEFEUILLE_STATUTS[b.statut].rang;
+    if (ra !== rb) return ra - rb;
+    if (a.echeance && b.echeance && a.echeance !== b.echeance) return a.echeance < b.echeance ? -1 : 1;
+    return String(a.nom || "").localeCompare(String(b.nom || ""), "fr");
+  });
+
+  const compte = (s) => lignes.filter((l) => l.statut === s).length;
+  return {
+    aujourdhui,
+    revision_ans: ETUDE_REVISION_ANS,
+    total: lignes.length,
+    resume: {
+      en_retard: compte("en_retard"),
+      inconnue: compte("inconnue"),
+      a_prevoir: compte("a_prevoir"),
+      en_cours: compte("en_cours"),
+      a_jour: compte("a_jour")
+    },
+    lignes
+  };
+}
+
+const portefeuille = new Hono();
+
+// La recherche qui sert à rattacher un dossier à son immeuble. Elle renvoie ce
+// que le formulaire de création a besoin de préremplir — adresse, ville,
+// nombre de portes — pour qu'on ne les retape pas à côté de ce que le CRM sait.
+portefeuille.get("/syndicats", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "non authentifié" }, 401);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const rows = await c.env.CRM.prepare(
+    `SELECT id, nom, address, city, units
+       FROM syndicats
+      WHERE actif = 1 AND superseded_by_syndicat_id IS NULL
+      ORDER BY nom`
+  ).all();
+  // Le filtre se fait ici, pas en SQL : « cedres » doit trouver « Cèdres », et
+  // LIKE ne replie pas les accents. Cent quarante lignes se filtrent en
+  // mémoire sans qu'on s'en aperçoive.
+  const q = sansAccents(c.req.query("q"));
+  const resultats = q
+    ? rows.results.filter((s) => sansAccents(s.nom).includes(q) || sansAccents(s.address).includes(q))
+    : rows.results;
+  return c.json(resultats.slice(0, 200));
+});
+
+portefeuille.get("/", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "non authentifié" }, 401);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  return c.json(await portefeuilleLignes(c, user));
+});
+
+// Une étude antérieure qu'on n'a pas produite. C'est une saisie manuelle
+// assumée : personne ne peut la deviner, et sans elle l'échéance est fausse.
+function lireEtudeBody(body2, { partiel = false } = {}) {
+  const valeurs = {};
+  if (!partiel || "crm_syndicat_id" in body2) {
+    const id = String(body2.crm_syndicat_id ?? "").trim();
+    if (!id) return { erreur: "syndicat requis" };
+    valeurs.crm_syndicat_id = id;
+  }
+  if (!partiel || "date_etude" in body2) {
+    const date = String(body2.date_etude ?? "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { erreur: "date de l'étude requise (AAAA-MM-JJ)" };
+    if (date > jourIso(Date.now())) return { erreur: "la date de l'étude est dans le futur" };
+    valeurs.date_etude = date;
+  }
+  if (!partiel || "syndicat_nom" in body2) valeurs.syndicat_nom = texteOuNull(body2.syndicat_nom);
+  if (!partiel || "auteur" in body2) valeurs.auteur = texteOuNull(body2.auteur);
+  if (!partiel || "note" in body2) valeurs.note = texteOuNull(body2.note);
+  return { valeurs };
+}
+
+portefeuille.post("/etudes", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json({ error: "non authentifié" }, 401);
+  const { erreur, valeurs } = lireEtudeBody(await c.req.json());
+  if (erreur) return c.json({ error: erreur }, 400);
+  const id = newId("etu");
+  await c.env.DB.prepare(
+    `INSERT INTO etudes_connues (id, company_id, crm_syndicat_id, syndicat_nom, date_etude, auteur, note, created_by)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+  ).bind(id, user.company_id, valeurs.crm_syndicat_id, valeurs.syndicat_nom ?? null, valeurs.date_etude, valeurs.auteur ?? null, valeurs.note ?? null, user.id).run();
+  const row = await c.env.DB.prepare("SELECT * FROM etudes_connues WHERE id = ?1").bind(id).first();
+  return c.json(row, 201);
+});
+
+portefeuille.patch("/etudes/:id", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json({ error: "non authentifié" }, 401);
+  const id = c.req.param("id");
+  const owned = await c.env.DB.prepare("SELECT * FROM etudes_connues WHERE id = ?1 AND company_id = ?2").bind(id, user.company_id).first();
+  if (!owned) return c.json({ error: "étude introuvable" }, 404);
+  const { erreur, valeurs } = lireEtudeBody(await c.req.json(), { partiel: true });
+  if (erreur) return c.json({ error: erreur }, 400);
+  const cles = Object.keys(valeurs);
+  if (cles.length === 0) return c.json({ error: "aucun champ à mettre à jour" }, 400);
+  await c.env.DB.prepare(
+    `UPDATE etudes_connues SET ${cles.map((k, i) => `${k} = ?${i + 1}`).join(", ")},
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?${cles.length + 1}`
+  ).bind(...cles.map((k) => valeurs[k]), id).run();
+  return c.json(await c.env.DB.prepare("SELECT * FROM etudes_connues WHERE id = ?1").bind(id).first());
+});
+
+portefeuille.delete("/etudes/:id", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json({ error: "non authentifié" }, 401);
+  const res = await c.env.DB.prepare("DELETE FROM etudes_connues WHERE id = ?1 AND company_id = ?2")
+    .bind(c.req.param("id"), user.company_id).run();
+  if (!res.meta?.changes) return c.json({ error: "étude introuvable" }, 404);
+  return c.json({ ok: true });
+});
+
 app.route("/api/auth", auth);
 app.route("/api/companies", companies);
 app.route("/api/dossiers", dossiers);
 app.route("/api/components", components);
 app.route("/api/photos", photos);
 app.route("/api/prix", prix);
+app.route("/api/portefeuille", portefeuille);
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 const index = {
   fetch: app.fetch
