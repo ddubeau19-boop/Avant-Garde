@@ -45621,6 +45621,163 @@ prix.post("/crm/import", async (c) => {
   return c.json({ importees: importees.length, ignorees: ignorees.length, lignes: importees }, 201);
 });
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Justesse — ce que l'étude annonçait, ce que la facture a dit
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Une étude de fonds de prévoyance promet des coûts trente ans d'avance et
+// n'est jamais notée. La firme qui produit l'étude et celle qui reçoit la
+// facture sont rarement la même maison ; ici elles le sont, et c'est la seule
+// chose que personne d'autre ne peut faire.
+//
+// On remonte donc de la facture vers l'étude, et non l'inverse : pour chaque
+// travail que le CRM a vu passer, on cherche la dernière étude publiée de cet
+// immeuble qui le précède, et ce qu'elle prévoyait pour cette composante.
+// Indexé jusqu'à l'année du chèque, c'est comparable au chèque.
+//
+// Ce que ça vaut : un écart qui se répète dans le même sens sur une composante
+// n'est plus une erreur d'estimation, c'est un barème à corriger.
+
+async function justessePour(c, user) {
+  const refus = crmRefus(c, user);
+  if (refus) return { disponible: false, motif: refus };
+
+  const etudes = (await c.env.DB.prepare(
+    `SELECT id, dossier_no, name, crm_syndicat_id, published_at
+       FROM dossiers
+      WHERE company_id = ?1 AND crm_syndicat_id IS NOT NULL AND published_at IS NOT NULL
+      ORDER BY published_at ASC`
+  ).bind(user.company_id).all()).results;
+
+  if (etudes.length === 0) {
+    return {
+      disponible: true, etudes: 0, mesures: [], par_code: [],
+      motif: "aucune étude publiée n'est encore rattachée à une copropriété du portefeuille"
+    };
+  }
+
+  // Les composantes chiffrées de ces études, par étude puis par code.
+  const parEtude = new Map();
+  const rows = (await c.env.DB.prepare(
+    `SELECT dossier_id, uniformat_code, name, replacement_cost
+       FROM components
+      WHERE dossier_id IN (${etudes.map((_, i) => `?${i + 1}`).join(", ")})
+        AND uniformat_code IS NOT NULL AND TRIM(uniformat_code) <> ''
+        AND replacement_cost IS NOT NULL`
+  ).bind(...etudes.map((e) => e.id)).all()).results;
+  for (const r of rows) {
+    if (!parEtude.has(r.dossier_id)) parEtude.set(r.dossier_id, new Map());
+    parEtude.get(r.dossier_id).set(String(r.uniformat_code).trim().toUpperCase(), r);
+  }
+
+  // Les travaux vus par le CRM, groupés comme à l'import : un travail, pas un
+  // versement. Même clé que la banque de prix — syndicat, code, mois — pour
+  // qu'une facture payée en quatre fois ne compte pas pour quatre écarts.
+  const syndicats = [...new Set(etudes.map((e) => e.crm_syndicat_id))];
+  const travaux = (await c.env.CRM.prepare(
+    `SELECT f.syndicat_id,
+            m.component_code,
+            substr(COALESCE(f.date_facture, m.document_date), 1, 7) AS mois,
+            COUNT(*)      AS pieces,
+            SUM(m.amount) AS total,
+            MAX(COALESCE(f.date_facture, m.document_date)) AS date_piece
+       FROM component_cost_matches m
+       JOIN syndicat_factures f
+         ON f.id = m.source_id AND m.source_type = 'syndicat_facture'
+      WHERE f.syndicat_id IN (${syndicats.map((_, i) => `?${i + 1}`).join(", ")})
+        AND f.deleted_at IS NULL
+        AND m.amount > 0
+        AND COALESCE(f.date_facture, m.document_date) IS NOT NULL
+      GROUP BY f.syndicat_id, m.component_code, mois`
+  ).bind(...syndicats).all()).results;
+
+  const anneeCible = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+  const mesures = [];
+
+  for (const t of travaux) {
+    const code = String(t.component_code).trim().toUpperCase();
+    const datePiece = String(t.date_piece).slice(0, 10);
+    // La dernière étude publiée AVANT ce travail : c'est elle qui l'a prédit.
+    // Une étude postérieure sait déjà que le travail a eu lieu ; la noter sur
+    // ce qu'elle « prévoyait » serait se donner la bonne réponse après coup.
+    const etude = [...etudes].reverse().find(
+      (e) => e.crm_syndicat_id === t.syndicat_id && String(e.published_at).slice(0, 10) <= datePiece
+    );
+    if (!etude) continue;
+    const comp = parEtude.get(etude.id)?.get(code);
+    if (!comp) continue;
+
+    const anneeEtude = anneeDe(etude.published_at);
+    const anneeFacture = anneeDe(datePiece);
+    const prevu = prixIndexe(comp.replacement_cost, anneeEtude, anneeFacture, taux);
+    if (prevu == null || prevu <= 0) continue;
+
+    mesures.push({
+      syndicat_id: t.syndicat_id,
+      immeuble: etude.name,
+      dossier_no: etude.dossier_no,
+      annee_etude: anneeEtude,
+      uniformat_code: code,
+      nom: comp.name,
+      annee_facture: anneeFacture,
+      pieces: t.pieces,
+      prevu_a_l_epoque: comp.replacement_cost,
+      prevu_indexe: prevu,
+      facture: t.total,
+      ecart: t.total - prevu,
+      ecart_pct: (t.total - prevu) / prevu
+    });
+  }
+
+  mesures.sort((a, b) => Math.abs(b.ecart_pct) - Math.abs(a.ecart_pct));
+
+  // Par code, pour que l'écart cesse d'être une anecdote. La médiane plutôt
+  // que la moyenne : un seul chantier hors norme ne doit pas déplacer le
+  // barème de toute une composante.
+  const parCode = new Map();
+  for (const m of mesures) {
+    if (!parCode.has(m.uniformat_code)) parCode.set(m.uniformat_code, []);
+    parCode.get(m.uniformat_code).push(m);
+  }
+  const par_code = [...parCode.entries()].map(([code, liste]) => {
+    const ecarts = liste.map((m) => m.ecart_pct).sort((a, b) => a - b);
+    return {
+      uniformat_code: code,
+      nom: liste[0].nom,
+      n: liste.length,
+      ecart_median_pct: quantile(ecarts, 0.5),
+      sous_estimes: liste.filter((m) => m.ecart_pct > 0).length,
+      sur_estimes: liste.filter((m) => m.ecart_pct < 0).length,
+      // Moins de trois observations, on affiche mais on ne conclut pas.
+      indicatif: liste.length < 3
+    };
+  }).sort((a, b) => b.n - a.n || Math.abs(b.ecart_median_pct) - Math.abs(a.ecart_median_pct));
+
+  const tous = mesures.map((m) => m.ecart_pct).sort((a, b) => a - b);
+  return {
+    disponible: true,
+    etudes: etudes.length,
+    annee_reference: anneeCible,
+    taux_indexation: taux,
+    total_mesures: mesures.length,
+    ecart_median_pct: tous.length ? quantile(tous, 0.5) : null,
+    ecart_absolu_median_pct: tous.length
+      ? quantile(mesures.map((m) => Math.abs(m.ecart_pct)).sort((a, b) => a - b), 0.5)
+      : null,
+    sous_estimes: mesures.filter((m) => m.ecart_pct > 0).length,
+    par_code,
+    mesures: mesures.slice(0, 100)
+  };
+}
+
+prix.get("/justesse", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json({ error: "non authentifié" }, 401);
+  return c.json(await justessePour(c, user));
+});
+
 prix.delete("/:id", async (c) => {
   const user = await prixCompany(c);
   if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);

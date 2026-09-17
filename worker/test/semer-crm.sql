@@ -63,7 +63,12 @@ INSERT INTO syndicats (id, nom, address, city, units, gestionnaire_name) VALUES
   ('syn_a_jour',   'Syndicat Le Belvédère',  '200 av. du Parc',     'Montréal',  60, 'A. Gestion'),
   ('syn_a_prevoir','Syndicat Les Cèdres',    '5 place des Cèdres',  'Brossard',  18, 'B. Gestion'),
   ('syn_inconnu',  'Syndicat Rive-Sud',      '77 boul. Taschereau', 'Brossard',   8, 'B. Gestion'),
-  ('syn_nouveau',  'Syndicat Du Moulin',     '3 chemin du Moulin',  'Chambly',   12, 'B. Gestion');
+  ('syn_nouveau',  'Syndicat Du Moulin',     '3 chemin du Moulin',  'Chambly',   12, 'B. Gestion'),
+  -- Celui-ci sert aux tests de réconciliation et de justesse, qui laissent
+  -- derrière eux des dossiers publiés. Il est tenu à l'écart des copropriétés
+  -- sur lesquelles le calendrier fait ses vérifications, sinon les deux suites
+  -- se marcheraient dessus à la deuxième exécution sur une même base.
+  ('syn_travaux',  'Syndicat Des Travaux',   '9 rue du Chantier',   'Laval',     36, 'C. Gestion');
 
 -- Deux copropriétés qui ne doivent PAS figurer au calendrier : un contrat
 -- terminé et une entité remplacée par une autre. Si elles apparaissent, le
@@ -82,9 +87,9 @@ INSERT INTO syndicat_reserve_fund_studies (id, syndicat_id, study_date, expires_
 -- De quoi exercer l'import du CRM vers la banque de prix : deux versements
 -- d'une même toiture le même mois, qui doivent se regrouper en une observation.
 INSERT INTO syndicat_factures (id, syndicat_id, numero_facture, vendor_name, date_facture) VALUES
-  ('fac_1', 'syn_a_jour', 'F-1001', 'Toitures Nord', date('now','-1 years')),
-  ('fac_2', 'syn_a_jour', 'F-1002', 'Toitures Nord', date('now','-1 years'));
+  ('fac_1', 'syn_travaux', 'F-1001', 'Toitures Nord', date('now','-1 years')),
+  ('fac_2', 'syn_travaux', 'F-1002', 'Toitures Nord', date('now','-1 years'));
 
 INSERT INTO component_cost_matches (source_type, source_id, component_code, amount, syndicat_name, document_date, description, confidence, matched_at) VALUES
-  ('syndicat_facture', 'fac_1', 'B30.10', 42000, 'Syndicat Le Belvédère', date('now','-1 years'), 'Réfection de la toiture — acompte', 'haute', date('now')),
-  ('syndicat_facture', 'fac_2', 'B30.10', 18000, 'Syndicat Le Belvédère', date('now','-1 years'), 'Réfection de la toiture — solde',   'haute', date('now'));
+  ('syndicat_facture', 'fac_1', 'B30.10', 42000, 'Syndicat Des Travaux', date('now','-1 years'), 'Réfection de la toiture — acompte', 'haute', date('now')),
+  ('syndicat_facture', 'fac_2', 'B30.10', 18000, 'Syndicat Des Travaux', date('now','-1 years'), 'Réfection de la toiture — solde',   'haute', date('now'));

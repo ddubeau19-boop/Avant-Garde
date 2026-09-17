@@ -339,8 +339,8 @@ async function etudePour(numero, syndicatId, composantes, publieeLe) {
   const cree = await api("/api/dossiers", {
     method: "POST", jeton: jetonPortefeuille,
     body: JSON.stringify({
-      dossier_no: numero, name: "Syndicat Le Belvédère", units: 60, built_year: 1996,
-      crm_syndicat_id: syndicatId, crm_syndicat_nom: "Syndicat Le Belvédère"
+      dossier_no: numero, name: "Syndicat Des Travaux", units: 36, built_year: 1996,
+      crm_syndicat_id: syndicatId, crm_syndicat_nom: "Syndicat Des Travaux"
     })
   });
   for (const c of await api(`/api/dossiers/${cree.id}/components`, { jeton: jetonPortefeuille })) {
@@ -362,13 +362,13 @@ async function testReconciliation() {
   const t = Date.now();
   // Le CRM semé porte deux factures de toiture (B30.10) pour ce syndicat,
   // datées d'il y a un an. L'étude précédente les précède donc.
-  await etudePour(`T-RC-A-${t}`, "syn_a_jour", [
+  await etudePour(`T-RC-A-${t}`, "syn_travaux", [
     { name: "Toiture", cat: "enveloppe", uniformat_code: "B30.10", useful_life_years: 25, install_year: 1996, replacement_cost: 55000 },
     { name: "Ascenseur", cat: "equipements", uniformat_code: "D10.10", useful_life_years: 30, install_year: 2000, replacement_cost: 120000 },
     { name: "Balcons", cat: "enveloppe", uniformat_code: "B20.30", useful_life_years: 40, install_year: 1996, replacement_cost: 90000 }
   ], "2021-06-01T12:00:00.000Z");
 
-  const neuf = await etudePour(`T-RC-B-${t}`, "syn_a_jour", [
+  const neuf = await etudePour(`T-RC-B-${t}`, "syn_travaux", [
     { name: "Toiture", cat: "enveloppe", uniformat_code: "B30.10", useful_life_years: 25, install_year: 2025, replacement_cost: 72000 },
     { name: "Ascenseur", cat: "equipements", uniformat_code: "D10.10", useful_life_years: 30, install_year: 2000, replacement_cost: 145000 },
     { name: "Drains", cat: "mecanique", uniformat_code: "D20.40", useful_life_years: 35, install_year: 1996, replacement_cost: 40000 }
@@ -410,6 +410,43 @@ async function testReconciliation() {
   verifier("un dossier non rattaché n'invente pas de comparaison", sans.disponible === false && !!sans.motif, JSON.stringify(sans));
 }
 
+async function testJustesse() {
+  console.log("\nJustesse : le prévu contre le facturé");
+  const j = await api("/api/prix/justesse", { jeton: jetonPortefeuille });
+  verifier("la mesure est ouverte à l'entreprise du CRM", j.disponible === true, j.motif);
+  const toiture = j.mesures.find((m) => m.uniformat_code === "B30.10");
+  verifier("le travail facturé est rattaché à l'étude qui l'a prédit", !!toiture, JSON.stringify(j.mesures));
+  if (!toiture) return;
+  verifier("il est rattaché à l'étude de 2021", toiture.annee_etude === 2021, String(toiture.annee_etude));
+  verifier("les deux versements comptent pour un seul travail", toiture.pieces === 2 && toiture.facture === 60000,
+    `${toiture.pieces} pièces, ${toiture.facture} $`);
+  verifier("l'écart est mesuré en dollars de l'année de la facture",
+    presque(toiture.prevu_indexe, 55000 * Math.pow(1.0176, toiture.annee_facture - 2021), 1),
+    JSON.stringify(toiture));
+
+  // Une étude publiée APRÈS la facture connaît déjà la réponse : la créditer
+  // d'avoir prédit ce travail serait se noter soi-même après coup.
+  const avant = j.total_mesures;
+  const ds = await api("/api/dossiers", { jeton: jetonPortefeuille });
+  const neuve = ds.find((d) => d.dossier_no.startsWith("T-RC-B-"));
+  await api(`/api/dossiers/${neuve.id}`, {
+    method: "PATCH", jeton: jetonPortefeuille, body: JSON.stringify({ published_at: new Date().toISOString() })
+  });
+  const apres = await api("/api/prix/justesse", { jeton: jetonPortefeuille });
+  const encore = apres.mesures.find((m) => m.uniformat_code === "B30.10");
+  verifier("une étude publiée après la facture ne se note pas elle-même",
+    apres.total_mesures === avant && encore?.annee_etude === 2021,
+    `${avant} → ${apres.total_mesures}, créditée à ${encore?.annee_etude}`);
+  await api(`/api/dossiers/${neuve.id}`, {
+    method: "PATCH", jeton: jetonPortefeuille, body: JSON.stringify({ published_at: null })
+  });
+
+  // Une firme sans lien CRM n'a pas de facture à confronter : on le dit plutôt
+  // que de lui montrer un zéro qui ressemble à un mauvais score.
+  const autre = await api("/api/prix/justesse");
+  verifier("sans CRM, la mesure se déclare indisponible", autre.disponible === false && !!autre.motif, JSON.stringify(autre));
+}
+
 // ---------------------------------------------------------------------------
 
 const suites = [
@@ -424,7 +461,8 @@ const suites = [
   testEtudeConnueChangeLEcheance,
   testDossierRattacheAuSyndicat,
   testRechercheDeSyndicat,
-  testReconciliation
+  testReconciliation,
+  testJustesse
 ];
 
 try {

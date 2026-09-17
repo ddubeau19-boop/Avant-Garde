@@ -222,6 +222,8 @@ const state = {
   prixCrmSel: {},            // clé de candidat -> sélectionné
   prixCrmDetail: {},         // clé de candidat -> pièces dépliées
   prixCrmImporting: false,
+  justesse: null,            // écart entre le prévu d'une étude et le facturé
+  justesseDetail: false,
 
   compAddOpen: false,        // formulaire d'ajout d'une composante
   compAdd: { name: '', cat: 'enveloppe', qty: '', useful_life_years: '', install_year: '' },
@@ -773,6 +775,18 @@ async function loadPrix() {
   // serait vide alors que la firme a bel et bien des dossiers.
   if (state.dossiers.length === 0 && !state.dossiersLoading) loadDossiers();
   loadPrixCrm();
+  loadJustesse();
+}
+
+// La mesure de justesse dépend du CRM et des études publiées : elle peut être
+// vide longtemps, et ce n'est pas une panne. Elle se charge à côté du reste.
+async function loadJustesse() {
+  try {
+    state.justesse = await apiJson('/api/prix/justesse');
+  } catch (e) {
+    state.justesse = { disponible: false, motif: e.message || 'mesure indisponible' };
+  }
+  render();
 }
 
 // Les factures que le CRM a déjà rattachées à une composante. Une entreprise
@@ -1600,6 +1614,61 @@ function renderPortefeuille() {
 // ---------------------------------------------------------------
 // Banque de prix — rendu
 // ---------------------------------------------------------------
+// Ce que l'étude annonçait contre ce que la facture a dit. C'est la seule
+// note que reçoit jamais une étude de fonds de prévoyance, et elle n'est
+// possible que parce que la même maison tient les deux bouts.
+function justesseHtml() {
+  const j = state.justesse;
+  if (!j) return '';
+  if (!j.disponible) {
+    return `<div class="recon-card muted" style="margin-top:28px"><i data-lucide="target"></i><span>Mesure de justesse indisponible — ${escapeHtml(j.motif || '')}.</span></div>`;
+  }
+  if (j.total_mesures === 0) {
+    return `<div class="recon-card muted" style="margin-top:28px"><i data-lucide="target"></i><span>Aucun remplacement prévu par une étude publiée ici n'a encore été facturé. ${escapeHtml(j.motif || `${j.etudes} étude(s) rattachée(s) au portefeuille, aucune facture correspondante pour l'instant.`)}</span></div>`;
+  }
+  const lignes = state.justesseDetail ? j.mesures : j.mesures.slice(0, 5);
+  const signe = (v) => v == null ? '—' : `${v > 0 ? '+' : ''}${(v * 100).toFixed(1)} %`;
+  return `
+  <div class="recon-card" style="margin-top:28px">
+    <div class="recon-head">
+      <div>
+        <div class="recon-title"><i data-lucide="target"></i>Justesse de nos estimations</div>
+        <div class="recon-sub">Pour chaque travail facturé au CRM, ce que la dernière étude publiée avant ce travail prévoyait — indexé jusqu'à l'année de la facture. Un écart positif veut dire que nous avions sous-estimé.</div>
+      </div>
+      ${j.mesures.length > 5 ? `<button class="btn-secondary" data-action="justesse-detail" style="padding:7px 14px;font-size:12px">${state.justesseDetail ? 'Réduire' : `Tout voir · ${j.mesures.length}`}</button>` : ''}
+    </div>
+    <div class="recon-stats">
+      <div class="recon-stat"><b>${j.total_mesures}</b><span>remplacement${j.total_mesures > 1 ? 's' : ''} mesuré${j.total_mesures > 1 ? 's' : ''}</span></div>
+      <div class="recon-stat"><b>${signe(j.ecart_median_pct)}</b><span>écart médian</span></div>
+      <div class="recon-stat"><b>${j.ecart_absolu_median_pct == null ? '—' : (j.ecart_absolu_median_pct * 100).toFixed(1) + ' %'}</b><span>écart médian en valeur absolue</span></div>
+      <div class="recon-stat"><b>${j.sous_estimes}</b><span>sous-estimé${j.sous_estimes > 1 ? 's' : ''}</span></div>
+    </div>
+    ${j.par_code.some(p => !p.indicatif) ? `
+    <div class="comp-section-head" style="margin:8px 0 10px"><span class="lbl">Par composante</span><span class="rule"></span></div>
+    <div class="recon-table" style="margin-bottom:16px">
+      <div class="recon-row recon-thead" style="grid-template-columns:1.6fr .6fr 1fr 1.4fr"><div>Code</div><div>n</div><div>Écart médian</div><div>Sens</div></div>
+      ${j.par_code.map(p => `
+      <div class="recon-row" style="grid-template-columns:1.6fr .6fr 1fr 1.4fr">
+        <div><div class="dt-name">${escapeHtml(p.uniformat_code)}</div><div class="dt-sub">${escapeHtml(p.nom || '')}</div></div>
+        <div class="dt-no">${p.n}</div>
+        <div><div class="dt-no">${signe(p.ecart_median_pct)}</div>${p.indicatif ? `<div class="dt-sub">indicatif</div>` : ''}</div>
+        <div class="dt-sub">${p.sous_estimes} sous-estimé${p.sous_estimes > 1 ? 's' : ''} · ${p.sur_estimes} sur-estimé${p.sur_estimes > 1 ? 's' : ''}</div>
+      </div>`).join('')}
+    </div>` : ''}
+    <div class="recon-table">
+      <div class="recon-row recon-thead" style="grid-template-columns:1.8fr 1.4fr 1fr 1fr .9fr"><div>Immeuble</div><div>Composante</div><div>Prévu</div><div>Facturé</div><div>Écart</div></div>
+      ${lignes.map(m => `
+      <div class="recon-row" style="grid-template-columns:1.8fr 1.4fr 1fr 1fr .9fr">
+        <div><div class="dt-name">${escapeHtml(m.immeuble || '—')}</div><div class="dt-sub">étude de ${m.annee_etude} · ${escapeHtml(m.dossier_no || '')}</div></div>
+        <div><div class="dt-no">${escapeHtml(m.uniformat_code)}</div><div class="dt-sub">${escapeHtml(m.nom || '')}</div></div>
+        <div><div class="dt-no">${fmt(m.prevu_indexe)} $</div><div class="dt-sub">en ${m.annee_facture}</div></div>
+        <div><div class="dt-no">${fmt(m.facture)} $</div><div class="dt-sub">${m.pieces} pièce${m.pieces > 1 ? 's' : ''}</div></div>
+        <div class="dt-no" style="color:${Math.abs(m.ecart_pct) > 0.15 ? 'var(--red)' : 'var(--ink-600)'}">${signe(m.ecart_pct)}</div>
+      </div>`).join('')}
+    </div>
+  </div>`;
+}
+
 function renderPrix() {
   if (state.prixLoading && !state.prixResume) {
     return `<div class="page-pad">${spinnerBlock('Chargement de la banque de prix…')}</div>`;
@@ -1631,6 +1700,8 @@ function renderPrix() {
     ${prixPortesHtml(r)}
 
     ${prixCrmHtml()}
+
+    ${justesseHtml()}
 
     <div class="comp-section-head" style="margin-top:32px">
       <span class="lbl">Lignes saisies</span><span class="rule"></span>
@@ -2769,6 +2840,10 @@ function initEvents() {
         state.screen = 'portefeuille';
         render();
         loadPortefeuille();
+        break;
+      case 'justesse-detail':
+        state.justesseDetail = !state.justesseDetail;
+        render();
         break;
       case 'recon-toggle':
         state.reconciliationOuverte = !state.reconciliationOuverte;
