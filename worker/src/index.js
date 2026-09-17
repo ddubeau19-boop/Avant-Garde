@@ -23029,6 +23029,76 @@ Réponds UNIQUEMENT avec un objet JSON dont les clés sont prises dans la liste 
   return { sections: nettoyerSections(extractJson(brut)), note: null };
 }
 
+// ── Squelette de rapport ─────────────────────────────────────────────────────
+// La firme fournit UN document Word : ses pages de garde, un paragraphe
+// marqueur, puis ses annexes de fin. On ne fusionne pas trois fichiers — on
+// garde le sien et on remplace le marqueur par le corps généré. Sa mise en
+// page, ses en-têtes et ses pieds de page restent les siens, intacts, parce
+// qu'on ne les touche jamais.
+const MARQUEUR_RAPPORT = "{{RAPPORT}}";
+
+// Word découpe un paragraphe en plusieurs « runs » — à la moindre correction
+// orthographique, au moindre changement de casse. « {{RAPPORT}} » se retrouve
+// donc fréquemment éclaté sur trois ou quatre <w:t>, et le chercher tel quel
+// dans le XML échouerait sur un document réel tout en marchant sur un fichier
+// de test. On reconstitue donc le texte de chaque paragraphe avant de chercher.
+function texteParagrapheDocx(xmlParagraphe) {
+  const morceaux = xmlParagraphe.match(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g) ?? [];
+  return decodeEntitesXml(morceaux.map((m) => m.replace(/<[^>]+>/g, "")).join(""));
+}
+
+// Le corps généré, débarrassé de ses propriétés de section. Le générateur
+// produit plusieurs sections, donc plusieurs <w:sectPr> : laissés en place, ils
+// imposeraient leur format de page au milieu du document de la firme et
+// casseraient sa mise en page. C'est celle du squelette qui doit gouverner.
+function corpsSansSections(xmlDocument) {
+  const corps = xmlDocument.match(/<w:body[^>]*>([\s\S]*)<\/w:body>/);
+  if (!corps) throw new Error("le document généré n'a pas de <w:body>");
+  return corps[1]
+    .replace(/<w:sectPr[\s\S]*?<\/w:sectPr>/g, "")
+    .replace(/<w:sectPr[^>]*\/>/g, "");
+}
+
+// Renvoie l'index du paragraphe porteur du marqueur, ou -1.
+function paragraphesDuCorps(xmlCorps) {
+  return xmlCorps.match(/<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>|<w:p(?:\s[^>]*)?\/>/g) ?? [];
+}
+
+function squeletteContientMarqueur(xmlDocument) {
+  const corps = xmlDocument.match(/<w:body[^>]*>([\s\S]*)<\/w:body>/);
+  if (!corps) return false;
+  return paragraphesDuCorps(corps[1]).some((p) => texteParagrapheDocx(p).includes(MARQUEUR_RAPPORT));
+}
+
+// Ouvre le squelette de la firme, y remplace le paragraphe marqueur par le
+// corps du rapport généré, et referme l'archive. Tout le reste du paquet —
+// styles, en-têtes, pieds, images, relations — est rendu tel quel.
+async function injecterDansSquelette(squeletteBuffer, genereBuffer) {
+  const JSZipClasse = import_jszip_min.default;
+  const squelette = await JSZipClasse.loadAsync(squeletteBuffer);
+  const fichierDocument = squelette.file("word/document.xml");
+  if (!fichierDocument) throw new Error("le squelette n'est pas un .docx lisible");
+  const xmlSquelette = await fichierDocument.async("string");
+
+  const corpsSquelette = xmlSquelette.match(/(<w:body[^>]*>)([\s\S]*)(<\/w:body>)/);
+  if (!corpsSquelette) throw new Error("le squelette n'a pas de <w:body>");
+  const paragraphes = paragraphesDuCorps(corpsSquelette[2]);
+  const porteur = paragraphes.find((p) => texteParagrapheDocx(p).includes(MARQUEUR_RAPPORT));
+  if (!porteur) throw new Error(`le squelette ne contient pas le marqueur ${MARQUEUR_RAPPORT}`);
+
+  const genere = await JSZipClasse.loadAsync(genereBuffer);
+  const xmlGenere = await genere.file("word/document.xml").async("string");
+  const injection = corpsSansSections(xmlGenere);
+
+  const nouveauCorps = corpsSquelette[2].replace(porteur, injection);
+  const nouveauXml = xmlSquelette.replace(
+    corpsSquelette[0],
+    `${corpsSquelette[1]}${nouveauCorps}${corpsSquelette[3]}`
+  );
+  squelette.file("word/document.xml", nouveauXml);
+  return await squelette.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
+}
+
 // Le même gabarit, lu une seconde fois pour une autre question : quelles
 // composantes cette firme inspecte-t-elle, sous quel nom, avec quelle durée de
 // vie, et quel texte écrit-elle pour chacune.
@@ -44166,6 +44236,64 @@ companies.delete("/:id/template", async (c) => {
   return c.json({ ok: true, retour: "gabarit intégré" });
 });
 
+// ── Squelette de rapport de l'entreprise ────────────────────────────────────
+// Le marqueur est vérifié ICI, au téléversement, et pas au moment de produire
+// un rapport : découvrir qu'il manque en pleine génération donnerait soit une
+// erreur à un ingénieur qui n'y peut rien, soit — pire — un document
+// silencieusement amputé de son contenu.
+companies.post("/:id/skeleton", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 20 * 1024 * 1024) return c.json({ error: "squelette trop volumineux (max 20 Mo)" }, 413);
+
+  let xml;
+  try {
+    xml = await lireDocx(buffer);
+  } catch (e) {
+    return c.json({ error: `document illisible : ${e.message}` }, 400);
+  }
+  if (!squeletteContientMarqueur(xml)) {
+    return c.json({
+      error: `ce document ne contient pas le marqueur ${MARQUEUR_RAPPORT}. Ajoutez un paragraphe contenant exactement ${MARQUEUR_RAPPORT} à l'endroit où le rapport doit s'insérer, entre vos pages de garde et vos annexes de fin.`
+    }, 422);
+  }
+
+  const cle = `company-skeletons/${id}.docx`;
+  await c.env.PHOTOS.put(cle, buffer, {
+    httpMetadata: { contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
+  });
+  await c.env.DB.prepare(
+    `INSERT INTO company_templates (company_id, skeleton_r2_key, skeleton_filename, skeleton_imported_at)
+     VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+     ON CONFLICT(company_id) DO UPDATE SET
+       skeleton_r2_key = excluded.skeleton_r2_key,
+       skeleton_filename = excluded.skeleton_filename,
+       skeleton_imported_at = excluded.skeleton_imported_at,
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  ).bind(id, cle, file.name ?? "squelette.docx").run();
+
+  return c.json({ ok: true, fichier: file.name ?? null }, 201);
+});
+
+companies.delete("/:id/skeleton", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  await c.env.DB.prepare(
+    `UPDATE company_templates
+        SET skeleton_r2_key = NULL, skeleton_filename = NULL, skeleton_imported_at = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE company_id = ?1`
+  ).bind(id).run();
+  try { await c.env.PHOTOS.delete(`company-skeletons/${id}.docx`); } catch { /* déjà absent */ }
+  return c.json({ ok: true, retour: "mise en page intégrée" });
+});
+
 // ── Catalogue de composantes de l'entreprise ────────────────────────────────
 const CATALOGUE_CHAMPS = ["uniformat_code", "nom", "cat", "duree_vie_ans", "unite_mesure", "texte_type", "entretien", "actif", "ordre", "valide"];
 
@@ -44579,13 +44707,32 @@ dossiers.get("/:id/projection", async (c) => {
 dossiers.get("/:id/report.docx", async (c) => {
   const ctx = await buildReportContext(c);
   if (!ctx) return c.json({ error: "dossier introuvable" }, 404);
-  const bytes = await generateReportDocx(ctx);
-  return new Response(new Blob([new Uint8Array(bytes)]), {
-    headers: {
-      "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      "content-disposition": `attachment; filename="${ctx.dossier.dossier_no}-etude-fonds-prevoyance.docx"`
+  let bytes = await generateReportDocx(ctx);
+
+  // Quand la firme a fourni son squelette, le rapport sort dans SON document.
+  // Un échec ici ne doit pas priver l'ingénieur de son rapport : on retombe sur
+  // la mise en page intégrée en le disant dans un en-tête, plutôt que de
+  // renvoyer une erreur au moment où il en a besoin.
+  const squelette = await c.env.DB.prepare(
+    "SELECT skeleton_r2_key FROM company_templates WHERE company_id = ?1"
+  ).bind(ctx.dossier.company_id).first();
+  let avertissement = null;
+  if (squelette?.skeleton_r2_key) {
+    try {
+      const objet = await c.env.PHOTOS.get(squelette.skeleton_r2_key);
+      if (!objet) throw new Error("squelette introuvable dans le stockage");
+      bytes = await injecterDansSquelette(await objet.arrayBuffer(), bytes);
+    } catch (e) {
+      avertissement = `mise en page intégrée utilisée — ${e.message}`;
     }
-  });
+  }
+
+  const entetes = {
+    "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "content-disposition": `attachment; filename="${ctx.dossier.dossier_no}-etude-fonds-prevoyance.docx"`
+  };
+  if (avertissement) entetes["x-squelette"] = avertissement;
+  return new Response(new Blob([new Uint8Array(bytes)]), { headers: entetes });
 });
 dossiers.get("/:id/report.xlsx", async (c) => {
   const ctx = await buildReportContext(c);

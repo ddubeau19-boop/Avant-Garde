@@ -110,7 +110,14 @@ CREATE TABLE company_templates (
   source_filename TEXT,
   source_extrait  TEXT,   -- texte brut extrait du .docx, conservé tel quel
   imported_at     TEXT,
-  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  -- Squelette de rapport : le document Word de la firme, avec ses pages de
+  -- garde, un paragraphe marqueur {{RAPPORT}} et ses annexes de fin. Le rapport
+  -- généré y est injecté à la place du marqueur ; la mise en page reste la
+  -- sienne. Distinct du gabarit ci-dessus, qui ne porte que du texte.
+  skeleton_r2_key   TEXT,
+  skeleton_filename TEXT,
+  skeleton_imported_at TEXT
 );
 
 -- Catalogue de composantes de l'entreprise : ce que la firme inspecte, sous
