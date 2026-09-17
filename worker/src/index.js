@@ -2987,36 +2987,90 @@ const DEFAULT_USEFUL_LIFE_YEARS = {
 };
 const ALLOCATION_USEFUL_LIFE = 10;
 const MODEL = "claude-sonnet-5";
+function attendre(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Lit le flux SSE de l'API Messages et reconstitue le texte complet. Passer
+// par le streaming (plutôt qu'une réponse tamponnée) évite qu'un appel à
+// forte sortie — comme la répartition d'un gros gabarit importé, à
+// max_tokens 16000 — dépasse la fenêtre de timeout du gateway avant le
+// premier octet et échoue en 524.
+async function lireFluxClaude(corpsReponse) {
+  const lecteur = corpsReponse.pipeThrough(new TextDecoderStream()).getReader();
+  let tampon = "";
+  let texte = "";
+  let raisonArret = null;
+  let tokensSortis = null;
+  const typesBloc = [];
+  while (true) {
+    const { done, value } = await lecteur.read();
+    if (done) break;
+    tampon += value;
+    let fin;
+    while ((fin = tampon.indexOf("\n\n")) !== -1) {
+      const evenement = tampon.slice(0, fin);
+      tampon = tampon.slice(fin + 2);
+      const ligneDonnees = evenement.split("\n").find((l) => l.startsWith("data:"));
+      if (!ligneDonnees) continue;
+      const donnees = JSON.parse(ligneDonnees.slice(5).trim());
+      if (donnees.type === "content_block_start" && donnees.content_block?.type) {
+        typesBloc.push(donnees.content_block.type);
+      } else if (donnees.type === "content_block_delta" && donnees.delta?.type === "text_delta") {
+        texte += donnees.delta.text;
+      } else if (donnees.type === "message_delta") {
+        raisonArret = donnees.delta?.stop_reason ?? raisonArret;
+        tokensSortis = donnees.usage?.output_tokens ?? tokensSortis;
+      } else if (donnees.type === "error") {
+        throw new Error(`Anthropic API error en cours de flux : ${donnees.error?.message ?? JSON.stringify(donnees.error)}`);
+      }
+    }
+  }
+  return { texte, raisonArret, tokensSortis, typesBloc };
+}
+
 async function callClaude(apiKey, opts) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: opts.maxTokens,
-      system: opts.system,
-      messages: [{ role: "user", content: opts.content }]
-    })
+  const corps = JSON.stringify({
+    model: MODEL,
+    max_tokens: opts.maxTokens,
+    system: opts.system,
+    stream: true,
+    messages: [{ role: "user", content: opts.content }]
   });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`Anthropic API error (${res.status}): ${detail}`);
+  let derniereErreur;
+  // Jusqu'à 3 tentatives : un 524/529/502/503 est un incident d'infrastructure
+  // passager — plus probable sur un gros document — pas une erreur de
+  // contenu. Une deuxième tentative suffit presque toujours.
+  for (let essai = 0; essai < 3; essai++) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: corps
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      derniereErreur = new Error(`Anthropic API error (${res.status}): ${detail}`);
+      if (res.status >= 500 && essai < 2) {
+        await attendre(500 * 2 ** essai);
+        continue;
+      }
+      throw derniereErreur;
+    }
+    const { texte, raisonArret, tokensSortis, typesBloc } = await lireFluxClaude(res.body);
+    if (!texte) {
+      // Une réponse sans bloc de texte renvoyait une chaîne vide, que chaque
+      // appelant interprétait comme « le modèle n'a rien d'utile à dire » et
+      // traitait par un repli silencieux. Le plus souvent, max_tokens a été
+      // épuisé avant le premier mot : il faut le dire, pas le taire.
+      throw new Error(`réponse sans texte (stop_reason: ${raisonArret}, blocs: ${typesBloc.join(", ") || "aucun"}, jetons sortis: ${tokensSortis})`);
+    }
+    return texte;
   }
-  const data = await res.json();
-  const texte = data.content?.find((c) => c.type === "text")?.text ?? "";
-  if (!texte) {
-    // Une réponse 200 sans bloc de texte renvoyait une chaîne vide, que chaque
-    // appelant interprétait comme « le modèle n'a rien d'utile à dire » et
-    // traitait par un repli silencieux. Le plus souvent, max_tokens a été
-    // épuisé avant le premier mot : il faut le dire, pas le taire.
-    const blocs = (data.content ?? []).map((c) => c.type).join(", ") || "aucun";
-    throw new Error(`réponse sans texte (stop_reason: ${data.stop_reason}, blocs: ${blocs}, jetons sortis: ${data.usage?.output_tokens})`);
-  }
-  return texte;
+  throw derniereErreur;
 }
 // Récupère les objets complets d'un tableau JSON tronqué. Une réponse coupée en
 // plein milieu d'un objet faisait perdre la totalité de l'inventaire ; garder
