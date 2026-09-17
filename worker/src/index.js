@@ -3035,6 +3035,13 @@ async function callClaude(apiKey, opts) {
     max_tokens: opts.maxTokens,
     system: opts.system,
     stream: true,
+    // Sonnet 5 pense par défaut (adaptatif) même sans le demander. Sur un gros
+    // classement déterministe (répartir un document dans des sections fixes),
+    // cette réflexion peut engloutir tout le budget de sortie avant le premier
+    // mot — d'où un stop_reason "max_tokens" avec pour seul bloc "thinking" et
+    // zéro texte. Les appelants qui n'ont pas besoin de raisonnement la
+    // désactivent via opts.thinking.
+    ...(opts.thinking ? { thinking: opts.thinking } : {}),
     messages: [{ role: "user", content: opts.content }]
   });
   let derniereErreur;
@@ -23049,7 +23056,11 @@ TEXTE DU GABARIT :
 ${corpus}
 
 Réponds UNIQUEMENT avec un objet JSON dont les clés sont prises dans la liste ci-dessus.`;
-  const brut = await callClaude(apiKey, { content: prompt, maxTokens: 16000 });
+  // Répartir un texte déjà écrit dans des sections fixes est un classement, pas
+  // un problème à raisonner : désactiver la réflexion laisse tout le budget de
+  // sortie au JSON attendu, plutôt que de risquer qu'elle l'épuise avant le
+  // premier mot sur un gros document.
+  const brut = await callClaude(apiKey, { content: prompt, maxTokens: 16000, thinking: { type: "disabled" } });
   return { sections: nettoyerSections(extractJson(brut)), note: null };
 }
 
