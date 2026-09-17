@@ -23070,6 +23070,76 @@ function squeletteContientMarqueur(xmlDocument) {
   return paragraphesDuCorps(corps[1]).some((p) => texteParagrapheDocx(p).includes(MARQUEUR_RAPPORT));
 }
 
+// Les images du corps généré — logo, photos de relevé — pointent vers des
+// relations du paquet GÉNÉRÉ. Transplantées telles quelles dans le squelette,
+// elles désignent des rId qui n'y existent pas : Word affiche une croix rouge,
+// ou refuse d'ouvrir le fichier. Il faut donc copier les médias, leur créer des
+// relations dans le squelette, et réécrire les identifiants dans le XML injecté.
+const TYPES_IMAGE = { png: "image/png", jpeg: "image/jpeg", jpg: "image/jpeg", gif: "image/gif", bmp: "image/bmp", tiff: "image/tiff" };
+
+async function transplanterImages(squelette, genere, injection) {
+  const references = [...injection.matchAll(/r:embed="([^"]+)"/g)].map((m) => m[1]);
+  if (references.length === 0) return injection;
+
+  const relsGenere = await genere.file("word/_rels/document.xml.rels")?.async("string");
+  if (!relsGenere) return injection;
+  const cibles = new Map(
+    [...relsGenere.matchAll(/<Relationship[^>]*Id="([^"]+)"[^>]*Target="([^"]+)"[^>]*\/>/g)]
+      .map((m) => [m[1], m[2].replace(/^\/?word\//, "")])
+  );
+
+  const cheminRels = "word/_rels/document.xml.rels";
+  let relsSquelette = await squelette.file(cheminRels)?.async("string");
+  if (!relsSquelette) {
+    relsSquelette = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`;
+  }
+  // Un rId doit être unique dans le squelette : on repart au-dessus du plus
+  // grand qu'il porte déjà, sinon on écraserait une de ses propres images.
+  let prochain = Math.max(0, ...[...relsSquelette.matchAll(/Id="rId(\d+)"/g)].map((m) => Number(m[1]))) + 1;
+
+  const extensions = new Set();
+  const nouvellesRelations = [];
+  const correspondance = new Map();
+  let numero = 0;
+
+  for (const ancien of new Set(references)) {
+    const cible = cibles.get(ancien);
+    if (!cible) continue;
+    const fichier = genere.file(`word/${cible}`);
+    if (!fichier) continue;
+    const extension = (cible.split(".").pop() ?? "png").toLowerCase();
+    numero += 1;
+    // Nom propre au rapport : un squelette qui contient déjà media/image1.png
+    // ne doit pas voir son image remplacée par la nôtre.
+    const nouvelleCible = `media/rapport-${numero}.${extension}`;
+    squelette.file(`word/${nouvelleCible}`, await fichier.async("uint8array"));
+    const nouvelId = `rId${prochain++}`;
+    correspondance.set(ancien, nouvelId);
+    nouvellesRelations.push(
+      `<Relationship Id="${nouvelId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${nouvelleCible}"/>`
+    );
+    extensions.add(extension);
+  }
+  if (nouvellesRelations.length === 0) return injection;
+
+  squelette.file(cheminRels, relsSquelette.replace("</Relationships>", `${nouvellesRelations.join("")}</Relationships>`));
+
+  // Sans Default pour l'extension, Word considère le paquet invalide.
+  const cheminTypes = "[Content_Types].xml";
+  let types = await squelette.file(cheminTypes)?.async("string");
+  if (types) {
+    const manquantes = [...extensions]
+      .filter((ext) => !new RegExp(`Extension="${ext}"`, "i").test(types))
+      .map((ext) => `<Default Extension="${ext}" ContentType="${TYPES_IMAGE[ext] ?? "application/octet-stream"}"/>`);
+    if (manquantes.length > 0) {
+      squelette.file(cheminTypes, types.replace(/(<Types[^>]*>)/, `$1${manquantes.join("")}`));
+    }
+  }
+
+  return injection.replace(/r:embed="([^"]+)"/g, (entier, ancien) =>
+    correspondance.has(ancien) ? `r:embed="${correspondance.get(ancien)}"` : entier);
+}
+
 // Ouvre le squelette de la firme, y remplace le paragraphe marqueur par le
 // corps du rapport généré, et referme l'archive. Tout le reste du paquet —
 // styles, en-têtes, pieds, images, relations — est rendu tel quel.
@@ -23088,7 +23158,8 @@ async function injecterDansSquelette(squeletteBuffer, genereBuffer) {
 
   const genere = await JSZipClasse.loadAsync(genereBuffer);
   const xmlGenere = await genere.file("word/document.xml").async("string");
-  const injection = corpsSansSections(xmlGenere);
+  let injection = corpsSansSections(xmlGenere);
+  injection = await transplanterImages(squelette, genere, injection);
 
   const nouveauCorps = corpsSquelette[2].replace(porteur, injection);
   const nouveauXml = xmlSquelette.replace(
@@ -23225,6 +23296,32 @@ function tableauMaison(entetes, lignes) {
 }
 function pourcent(taux) {
   return `${(taux * 100).toFixed(2).replace(".", ",").replace(/,00$/, "")}${NBSP}%`;
+}
+
+// Les photos d'une composante, sous sa fiche. Largeur fixe et hauteur dérivée
+// d'un cadrage 4:3 : lire les dimensions réelles du JPEG demanderait de le
+// décoder, et une photo de relevé est presque toujours dans ce rapport-là.
+const PHOTO_LARGEUR = 260;
+const PHOTO_HAUTEUR = 195;
+
+function photosDeLaFiche(photos) {
+  if (!Array.isArray(photos) || photos.length === 0) return [];
+  const blocs = [body("Photos du relevé", { bold: true, size: 18 })];
+  for (const photo of photos) {
+    blocs.push(new Paragraph({
+      spacing: { after: 60 },
+      children: [new ImageRun({
+        data: photo.donnees,
+        transformation: { width: PHOTO_LARGEUR, height: PHOTO_HAUTEUR },
+        // Sans ce type, la librairie écrit le média sous l'extension
+        // « undefined » — une partie que [Content_Types].xml ne déclare pas, et
+        // que Word refuse.
+        type: photo.type === "image/png" ? "png" : "jpg"
+      })]
+    }));
+    if (photo.tag) blocs.push(body(photo.tag, { color: GREY, size: 16 }));
+  }
+  return blocs;
 }
 async function generateReportDocx(ctx) {
   const { dossier, components: components2, projection } = ctx;
@@ -23430,6 +23527,7 @@ async function generateReportDocx(ctx) {
           observation.push(body(""));
         }
       }
+      observation.push(...photosDeLaFiche(ctx.photos?.[comp.id]));
     }
   }
   // ---- 5.0 Résultats et scénarios de financement --------------------------
@@ -44669,6 +44767,48 @@ dossiers.post("/:id/components", async (c) => {
   const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
   return c.json({ ...component, photos: 0 }, 201);
 });
+// Les photos du relevé, chargées pour le rapport. Elles étaient saisies sur le
+// terrain, stockées, comptées à l'écran — et n'entraient dans aucun document.
+//
+// Deux par composante au plus : un rapport d'étude n'est pas un album, et
+// chaque photo est une lecture R2 de plus dans une requête déjà longue. La
+// première d'une composante est sa vue générale, la seconde son détail ou son
+// défaut — c'est l'ordre dans lequel le terrain les prend (voir TAG_ORDER).
+const PHOTOS_PAR_COMPOSANTE = 2;
+const PHOTOS_MAX_RAPPORT = 40;
+
+async function photosPourRapport(env, dossierId) {
+  const parComposante = {};
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT p.id, p.component_id, p.r2_key, p.tag
+         FROM photos p JOIN components c ON c.id = p.component_id
+        WHERE c.dossier_id = ?1
+        ORDER BY p.component_id, p.created_at ASC`
+    ).bind(dossierId).all();
+
+    let budget = PHOTOS_MAX_RAPPORT;
+    for (const row of rows.results) {
+      if (budget <= 0) break;
+      const deja = parComposante[row.component_id] ?? [];
+      if (deja.length >= PHOTOS_PAR_COMPOSANTE) continue;
+      const obj = await env.PHOTOS.get(row.r2_key);
+      if (!obj) continue;
+      deja.push({
+        donnees: new Uint8Array(await obj.arrayBuffer()),
+        type: obj.httpMetadata?.contentType ?? "image/jpeg",
+        tag: row.tag ?? null
+      });
+      parComposante[row.component_id] = deja;
+      budget -= 1;
+    }
+  } catch {
+    // Une photo manquante ne doit jamais empêcher de produire un rapport.
+    return parComposante;
+  }
+  return parComposante;
+}
+
 async function buildReportContext(c) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return null;
@@ -44687,6 +44827,7 @@ async function buildReportContext(c) {
     texteMaison: await texteMaisonPour(c.env.DB, dossier.company_id),
     banque: await banquePour(c.env.DB, dossier.company_id),
     textesValides: await textesValidesPour(c.env.DB, dossier.id),
+    photos: await photosPourRapport(c.env, dossier.id),
     engineerName: user?.name ?? "Condo Stratégis",
     signataire: user ?? null,
     apiKey: c.env.ANTHROPIC_API_KEY ?? null
