@@ -44235,7 +44235,9 @@ companies.get("/:id/template", async (c) => {
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
   const ligne = await c.env.DB.prepare(
-    "SELECT sections, source_filename, source_extrait, imported_at, updated_at FROM company_templates WHERE company_id = ?1"
+    `SELECT sections, source_filename, source_extrait, imported_at, updated_at,
+            skeleton_filename, skeleton_imported_at
+       FROM company_templates WHERE company_id = ?1`
   ).bind(id).first();
   let sections = {};
   try {
@@ -44250,7 +44252,11 @@ companies.get("/:id/template", async (c) => {
     source_filename: ligne?.source_filename ?? null,
     imported_at: ligne?.imported_at ?? null,
     updated_at: ligne?.updated_at ?? null,
-    extrait: ligne?.source_extrait ? ligne.source_extrait.slice(0, 4000) : null
+    extrait: ligne?.source_extrait ? ligne.source_extrait.slice(0, 4000) : null,
+    squelette: ligne?.skeleton_filename
+      ? { fichier: ligne.skeleton_filename, importe_le: ligne.skeleton_imported_at }
+      : null,
+    marqueur: MARQUEUR_RAPPORT
   });
 });
 

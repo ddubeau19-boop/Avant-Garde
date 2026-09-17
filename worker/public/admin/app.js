@@ -78,6 +78,9 @@ const state = {
   catalogueBusyId: null,
   catalogueAddOpen: false,
   catalogueAdd: { nom: '', uniformat_code: '', cat: '', duree_vie_ans: '', unite_mesure: '' },
+
+  squeletteBusy: false,
+  squeletteError: null,
 };
 
 // ---------------------------------------------------------------
@@ -359,6 +362,44 @@ async function loadCompanyDetail(id) {
   } catch (e) {
     state.companyLoading = false;
     state.companyError = e.message || 'Impossible de charger cette entreprise.';
+    render();
+  }
+}
+
+// Le squelette est refusé au téléversement s'il ne porte pas le marqueur :
+// c'est le seul moment où la personne qui peut corriger le document l'a encore
+// sous les yeux.
+async function uploadSquelette(file) {
+  if (state.squeletteBusy) return;
+  state.squeletteBusy = true;
+  state.squeletteError = null;
+  render();
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    await apiJson(`/api/companies/${state.companyId}/skeleton`, { method: 'POST', body: fd, headers: {} });
+    state.squeletteBusy = false;
+    await loadTemplate(state.companyId);
+  } catch (e) {
+    state.squeletteBusy = false;
+    state.squeletteError = e.message || "Impossible d'importer le squelette.";
+    render();
+  }
+}
+
+async function retirerSquelette() {
+  if (state.squeletteBusy) return;
+  if (!window.confirm('Retirer le squelette ? Les rapports repasseront à la mise en page intégrée.')) return;
+  state.squeletteBusy = true;
+  state.squeletteError = null;
+  render();
+  try {
+    await apiJson(`/api/companies/${state.companyId}/skeleton`, { method: 'DELETE' });
+    state.squeletteBusy = false;
+    await loadTemplate(state.companyId);
+  } catch (e) {
+    state.squeletteBusy = false;
+    state.squeletteError = e.message || 'Impossible de retirer le squelette.';
     render();
   }
 }
@@ -963,6 +1004,8 @@ function renderCompanyDetail() {
       </div>`; }).join('')}
     </div>
 
+    ${squeletteCardHtml()}
+
     ${catalogueCardHtml()}
 
     ${templateCardHtml()}
@@ -1075,6 +1118,32 @@ function catalogueCardHtml() {
           </div>`;
         }).join('')}
       </div>`}
+  </div>`;
+}
+
+// Le squelette est le document Word de la firme dans lequel le rapport vient
+// s'insérer : ses pages de garde, ses annexes de fin, sa mise en page. Distinct
+// du gabarit de texte ci-dessous, qui ne porte que des mots.
+function squeletteCardHtml() {
+  const t = state.template;
+  const sq = t && t.squelette;
+  const marqueur = (t && t.marqueur) || '{{RAPPORT}}';
+  return `
+  <div>
+    <div class="eng-section-head">
+      <span class="lbl">Mise en page du rapport</span>
+      <div class="rule"></div>
+      ${sq ? `<button class="btn-row-action" data-action="squelette-retirer" ${state.squeletteBusy ? 'disabled' : ''}>Retirer</button>` : ''}
+      <label class="btn-pill-sm">${state.squeletteBusy ? 'Lecture du document…' : (sq ? 'Remplacer le .docx' : 'Importer un .docx')}<input type="file" accept=".docx" data-role="squelette-file" style="display:none" ${state.squeletteBusy ? 'disabled' : ''}></label>
+    </div>
+    <div class="tpl-lead">
+      Votre document Word complet : pages de garde, un paragraphe contenant <code>${escapeHtml(marqueur)}</code> à l'endroit où le rapport s'insère, puis vos annexes de fin.
+      Vos en-têtes, pieds de page et numérotation sont conservés tels quels — le rapport sort dans votre document, pas dans le nôtre.
+    </div>
+    ${state.squeletteError ? `<div class="login-error" style="margin:10px 0">${escapeHtml(state.squeletteError)}</div>` : ''}
+    ${sq
+      ? `<div class="tpl-lead" style="margin:10px 0 4px">En place depuis <code>${escapeHtml(sq.fichier || '')}</code>, importé le ${fmtDate(sq.importe_le)}.</div>`
+      : `<div class="tpl-lead" style="margin:10px 0 4px">Aucun squelette : les rapports sortent avec la mise en page intégrée.</div>`}
   </div>`;
 }
 
@@ -1196,6 +1265,12 @@ function initEvents() {
 
   app.addEventListener('change', (e) => {
     const t = e.target;
+    if (t && t.matches && t.matches('[data-role="squelette-file"]')) {
+      const f = t.files && t.files[0];
+      t.value = '';
+      if (f) uploadSquelette(f);
+      return;
+    }
     if (t && t.matches && t.matches('[data-role="template-file"]')) {
       const f = t.files && t.files[0];
       t.value = '';
@@ -1215,6 +1290,9 @@ function initEvents() {
     switch (action) {
       case 'logout':
         doLogout();
+        break;
+      case 'squelette-retirer':
+        retirerSquelette();
         break;
       case 'cat-extraire':
         extraireCatalogue();
