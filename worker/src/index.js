@@ -2987,32 +2987,141 @@ const DEFAULT_USEFUL_LIFE_YEARS = {
 };
 const ALLOCATION_USEFUL_LIFE = 10;
 const MODEL = "claude-sonnet-5";
-async function callClaude(apiKey, opts) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: opts.maxTokens,
-      system: opts.system,
-      messages: [{ role: "user", content: opts.content }]
-    })
-  });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`Anthropic API error (${res.status}): ${detail}`);
-  }
-  const data = await res.json();
-  return data.content.find((c) => c.type === "text")?.text ?? "";
+function attendre(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// Lit le flux SSE de l'API Messages et reconstitue le texte complet. Passer
+// par le streaming (plutôt qu'une réponse tamponnée) évite qu'un appel à
+// forte sortie — comme la répartition d'un gros gabarit importé, à
+// max_tokens 16000 — dépasse la fenêtre de timeout du gateway avant le
+// premier octet et échoue en 524.
+async function lireFluxClaude(corpsReponse) {
+  const lecteur = corpsReponse.pipeThrough(new TextDecoderStream()).getReader();
+  let tampon = "";
+  let texte = "";
+  let raisonArret = null;
+  let tokensSortis = null;
+  const typesBloc = [];
+  while (true) {
+    const { done, value } = await lecteur.read();
+    if (done) break;
+    tampon += value;
+    let fin;
+    while ((fin = tampon.indexOf("\n\n")) !== -1) {
+      const evenement = tampon.slice(0, fin);
+      tampon = tampon.slice(fin + 2);
+      const ligneDonnees = evenement.split("\n").find((l) => l.startsWith("data:"));
+      if (!ligneDonnees) continue;
+      const donnees = JSON.parse(ligneDonnees.slice(5).trim());
+      if (donnees.type === "content_block_start" && donnees.content_block?.type) {
+        typesBloc.push(donnees.content_block.type);
+      } else if (donnees.type === "content_block_delta" && donnees.delta?.type === "text_delta") {
+        texte += donnees.delta.text;
+      } else if (donnees.type === "message_delta") {
+        raisonArret = donnees.delta?.stop_reason ?? raisonArret;
+        tokensSortis = donnees.usage?.output_tokens ?? tokensSortis;
+      } else if (donnees.type === "error") {
+        throw new Error(`Anthropic API error en cours de flux : ${donnees.error?.message ?? JSON.stringify(donnees.error)}`);
+      }
+    }
+  }
+  return { texte, raisonArret, tokensSortis, typesBloc };
+}
+
+async function callClaude(apiKey, opts) {
+  const corps = JSON.stringify({
+    model: MODEL,
+    max_tokens: opts.maxTokens,
+    system: opts.system,
+    stream: true,
+    messages: [{ role: "user", content: opts.content }]
+  });
+  let derniereErreur;
+  // Jusqu'à 3 tentatives : un 524/529/502/503 est un incident d'infrastructure
+  // passager — plus probable sur un gros document — pas une erreur de
+  // contenu. Une deuxième tentative suffit presque toujours.
+  for (let essai = 0; essai < 3; essai++) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: corps
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      derniereErreur = new Error(`Anthropic API error (${res.status}): ${detail}`);
+      if (res.status >= 500 && essai < 2) {
+        await attendre(500 * 2 ** essai);
+        continue;
+      }
+      throw derniereErreur;
+    }
+    const { texte, raisonArret, tokensSortis, typesBloc } = await lireFluxClaude(res.body);
+    if (!texte) {
+      // Une réponse sans bloc de texte renvoyait une chaîne vide, que chaque
+      // appelant interprétait comme « le modèle n'a rien d'utile à dire » et
+      // traitait par un repli silencieux. Le plus souvent, max_tokens a été
+      // épuisé avant le premier mot : il faut le dire, pas le taire.
+      throw new Error(`réponse sans texte (stop_reason: ${raisonArret}, blocs: ${typesBloc.join(", ") || "aucun"}, jetons sortis: ${tokensSortis})`);
+    }
+    return texte;
+  }
+  throw derniereErreur;
+}
+// Récupère les objets complets d'un tableau JSON tronqué. Une réponse coupée en
+// plein milieu d'un objet faisait perdre la totalité de l'inventaire ; garder
+// les 30 éléments complets vaut infiniment mieux que de basculer sur la liste
+// générique, qui n'a aucun rapport avec l'immeuble visité.
+function sauverObjetsComplets(s) {
+  const objets = [];
+  let profondeur = 0, debut = -1, dansChaine = false, echappe = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (dansChaine) {
+      if (echappe) echappe = false;
+      else if (ch === "\\") echappe = true;
+      else if (ch === '"') dansChaine = false;
+      continue;
+    }
+    if (ch === '"') { dansChaine = true; continue; }
+    if (ch === "{") { if (profondeur === 0) debut = i; profondeur++; }
+    else if (ch === "}") {
+      profondeur--;
+      if (profondeur === 0 && debut >= 0) {
+        try { objets.push(JSON.parse(s.slice(debut, i + 1))); } catch {}
+        debut = -1;
+      }
+    }
+  }
+  return objets.length ? objets : null;
+}
+
 function extractJson(text) {
-  const match2 = text.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
-  if (!match2) throw new Error("réponse IA sans JSON exploitable");
-  return JSON.parse(match2[0]);
+  const iTableau = text.indexOf("[");
+  const iObjet = text.indexOf("{");
+  // On essaie d'abord la structure qui commence le plus tôt. L'ancienne regex
+  // tentait toujours {…} en premier : sur un tableau tronqué, privée de son «]»,
+  // elle capturait une enfilade d'objets séparés par des virgules, que
+  // JSON.parse refuse — et tout l'inventaire était perdu.
+  const essais = [];
+  if (iTableau >= 0) essais.push([iTableau, text.lastIndexOf("]")]);
+  if (iObjet >= 0) essais.push([iObjet, text.lastIndexOf("}")]);
+  essais.sort((a, b) => a[0] - b[0]);
+  for (const [debut, fin] of essais) {
+    if (debut < 0 || fin <= debut) continue;
+    try {
+      return JSON.parse(text.slice(debut, fin + 1));
+    } catch {}
+  }
+  if (iTableau >= 0 || iObjet >= 0) {
+    const sauves = sauverObjetsComplets(text.slice(Math.max(0, Math.min(...[iTableau, iObjet].filter((x) => x >= 0)))));
+    if (sauves) return sauves.length === 1 && iTableau < 0 ? sauves[0] : sauves;
+  }
+  throw new Error("réponse IA sans JSON exploitable");
 }
 const DEFAULT_CHECKLIST = [
   { cat: "terrain", name: "Aménagement paysager", code: "G40.10-50", vu: 25, qty: "—" },
@@ -3084,8 +3193,31 @@ métrique entre parenthèses.
 
 SIGLES : PCUR = partie commune à usage restreint ; PCUG = partie commune à usage général ;
 FP = fonds de prévoyance ; CE = carnet d'entretien ; VU = durée de vie utile.`;
+function parseLignesChecklist(texte) {
+  const items = [];
+  for (const brut of String(texte ?? "").split("\n")) {
+    const ligne = brut.trim();
+    if (!ligne || !ligne.includes("|")) continue;
+    const champs = ligne.split("|").map((x) => x.trim());
+    if (champs.length < 2) continue;
+    const [cat, name, code, vu, qty] = champs;
+    // Une catégorie inconnue signalerait une ligne mal formée autant qu'une
+    // hallucination : on retombe sur « équipements », comme à l'insertion.
+    if (!name) continue;
+    const duree = Number(vu);
+    items.push({
+      cat: CATEGORIES[cat] ? cat : "equipements",
+      name,
+      code: code && code !== "-" && code !== "—" ? code : null,
+      vu: Number.isFinite(duree) && duree > 0 ? Math.round(duree) : null,
+      qty: qty || "—"
+    });
+  }
+  return items;
+}
+
 async function generateChecklist(apiKey, profile) {
-  if (!apiKey) return DEFAULT_CHECKLIST;
+  if (!apiKey) return { items: DEFAULT_CHECKLIST, source: "generique", erreur: "aucune clé API configurée" };
   const prompt = `Tu es ingénieur en bâtiment spécialisé dans les études de fonds de prévoyance
 pour syndicats de copropriété au Québec. Pour un immeuble résidentiel de
 ${profile.units} unités${profile.floors ? `, ${profile.floors} étages` : ""}${profile.builtYear ? `, construit en ${profile.builtYear}` : ""}, propose la liste des composantes typiques à inspecter.
@@ -3115,17 +3247,34 @@ salles de services 20 · détection des gaz 25 · alimentation électrique princ
 alimentation en eau potable 10 (all.) · inspection DAR 1 · évacuation sanitaire et pluviale 10 (all.) ·
 nettoyage des colonnes 5 (all.) · réservoir d'eau chaude conciergerie 10, communs 25 · gicleurs 10 (all.).
 
-Réponds UNIQUEMENT avec un tableau JSON d'objets {"cat", "name", "code", "vu", "qty"} où
-"code" est le code Uniformat II de l'élément parent (ou null si tu n'en es pas certain), "vu"
-la durée de vie utile en années, et "qty" la quantité approximative ou "—". Entre 20 et 34
-composantes, couvrant les catégories pertinentes pour cet immeuble.`;
+Réponds UNIQUEMENT par une liste, UNE COMPOSANTE PAR LIGNE, au format exact :
+
+categorie|nom|code Uniformat|durée de vie|quantité
+
+Exemple de ligne : terrain|Stationnement et voies de circulation – Pavage|G10.10-30|25|—
+
+Le code Uniformat II est celui de l'élément parent ; mets un tiret « - » si tu n'en es pas
+certain. La durée de vie est en années. La quantité est approximative, ou « — ».
+Aucun en-tête, aucune numérotation, aucun commentaire, aucune ligne vide.
+Entre 20 et 34 composantes, couvrant les catégories pertinentes pour cet immeuble.`;
+  // 34 éléments JSON avec accents frôlent les 1500 jetons, sans compter le
+  // préambule que le modèle écrit parfois avant le tableau. Trop juste : la
+  // réponse était tronquée, extractJson échouait, et chaque dossier recevait
+  // silencieusement la liste générique au lieu d'un inventaire adapté à l'immeuble.
+  let texte = null;
   try {
-    const text = await callClaude(apiKey, { content: prompt, maxTokens: 1500 });
-    const items = extractJson(text);
-    if (Array.isArray(items) && items.length > 0) return items;
-    return DEFAULT_CHECKLIST;
-  } catch {
-    return DEFAULT_CHECKLIST;
+    texte = await callClaude(apiKey, { content: prompt, maxTokens: 4000 });
+    // Une ligne par composante plutôt qu'un gros JSON : la réponse revenait
+    // tronquée à un endroit imprévisible et tout l'inventaire était perdu d'un
+    // coup. Ici, une ligne coupée se jette seule et les autres tiennent.
+    const propres = parseLignesChecklist(texte);
+    if (propres.length > 0) return { items: propres, source: "ia", erreur: null };
+    return { items: DEFAULT_CHECKLIST, source: "generique", erreur: `aucune ligne exploitable (${texte.length} caractères reçus) | DÉBUT: « ${texte.slice(0, 200)} »` };
+  } catch (e) {
+    // Un repli silencieux est pire qu'un repli : personne ne peut voir que
+    // l'inventaire proposé n'a rien à voir avec l'immeuble visité.
+    const indice = texte ? ` — ${texte.length} caractères reçus | DÉBUT: « ${texte.slice(0, 220)} » | FIN: « ${texte.slice(-120)} »` : " — aucune réponse reçue";
+    return { items: DEFAULT_CHECKLIST, source: "generique", erreur: `${e && e.message}${indice}` };
   }
 }
 function heuristicEstimate(installYear, usefulLife) {
@@ -44004,11 +44153,12 @@ dossiers.post("/", async (c) => {
     user.id,
     user.company_id
   ).run();
-  const items = await generateChecklist(c.env.ANTHROPIC_API_KEY, {
+  const checklist = await generateChecklist(c.env.ANTHROPIC_API_KEY, {
     units: body2.units ?? 0,
     floors: body2.floors ?? null,
     builtYear: body2.built_year ?? null
   });
+  const items = checklist.items;
   const stmt = c.env.DB.prepare(
     `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)`
   );
@@ -44027,7 +44177,13 @@ dossiers.post("/", async (c) => {
     )
   );
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
-  return c.json({ ...dossier, stats: await dossierStats(c.env.DB, id) }, 201);
+  return c.json({
+    ...dossier,
+    stats: await dossierStats(c.env.DB, id),
+    // L'ingénieur doit savoir si l'inventaire a été adapté à son immeuble ou
+    // si c'est la liste générique : les deux ne se révisent pas de la même façon.
+    inventaire: { source: checklist.source, erreur: checklist.erreur, total: items.length }
+  }, 201);
 });
 async function getOwnedDossier(c, id) {
   const user = await getCurrentUser(c);
