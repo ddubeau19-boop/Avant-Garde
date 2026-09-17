@@ -675,3 +675,35 @@ button { font-family: inherit; }
   .pf-row { grid-template-columns: 1.6fr .6fr 1fr 1fr; }
   .pf-row > :nth-child(5), .pf-row > :nth-child(6) { grid-column: span 2; }
 }
+
+/* ---------- réconciliation avec l'étude précédente ---------- */
+.recon-card { border: 1px solid var(--ink-200); border-radius: 14px; background: #fff; padding: 20px 22px; margin: 24px 0; }
+.recon-card.muted {
+  display: flex; align-items: center; gap: 10px; color: var(--ink-500); font-size: 13px;
+  background: var(--ink-050); padding: 14px 18px;
+}
+.recon-card.muted i { width: 16px; height: 16px; }
+.recon-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+.recon-title { display: flex; align-items: center; gap: 8px; font-family: var(--font-display); font-size: 17px; font-weight: 800; }
+.recon-title i { width: 17px; height: 17px; color: var(--orange); }
+.recon-sub { font-size: 12.5px; color: var(--ink-500); margin-top: 4px; line-height: 1.45; }
+.recon-stats { display: flex; gap: 22px; flex-wrap: wrap; margin-bottom: 14px; }
+.recon-stat b { font-family: var(--font-display); font-size: 22px; font-weight: 800; margin-right: 6px; }
+.recon-stat span { font-size: 12px; color: var(--ink-500); }
+.recon-note {
+  background: var(--orange-wash); color: var(--accent-press); border-radius: 8px;
+  padding: 10px 13px; font-size: 12.5px; line-height: 1.45; margin-bottom: 14px;
+}
+.recon-table { border: 1px solid var(--ink-200); border-radius: 12px; overflow: hidden; }
+.recon-row {
+  display: grid; grid-template-columns: 1.8fr 1fr 1fr 1.6fr 140px; gap: 14px; padding: 12px 16px;
+  align-items: center; border-top: 1px solid var(--line-soft);
+}
+.recon-thead {
+  border-top: none; background: var(--ink-050); font-family: var(--font-mono); font-size: 10.5px;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--ink-500);
+}
+@media (max-width: 1100px) {
+  .recon-row { grid-template-columns: 1.6fr 1fr 1fr; }
+  .recon-row > :nth-child(4), .recon-row > :nth-child(5) { grid-column: span 3; }
+}

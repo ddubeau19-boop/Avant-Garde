@@ -331,6 +331,86 @@ async function testRechercheDeSyndicat() {
 }
 
 // ---------------------------------------------------------------------------
+// Réconciliation avec l'étude précédente
+
+// Même patron que dossierAvec, mais du côté du portefeuille et avec un
+// rattachement à un syndicat du CRM — c'est lui qui relie les deux études.
+async function etudePour(numero, syndicatId, composantes, publieeLe) {
+  const cree = await api("/api/dossiers", {
+    method: "POST", jeton: jetonPortefeuille,
+    body: JSON.stringify({
+      dossier_no: numero, name: "Syndicat Le Belvédère", units: 60, built_year: 1996,
+      crm_syndicat_id: syndicatId, crm_syndicat_nom: "Syndicat Le Belvédère"
+    })
+  });
+  for (const c of await api(`/api/dossiers/${cree.id}/components`, { jeton: jetonPortefeuille })) {
+    await api(`/api/components/${c.id}`, { method: "DELETE", jeton: jetonPortefeuille });
+  }
+  for (const comp of composantes) {
+    const { replacement_cost, ...creation } = comp;
+    const n = await api(`/api/dossiers/${cree.id}/components`, { method: "POST", jeton: jetonPortefeuille, body: JSON.stringify(creation) });
+    await api(`/api/components/${n.id}`, { method: "PATCH", jeton: jetonPortefeuille, body: JSON.stringify({ replacement_cost, done: 1 }) });
+  }
+  if (publieeLe) {
+    await api(`/api/dossiers/${cree.id}`, { method: "PATCH", jeton: jetonPortefeuille, body: JSON.stringify({ published_at: publieeLe }) });
+  }
+  return cree.id;
+}
+
+async function testReconciliation() {
+  console.log("\nRéconciliation avec l'étude précédente");
+  const t = Date.now();
+  // Le CRM semé porte deux factures de toiture (B30.10) pour ce syndicat,
+  // datées d'il y a un an. L'étude précédente les précède donc.
+  await etudePour(`T-RC-A-${t}`, "syn_a_jour", [
+    { name: "Toiture", cat: "enveloppe", uniformat_code: "B30.10", useful_life_years: 25, install_year: 1996, replacement_cost: 55000 },
+    { name: "Ascenseur", cat: "equipements", uniformat_code: "D10.10", useful_life_years: 30, install_year: 2000, replacement_cost: 120000 },
+    { name: "Balcons", cat: "enveloppe", uniformat_code: "B20.30", useful_life_years: 40, install_year: 1996, replacement_cost: 90000 }
+  ], "2021-06-01T12:00:00.000Z");
+
+  const neuf = await etudePour(`T-RC-B-${t}`, "syn_a_jour", [
+    { name: "Toiture", cat: "enveloppe", uniformat_code: "B30.10", useful_life_years: 25, install_year: 2025, replacement_cost: 72000 },
+    { name: "Ascenseur", cat: "equipements", uniformat_code: "D10.10", useful_life_years: 30, install_year: 2000, replacement_cost: 145000 },
+    { name: "Drains", cat: "mecanique", uniformat_code: "D20.40", useful_life_years: 35, install_year: 1996, replacement_cost: 40000 }
+  ], null);
+
+  const r = await api(`/api/dossiers/${neuf}/reconciliation`, { jeton: jetonPortefeuille });
+  verifier("l'étude précédente est retrouvée par le syndicat", r.disponible === true, r.motif);
+  verifier("c'est bien celle de 2021", r.precedente?.annee === 2021, String(r.precedente?.annee));
+  const par = Object.fromEntries(r.lignes.map((l) => [l.uniformat_code, l]));
+
+  // Les factures du CRM sont la seule preuve qu'un travail a eu lieu : sans
+  // elles, une composante qui sort de l'inventaire est un oubli possible.
+  verifier("la toiture facturée est déclarée réalisée", par["B30.10"]?.etat === "realisee", par["B30.10"]?.etat);
+  verifier("les balcons disparus ne sont PAS déclarés réalisés", par["B20.30"]?.etat === "disparue", par["B20.30"]?.etat);
+  verifier("les drains sont une nouveauté", par["D20.40"]?.etat === "nouvelle", par["D20.40"]?.etat);
+  verifier("l'ascenseur, même année, reste stable", par["D10.10"]?.etat === "stable", par["D10.10"]?.etat);
+
+  // L'ancienne estimation doit être lue avec les yeux de son époque : prévue
+  // en 1996 + 25 ans, elle tombe en 2021, pas à un nombre d'années compté
+  // depuis aujourd'hui.
+  verifier("l'année prévue par l'étude de 2021 est une année civile de 2021",
+    par["D10.10"]?.precedent?.annee_prevue === 2030, String(par["D10.10"]?.precedent?.annee_prevue));
+
+  // Le cœur de l'affaire : prévu contre facturé, en dollars de l'année du
+  // chèque. Les deux factures du CRM totalisent 60 000 $.
+  const j = par["B30.10"]?.justesse;
+  verifier("la justesse compare le prévu au facturé", j?.facture === 60000, JSON.stringify(j));
+  verifier("le prévu est indexé jusqu'à l'année de la facture",
+    j != null && presque(j.prevu_indexe, 55000 * Math.pow(1.0176, j.annee_facture - 2021), 1),
+    JSON.stringify(j));
+  verifier("une composante réalisée n'est pas comptée comme renchérie", r.resume.rencheries === 1, JSON.stringify(r.resume));
+
+  // Une étude sans immeuble ne se compare à rien, et le dit.
+  const orphelin = await api("/api/dossiers", {
+    method: "POST", jeton: jetonPortefeuille,
+    body: JSON.stringify({ dossier_no: `T-RC-O-${t}`, name: "Immeuble hors portefeuille", units: 10 })
+  });
+  const sans = await api(`/api/dossiers/${orphelin.id}/reconciliation`, { jeton: jetonPortefeuille });
+  verifier("un dossier non rattaché n'invente pas de comparaison", sans.disponible === false && !!sans.motif, JSON.stringify(sans));
+}
+
+// ---------------------------------------------------------------------------
 
 const suites = [
   testAnneeAncreeSurInstallation,
@@ -343,7 +423,8 @@ const suites = [
   testStatutsDuCalendrier,
   testEtudeConnueChangeLEcheance,
   testDossierRattacheAuSyndicat,
-  testRechercheDeSyndicat
+  testRechercheDeSyndicat,
+  testReconciliation
 ];
 
 try {

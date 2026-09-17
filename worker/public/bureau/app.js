@@ -246,6 +246,10 @@ const state = {
   etudeForm: { date_etude: '', auteur: '', note: '' },
   etudeSaving: false,
   etudeError: null,
+
+  // Réconciliation avec l'étude précédente du même immeuble
+  reconciliation: null,
+  reconciliationOuverte: false,
 };
 
 // ---------------------------------------------------------------
@@ -950,7 +954,10 @@ async function openDossier(id) {
   state.batiment = {};
   state.batimentOpen = false;
   state.redactionCache = {};
+  state.reconciliation = null;
+  state.reconciliationOuverte = false;
   await loadDossierDetail(id);
+  loadReconciliation(id);
 }
 
 async function loadDossierDetail(id) {
@@ -974,6 +981,18 @@ async function loadDossierDetail(id) {
     state.revisionError = e.message || 'Impossible de charger ce dossier.';
     render();
   }
+}
+
+// La réconciliation est secondaire : elle ne doit jamais retarder l'écran ni
+// le faire échouer. Elle se charge à côté et s'affiche quand elle arrive.
+async function loadReconciliation(id) {
+  state.reconciliation = null;
+  try {
+    state.reconciliation = await apiJson(`/api/dossiers/${id}/reconciliation`);
+  } catch (e) {
+    state.reconciliation = { disponible: false, motif: e.message || 'comparaison indisponible' };
+  }
+  if (state.dossierId === id) render();
 }
 
 async function refreshProjection() {
@@ -2260,6 +2279,72 @@ function batimentPanelHtml(d) {
   </div>`;
 }
 
+// « Pourquoi le chiffre n'est plus celui d'il y a cinq ans ? » — la question
+// que pose tout conseil d'administration, et à laquelle il fallait jusqu'ici
+// répondre en rouvrant l'ancien rapport.
+const RECON_COULEURS = {
+  realisee: { bg: 'var(--green-wash)', fg: 'var(--green)' },
+  disparue: { bg: 'var(--red-wash)', fg: 'var(--red)' },
+  reportee: { bg: 'var(--orange-wash)', fg: 'var(--accent-press)' },
+  avancee: { bg: 'var(--orange-wash)', fg: 'var(--accent-press)' },
+  nouvelle: { bg: 'var(--ink-100)', fg: 'var(--ink-600)' },
+  stable: { bg: 'var(--ink-100)', fg: 'var(--ink-500)' },
+};
+
+function pct(v) {
+  if (v == null) return '—';
+  const signe = v > 0 ? '+' : '';
+  return `${signe}${(v * 100).toFixed(1)} %`;
+}
+
+function reconciliationCardHtml() {
+  const r = state.reconciliation;
+  if (!r) return '';
+  if (!r.disponible) {
+    // On ne cache pas l'absence de comparaison : savoir qu'il n'y a rien à
+    // quoi se comparer fait partie de ce que l'ingénieur doit savoir.
+    return `<div class="recon-card muted"><i data-lucide="git-compare"></i><span>Aucune comparaison avec une étude précédente — ${escapeHtml(r.motif || '')}.</span></div>`;
+  }
+  const s = r.resume;
+  const aVoir = r.lignes.filter(l => l.etat !== 'stable');
+  const lignes = state.reconciliationOuverte ? r.lignes : aVoir;
+  return `
+  <div class="recon-card">
+    <div class="recon-head">
+      <div>
+        <div class="recon-title"><i data-lucide="git-compare"></i>Écart avec l'étude de ${r.precedente.annee}</div>
+        <div class="recon-sub">Dossier ${escapeHtml(r.precedente.dossier_no || '')}, publié le ${escapeHtml(String(r.precedente.publiee_le).slice(0, 10))}. Les montants de ${r.precedente.annee} sont ramenés en dollars de ${r.annee_actuelle} avant comparaison.</div>
+      </div>
+      <button class="btn-secondary" data-action="recon-toggle" style="padding:7px 14px;font-size:12px">${state.reconciliationOuverte ? 'Masquer les inchangées' : `Tout voir · ${r.lignes.length}`}</button>
+    </div>
+    <div class="recon-stats">
+      <div class="recon-stat"><b>${s.realisees}</b><span>réalisée${s.realisees > 1 ? 's' : ''}</span></div>
+      <div class="recon-stat"><b>${s.reportees}</b><span>reportée${s.reportees > 1 ? 's' : ''}</span></div>
+      <div class="recon-stat"><b>${s.disparues}</b><span>disparue${s.disparues > 1 ? 's' : ''}</span></div>
+      <div class="recon-stat"><b>${s.nouvelles}</b><span>nouvelle${s.nouvelles > 1 ? 's' : ''}</span></div>
+      <div class="recon-stat"><b>${s.rencheries}</b><span>renchérie${s.rencheries > 1 ? 's' : ''}</span></div>
+    </div>
+    ${!r.preuve_crm ? `<div class="recon-note">Les factures du CRM ne sont pas lisibles depuis ce compte : aucune composante ne peut être déclarée réalisée, seulement absente du nouvel inventaire.</div>` : ''}
+    ${s.disparues ? `<div class="recon-note">${s.disparues} composante${s.disparues > 1 ? 's' : ''} de l'étude précédente ${s.disparues > 1 ? 'ont' : 'a'} disparu de l'inventaire sans qu'aucune facture ne montre ${s.disparues > 1 ? 'leur' : 'son'} remplacement. Vérifiez qu'il ne s'agit pas d'un oubli du relevé.</div>` : ''}
+    <div class="recon-table">
+      <div class="recon-row recon-thead"><div>Composante</div><div>Étude ${r.precedente.annee}</div><div>Étude ${r.annee_actuelle}</div><div>Écart</div><div>État</div></div>
+      ${lignes.length === 0 ? `<div class="empty-state">Rien n'a bougé depuis l'étude précédente.</div>` : lignes.map(l => {
+        const col = RECON_COULEURS[l.etat] || RECON_COULEURS.stable;
+        return `
+      <div class="recon-row">
+        <div><div class="dt-name">${escapeHtml(l.nom)}</div><div class="dt-sub">${escapeHtml(l.uniformat_code || 'sans code')}</div></div>
+        <div>${l.precedent ? `<div class="dt-no">${l.precedent.annee_prevue ?? '—'}</div><div class="dt-sub">${l.precedent.cout_indexe != null ? fmt(l.precedent.cout_indexe) + ' $' : '—'}</div>` : '<span class="dt-sub">absente</span>'}</div>
+        <div>${l.actuel ? `<div class="dt-no">${l.actuel.annee_prevue ?? '—'}</div><div class="dt-sub">${l.actuel.cout != null ? fmt(l.actuel.cout) + ' $' : 'à compléter'}</div>` : '<span class="dt-sub">absente</span>'}</div>
+        <div>${l.justesse
+            ? `<div class="dt-no">${pct(l.justesse.ecart_pct)}</div><div class="dt-sub">facturé ${fmt(l.justesse.facture)} $ en ${l.justesse.annee_facture}, prévu ${fmt(l.justesse.prevu_indexe)} $</div>`
+            : (l.ecart_pct != null ? `<div class="dt-no">${pct(l.ecart_pct)}</div><div class="dt-sub">${l.ecart_ans ? (l.ecart_ans > 0 ? '+' : '') + l.ecart_ans + ' an' + (Math.abs(l.ecart_ans) > 1 ? 's' : '') : 'même année'}</div>` : '<span class="dt-sub">—</span>')}</div>
+        <div><span class="status-badge" style="background:${col.bg};color:${col.fg}">${escapeHtml(l.etat_label)}</span></div>
+      </div>`;
+      }).join('')}
+    </div>
+  </div>`;
+}
+
 function renderRevision() {
   if (state.revisionLoading) return `<div class="rev-shell">${spinnerBlock('Chargement du dossier…')}</div>`;
   if (state.revisionError) return `<div class="rev-shell"><div class="page-pad">${errorBanner(state.revisionError, 'retry-revision')}</div></div>`;
@@ -2316,6 +2401,8 @@ function renderRevision() {
           <i data-lucide="arrow-right"></i>
         </div>
       </button>
+
+      ${reconciliationCardHtml()}
 
       ${batimentPanelHtml(d)}
 
@@ -2682,6 +2769,10 @@ function initEvents() {
         state.screen = 'portefeuille';
         render();
         loadPortefeuille();
+        break;
+      case 'recon-toggle':
+        state.reconciliationOuverte = !state.reconciliationOuverte;
+        render();
         break;
       case 'retry-portefeuille':
         loadPortefeuille();

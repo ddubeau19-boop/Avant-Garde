@@ -23588,6 +23588,50 @@ async function generateReportDocx(ctx) {
     resultats.push(body("Les composantes suivantes n'ont pu être incluses à la projection, faute d'un coût de remplacement ou d'une durée de vie utile documentée. Elles demeurent au carnet d'entretien et devront être documentées afin d'être intégrées au calcul lors de la mise à jour."));
     for (const e of projection.excludedComponents) resultats.push(puce(`${sansNotesInternes(e.name)} — ${e.reason}`));
   }
+  // La première question d'un conseil d'administration devant une deuxième
+  // étude est « pourquoi le chiffre a changé ». Y répondre dans le document,
+  // avec les montants de l'ancienne étude ramenés en dollars d'aujourd'hui,
+  // vaut mieux que de la laisser se poser en assemblée.
+  const recon = ctx.reconciliation;
+  if (recon?.disponible && recon.lignes.some((l) => l.etat !== "stable")) {
+    const r = recon.resume;
+    resultats.push(titre2(`Écart avec l'étude de ${recon.precedente.annee}`));
+    resultats.push(body(`La présente étude succède à celle de ${recon.precedente.annee}. Les montants de cette dernière sont ramenés en dollars de ${recon.annee_actuelle} au taux d'inflation des coûts de la construction retenu à la section 3.0, de manière que la comparaison porte sur des valeurs comparables et non sur l'effet du temps.`));
+    // La phrase ne se construit que des mouvements réels : « 0 élément a vu son
+    // remplacement reporté » est une phrase que personne n'écrirait à la main.
+    const mouvements = [];
+    if (r.realisees) mouvements.push(`${r.realisees} élément${r.realisees > 1 ? "s ont" : " a"} été remplacé${r.realisees > 1 ? "s" : ""}`);
+    if (r.reportees) mouvements.push(`${r.reportees} ${r.reportees > 1 ? "ont vu leur remplacement reporté" : "a vu son remplacement reporté"}`);
+    if (r.avancees) mouvements.push(`${r.avancees} ${r.avancees > 1 ? "ont été devancés" : "a été devancé"}`);
+    if (r.nouvelles) mouvements.push(`${r.nouvelles} ${r.nouvelles > 1 ? "s'ajoutent" : "s'ajoute"} à l'inventaire`);
+    if (mouvements.length > 0) {
+      const derniere = mouvements.pop();
+      resultats.push(body(`Depuis, ${[mouvements.join(", "), derniere].filter(Boolean).join(" et ")}.`));
+    }
+    resultats.push(tableauMaison(
+      ["Élément", `Prévu en ${recon.precedente.annee}`, `Prévu en ${recon.annee_actuelle}`, "Écart", "État"],
+      recon.lignes.filter((l) => l.etat !== "stable").map((l) => [
+        sansNotesInternes(l.nom),
+        l.precedent ? `${l.precedent.annee_prevue ?? "—"} · ${montantMaison(l.precedent.cout_indexe) ?? "—"}` : "—",
+        l.actuel ? `${l.actuel.annee_prevue ?? "—"} · ${montantMaison(l.actuel.cout) ?? "—"}` : "—",
+        l.justesse
+          ? `facturé ${montantMaison(l.justesse.facture) ?? "—"} en ${l.justesse.annee_facture}`
+          : (l.ecart_pct != null ? `${l.ecart_pct > 0 ? "+" : ""}${(l.ecart_pct * 100).toFixed(1)} %` : "—"),
+        l.etat_label
+      ])
+    ));
+    // Une composante qui sort de l'inventaire sans facture pour l'expliquer est
+    // soit un travail dont nous n'avons pas la trace, soit un oubli du relevé.
+    // Le dire est plus honnête que de la faire disparaître en silence.
+    if (r.disparues > 0) {
+      resultats.push(body(`${r.disparues} élément${r.disparues > 1 ? "s figurant" : " figurant"} à l'étude de ${recon.precedente.annee} ${r.disparues > 1 ? "ne sont" : "n'est"} plus à l'inventaire, sans qu'une pièce justificative n'en atteste le remplacement. ${r.disparues > 1 ? "Ils devront" : "Il devra"} être confirmé${r.disparues > 1 ? "s" : ""} auprès du conseil d'administration.`, { color: GREY, size: 18 }));
+    }
+    if (r.mesurees > 0) {
+      const ecarts = recon.lignes.filter((l) => l.justesse).map((l) => Math.abs(l.justesse.ecart_pct));
+      const moyen = ecarts.reduce((a, b) => a + b, 0) / ecarts.length;
+      resultats.push(body(`Sur ${r.mesurees} remplacement${r.mesurees > 1 ? "s" : ""} réalisé${r.mesurees > 1 ? "s" : ""} depuis l'étude précédente et dont le coût nous est connu, l'écart moyen entre le montant prévu et le montant facturé s'établit à ${(moyen * 100).toFixed(1)} %.`, { color: GREY, size: 18 }));
+    }
+  }
   // ---- 6.0 Conclusion et suggestions -------------------------------------
   const conclusion = [
     heading("6.0 Conclusion et suggestions"),
@@ -44836,6 +44880,7 @@ async function buildReportContext(c) {
     banque: await banquePour(c.env.DB, dossier.company_id),
     textesValides: await textesValidesPour(c.env.DB, dossier.id),
     photos: await photosPourRapport(c.env, dossier.id),
+    reconciliation: await reconciliationPour(c, user, dossier),
     engineerName: user?.name ?? "Condo Stratégis",
     signataire: user ?? null,
     apiKey: c.env.ANTHROPIC_API_KEY ?? null
@@ -44852,6 +44897,11 @@ dossiers.get("/:id/projection", async (c) => {
     dossier
   });
   return c.json(projection);
+});
+dossiers.get("/:id/reconciliation", async (c) => {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  return c.json(await reconciliationPour(c, user, dossier));
 });
 dossiers.get("/:id/report.docx", async (c) => {
   const ctx = await buildReportContext(c);
@@ -45642,6 +45692,15 @@ function joursJusqua(dateIso, aujourdhui) {
 
 // Les statuts du calendrier. Le vocabulaire est celui du gestionnaire, pas
 // celui de la base : « en retard » veut dire que l'échéance est passée.
+const RECONCILIATION_ETATS = {
+  realisee: "Réalisée",
+  disparue: "Disparue",
+  reportee: "Reportée",
+  avancee: "Avancée",
+  nouvelle: "Nouvelle",
+  stable: "Inchangée"
+};
+
 const PORTEFEUILLE_STATUTS = {
   inconnue: { label: "Aucune étude", rang: 1 },
   en_retard: { label: "En retard", rang: 0 },
@@ -45770,6 +45829,210 @@ async function portefeuilleLignes(c, user) {
       a_prevoir: compte("a_prevoir"),
       en_cours: compte("en_cours"),
       a_jour: compte("a_jour")
+    },
+    lignes
+  };
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Réconciliation avec l'étude précédente
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// « Pourquoi le chiffre n'est plus celui d'il y a cinq ans ? » est la première
+// question d'un conseil d'administration, et la plus mal outillée : jusqu'ici
+// il fallait rouvrir l'ancien rapport et comparer à la main, ligne par ligne.
+//
+// Deux études du même immeuble sont désormais reliées par le syndicat. On peut
+// donc dire, composante par composante, ce qui a été réalisé, ce qui a été
+// reporté, ce qui a renchéri — et de combien.
+//
+// Une précaution y tient une grande place. Une composante absente du nouvel
+// inventaire n'est PAS une composante réalisée : c'est peut-être un oubli du
+// relevé. On ne la déclare faite que si une facture du CRM le montre ; sinon
+// elle est signalée comme disparue sans preuve, ce qui est exactement ce que
+// l'ingénieur doit voir avant de signer.
+
+// Au-delà de dix pour cent en dollars constants, l'écart cesse d'être du bruit
+// d'arrondi et mérite une phrase dans le rapport.
+const RECONCILIATION_SEUIL_ECART = 0.10;
+// Un an de décalage, c'est la précision de l'exercice. Deux, c'est une décision.
+const RECONCILIATION_SEUIL_ANS = 2;
+
+// Deux études ne nomment pas toujours une composante pareil. Le code Uniformat
+// est la clé sûre ; le nom normalisé n'est qu'un repli, et il vaut mieux qu'un
+// rapprochement manqué qu'un rapprochement faux.
+function cleReconciliation(comp) {
+  const code = String(comp?.uniformat_code ?? "").trim().toUpperCase();
+  if (code) return `code:${code}`;
+  return `nom:${sansAccents(comp?.name)}`;
+}
+
+// L'année civile où l'étude prévoyait le remplacement. Le moteur raisonne en
+// nombre d'années à partir de l'année courante : pour retrouver ce que l'étude
+// de 2021 annonçait, il faut le lui redemander avec 2021 comme année courante,
+// sinon on relit le passé avec les yeux d'aujourd'hui.
+function anneePrevueSelon(comp, dossier, anneeEtude) {
+  const usefulLife = comp.useful_life_years ?? DEFAULT_USEFUL_LIFE_YEARS[comp.cat] ?? null;
+  if (!usefulLife || usefulLife <= 0) return null;
+  const decalage = premiereAnneeRemplacement(comp, dossier, usefulLife, anneeEtude);
+  return decalage == null ? null : anneeEtude + decalage;
+}
+
+function anneeDe(iso) {
+  const m = /^(\d{4})/.exec(String(iso ?? ""));
+  return m ? Number(m[1]) : null;
+}
+
+// Ce que le CRM a vu passer comme factures pour cet immeuble depuis l'étude
+// précédente, regroupé par code de composante. C'est la seule preuve de
+// réalisation dont l'application dispose — et personne d'autre ne l'a, parce
+// que personne d'autre ne tient les deux bouts.
+async function travauxDepuis(c, user, syndicatId, depuisIso) {
+  if (crmRefus(c, user) || !syndicatId) return null;
+  const rows = await c.env.CRM.prepare(
+    `SELECT m.component_code,
+            COUNT(*)        AS pieces,
+            SUM(m.amount)   AS total,
+            MAX(COALESCE(f.date_facture, m.document_date)) AS derniere
+       FROM component_cost_matches m
+       JOIN syndicat_factures f
+         ON f.id = m.source_id AND m.source_type = 'syndicat_facture'
+      WHERE f.syndicat_id = ?1
+        AND f.deleted_at IS NULL
+        AND m.amount > 0
+        AND COALESCE(f.date_facture, m.document_date) >= ?2
+      GROUP BY m.component_code`
+  ).bind(syndicatId, depuisIso).all();
+  const par = new Map();
+  for (const r of rows.results) {
+    par.set(`code:${String(r.component_code).trim().toUpperCase()}`, {
+      pieces: r.pieces, total: r.total, derniere: r.derniere
+    });
+  }
+  return par;
+}
+
+async function reconciliationPour(c, user, dossier) {
+  if (!dossier.crm_syndicat_id) {
+    return { disponible: false, motif: "ce dossier n'est rattaché à aucune copropriété du portefeuille" };
+  }
+  const precedente = await c.env.DB.prepare(
+    `SELECT * FROM dossiers
+      WHERE company_id = ?1 AND crm_syndicat_id = ?2 AND id <> ?3 AND published_at IS NOT NULL
+      ORDER BY published_at DESC LIMIT 1`
+  ).bind(dossier.company_id, dossier.crm_syndicat_id, dossier.id).first();
+  if (!precedente) {
+    return { disponible: false, motif: "aucune étude antérieure publiée ici pour cette copropriété" };
+  }
+
+  const anneeEtudePrecedente = anneeDe(precedente.published_at) ?? anneeCourante();
+  const anneeActuelle = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+
+  const avant = (await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(precedente.id).all()).results;
+  const apres = (await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(dossier.id).all()).results;
+  const travaux = await travauxDepuis(c, user, dossier.crm_syndicat_id, String(precedente.published_at).slice(0, 10));
+
+  const parCle = new Map();
+  const entree = (cle) => {
+    if (!parCle.has(cle)) parCle.set(cle, { cle, avant: null, apres: null });
+    return parCle.get(cle);
+  };
+  for (const comp of avant) entree(cleReconciliation(comp)).avant = comp;
+  for (const comp of apres) entree(cleReconciliation(comp)).apres = comp;
+
+  const lignes = [];
+  for (const { cle, avant: a, apres: b } of parCle.values()) {
+    const preuve = travaux ? travaux.get(cle) ?? null : null;
+    const anneeAvant = a ? anneePrevueSelon(a, precedente, anneeEtudePrecedente) : null;
+    const anneeApres = b ? anneePrevueSelon(b, dossier, anneeActuelle) : null;
+    const coutAvant = a?.replacement_cost ?? null;
+    const coutAvantIndexe = prixIndexe(coutAvant, anneeEtudePrecedente, anneeActuelle, taux);
+    const coutApres = b?.replacement_cost ?? null;
+    const ecartCout = coutAvantIndexe != null && coutApres != null ? coutApres - coutAvantIndexe : null;
+    const ecartPct = ecartCout != null && coutAvantIndexe > 0 ? ecartCout / coutAvantIndexe : null;
+    const ecartAns = anneeAvant != null && anneeApres != null ? anneeApres - anneeAvant : null;
+
+    // Quand le travail a été fait, la comparaison qui compte n'est plus
+    // « ancienne estimation contre nouvelle estimation » — la nouvelle porte
+    // sur le cycle suivant, dans vingt-cinq ans. C'est l'estimation contre la
+    // facture : ce que l'étude annonçait, ramené en dollars de l'année où le
+    // chèque a été signé, contre le montant du chèque. C'est la seule mesure
+    // honnête de la justesse d'une étude, et elle n'existe que parce que la
+    // même maison tient l'étude et les factures.
+    let justesse = null;
+    if (preuve && coutAvant != null) {
+      const anneeFacture = anneeDe(preuve.derniere) ?? anneeActuelle;
+      const prevuAlors = prixIndexe(coutAvant, anneeEtudePrecedente, anneeFacture, taux);
+      if (prevuAlors != null && prevuAlors > 0) {
+        justesse = {
+          annee_facture: anneeFacture,
+          prevu_indexe: prevuAlors,
+          facture: preuve.total,
+          ecart: preuve.total - prevuAlors,
+          ecart_pct: (preuve.total - prevuAlors) / prevuAlors
+        };
+      }
+    }
+
+    let etat;
+    if (preuve) etat = "realisee";
+    else if (!a) etat = "nouvelle";
+    else if (!b) etat = "disparue";
+    else if (ecartAns != null && ecartAns >= RECONCILIATION_SEUIL_ANS) etat = "reportee";
+    else if (ecartAns != null && ecartAns <= -RECONCILIATION_SEUIL_ANS) etat = "avancee";
+    else etat = "stable";
+
+    lignes.push({
+      cle,
+      nom: b?.name ?? a?.name ?? "—",
+      uniformat_code: b?.uniformat_code ?? a?.uniformat_code ?? null,
+      cat: b?.cat ?? a?.cat ?? null,
+      etat,
+      etat_label: RECONCILIATION_ETATS[etat],
+      precedent: a ? { annee_prevue: anneeAvant, cout: coutAvant, cout_indexe: coutAvantIndexe } : null,
+      actuel: b ? { annee_prevue: anneeApres, cout: coutApres, confirmee: b.confirmed === 1 } : null,
+      ecart_cout: ecartCout,
+      ecart_pct: ecartPct,
+      ecart_ans: ecartAns,
+      travaux_crm: preuve,
+      justesse
+    });
+  }
+
+  // Ce qui a bougé d'abord, ce qui n'a pas bougé ensuite : la ligne stable
+  // n'intéresse personne tant qu'elle est stable.
+  const rang = { realisee: 0, disparue: 1, reportee: 2, nouvelle: 3, avancee: 4, stable: 5 };
+  lignes.sort((x, y) => (rang[x.etat] - rang[y.etat]) || String(x.nom).localeCompare(String(y.nom), "fr"));
+
+  const compte = (e) => lignes.filter((l) => l.etat === e).length;
+  return {
+    disponible: true,
+    precedente: {
+      dossier_id: precedente.id,
+      dossier_no: precedente.dossier_no,
+      publiee_le: precedente.published_at,
+      annee: anneeEtudePrecedente
+    },
+    annee_actuelle: anneeActuelle,
+    taux_indexation: taux,
+    // Le CRM n'est pas ouvert à toutes les firmes : sans lui, « réalisée » ne
+    // peut pas être établi, et il faut le dire plutôt que de laisser croire
+    // qu'aucun travail n'a eu lieu.
+    preuve_crm: travaux != null,
+    resume: {
+      realisees: compte("realisee"),
+      disparues: compte("disparue"),
+      reportees: compte("reportee"),
+      nouvelles: compte("nouvelle"),
+      avancees: compte("avancee"),
+      stables: compte("stable"),
+      // Une composante déjà remplacée n'est pas comptée ici : sa nouvelle
+      // estimation porte sur le cycle suivant, pas sur le même travail.
+      rencheries: lignes.filter((l) => l.etat !== "realisee" && l.ecart_pct != null && l.ecart_pct >= RECONCILIATION_SEUIL_ECART).length,
+      moins_cheres: lignes.filter((l) => l.etat !== "realisee" && l.ecart_pct != null && l.ecart_pct <= -RECONCILIATION_SEUIL_ECART).length,
+      mesurees: lignes.filter((l) => l.justesse).length
     },
     lignes
   };
