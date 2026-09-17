@@ -23015,6 +23015,80 @@ function paragraphesDocx(xml) {
   return paras;
 }
 
+// Un tableau Word contient des <w:p> comme le reste du document : les
+// aplatir avec paragraphesDocx mélangerait les cellules d'une même ligne
+// avec celles de la ligne suivante. On garde ici la structure
+// tableau > ligne > cellule pour pouvoir reconstituer les colonnes.
+function tableauxDocx(xml) {
+  const tableaux = [];
+  for (const tbl of xml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>/g)) {
+    const lignes = [];
+    for (const tr of tbl[0].matchAll(/<w:tr[ >][\s\S]*?<\/w:tr>|<w:tr\/>/g)) {
+      const cellules = [];
+      for (const tc of tr[0].matchAll(/<w:tc[ >][\s\S]*?<\/w:tc>|<w:tc\/>/g)) {
+        const morceaux = [...tc[0].matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)].map((m) => m[1]);
+        cellules.push(decodeEntitesXml(morceaux.join("")).replace(/\s+/g, " ").trim());
+      }
+      if (cellules.length) lignes.push(cellules);
+    }
+    if (lignes.length) tableaux.push(lignes);
+  }
+  return tableaux;
+}
+
+// Reconnaît les composantes d'un document existant (ex. une étude
+// antérieure du même bâtiment) pour amorcer l'inventaire d'un dossier
+// précis. Contrairement au gabarit de rapport, qui trie du texte déjà
+// écrit, on demande ici au modèle de repérer des lignes de composantes
+// dans un tableau — ça reste un classement, donc la réflexion reste
+// désactivée pour ne pas répéter l'échec de sectionsDepuisTexte.
+async function composantesDepuisDocument(apiKey, { tableaux, paragraphes }) {
+  if (!apiKey) {
+    return { items: [], note: "Aucune clé API n'est configurée : impossible d'extraire les composantes automatiquement." };
+  }
+  let corpus;
+  if (tableaux.length > 0) {
+    // Le plus grand tableau du document est presque toujours celui des
+    // composantes ; les petits tableaux (page de garde, résumé financier)
+    // n'ont pas assez de lignes pour rivaliser.
+    const plusGrand = tableaux.reduce((a, b) => (b.length > a.length ? b : a));
+    corpus = plusGrand.map((ligne) => ligne.join(" | ")).join("\n");
+  } else {
+    corpus = paragraphes.join("\n");
+  }
+  corpus = corpus.slice(0, 60000);
+  const prompt = `Voici un extrait d'un document d'étude de fonds de prévoyance pour un
+immeuble résidentiel québécois — probablement le tableau des composantes
+(Uniformat II) d'une étude antérieure de CE bâtiment.
+
+Catégories valides (utilise exactement ces clés) :
+${Object.entries(CATEGORIES).map(([k, v]) => `${v.ordre}. ${k} — ${v.label}`).join("\n")}
+
+Extrait CHAQUE ligne qui décrit une composante réelle du bâtiment (ignore les
+en-têtes de colonnes, les titres de section, les totaux et les lignes vides).
+Ne complète PAS la liste avec des composantes typiques absentes du texte : si
+le document n'en mentionne que 12, réponds 12 lignes.
+
+Réponds UNIQUEMENT par une liste, UNE COMPOSANTE PAR LIGNE, au format exact :
+
+categorie|nom|code Uniformat|durée de vie|quantité
+
+Exemple de ligne : enveloppe|Surface de toit principal, solins|B30.10-40|35|—
+
+Mets un tiret « - » pour tout champ absent du document plutôt que d'inventer
+une valeur. Aucun en-tête, aucune numérotation, aucun commentaire.
+
+TEXTE :
+${corpus}`;
+  try {
+    const texte = await callClaude(apiKey, { content: prompt, maxTokens: 12000, thinking: { type: "disabled" } });
+    const items = parseLignesChecklist(texte);
+    return { items, note: items.length === 0 ? `aucune composante reconnue dans ce document (${texte.length} caractères reçus)` : null };
+  } catch (e) {
+    return { items: [], note: `l'extraction a échoué (${e && e.message})` };
+  }
+}
+
 // Répartit le texte importé sur les sections du rapport. Le modèle trie ; il ne
 // réécrit pas : c'est le texte de la firme qui doit ressortir, pas une
 // paraphrase.
@@ -44212,6 +44286,59 @@ dossiers.get("/:id/components", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
+});
+dossiers.post("/:id/components/import", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 20 * 1024 * 1024) return c.json({ error: "document trop volumineux (max 20 Mo)" }, 413);
+  let xml;
+  try {
+    xml = await lireDocx(buffer);
+  } catch (e) {
+    return c.json({ error: `lecture du .docx impossible : ${e.message}` }, 400);
+  }
+  const tableaux = tableauxDocx(xml);
+  const paragraphes = paragraphesDocx(xml);
+  if (tableaux.length === 0 && paragraphes.length === 0) {
+    return c.json({ error: "aucun texte trouvé dans ce document" }, 400);
+  }
+
+  const { items, note } = await composantesDepuisDocument(c.env.ANTHROPIC_API_KEY, { tableaux, paragraphes });
+  if (items.length === 0) {
+    return c.json({ ok: false, composantes_importees: 0, note: note || "aucune composante reconnue dans ce document." });
+  }
+
+  // On ajoute à la suite de l'inventaire existant plutôt que de l'écraser :
+  // un dossier peut déjà avoir des composantes documentées sur le terrain.
+  const depart = await c.env.DB.prepare(
+    "SELECT COALESCE(MAX(sort_order), -1) AS m FROM components WHERE dossier_id = ?1"
+  ).bind(dossier.id).first();
+  const base = (depart?.m ?? -1) + 1;
+  const stmt = c.env.DB.prepare(
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)`
+  );
+  await c.env.DB.batch(
+    items.map((item, i) => stmt.bind(
+      newId("cmp"),
+      dossier.id,
+      CATEGORIES[item.cat] ? item.cat : "equipements",
+      item.name,
+      item.qty ?? "—",
+      base + i,
+      item.vu ?? DEFAULT_USEFUL_LIFE_YEARS[item.cat] ?? ALLOCATION_USEFUL_LIFE,
+      item.code ?? null
+    ))
+  );
+  return c.json({
+    ok: true,
+    composantes_importees: items.length,
+    note,
+    stats: await dossierStats(c.env.DB, dossier.id)
+  });
 });
 async function buildReportContext(c) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));

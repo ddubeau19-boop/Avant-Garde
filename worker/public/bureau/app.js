@@ -186,6 +186,9 @@ const state = {
   expanded: {},            // id de composante -> panneau de détail ouvert
   batiment: {},            // contenu de dossiers.batiment_info (lecture seule ici)
   batimentOpen: false,
+  composantesImportUploading: false,
+  composantesImportError: null,
+  composantesImportNote: null,
 
   reviewIdx: 0,
   reviewPhotos: [],
@@ -331,7 +334,10 @@ async function apiRaw(path, opts) {
 }
 async function apiJson(path, opts) {
   opts = opts || {};
-  const headers = authHeaders(Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {}));
+  const isForm = opts.body instanceof FormData;
+  const headers = isForm
+    ? authHeaders(opts.headers || {})
+    : authHeaders(Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {}));
   const res = await fetch(path, Object.assign({}, opts, { headers }));
   if (res.status === 401) {
     handleUnauthorized();
@@ -752,6 +758,34 @@ async function loadDossierDetail(id) {
     state.revisionError = e.message || 'Impossible de charger ce dossier.';
     render();
   }
+}
+
+async function uploadComposantesImport(file) {
+  if (!file || state.composantesImportUploading || !state.dossierId) return;
+  state.composantesImportUploading = true;
+  state.composantesImportError = null;
+  state.composantesImportNote = null;
+  render();
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await apiJson(`/api/dossiers/${state.dossierId}/components/import`, { method: 'POST', body: fd });
+    state.composantesImportNote = res.note
+      || `${res.composantes_importees} composante${res.composantes_importees > 1 ? 's' : ''} ajoutée${res.composantes_importees > 1 ? 's' : ''} à l'inventaire. Relisez-les avant de confirmer.`;
+    // On recharge juste le dossier et ses composantes, sans repasser par
+    // revisionLoading : un plein écran de chargement effacerait la note
+    // qu'on vient d'afficher.
+    const [dossier, components] = await Promise.all([
+      apiJson(`/api/dossiers/${state.dossierId}`),
+      apiJson(`/api/dossiers/${state.dossierId}/components`)
+    ]);
+    state.dossier = dossier;
+    state.components = Array.isArray(components) ? components : [];
+  } catch (e) {
+    state.composantesImportError = e.message || "L'import du document a échoué.";
+  }
+  state.composantesImportUploading = false;
+  render();
 }
 
 async function refreshProjection() {
@@ -1900,7 +1934,10 @@ function renderRevision() {
         <span class="lbl">Composantes · ${docCount}/${total} documentées</span>
         <div class="rule"></div>
         <span class="hint">Édition directe des cellules</span>
+        <label class="btn-pill-sm">${state.composantesImportUploading ? 'Lecture du document…' : 'Importer un .docx'}<input type="file" accept=".docx" data-role="composantes-import-file" style="display:none" ${state.composantesImportUploading ? 'disabled' : ''}></label>
       </div>
+      ${state.composantesImportError ? errorBanner(state.composantesImportError) : ''}
+      ${state.composantesImportNote ? `<div class="temp-pass-warn" style="margin-bottom:14px"><i data-lucide="info"></i><span>${escapeHtml(state.composantesImportNote)}</span></div>` : ''}
 
       <div class="comp-table">
         <div class="comp-grid comp-thead">
@@ -2194,6 +2231,15 @@ function initEvents() {
       state.prixForm[champ] = t.type === 'checkbox' ? t.checked : t.value;
       // L'unité commande la présence du champ quantité : elle seule redessine.
       if (champ === 'unite') render();
+    }
+  });
+
+  app.addEventListener('change', (e) => {
+    const t = e.target;
+    if (t && t.matches && t.matches('[data-role="composantes-import-file"]')) {
+      const f = t.files && t.files[0];
+      t.value = '';
+      if (f) uploadComposantesImport(f);
     }
   });
 
