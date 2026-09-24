@@ -2932,7 +2932,7 @@ auth.get("/me", async (c) => {
 // Envoi par l'API Resend. Secrets du worker :
 //   RESEND_API_KEY  clé Resend (wrangler secret put RESEND_API_KEY)
 //   MAIL_FROM       expéditeur, sur un domaine vérifié dans Resend
-//                   (défaut : « Condo Stratégis <noreply@stratege.io> »)
+//                   (défaut : « Condo Stratégis <noreply@stratege.me> »)
 //   APP_URL         adresse publique de l'app (défaut : https://pga.stratege.io)
 // ============================================================================
 const RESET_TTL_MS = 60 * 60 * 1e3;
@@ -2960,7 +2960,7 @@ async function sendResetMail(env, user, link) {
     method: "POST",
     headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      from: env.MAIL_FROM || "Condo Stratégis <noreply@stratege.io>",
+      from: env.MAIL_FROM || "Condo Stratégis <noreply@stratege.me>",
       to: [user.email],
       subject: "Réinitialisation de votre mot de passe",
       text: `Bonjour ${user.name},
