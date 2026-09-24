@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="fr-CA">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Mot de passe oublié — Condo Stratégis</title>
+<link rel="icon" href="../assets/logo-mark.png">
+<link rel="stylesheet" href="../shared/tokens.css">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px 16px; background: var(--ink-050); font-family: var(--font-body); color: var(--ink); }
+  .card { width: 100%; max-width: 400px; background: var(--paper); border-radius: 18px; padding: 30px 26px; box-shadow: var(--shadow-lg); }
+  .brand { display: flex; align-items: center; gap: 9px; margin-bottom: 26px; font-family: var(--font-display); font-weight: 800; font-size: 15px; text-transform: uppercase; letter-spacing: -.01em; }
+  .brand img { width: 18px; height: 40px; object-fit: contain; }
+  .brand b { color: var(--orange); }
+  h1 { font-family: var(--font-display); font-weight: 900; font-size: 26px; line-height: 1.05; letter-spacing: -.02em; text-transform: uppercase; margin: 0 0 10px; }
+  p { font-size: 14px; line-height: 1.55; color: var(--ink-600); margin: 0 0 20px; }
+  label { display: block; font-family: var(--font-mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-500); margin: 0 0 6px; }
+  input { width: 100%; font: inherit; font-size: 15px; padding: 12px 14px; border: 1.5px solid var(--ink-200, #ddd); border-radius: 10px; margin-bottom: 16px; outline: none; }
+  input:focus { border-color: var(--orange); }
+  button { width: 100%; border: none; border-radius: 999px; background: var(--orange); color: #fff; font: inherit; font-weight: 700; font-size: 15px; padding: 14px; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  .msg { font-size: 13.5px; line-height: 1.5; border-radius: 10px; padding: 11px 13px; margin-bottom: 16px; }
+  .msg.err { background: var(--orange-wash); color: #B8341A; }
+  .msg.ok { background: var(--green-wash, #E6F2EB); color: var(--green, #1F8A4E); }
+  .links { margin-top: 20px; font-size: 13px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .links a { color: var(--ink-600); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="brand"><img src="../assets/logo-mark.png" alt=""><span>Condo Strat<b>é</b>gis</span></div>
+
+    <!-- Étape 1 : demander le lien -->
+    <form id="demande" hidden novalidate>
+      <h1>Mot de passe oublié</h1>
+      <p>Entrez le courriel de votre compte. Si un compte y correspond, vous recevrez un lien pour choisir un nouveau mot de passe.</p>
+      <div class="msg" id="demandeMsg" hidden></div>
+      <label for="email">Courriel</label>
+      <input id="email" type="email" autocomplete="username" required placeholder="prenom.nom@condostrategis.ca">
+      <button type="submit">Envoyer le lien</button>
+    </form>
+
+    <!-- Étape 2 : choisir le nouveau mot de passe (lien reçu par courriel) -->
+    <form id="nouveau" hidden novalidate>
+      <h1>Nouveau mot de passe</h1>
+      <p>Au moins 8 caractères.</p>
+      <div class="msg" id="nouveauMsg" hidden></div>
+      <label for="pw1">Nouveau mot de passe</label>
+      <input id="pw1" type="password" autocomplete="new-password" required minlength="8">
+      <label for="pw2">Confirmer</label>
+      <input id="pw2" type="password" autocomplete="new-password" required minlength="8">
+      <button type="submit">Enregistrer</button>
+    </form>
+
+    <div class="links">
+      <a href="/terrain/">Inspection terrain</a>
+      <a href="/bureau/">Console bureau</a>
+    </div>
+  </main>
+
+<script>
+(function () {
+  var jeton = new URLSearchParams(location.search).get('jeton');
+  var demande = document.getElementById('demande');
+  var nouveau = document.getElementById('nouveau');
+
+  function show(el, kind, text) {
+    el.className = 'msg ' + kind;
+    el.textContent = text;
+    el.hidden = false;
+  }
+
+  async function post(path, body) {
+    var res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    var data = null;
+    try { data = await res.json(); } catch (e) {}
+    if (!res.ok) throw new Error((data && data.error) || ('Erreur (' + res.status + ')'));
+    return data || {};
+  }
+
+  if (!jeton) {
+    demande.hidden = false;
+    var q = new URLSearchParams(location.search).get('courriel');
+    if (q) document.getElementById('email').value = q;
+    demande.addEventListener('submit', async function (e) {
+      e.preventDefault();
+      var msg = document.getElementById('demandeMsg');
+      var email = document.getElementById('email').value.trim();
+      if (!email) { show(msg, 'err', 'Entrez votre courriel.'); return; }
+      var btn = demande.querySelector('button');
+      btn.disabled = true; btn.textContent = 'Envoi…';
+      try {
+        await post('/api/auth/forgot', { email: email });
+        show(msg, 'ok', 'Si un compte correspond à ' + email + ', un courriel vient d’être envoyé. Vérifiez aussi vos indésirables. Le lien est valide une heure.');
+      } catch (err) {
+        show(msg, 'err', err.message);
+      } finally {
+        btn.disabled = false; btn.textContent = 'Envoyer le lien';
+      }
+    });
+    return;
+  }
+
+  nouveau.hidden = false;
+  nouveau.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    var msg = document.getElementById('nouveauMsg');
+    var p1 = document.getElementById('pw1').value, p2 = document.getElementById('pw2').value;
+    if (p1.length < 8) { show(msg, 'err', 'Le mot de passe doit compter au moins 8 caractères.'); return; }
+    if (p1 !== p2) { show(msg, 'err', 'Les deux mots de passe ne correspondent pas.'); return; }
+    var btn = nouveau.querySelector('button');
+    btn.disabled = true; btn.textContent = 'Enregistrement…';
+    try {
+      var data = await post('/api/auth/reset', { token: jeton, password: p1 });
+      history.replaceState(null, '', location.pathname);
+      nouveau.querySelectorAll('input, label, p').forEach(function (n) { n.hidden = true; });
+      btn.hidden = true;
+      show(msg, 'ok', 'Mot de passe changé. Vous pouvez maintenant vous connecter' + (data.email ? ' avec ' + data.email : '') + '.');
+    } catch (err) {
+      show(msg, 'err', err.message);
+      btn.disabled = false; btn.textContent = 'Enregistrer';
+    }
+  });
+})();
+</script>
+</body>
+</html>

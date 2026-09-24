@@ -2921,6 +2921,99 @@ auth.get("/me", async (c) => {
   if (!user) return c.json({ error: "non authentifié" }, 401);
   return c.json(await publicUser(c.env.DB, user));
 });
+// ============================================================================
+// MOT DE PASSE OUBLIÉ
+// ----------------------------------------------------------------------------
+// Lien par courriel, valide une heure. Le jeton n'est stocké nulle part : il est
+// signé (SESSION_SECRET) sur l'identifiant, l'échéance et l'empreinte actuelle
+// du mot de passe. Dès que le mot de passe change, l'empreinte change et le
+// lien devient caduc : il ne sert qu'une fois, sans table ni migration.
+//
+// Envoi par l'API Resend. Secrets du worker :
+//   RESEND_API_KEY  clé Resend (wrangler secret put RESEND_API_KEY)
+//   MAIL_FROM       expéditeur, sur un domaine vérifié dans Resend
+//                   (défaut : « Condo Stratégis <noreply@stratege.io> »)
+//   APP_URL         adresse publique de l'app (défaut : https://pga.stratege.io)
+// ============================================================================
+const RESET_TTL_MS = 60 * 60 * 1e3;
+const PASSWORD_MIN_LENGTH = 8;
+async function createResetToken(user, secret) {
+  const expiresAt = Date.now() + RESET_TTL_MS;
+  const sig = await hmac(secret, `reset:${user.id}.${expiresAt}.${user.password_hash}`);
+  return `${user.id}.${expiresAt}.${sig}`;
+}
+async function verifyResetToken(db, token, secret) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 3) return null;
+  const [userId, expiresAt, sig] = parts;
+  if (!(Date.now() <= Number(expiresAt))) return null;
+  const user = await db.prepare("SELECT * FROM users WHERE id = ?1").bind(userId).first();
+  if (!user) return null;
+  const expected = await hmac(secret, `reset:${user.id}.${expiresAt}.${user.password_hash}`);
+  return expected === sig ? user : null;
+}
+function escapeMailHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
+}
+async function sendResetMail(env, user, link) {
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from: env.MAIL_FROM || "Condo Stratégis <noreply@stratege.io>",
+      to: [user.email],
+      subject: "Réinitialisation de votre mot de passe",
+      text: `Bonjour ${user.name},
+
+Pour choisir un nouveau mot de passe, ouvrez ce lien (valide une heure) :
+${link}
+
+Si vous n'avez rien demandé, ignorez ce courriel : votre mot de passe reste inchangé.
+
+Condo Stratégis`,
+      html: `<p>Bonjour ${escapeMailHtml(user.name)},</p>
+<p>Pour choisir un nouveau mot de passe, cliquez sur ce lien (valide une heure) :</p>
+<p><a href="${escapeMailHtml(link)}">Choisir un nouveau mot de passe</a></p>
+<p>Si vous n'avez rien demandé, ignorez ce courriel : votre mot de passe reste inchangé.</p>
+<p>Condo Stratégis</p>`
+    })
+  });
+  if (!res.ok) throw new Error(`Resend ${res.status}: ${(await res.text()).slice(0, 300)}`);
+}
+auth.post("/forgot", async (c) => {
+  if (!c.env.RESEND_API_KEY) {
+    return c.json({ error: "L'envoi de courriels n'est pas encore configuré. Contactez l'administrateur de la plateforme." }, 503);
+  }
+  const body2 = await c.req.json().catch(() => ({}));
+  const email = body2.email?.trim().toLowerCase();
+  if (!email) return c.json({ error: "courriel requis" }, 400);
+  const user = await c.env.DB.prepare("SELECT * FROM users WHERE email = ?1").bind(email).first();
+  // Même réponse que le compte existe ou non : la page ne doit pas permettre
+  // de deviner quelles adresses ont un compte.
+  if (user) {
+    const token = await createResetToken(user, c.env.SESSION_SECRET);
+    const base = (c.env.APP_URL || "https://pga.stratege.io").replace(/\/+$/, "");
+    try {
+      await sendResetMail(c.env, user, `${base}/reinitialiser/?jeton=${encodeURIComponent(token)}`);
+    } catch (e) {
+      console.error("mot de passe oublié : envoi échoué", e);
+      return c.json({ error: "Le courriel n'a pas pu être envoyé. Réessayez dans quelques minutes." }, 502);
+    }
+  }
+  return c.json({ ok: true });
+});
+auth.post("/reset", async (c) => {
+  const body2 = await c.req.json().catch(() => ({}));
+  const password = String(body2.password ?? "");
+  if (password.length < PASSWORD_MIN_LENGTH) {
+    return c.json({ error: `Le mot de passe doit compter au moins ${PASSWORD_MIN_LENGTH} caractères.` }, 400);
+  }
+  const user = await verifyResetToken(c.env.DB, body2.token, c.env.SESSION_SECRET);
+  if (!user) return c.json({ error: "Ce lien n'est plus valide (expiré ou déjà utilisé). Faites une nouvelle demande." }, 400);
+  const { hash, salt } = await hashPassword(password);
+  await c.env.DB.prepare("UPDATE users SET password_hash = ?1, password_salt = ?2 WHERE id = ?3").bind(hash, salt, user.id).run();
+  return c.json({ ok: true, email: user.email });
+});
 async function getCurrentUser(c) {
   const authHeader = c.req.header("Authorization");
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;

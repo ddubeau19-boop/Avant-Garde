@@ -533,3 +533,5 @@ input, textarea { font-family: var(--font-body); }
 .ai-warn { margin-top: 12px; font-size: 12px; line-height: 1.45; color: var(--orange); font-weight: 600; }
 
 .mic-btn + .note-fallback { margin-top: 10px; }
+
+.login-forgot { display: block; text-align: center; margin-top: 16px; font-size: 13px; color: var(--ink-500); }

@@ -1350,6 +1350,7 @@ function loginHtml() {
           ${state.loginLoading ? `<i data-lucide="loader-2" class="spin" style="width:17px;height:17px"></i>Connexion…` : `<i data-lucide="log-in" style="width:17px;height:17px"></i>Se connecter`}
         </button>
       </form>
+      <a class="login-forgot" href="/reinitialiser/">Mot de passe oublié ?</a>
     </div>
   </div>`;
 }

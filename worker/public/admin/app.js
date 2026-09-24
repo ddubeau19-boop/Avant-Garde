@@ -623,6 +623,7 @@ function renderLogin() {
         <label class="field-label" for="login-password">Mot de passe</label>
         <div class="field-box"><i data-lucide="lock"></i><input id="login-password" data-role="login-password" name="password" type="password" autocomplete="current-password" placeholder="Mot de passe" value="${escapeHtml(state.loginPassword || '')}" required></div>
         <button type="submit" class="btn-primary" style="width:100%" ${state.loginLoading ? 'disabled' : ''}>${state.loginLoading ? 'Connexion…' : 'Se connecter'}<i data-lucide="${state.loginLoading ? 'loader-2' : 'arrow-right'}" class="${state.loginLoading ? 'spin' : ''}"></i></button>
+        <a class="login-forgot" href="/reinitialiser/">Mot de passe oublié ?</a>
       </form>
     </div>
   </div>`;
