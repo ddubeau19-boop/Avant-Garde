@@ -1,0 +1,64 @@
+// Application Android « Inspection terrain » : une Trusted Web Activity qui
+// ouvre https://pga.stratege.io/terrain/ dans Chrome, en plein écran.
+// Le site reste la seule source du code : une mise à jour déployée sur le
+// worker arrive dans l'app sans republier d'APK. Le hors-ligne est assuré par
+// le service worker et le stockage local du site (worker/public/terrain/).
+//
+// Signature : variables d'environnement (voir android/README.md)
+//   TERRAIN_KEYSTORE           chemin du fichier .jks
+//   TERRAIN_KEYSTORE_PASSWORD  mot de passe (magasin et clé)
+//   TERRAIN_KEY_ALIAS          alias de la clé (défaut : terrain)
+
+plugins {
+    id 'com.android.application'
+}
+
+def host = 'pga.stratege.io'
+def launchUrl = "https://${host}/terrain/"
+def keystorePath = System.getenv('TERRAIN_KEYSTORE')
+
+android {
+    namespace 'io.stratege.pga.terrain'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'io.stratege.pga.terrain'
+        minSdk 21
+        targetSdk 35
+        versionCode((System.getenv('TERRAIN_VERSION_CODE') ?: '1') as int)
+        versionName System.getenv('TERRAIN_VERSION_NAME') ?: '1.0.0'
+
+        resValue 'string', 'app_name', 'Terrain'
+        resValue 'string', 'launch_url', launchUrl
+        resValue 'string', 'host_name', host
+        resValue 'string', 'asset_statements',
+            "[{\\\"relation\\\": [\\\"delegate_permission/common.handle_all_urls\\\"], \\\"target\\\": {\\\"namespace\\\": \\\"web\\\", \\\"site\\\": \\\"https://${host}\\\"}}]"
+    }
+
+    signingConfigs {
+        release {
+            if (keystorePath) {
+                storeFile file(keystorePath)
+                storePassword System.getenv('TERRAIN_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('TERRAIN_KEY_ALIAS') ?: 'terrain'
+                keyPassword System.getenv('TERRAIN_KEYSTORE_PASSWORD')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (keystorePath) signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'com.google.androidbrowserhelper:androidbrowserhelper:2.5.0'
+}

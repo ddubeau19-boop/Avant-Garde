@@ -1,0 +1,56 @@
+name: APK Android
+
+# Construit l'APK de l'app terrain (Trusted Web Activity, dossier android/)
+# et le publie comme artefact téléchargeable depuis l'onglet Actions.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Construire l'APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      # Avec les secrets : APK de production signé avec la clé déclarée dans
+      # assetlinks.json (plein écran). Sans eux : APK debug, installable mais
+      # affiché avec la barre d'adresse.
+      - name: Construire
+        working-directory: android
+        env:
+          KEYSTORE_B64: ${{ secrets.TERRAIN_KEYSTORE_BASE64 }}
+          TERRAIN_KEYSTORE_PASSWORD: ${{ secrets.TERRAIN_KEYSTORE_PASSWORD }}
+          TERRAIN_VERSION_CODE: ${{ github.run_number }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/terrain.jks"
+            export TERRAIN_KEYSTORE="$RUNNER_TEMP/terrain.jks"
+            gradle assembleRelease
+            mkdir -p out && cp app/build/outputs/apk/release/app-release.apk out/terrain.apk
+          else
+            echo "::warning::Secrets de signature absents : APK debug (barre d'adresse visible)."
+            gradle assembleDebug
+            mkdir -p out && cp app/build/outputs/apk/debug/app-debug.apk out/terrain-debug.apk
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terrain-apk
+          path: android/out/*.apk

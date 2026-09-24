@@ -7,6 +7,17 @@
 //   facettes optionnelles (position de façade, emplacement, variante de matériau),
 //   attributs typés libres, et l'année anticipée de remplacement dérivée de
 //   « année de construction ou réparation + durée de vie utile ».
+//
+// Hors ligne : toute saisie est d'abord écrite sur l'appareil (offline.js), puis
+// envoyée au serveur dans l'ordre dès qu'il répond. Les lectures retombent sur la
+// dernière copie connue. Une visite peut donc se faire entièrement sans réseau,
+// une fois le dossier ouvert au moins une fois avec du signal.
+
+import {
+  kvGet, kvSet, blobGet, blobSet, blobDelete,
+  outboxAdd, outboxAll, outboxDelete, outboxClear,
+  requestPersistence, compressPhoto,
+} from './offline.js';
 
 const TOKEN_KEY = 'cs_terrain_token';
 
@@ -171,6 +182,11 @@ const state = {
   projectionLoading: false,
   downloadingDocx: false,
   downloadingXlsx: false,
+
+  pendingOps: [],        // copie mémoire de la file d'envoi (outbox)
+  syncing: false,
+  fromCache: false,      // données affichées issues de la copie locale
+  aiAvailable: null,     // null = inconnu ; false = clé IA absente côté serveur
 };
 
 try { state.token = localStorage.getItem(TOKEN_KEY) || null; } catch (e) { state.token = null; }
@@ -203,17 +219,27 @@ function toInt(v) {
   return isNaN(n) ? null : n;
 }
 
+// Le toast vit hors de #app : l'afficher ne redessine pas l'écran, donc ne
+// coupe jamais une saisie en cours.
 let toastTimer = null;
+let toastEl = null;
 function showToast(msg) {
-  state.toast = msg;
-  render();
+  if (!toastEl) {
+    toastEl = document.createElement('div');
+    toastEl.className = 'toast';
+    toastEl.setAttribute('role', 'status');
+    document.body.appendChild(toastEl);
+  }
+  toastEl.textContent = msg;
+  toastEl.style.display = '';
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { state.toast = null; render(); }, 2600);
+  toastTimer = setTimeout(() => { toastEl.style.display = 'none'; }, 2600);
 }
 
 function friendlyError(e) {
   if (!e) return 'Une erreur est survenue.';
   if (e.message === 'OFFLINE') return 'Vous êtes hors connexion.';
+  if (e.name === 'AbortError') return 'Le serveur met trop de temps à répondre.';
   if (e.message === 'SESSION_EXPIRED') return 'Votre session a expiré.';
   return e.message || 'Une erreur est survenue.';
 }
@@ -232,51 +258,323 @@ function setSaveStatus(id, txt) {
    API layer
    ============================================================ */
 
+// Une erreur « retry » est passagère (réseau, serveur indisponible) : la lecture
+// retombe sur la copie locale, l'écriture reste dans la file et sera renvoyée.
+function retryableError(msg) {
+  const e = new Error(msg);
+  e.retry = true;
+  return e;
+}
+
 async function apiFetch(path, opts, config) {
   opts = opts || {};
   config = config || {};
   const auth = config.auth !== false;
-  if (!state.online) throw new Error('OFFLINE');
+  if (!state.online) throw retryableError('OFFLINE');
   const headers = Object.assign({}, opts.headers || {});
   if (auth && state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  // Sans délai maximal, un signal faible (sous-sol, cage d'escalier) laisse une
+  // requête pendante plusieurs minutes et bloque la file derrière elle.
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), config.timeout || 20000) : null;
   let res;
   try {
-    res = await fetch(path, Object.assign({}, opts, { headers }));
+    res = await fetch(path, Object.assign({}, opts, { headers }, ctrl ? { signal: ctrl.signal } : {}));
   } catch (e) {
-    throw new Error('Erreur réseau. Vérifiez votre connexion.');
+    throw retryableError('Erreur réseau. Vérifiez votre connexion.');
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   if (auth && res.status === 401) {
-    try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
-    state.token = null; state.user = null; state.dossier = null; state.dossiers = []; state.components = [];
-    state.screen = 'login';
-    state.loginError = 'Votre session a expiré. Reconnectez-vous.';
-    render();
+    sessionExpired();
     throw new Error('SESSION_EXPIRED');
   }
   return res;
 }
 
-async function apiJson(path, opts, config) {
-  const res = await apiFetch(path, opts, config);
+function sessionExpired() {
+  try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+  const n = state.pendingOps.length;
+  state.token = null; state.user = null; state.dossier = null; state.dossiers = []; state.components = [];
+  state.screen = 'login';
+  state.loginError = n
+    ? `Votre session a expiré. Reconnectez-vous : vos ${n} saisie${n > 1 ? 's' : ''} en attente seront envoyée${n > 1 ? 's' : ''} ensuite.`
+    : 'Votre session a expiré. Reconnectez-vous.';
+  render();
+}
+
+async function readError(res) {
   let data = null;
   try { data = await res.json(); } catch (e) {}
-  if (!res.ok) throw new Error((data && data.error) || `Erreur (${res.status})`);
-  return data;
+  const e = new Error((data && data.error) || `Erreur (${res.status})`);
+  e.status = res.status;
+  if (res.status >= 500 || res.status === 429) e.retry = true;
+  return e;
+}
+
+async function apiJson(path, opts, config) {
+  const res = await apiFetch(path, opts, config);
+  if (!res.ok) throw await readError(res);
+  try { return await res.json(); } catch (e) { return null; }
+}
+
+// Lecture avec repli : la réponse fraîche est mémorisée sur l'appareil ; sans
+// réseau, on sert la dernière copie connue.
+async function cachedJson(path, key) {
+  try {
+    const data = await apiJson(path);
+    kvSet(key, data);
+    return { data, fresh: true };
+  } catch (e) {
+    if (e.message === 'SESSION_EXPIRED' || !e.retry) throw e;
+    const cached = await kvGet(key);
+    if (cached === undefined) throw e;
+    return { data: cached, fresh: false };
+  }
 }
 
 async function loadCompanyLogo() {
   if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
   const co = state.user && state.user.company;
-  if (!co || !co.hasLogo) { render(); return; }
+  if (!co || !co.hasLogo) { softRender(); return; }
+  const key = `logo:${co.id}`;
   try {
-    const res = await apiFetch(`/api/companies/${co.id}/logo`);
-    if (!res.ok) throw new Error('logo indisponible');
-    const blob = await res.blob();
-    state.companyLogoUrl = URL.createObjectURL(blob);
+    let blob = null;
+    try {
+      const res = await apiFetch(`/api/companies/${co.id}/logo`);
+      if (res.ok) { blob = await res.blob(); blobSet(key, blob).catch(() => {}); }
+    } catch (e) {
+      if (e.message === 'SESSION_EXPIRED') return;
+    }
+    if (!blob) blob = await blobGet(key);
+    state.companyLogoUrl = blob ? URL.createObjectURL(blob) : null;
   } catch (e) {
     state.companyLogoUrl = null;
   }
-  render();
+  softRender();
+}
+
+async function checkHealth() {
+  if (!state.online) return;
+  try {
+    const res = await fetch('/api/health', { cache: 'no-store' });
+    const data = await res.json();
+    if (data && typeof data.ai === 'boolean') {
+      state.aiAvailable = data.ai;
+      kvSet('aiAvailable', data.ai);
+      softRender();
+    }
+  } catch (e) { /* sans réseau : on garde la dernière valeur connue */ }
+}
+
+/* ============================================================
+   File d'envoi (outbox)
+   ============================================================ */
+
+// Types d'opérations :
+//   patchComponent { compId, dossierId, patch }
+//   patchDossier   { dossierId, patch }
+//   photo          { compId, dossierId, localId }   — blob dans le magasin « blobs »
+//   note           { compId, dossierId, transcript } — mise en forme IA à l'envoi
+
+let flushing = false;
+let flushTimer = null;
+
+function enqueue(op) {
+  op.createdAt = Date.now();
+  const rec = Object.assign({}, op);
+  state.pendingOps.push(op);
+  op._stored = outboxAdd(rec)
+    .then(seq => { op.seq = seq; })
+    .catch(() => {
+      state.error = "Impossible d'écrire sur l'appareil (stockage plein ou bloqué). La saisie sera tentée directement.";
+      softRender();
+    });
+  op._stored.then(() => scheduleFlush(250));
+  updateSyncUi();
+}
+
+function scheduleFlush(ms) {
+  clearTimeout(flushTimer);
+  flushTimer = setTimeout(flush, ms);
+}
+
+async function flush() {
+  if (flushing || !state.token || !state.pendingOps.length || !state.online) { updateSyncUi(); return; }
+  flushing = true; state.syncing = true; updateSyncUi();
+  let retryLater = false;
+  try {
+    while (state.pendingOps.length && state.token) {
+      const op = state.pendingOps[0];
+      if (op._stored) await op._stored;
+      try {
+        await sendOp(op);
+      } catch (e) {
+        if (e.message === 'SESSION_EXPIRED') break;
+        if (e.retry) { retryLater = true; break; }
+        // Refus définitif (4xx) : on retire la saisie pour ne pas bloquer la file.
+        state.error = `Une saisie a été refusée par le serveur et retirée de la file : ${friendlyError(e)}`;
+        softRender();
+      }
+      state.pendingOps.shift();
+      if (op.seq != null) await outboxDelete(op.seq).catch(() => {});
+      updateSyncUi();
+    }
+  } finally {
+    flushing = false; state.syncing = false; updateSyncUi();
+    if (retryLater) scheduleFlush(20000);
+  }
+}
+
+function laterKeys(op, kind, id) {
+  const keys = new Set();
+  for (const o of state.pendingOps) {
+    if (o === op || o.type !== kind) continue;
+    if ((kind === 'patchComponent' ? o.compId : o.dossierId) !== id) continue;
+    Object.keys(o.patch || {}).forEach(k => keys.add(k));
+  }
+  return keys;
+}
+
+// Reprend du serveur la valeur normalisée des champs envoyés, sauf ceux qu'une
+// saisie plus récente, encore en file, va de toute façon remplacer.
+function pickSent(row, op, kind, id) {
+  const later = laterKeys(op, kind, id);
+  const out = {};
+  for (const k of Object.keys(op.patch || {})) {
+    if (later.has(k)) continue;
+    out[k] = row && k in row ? row[k] : op.patch[k];
+  }
+  return out;
+}
+
+async function updateCachedComponent(dossierId, compId, fn) {
+  if (dossierId) {
+    const list = await kvGet(`components:${dossierId}`);
+    if (Array.isArray(list)) {
+      const i = list.findIndex(c => c.id === compId);
+      if (i >= 0) {
+        const e = Object.assign({}, list[i]);
+        fn(e, 'list');
+        list[i] = e;
+        await kvSet(`components:${dossierId}`, list);
+      }
+    }
+  }
+  const det = await kvGet(`component:${compId}`);
+  if (det) {
+    const e = Object.assign({}, det);
+    fn(e, 'detail');
+    await kvSet(`component:${compId}`, e);
+  }
+}
+
+function hasPendingFor(compId) {
+  return state.pendingOps.some(o => o.compId === compId);
+}
+
+async function sendOp(op) {
+  if (op.type === 'patchComponent') {
+    const row = await apiJson(`/api/components/${op.compId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(op.patch),
+    });
+    applyComponentPatch(op.compId, pickSent(row, op, 'patchComponent', op.compId));
+    if (row) {
+      await updateCachedComponent(op.dossierId, op.compId, (e) => {
+        const photos = e.photos;
+        Object.assign(e, row);
+        e.photos = photos;
+      });
+    }
+    if (state.activeId === op.compId && state.pendingOps.filter(o => o.compId === op.compId).length <= 1) {
+      setSaveStatus('ficheStatus', 'Enregistré');
+    }
+    return;
+  }
+
+  if (op.type === 'patchDossier') {
+    const row = await apiJson(`/api/dossiers/${op.dossierId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(op.patch),
+    });
+    if (state.dossier && state.dossier.id === op.dossierId) {
+      state.dossier = Object.assign({}, state.dossier, pickSent(row, op, 'patchDossier', op.dossierId), row && row.stats ? { stats: row.stats } : {});
+      if (state.pendingOps.filter(o => o.type === 'patchDossier').length <= 1) setSaveStatus('immStatus', 'Enregistré');
+    }
+    if (row) await kvSet(`dossier:${op.dossierId}`, row);
+    return;
+  }
+
+  if (op.type === 'photo') {
+    const blob = await blobGet(op.localId);
+    if (!blob) return; // photo perdue sur l'appareil : rien à envoyer
+    const fd = new FormData();
+    fd.append('file', blob, 'photo.jpg');
+    const res = await apiFetch(`/api/components/${op.compId}/photos`, { method: 'POST', body: fd }, { timeout: 120000 });
+    if (!res.ok) throw await readError(res);
+    const photo = await res.json();
+    await blobSet(`photo:${photo.id}`, blob).catch(() => {});
+    await blobDelete(op.localId).catch(() => {});
+    if (state.photoBlobUrls[op.localId]) state.photoBlobUrls[photo.id] = state.photoBlobUrls[op.localId];
+    if (state.activeComponent && state.activeComponent.id === op.compId) {
+      state.activeComponent = Object.assign({}, state.activeComponent, {
+        photos: (state.activeComponent.photos || []).map(p => (p.id === op.localId ? photo : p)),
+      });
+    }
+    await updateCachedComponent(op.dossierId, op.compId, (e, kind) => {
+      if (kind === 'list') e.photos = (typeof e.photos === 'number' ? e.photos : 0) + 1;
+      else e.photos = (Array.isArray(e.photos) ? e.photos : []).concat([photo]);
+    });
+    softRender();
+    return;
+  }
+
+  if (op.type === 'note') {
+    const data = await apiJson(`/api/components/${op.compId}/structure-note`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transcript: op.transcript }),
+    }, { timeout: 60000 });
+    const note = data && data.note != null ? data.note : op.transcript;
+    const newer = state.pendingOps.some(o => o !== op && o.type === 'note' && o.compId === op.compId);
+    if (!newer) applyComponentPatch(op.compId, { note });
+    await updateCachedComponent(op.dossierId, op.compId, (e) => { e.note = note; });
+    softRender();
+  }
+}
+
+// Applique à une donnée serveur les saisies encore en file, pour qu'une
+// réouverture hors ligne montre l'état réel de la visite.
+function overlayComponent(c) {
+  if (!c) return c;
+  const ops = state.pendingOps.filter(o => o.compId === c.id);
+  if (!ops.length) return c;
+  const out = Object.assign({}, c);
+  let extra = 0;
+  for (const op of ops) {
+    if (op.type === 'patchComponent') Object.assign(out, op.patch);
+    else if (op.type === 'note') out.note = op.transcript;
+    else if (op.type === 'photo') {
+      extra++;
+      if (Array.isArray(out.photos) && !out.photos.some(p => p.id === op.localId)) {
+        out.photos = out.photos.concat([{ id: op.localId, local: true, tag: 'En attente' }]);
+      }
+    }
+  }
+  if (typeof out.photos === 'number') out.photos += extra;
+  return out;
+}
+
+function overlayDossier(d) {
+  if (!d) return d;
+  let out = d;
+  for (const op of state.pendingOps) {
+    if (op.type === 'patchDossier' && op.dossierId === d.id) out = Object.assign({}, out, op.patch);
+  }
+  return out;
 }
 
 /* ============================================================
@@ -284,15 +582,26 @@ async function loadCompanyLogo() {
    ============================================================ */
 
 async function boot() {
+  requestPersistence();
+  state.pendingOps = await outboxAll();
+  const ai = await kvGet('aiAvailable');
+  if (typeof ai === 'boolean') state.aiAvailable = ai;
+  checkHealth();
   if (state.token) {
     state.screen = 'loading';
     render();
     try {
-      state.user = await apiJson('/api/auth/me');
+      const { data } = await cachedJson('/api/auth/me', 'me');
+      state.user = data;
       loadCompanyLogo();
       await loadDossiers();
+      flush();
     } catch (e) {
-      if (e.message !== 'SESSION_EXPIRED') { state.screen = 'login'; render(); }
+      if (e.message !== 'SESSION_EXPIRED') {
+        state.screen = 'login';
+        state.loginError = e.retry ? 'Hors connexion : connectez-vous une première fois avec du réseau.' : friendlyError(e);
+        render();
+      }
     }
   } else {
     state.screen = 'login';
@@ -311,7 +620,9 @@ async function doLogin(email, password) {
     }, { auth: false });
     state.token = data.token; state.user = data.user;
     try { localStorage.setItem(TOKEN_KEY, data.token); } catch (e) {}
+    kvSet('me', data.user);
     loadCompanyLogo();
+    flush();
     await loadDossiers();
   } catch (e) {
     state.loginError = friendlyError(e);
@@ -322,12 +633,15 @@ async function doLogin(email, password) {
 }
 
 function logout() {
+  const n = state.pendingOps.length;
+  if (n && !window.confirm(`${n} saisie${n > 1 ? 's' : ''} n'${n > 1 ? 'ont' : 'a'} pas encore été envoyée${n > 1 ? 's' : ''} au serveur et ${n > 1 ? 'seront perdues' : 'sera perdue'} si vous vous déconnectez. Se déconnecter quand même ?`)) return;
   try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+  outboxClear();
   if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
   Object.assign(state, {
     token: null, user: null, dossier: null, dossiers: [], components: [],
     activeComponent: null, activeId: null, projection: null, error: null,
-    batiment: {}, naChosen: {}, loginError: null, screen: 'login',
+    batiment: {}, naChosen: {}, loginError: null, screen: 'login', pendingOps: [],
   });
   render();
 }
@@ -335,8 +649,9 @@ function logout() {
 async function loadDossiers() {
   state.screen = 'loading'; state.error = null; render();
   try {
-    const dossiers = await apiJson('/api/dossiers');
+    const { data: dossiers, fresh } = await cachedJson('/api/dossiers', 'dossiers');
     state.dossiers = dossiers;
+    state.fromCache = !fresh;
     if (dossiers.length === 1) {
       await selectDossier(dossiers[0].id);
       return;
@@ -364,35 +679,50 @@ function parseJsonObject(raw) {
 async function selectDossier(id) {
   state.screen = 'loading'; render();
   try {
-    const [dossier, components] = await Promise.all([
-      apiJson(`/api/dossiers/${id}`),
-      apiJson(`/api/dossiers/${id}/components`),
+    const [d, comps] = await Promise.all([
+      cachedJson(`/api/dossiers/${id}`, `dossier:${id}`),
+      cachedJson(`/api/dossiers/${id}/components`, `components:${id}`),
     ]);
-    state.dossier = dossier;
-    state.components = components;
-    state.batiment = parseJsonObject(dossier.batiment_info);
+    state.dossier = overlayDossier(d.data);
+    state.components = (comps.data || []).map(overlayComponent);
+    state.fromCache = !(d.fresh && comps.fresh);
+    state.batiment = parseJsonObject(state.dossier.batiment_info);
     state.naChosen = {};
     state.filter = 'all'; state.search = '';
     state.screen = 'accueil';
     render();
     loadProjection(id);
+    if (comps.fresh) prefetchComponents(comps.data || []);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') {
-      state.error = friendlyError(e);
+      state.error = e.retry ? "Ce dossier n'a jamais été ouvert sur cet appareil : ouvrez-le une première fois avec du réseau." : friendlyError(e);
       state.screen = 'dossiers';
       render();
     }
   }
 }
 
+// Avec du réseau, on télécharge d'avance chaque fiche du dossier : une fiche
+// ouverte plus tard au sous-sol, sans signal, s'affichera quand même.
+async function prefetchComponents(list) {
+  const queue = list.map(c => c.id);
+  const worker = async () => {
+    while (queue.length && state.online) {
+      const id = queue.shift();
+      try { kvSet(`component:${id}`, await apiJson(`/api/components/${id}`)); } catch (e) { if (e.message === 'SESSION_EXPIRED') return; }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+}
+
 async function loadProjection(id) {
-  state.projectionLoading = true; render();
+  state.projectionLoading = true; softRender();
   try {
-    state.projection = await apiJson(`/api/dossiers/${id}/projection`);
+    state.projection = (await cachedJson(`/api/dossiers/${id}/projection`, `projection:${id}`)).data;
   } catch (e) {
     state.projection = null;
   } finally {
-    state.projectionLoading = false; render();
+    state.projectionLoading = false; softRender();
   }
 }
 
@@ -406,28 +736,42 @@ async function openFiche(id) {
   state.ficheLoading = true; state.activeComponent = null; state.error = null;
   state.attrKeyDraft = ''; state.attrValDraft = ''; state.facetsOpen = false;
   render();
+  let comp;
   try {
-    const comp = await apiJson(`/api/components/${id}`);
-    state.activeComponent = comp;
-    state.facetsOpen = !!(comp.position || comp.emplacement || comp.variante);
-    state.ficheLoading = false;
-    render();
-    loadPhotoBlobs(comp.photos || []);
+    comp = (await cachedJson(`/api/components/${id}`, `component:${id}`)).data;
   } catch (e) {
-    state.ficheLoading = false;
-    if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
+    if (e.message === 'SESSION_EXPIRED') return;
+    const base = state.components.find(c => c.id === id);
+    if (!e.retry || !base) {
+      state.ficheLoading = false; state.error = friendlyError(e); render();
+      return;
+    }
+    // Fiche jamais téléchargée : on part de la ligne de la liste.
+    comp = Object.assign({}, base, { photos: [] });
   }
+  if (state.activeId !== id) return;
+  comp = overlayComponent(comp);
+  state.activeComponent = comp;
+  state.facetsOpen = !!(comp.position || comp.emplacement || comp.variante);
+  state.ficheLoading = false;
+  render();
+  loadPhotoBlobs(comp.photos || []);
 }
 
 async function loadPhotoBlobs(photos) {
   for (const p of photos) {
     if (state.photoBlobUrls[p.id]) continue;
     try {
-      const res = await apiFetch(`/api/photos/${p.id}/file`);
-      if (!res.ok) continue;
-      const blob = await res.blob();
+      let blob = await blobGet(p.local ? p.id : `photo:${p.id}`);
+      if (!blob && !p.local && state.online) {
+        const res = await apiFetch(`/api/photos/${p.id}/file`);
+        if (!res.ok) continue;
+        blob = await res.blob();
+        blobSet(`photo:${p.id}`, blob).catch(() => {});
+      }
+      if (!blob) continue;
       state.photoBlobUrls[p.id] = URL.createObjectURL(blob);
-      render();
+      softRender();
     } catch (e) { /* ignore individual photo failures */ }
   }
 }
@@ -439,28 +783,9 @@ function applyComponentPatch(id, patch) {
   state.components = state.components.map(c => (c.id === id ? Object.assign({}, c, patch) : c));
 }
 
-async function patchComponent(id, patch) {
-  try {
-    const res = await apiFetch(`/api/components/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    });
-    let data = null;
-    try { data = await res.json(); } catch (e) {}
-    if (!res.ok) throw new Error((data && data.error) || `Erreur (${res.status})`);
-    const merged = Object.assign({}, patch, (data && typeof data === 'object') ? data : {});
-    applyComponentPatch(id, merged);
-    return merged;
-  } catch (e) {
-    if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
-    throw e;
-  }
-}
-
 // Enregistrement d'un champ de composante. Applique la valeur localement de façon
 // synchrone (pour qu'un re-rendu déclenché entre-temps ne perde pas la saisie),
-// puis pousse le PATCH.
+// l'inscrit dans la file d'envoi de l'appareil, puis la file part au serveur.
 function saveCompField(field, value, opts) {
   const id = state.activeId;
   if (!id || !state.activeComponent) return false;
@@ -468,13 +793,10 @@ function saveCompField(field, value, opts) {
   const cur = state.activeComponent[field];
   const same = (cur == null ? '' : String(cur)) === (value == null ? '' : String(value));
   if (same && !force) return false;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return false; }
   const patch = {}; patch[field] = value;
   applyComponentPatch(id, patch);
-  setSaveStatus('ficheStatus', 'Enregistrement…');
-  patchComponent(id, patch)
-    .then(() => setSaveStatus('ficheStatus', 'Enregistré'))
-    .catch(() => setSaveStatus('ficheStatus', ''));
+  enqueue({ type: 'patchComponent', compId: id, dossierId: state.dossier && state.dossier.id, patch });
+  setSaveStatus('ficheStatus', state.online ? 'Enregistrement…' : 'Sur l’appareil');
   return true;
 }
 
@@ -561,44 +883,55 @@ function onAttrValueBlur(key, e) {
 /* ---------- photos ---------- */
 
 function triggerPhotoInput() {
-  if (!state.online) { showToast('Hors connexion : ajout de photo indisponible.'); return; }
   const input = document.getElementById('photoFileInput');
   if (input) input.click();
 }
 
+function localId() {
+  const rnd = (window.crypto && crypto.randomUUID) ? crypto.randomUUID().replace(/-/g, '') : (Date.now().toString(16) + Math.random().toString(16).slice(2));
+  return 'loc_' + rnd;
+}
+
+// La photo est réduite, écrite sur l'appareil, puis mise en file : elle
+// s'affiche tout de suite et part au serveur dès qu'il y a du réseau.
 async function onPhotoFileChange(e) {
   const file = e.target.files && e.target.files[0];
   e.target.value = '';
   if (!file || !state.activeId) return;
+  const compId = state.activeId;
   state.uploadingPhoto = true; state.error = null; render();
   try {
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await apiFetch(`/api/components/${state.activeId}/photos`, { method: 'POST', body: fd });
-    let data = null;
-    try { data = await res.json(); } catch (e2) {}
-    if (!res.ok) throw new Error((data && data.error) || 'Le téléversement de la photo a échoué.');
-    if (state.activeComponent) {
-      state.activeComponent = Object.assign({}, state.activeComponent, { photos: (state.activeComponent.photos || []).concat([data]) });
+    const blob = await compressPhoto(file);
+    const id = localId();
+    await blobSet(id, blob);
+    state.photoBlobUrls[id] = URL.createObjectURL(blob);
+    const entry = { id, local: true, tag: 'En attente' };
+    if (state.activeComponent && state.activeComponent.id === compId) {
+      state.activeComponent = Object.assign({}, state.activeComponent, { photos: (state.activeComponent.photos || []).concat([entry]) });
     }
-    state.components = state.components.map(c => (c.id === state.activeId ? Object.assign({}, c, { photos: (c.photos || 0) + 1 }) : c));
-    state.uploadingPhoto = false;
-    render();
-    loadPhotoBlobs([data]);
+    state.components = state.components.map(c => (c.id === compId ? Object.assign({}, c, { photos: (typeof c.photos === 'number' ? c.photos : 0) + 1 }) : c));
+    enqueue({ type: 'photo', compId, dossierId: state.dossier && state.dossier.id, localId: id });
   } catch (e2) {
-    state.uploadingPhoto = false;
-    if (e2.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e2); render(); }
+    state.error = "La photo n'a pas pu être enregistrée sur l'appareil (stockage plein ?).";
   }
+  state.uploadingPhoto = false;
+  render();
 }
 
 /* ---------- AI analyze ---------- */
 
 async function analyze() {
   if (state.analyzing || !state.activeId) return;
-  if (!state.online) { showToast('Analyse indisponible hors connexion.'); return; }
+  if (!state.online) { showToast("Analyse IA indisponible hors connexion : elle sera possible au retour du réseau."); return; }
+  const waiting = state.pendingOps.filter(o => o.type === 'photo' && o.compId === state.activeId).length;
+  if (waiting) {
+    showToast(`${waiting} photo${waiting > 1 ? 's' : ''} encore en envoi — réessayez dans un instant.`);
+    flush();
+    return;
+  }
   state.analyzing = true; state.error = null; render();
   try {
-    const result = await apiJson(`/api/components/${state.activeId}/analyze`, { method: 'POST' });
+    const result = await apiJson(`/api/components/${state.activeId}/analyze`, { method: 'POST' }, { timeout: 90000 });
     state.aiResult = result;
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') state.error = friendlyError(e);
@@ -616,9 +949,8 @@ function parseCostEstimate(v) {
   return isNaN(n) ? null : Math.round(n);
 }
 
-async function applyAi() {
+function applyAi() {
   if (!state.aiResult || !state.activeId) return;
-  if (!state.online) { showToast('Hors connexion : impossible d’appliquer les valeurs.'); return; }
   const r = state.aiResult;
   const patch = {};
   if (typeof r.rating === 'number' && r.rating >= 1 && r.rating <= 4) patch.rating = r.rating;
@@ -629,9 +961,9 @@ async function applyAi() {
   if (typeof r.costEstimate === 'number' && !isNaN(r.costEstimate)) patch.replacement_cost = Math.round(r.costEstimate);
   if (!Object.keys(patch).length) { state.aiResult = null; showToast('Rien à appliquer.'); return; }
   applyComponentPatch(state.activeId, patch);
+  enqueue({ type: 'patchComponent', compId: state.activeId, dossierId: state.dossier && state.dossier.id, patch });
   state.aiResult = null;
   render();
-  try { await patchComponent(state.activeId, patch); } catch (e) { /* error already surfaced */ }
 }
 
 /* ---------- voice note ---------- */
@@ -644,7 +976,7 @@ function toggleVoice() {
     if (recognition) { try { recognition.stop(); } catch (e) {} }
     return;
   }
-  if (!state.online) { showToast('Micro indisponible hors connexion.'); return; }
+  if (!state.online) { showToast('Dictée indisponible hors connexion : utilisez le micro du clavier dans le champ ci-dessous.'); return; }
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   recognition = new SR();
   recognition.lang = 'fr-CA';
@@ -654,51 +986,46 @@ function toggleVoice() {
   recognition.onresult = (e) => {
     for (let i = 0; i < e.results.length; i++) transcript += e.results[i][0].transcript + ' ';
   };
-  recognition.onerror = () => {
+  recognition.onerror = (e) => {
     state.recording = false;
-    state.error = 'La reconnaissance vocale a échoué. Réessayez.';
+    state.error = (e && e.error === 'not-allowed')
+      ? "Accès au micro refusé. Autorisez-le dans les réglages, ou dictez avec le micro du clavier dans le champ texte."
+      : 'La reconnaissance vocale a échoué. Réessayez, ou dictez avec le micro du clavier dans le champ texte.';
     render();
   };
   recognition.onend = () => {
     state.recording = false; render();
     const t = transcript.trim();
-    if (t) submitTranscript(t);
+    if (t) { submitTranscript(t); render(); }
   };
   state.recording = true; state.error = null; render();
   try { recognition.start(); } catch (e) { state.recording = false; render(); }
 }
 
-async function submitTranscript(transcript) {
-  try {
-    const data = await apiJson(`/api/components/${state.activeId}/structure-note`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcript }),
-    });
-    applyComponentPatch(state.activeId, { note: data.note });
-  } catch (e) {
-    if (e.message !== 'SESSION_EXPIRED') state.error = friendlyError(e);
-  }
-  render();
+// La note brute est gardée telle quelle sur l'appareil ; le serveur la met en
+// forme (IA) au moment de l'envoi.
+function submitTranscript(transcript) {
+  const compId = state.activeId;
+  if (!compId) return;
+  applyComponentPatch(compId, { note: transcript });
+  enqueue({ type: 'note', compId, dossierId: state.dossier && state.dossier.id, transcript });
 }
 
 function onNoteFallbackSend() {
   const val = (state.noteDraft || '').trim();
   if (!val) return;
-  if (!state.online) { showToast('Hors connexion : impossible d’envoyer la note.'); return; }
   state.noteDraft = '';
-  render();
   submitTranscript(val);
+  render();
 }
 
-async function saveFiche() {
+function saveFiche() {
   if (!state.activeId) return;
-  if (!state.online) { showToast('Hors connexion : impossible d’enregistrer.'); return; }
   const id = state.activeId;
   applyComponentPatch(id, { done: 1 });
+  enqueue({ type: 'patchComponent', compId: id, dossierId: state.dossier && state.dossier.id, patch: { done: 1 } });
   state.screen = 'liste';
   render();
-  try { await patchComponent(id, { done: 1 }); } catch (e) { /* error already surfaced */ }
 }
 
 /* ============================================================
@@ -719,23 +1046,15 @@ function immSetLocal(sec, key, val) {
   if (!Object.keys(state.batiment[sec]).length) delete state.batiment[sec];
 }
 
-async function saveBatiment() {
+function saveDossierPatch(patch) {
   if (!state.dossier) return;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
-  setSaveStatus('immStatus', 'Enregistrement…');
-  try {
-    const payload = JSON.stringify(state.batiment || {});
-    const data = await apiJson(`/api/dossiers/${state.dossier.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ batiment_info: payload }),
-    });
-    if (data && typeof data === 'object') state.dossier = Object.assign({}, state.dossier, data);
-    setSaveStatus('immStatus', 'Enregistré');
-  } catch (e) {
-    if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
-    setSaveStatus('immStatus', '');
-  }
+  state.dossier = Object.assign({}, state.dossier, patch);
+  enqueue({ type: 'patchDossier', dossierId: state.dossier.id, patch });
+  setSaveStatus('immStatus', state.online ? 'Enregistrement…' : 'Sur l’appareil');
+}
+
+function saveBatiment() {
+  saveDossierPatch({ batiment_info: JSON.stringify(state.batiment || {}) });
 }
 
 function onImmChoice(sec, key, val) {
@@ -752,23 +1071,9 @@ function onImmTextBlur(sec, key, e) {
   saveBatiment();
 }
 
-async function saveDossierField(field, value) {
-  if (!state.dossier) return;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
-  setSaveStatus('immStatus', 'Enregistrement…');
-  try {
-    const patch = {}; patch[field] = value;
-    const data = await apiJson(`/api/dossiers/${state.dossier.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    });
-    state.dossier = Object.assign({}, state.dossier, patch, (data && typeof data === 'object') ? data : {});
-    setSaveStatus('immStatus', 'Enregistré');
-  } catch (e) {
-    if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
-    setSaveStatus('immStatus', '');
-  }
+function saveDossierField(field, value) {
+  const patch = {}; patch[field] = value;
+  saveDossierPatch(patch);
 }
 
 function onDossierNumberBlur(field, e) {
@@ -906,10 +1211,16 @@ function computeDecades(projection) {
 async function downloadReport(kind) {
   if (!state.dossier) return;
   if (!state.online) { showToast('Téléchargement indisponible hors connexion.'); return; }
+  // Le rapport est produit par le serveur : des saisies encore en file n'y
+  // figureraient pas. On vide la file d'abord.
+  if (state.pendingOps.length) {
+    await flush();
+    if (state.pendingOps.length) { showToast('Des saisies sont encore en attente d’envoi : réessayez dans un instant.'); return; }
+  }
   const key = kind === 'docx' ? 'downloadingDocx' : 'downloadingXlsx';
   state[key] = true; state.error = null; render();
   try {
-    const res = await apiFetch(`/api/dossiers/${state.dossier.id}/report.${kind}`);
+    const res = await apiFetch(`/api/dossiers/${state.dossier.id}/report.${kind}`, {}, { timeout: 180000 });
     if (!res.ok) throw new Error("Le rapport n'est pas disponible pour le moment.");
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
@@ -958,9 +1269,42 @@ function render() {
   }
 }
 
+// Re-rendu déclenché en arrière-plan (envoi terminé, photo chargée, réseau
+// revenu…) : si l'utilisateur est en train d'écrire, on attend qu'il quitte le
+// champ, sinon le texte pas encore enregistré serait effacé par le re-rendu.
+let deferredRender = false;
+function isTyping() {
+  const a = document.activeElement;
+  return !!(a && root.contains(a) && (a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' && a.type !== 'file')));
+}
+function softRender() {
+  if (isTyping()) { deferredRender = true; updateSyncUi(); return; }
+  deferredRender = false;
+  render();
+}
+
 function screenHtml() {
-  if (state.screen === 'login') return loginHtml() + toastHtml();
-  return `<div class="app-shell">${offlineBarHtml()}${errorBannerHtml()}${bodyForScreen()}</div>${toastHtml()}`;
+  if (state.screen === 'login') return loginHtml();
+  return `<div class="app-shell">${offlineBarHtml()}<div id="syncBar">${syncBarInner()}</div>${errorBannerHtml()}${bodyForScreen()}</div>`;
+}
+
+function syncBarInner() {
+  const n = state.pendingOps.length;
+  if (!n) return '';
+  const photos = state.pendingOps.filter(o => o.type === 'photo').length;
+  const label = `${n} saisie${n > 1 ? 's' : ''} en attente d’envoi${photos ? ` · dont ${photos} photo${photos > 1 ? 's' : ''}` : ''}`;
+  let action;
+  if (!state.online) action = `<span class="sync-now muted">Au retour du réseau</span>`;
+  else if (state.syncing) action = `<span class="sync-now muted">Envoi…</span>`;
+  else action = `<button class="sync-now" data-action="sync-now">Envoyer</button>`;
+  return `<div class="sync-bar"><i data-lucide="${state.syncing ? 'loader-2' : 'cloud-upload'}" class="${state.syncing ? 'spin' : ''}"></i><span class="txt">${label}</span>${action}</div>`;
+}
+
+function updateSyncUi() {
+  const el = document.getElementById('syncBar');
+  if (!el) return;
+  el.innerHTML = syncBarInner();
+  if (window.lucide && el.querySelector('[data-lucide]')) window.lucide.createIcons();
 }
 
 function bodyForScreen() {
@@ -978,17 +1322,12 @@ function bodyForScreen() {
 
 function offlineBarHtml() {
   if (state.online) return '';
-  return `<div class="offline-bar"><i data-lucide="wifi-off"></i>Hors connexion — certaines actions sont indisponibles</div>`;
+  return `<div class="offline-bar"><i data-lucide="wifi-off"></i>Hors connexion — vos saisies restent sur l’appareil</div>`;
 }
 
 function errorBannerHtml() {
   if (!state.error) return '';
   return `<div class="error-banner"><i data-lucide="alert-triangle"></i><div class="msg">${esc(state.error)}</div><button data-action="dismiss-error" aria-label="Fermer"><i data-lucide="x" style="width:15px;height:15px"></i></button></div>`;
-}
-
-function toastHtml() {
-  if (!state.toast) return '';
-  return `<div class="toast">${esc(state.toast)}</div>`;
 }
 
 function loadingHtml() {
@@ -1082,6 +1421,7 @@ function accueilHtml() {
       <div class="stat-tile"><div class="num accent">${st.critical}</div><div class="lbl">À traiter</div></div>
       <div class="stat-tile"><div class="num">${st.todo}</div><div class="lbl">À faire</div></div>
     </div>
+    ${state.aiAvailable === false ? `<div class="warn-banner"><i data-lucide="alert-triangle"></i><div><b>IA non configurée sur le serveur.</b> L'analyse photo donnera seulement une estimation selon l'âge, et les notes ne seront pas reformulées.</div></div>` : ''}
     <button class="nav-card" data-action="go-immeuble">
       <div class="icon"><i data-lucide="clipboard-list"></i></div>
       <div class="mid">
@@ -1335,21 +1675,27 @@ function ficheHtml() {
 
   const photoThumbsHtml = photos.map(p => {
     const url = state.photoBlobUrls[p.id];
-    return `<div class="photo-thumb ${url ? '' : 'loading'}">${url ? `<img src="${url}" alt="">` : `<i data-lucide="loader-2"></i>`}${url ? `<div class="tag">${esc(p.tag || '')}</div>` : ''}</div>`;
+    const icon = state.online ? 'loader-2' : 'image-off';
+    return `<div class="photo-thumb ${url ? '' : 'loading'} ${p.local ? 'pending' : ''}">${url ? `<img src="${url}" alt="">` : `<i data-lucide="${icon}"></i>`}${url ? `<div class="tag">${esc(p.tag || '')}</div>` : ''}</div>`;
   }).join('');
 
   const aiCardHtml = state.aiResult ? aiResultHtml(state.aiResult, c) : '';
 
-  const micSection = state.speechSupported ? `
-    <button class="mic-btn ${state.recording ? 'rec' : ''}" data-action="toggle-voice" ${!state.online ? 'disabled' : ''}>
+  // Le champ texte est toujours là : la dictée du navigateur exige du réseau et
+  // n'existe pas partout (iPhone), alors que le micro du clavier fonctionne sur
+  // tous les téléphones, souvent même hors ligne.
+  const micBtn = state.speechSupported && state.online ? `
+    <button class="mic-btn ${state.recording ? 'rec' : ''}" data-action="toggle-voice">
       <i data-lucide="mic" class="${state.recording ? 'pulse' : ''}"></i>${state.recording ? 'Écoute… touchez pour arrêter' : 'Dicter une note'}
-    </button>` : `
+    </button>` : '';
+  const micSection = `${micBtn}
     <div class="note-fallback">
-      <textarea id="noteFallbackText" data-role="note-fallback-text" placeholder="Reconnaissance vocale indisponible sur cet appareil. Écrivez votre note ici…">${esc(state.noteDraft)}</textarea>
-      <button class="send" data-action="note-fallback-send" ${!state.online ? 'disabled' : ''}>Envoyer la note</button>
+      <textarea id="noteFallbackText" data-role="note-fallback-text" placeholder="Écrivez votre note, ou touchez le micro du clavier pour la dicter…">${esc(state.noteDraft)}</textarea>
+      <button class="send" data-action="note-fallback-send">Enregistrer la note</button>
     </div>`;
 
-  const noteCard = c.note ? `<div class="note-card"><div class="note-card-hdr"><i data-lucide="sparkles"></i><span>Note structurée</span></div><div class="note-card-body">${esc(c.note)}</div></div>` : '';
+  const notePending = state.pendingOps.some(o => o.type === 'note' && o.compId === c.id);
+  const noteCard = c.note ? `<div class="note-card"><div class="note-card-hdr"><i data-lucide="${notePending ? 'clock' : 'sparkles'}"></i><span>${notePending ? 'Note — mise en forme au retour du réseau' : 'Note structurée'}</span></div><div class="note-card-body">${esc(c.note)}</div></div>` : '';
 
   const delaiChips = DELAIS.map(d => `<button class="quick-chip ${c.delai_suggere === d ? 'on' : ''}" data-action="pick-delai" data-val="${esc(d)}">${esc(d)}</button>`).join('');
 
@@ -1374,8 +1720,8 @@ function ficheHtml() {
     <div class="fiche-body">
       <div class="section-lbl">Photos (${photos.length})</div>
       <div class="photo-strip scr">
-        <button class="photo-add ${state.uploadingPhoto ? 'uploading' : ''}" data-action="add-photo" ${!state.online ? 'disabled' : ''}>
-          <i data-lucide="${state.uploadingPhoto ? 'loader-2' : 'camera'}"></i><span>${state.uploadingPhoto ? 'Envoi…' : 'Photo'}</span>
+        <button class="photo-add ${state.uploadingPhoto ? 'uploading' : ''}" data-action="add-photo" ${state.uploadingPhoto ? 'disabled' : ''}>
+          <i data-lucide="${state.uploadingPhoto ? 'loader-2' : 'camera'}"></i><span>${state.uploadingPhoto ? 'Préparation…' : 'Photo'}</span>
         </button>
         ${photoThumbsHtml}
       </div>
@@ -1445,7 +1791,7 @@ function ficheHtml() {
       ${noteCard}
     </div>
     <div class="fiche-bottom">
-      <button class="btn-cta" data-action="save-fiche" ${!state.online ? 'disabled' : ''}><i data-lucide="check"></i>Enregistrer &amp; suivante</button>
+      <button class="btn-cta" data-action="save-fiche"><i data-lucide="check"></i>Enregistrer &amp; suivante</button>
     </div>
   </div>`;
 }
@@ -1468,6 +1814,7 @@ function aiResultHtml(r, c) {
       ${line('Délai suggéré', r.delaiSuggere)}
       ${line('Conséquences', r.consequences)}
       ${line('Coût de remplacement', cost)}
+      ${r.source === 'heuristique' ? `<div class="ai-warn">IA indisponible : cote estimée d'après l'âge et la durée de vie seulement. Vérifiez sur place.</div>` : ''}
       ${r.source ? `<div class="ai-source">Source : ${esc(r.source)}</div>` : ''}
       <button class="btn-apply" data-action="apply-ai">Appliquer ces valeurs</button>
     </div>
@@ -1587,6 +1934,7 @@ function onRootClick(e) {
     case 'generate-reports': generateReports(); break;
     case 'dismiss-error': state.error = null; render(); break;
     case 'logout': logout(); break;
+    case 'sync-now': flush(); break;
   }
 }
 
@@ -1629,6 +1977,13 @@ function onRootFocusout(e) {
   if (t.matches('[data-role="dossier-number"]')) { onDossierNumberBlur(t.dataset.field, e); return; }
 }
 
+// Après chaque sortie de champ : effectue un re-rendu mis en attente pendant la
+// saisie (une fois le champ enregistré, plus rien à perdre).
+function onRootFocusoutAfter() {
+  if (!deferredRender) return;
+  setTimeout(() => { if (deferredRender && !isTyping()) { deferredRender = false; render(); } }, 0);
+}
+
 function onRootSubmit(e) {
   if (e.target && e.target.id === 'loginForm') {
     e.preventDefault();
@@ -1642,9 +1997,27 @@ root.addEventListener('click', onRootClick);
 root.addEventListener('input', onRootInput);
 root.addEventListener('change', onRootChange);
 root.addEventListener('focusout', onRootFocusout);
+root.addEventListener('focusout', onRootFocusoutAfter);
 root.addEventListener('submit', onRootSubmit);
 
-window.addEventListener('online', () => { state.online = true; render(); });
-window.addEventListener('offline', () => { state.online = false; showToast('Vous êtes hors connexion.'); render(); });
+window.addEventListener('online', () => {
+  state.online = true;
+  softRender();
+  checkHealth();
+  flush();
+});
+window.addEventListener('offline', () => {
+  state.online = false;
+  showToast('Hors connexion — vos saisies sont conservées sur l’appareil.');
+  softRender();
+});
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') flush(); });
+// Filet : navigator.onLine peut rester « vrai » sans que le serveur réponde
+// (signal faible). La file est retentée régulièrement tant qu'elle n'est pas vide.
+setInterval(() => { if (state.pendingOps.length) flush(); }, 30000);
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').catch(() => {});
+}
 
 boot();

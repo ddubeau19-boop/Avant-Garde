@@ -44259,7 +44259,29 @@ photos.get("/:id/file", async (c) => {
 globalThis.process = _process;
 globalThis.console = workerdConsole;
 const app = new Hono();
-app.get("/api/health", (c) => c.json({ ok: true }));
+// `ai` dit seulement si une clé est configurée (jamais la clé) : l'app terrain
+// prévient l'inspecteur avant la visite plutôt que de lui servir en silence
+// l'estimation par âge à la place de l'analyse photo.
+app.get("/api/health", (c) => c.json({ ok: true, ai: !!c.env.ANTHROPIC_API_KEY }));
+// Digital Asset Links : autorise l'APK Android (Trusted Web Activity, dossier
+// android/) à afficher /terrain/ en plein écran, sans barre d'adresse. Une
+// nouvelle clé de signature s'ajoute par la variable ANDROID_CERT_SHA256
+// (empreintes séparées par des virgules), sans toucher au code.
+const ANDROID_PACKAGE = "io.stratege.pga.terrain";
+const ANDROID_CERT_SHA256 = [
+  "51:F5:57:A5:A5:EE:57:6A:B5:61:8B:69:FA:74:85:FE:4E:06:7F:E0:8F:DD:25:63:EC:86:3D:0B:49:D1:51:49"
+];
+app.get("/.well-known/assetlinks.json", (c) => {
+  const extra = String(c.env.ANDROID_CERT_SHA256 ?? "").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+  return c.json([{
+    relation: ["delegate_permission/common.handle_all_urls"],
+    target: {
+      namespace: "android_app",
+      package_name: ANDROID_PACKAGE,
+      sha256_cert_fingerprints: [...new Set([...ANDROID_CERT_SHA256, ...extra])]
+    }
+  }]);
+});
 const PUBLIC_PREFIXES = ["/api/health", "/api/auth"];
 app.use("/api/*", async (c, next) => {
   if (PUBLIC_PREFIXES.some((p) => c.req.path === p || c.req.path.startsWith(p + "/"))) return next();

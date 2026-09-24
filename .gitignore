@@ -9,3 +9,11 @@ dist/
 
 # Systèmes de fichiers
 .DS_Store
+
+# Android (android/) : sorties de build et clés de signature
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.jks
+*.keystore

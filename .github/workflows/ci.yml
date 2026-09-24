@@ -44,7 +44,7 @@ jobs:
 
       - name: Syntaxe JavaScript
         run: |
-          for f in worker/src/index.js worker/public/*/app.js; do
+          for f in worker/src/index.js worker/public/*/*.js; do
             node --check "$f" && echo "ok  $f"
           done
 
