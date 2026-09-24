@@ -2929,11 +2929,12 @@ auth.get("/me", async (c) => {
 // du mot de passe. Dès que le mot de passe change, l'empreinte change et le
 // lien devient caduc : il ne sert qu'une fois, sans table ni migration.
 //
-// Envoi par l'API Resend. Secrets du worker :
-//   RESEND_API_KEY  clé Resend (wrangler secret put RESEND_API_KEY)
-//   MAIL_FROM       expéditeur, sur un domaine vérifié dans Resend
-//                   (défaut : « Condo Stratégis <noreply@stratege.me> »)
-//   APP_URL         adresse publique de l'app (défaut : https://pga.stratege.io)
+// Envoi par l'API SendGrid. Secrets du worker :
+//   SENDGRID_API_KEY  clé SendGrid, permission « Mail Send »
+//                     (wrangler secret put SENDGRID_API_KEY)
+//   MAIL_FROM         expéditeur, sur un domaine authentifié dans SendGrid
+//                     (défaut : « Condo Stratégis <noreply@stratege.me> »)
+//   APP_URL           adresse publique de l'app (défaut : https://pga.stratege.io)
 // ============================================================================
 const RESET_TTL_MS = 60 * 60 * 1e3;
 const PASSWORD_MIN_LENGTH = 8;
@@ -2955,33 +2956,45 @@ async function verifyResetToken(db, token, secret) {
 function escapeMailHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
 }
+// « Nom <adresse> » ou « adresse » → { email, name } attendu par SendGrid.
+function parseMailFrom(raw) {
+  const m = String(raw).match(/^\s*(.*?)\s*<([^>]+)>\s*$/);
+  return m ? { email: m[2].trim(), name: m[1].replace(/^"|"$/g, "") || void 0 } : { email: String(raw).trim() };
+}
 async function sendResetMail(env, user, link) {
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      from: env.MAIL_FROM || "Condo Stratégis <noreply@stratege.me>",
-      to: [user.email],
-      subject: "Réinitialisation de votre mot de passe",
-      text: `Bonjour ${user.name},
+  const text = `Bonjour ${user.name},
 
 Pour choisir un nouveau mot de passe, ouvrez ce lien (valide une heure) :
 ${link}
 
 Si vous n'avez rien demandé, ignorez ce courriel : votre mot de passe reste inchangé.
 
-Condo Stratégis`,
-      html: `<p>Bonjour ${escapeMailHtml(user.name)},</p>
+Condo Stratégis`;
+  const html = `<p>Bonjour ${escapeMailHtml(user.name)},</p>
 <p>Pour choisir un nouveau mot de passe, cliquez sur ce lien (valide une heure) :</p>
 <p><a href="${escapeMailHtml(link)}">Choisir un nouveau mot de passe</a></p>
 <p>Si vous n'avez rien demandé, ignorez ce courriel : votre mot de passe reste inchangé.</p>
-<p>Condo Stratégis</p>`
+<p>Condo Stratégis</p>`;
+  const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.SENDGRID_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      personalizations: [{ to: [{ email: user.email, name: user.name }] }],
+      from: parseMailFrom(env.MAIL_FROM || "Condo Stratégis <noreply@stratege.me>"),
+      subject: "Réinitialisation de votre mot de passe",
+      content: [
+        { type: "text/plain", value: text },
+        { type: "text/html", value: html }
+      ],
+      // Le lien doit arriver tel quel : le suivi des clics de SendGrid le
+      // réécrirait vers ses propres serveurs.
+      tracking_settings: { click_tracking: { enable: false, enable_text: false } }
     })
   });
-  if (!res.ok) throw new Error(`Resend ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  if (!res.ok) throw new Error(`SendGrid ${res.status}: ${(await res.text()).slice(0, 300)}`);
 }
 auth.post("/forgot", async (c) => {
-  if (!c.env.RESEND_API_KEY) {
+  if (!c.env.SENDGRID_API_KEY) {
     return c.json({ error: "L'envoi de courriels n'est pas encore configuré. Contactez l'administrateur de la plateforme." }, 503);
   }
   const body2 = await c.req.json().catch(() => ({}));
