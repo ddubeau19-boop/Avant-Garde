@@ -5808,18 +5808,23 @@ async function getOwnedComponent(c, id) {
   ).bind(id, user.company_id).first();
   return component ?? null;
 }
-components.get("/:id", async (c) => {
-  const component = await getOwnedComponent(c, c.req.param("id"));
-  if (!component) return c.json({ error: "composante introuvable" }, 404);
-  const photos2 = await c.env.DB.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY created_at ASC").bind(component.id).all();
+// Une composante telle que la fiche du terrain la montre : photos, guide,
+// tâches du carnet et, en révision, l'étude précédente.
+async function composanteComplete(db, component, biblio) {
+  const photos2 = await db.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY created_at ASC").bind(component.id).all();
   const guide = guidePour(component);
-  return c.json({
+  return {
     ...component,
     photos: photos2.results,
     guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats },
-    entretien: tachesPourComposante(component, { avecRetirees: true, biblio: await bibliothequeDuDossier(c.env.DB, component.dossier_id) }).map(tacheAffichee),
-    precedent: component.origine_id ? (await precedentsPour(c.env.DB, [component])).get(component.origine_id) ?? null : null
-  });
+    entretien: tachesPourComposante(component, { avecRetirees: true, biblio: biblio ?? await bibliothequeDuDossier(db, component.dossier_id) }).map(tacheAffichee),
+    precedent: component.origine_id ? (await precedentsPour(db, [component])).get(component.origine_id) ?? null : null
+  };
+}
+components.get("/:id", async (c) => {
+  const component = await getOwnedComponent(c, c.req.param("id"));
+  if (!component) return c.json({ error: "composante introuvable" }, 404);
+  return c.json(await composanteComplete(c.env.DB, component));
 });
 components.patch("/:id", async (c) => {
   const id = c.req.param("id");
@@ -47458,6 +47463,54 @@ dossiers.get("/:id/components", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
+});
+// Catalogue de la firme pour l'ajout sur le terrain : sa bibliothèque, ou la
+// liste de Condo Stratégis quand elle n'en a pas importé.
+dossiers.get("/:id/catalogue", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const liste = listeDeDepart(await bibliothequeDuDossier(c.env.DB, dossier.id));
+  return c.json(liste.map((item) => ({ cat: item.cat, name: item.name, vu: item.vu ?? null, code: item.code ?? null })));
+});
+// Composante trouvée sur place et absente de la liste. L'identifiant peut
+// venir de l'appareil : une création faite hors connexion et rejouée deux fois
+// (réponse perdue en route) ne crée qu'une composante.
+dossiers.post("/:id/components", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const name = String(body2.name ?? "").replace(/\s+/g, " ").trim();
+  if (!name) return c.json({ error: "le nom de la composante est requis" }, 400);
+  if (name.length > 200) return c.json({ error: "nom trop long (200 caractères au plus)" }, 400);
+  const idClient = String(body2.id ?? "");
+  if (idClient && !/^cmp_[a-f0-9]{20}$/.test(idClient)) return c.json({ error: "identifiant invalide" }, 400);
+  if (idClient) {
+    const existante = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(idClient).first();
+    if (existante) {
+      if (existante.dossier_id !== dossier.id) return c.json({ error: "identifiant déjà utilisé" }, 409);
+      return c.json(await composanteComplete(c.env.DB, existante));
+    }
+  }
+  // Une composante de la bibliothèque apporte sa vie utile, son code et son type.
+  const biblio = await bibliothequeDuDossier(c.env.DB, dossier.id);
+  const modele = listeDeDepart(biblio).find((item) => cleTexte(item.name) === cleTexte(name)) ?? null;
+  const cat = CATEGORIES[body2.cat] ? body2.cat : modele?.cat ?? "equipements";
+  const vuDemandee = Number(body2.useful_life_years);
+  const vu = Number.isInteger(vuDemandee) && vuDemandee > 0 && vuDemandee <= 150 ? vuDemandee
+    : modele?.vu ?? DEFAULT_USEFUL_LIFE_YEARS[cat] ?? ALLOCATION_USEFUL_LIFE;
+  const code = String(body2.uniformat_code ?? "").trim().slice(0, 40) || modele?.code || null;
+  const attributs = modele ? JSON.stringify({ type: modele.type, "unité": modele.unite }) : null;
+  const qty = String(body2.qty ?? "").trim().slice(0, 80) || "—";
+  const depart = await c.env.DB.prepare(
+    "SELECT COALESCE(MAX(sort_order), -1) AS m FROM components WHERE dossier_id = ?1"
+  ).bind(dossier.id).first();
+  const id = idClient || newId("cmp");
+  await c.env.DB.prepare(
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code, attributs, actif)
+     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, 1)`
+  ).bind(id, dossier.id, cat, name, qty, (depart?.m ?? -1) + 1, vu, code, attributs).run();
+  const creee = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
+  return c.json(await composanteComplete(c.env.DB, creee, biblio), 201);
 });
 // Toute la visite en un appel, pour la préparer hors connexion : chaque
 // composante avec ses photos, son guide et ses tâches du carnet, sous la

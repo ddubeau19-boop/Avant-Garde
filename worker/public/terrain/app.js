@@ -139,7 +139,7 @@ const IMM_ENTRETIENS = [
 const fmtCAD = new Intl.NumberFormat('fr-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
 
 const state = {
-  screen: 'loading', // loading | login | dossiers | accueil | immeuble | liste | fiche | synthese
+  screen: 'loading', // loading | login | dossiers | accueil | immeuble | liste | ajout | fiche | synthese
   token: null,
   user: null,
   online: navigator.onLine,
@@ -157,6 +157,8 @@ const state = {
   tacheForm: null,       // { x, f, q, mois: [] } — ajout d'une tâche au carnet
   components: [],        // composantes actives de la visite
   inactifs: [],          // composantes retirées de la visite, réactivables
+  catalogue: null,       // bibliothèque de la firme : [{ cat, name, vu, code }]
+  ajout: null,           // { q, cat, vu } — ajout d'une composante trouvée sur place
   filter: 'all',
   search: '',
 
@@ -421,6 +423,19 @@ function idAleatoire(prefixe, n, alphabet) {
 }
 const nouvelIdPhoto = () => idAleatoire('pho_', 20, '0123456789abcdef');
 const nouvelIdTache = () => idAleatoire('p_', 10, 'abcdefghijklmnopqrstuvwxyz0123456789');
+const nouvelIdComposante = () => idAleatoire('cmp_', 20, '0123456789abcdef');
+
+// Composantes créées sur l'appareil et pas encore reçues par le serveur.
+function creationEnAttente(id) {
+  return state.envois.find(o => o.kind === 'create-component' && o.id === id) || null;
+}
+function avecCreations(liste, dossierId) {
+  const connus = new Set(liste.map(c => c.id));
+  const nouvelles = state.envois
+    .filter(o => o.kind === 'create-component' && o.dossierId === dossierId && !connus.has(o.id))
+    .map(o => o.local);
+  return liste.concat(nouvelles);
+}
 
 // Copie locale d'une composante et de sa ligne dans la liste du dossier,
 // mises à jour avec ce que le serveur vient de confirmer.
@@ -474,12 +489,26 @@ async function envoyerPhoto(compId, photoId, blob, dossierId) {
 
 function descriptionEnvoi(op) {
   if (op.kind === 'photo') return 'Photo';
+  if (op.kind === 'create-component') return `Nouvelle composante « ${op.body.name} »`;
   if (op.kind === 'patch-dossier') return "Fiche d'immeuble";
   const c = state.components.concat(state.inactifs).find(x => x.id === op.id);
   return c ? c.name : 'Composante';
 }
 
 async function executerEnvoi(op) {
+  if (op.kind === 'create-component') {
+    const data = await apiJson(`/api/dossiers/${op.dossierId}/components`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(op.body),
+    }, { timeout: 20000 });
+    if (data) {
+      await HL.ecrire(`component:${op.id}`, data);
+      const c = state.activeComponent;
+      if (c && c.id === op.id) state.activeComponent = avecEnAttente(Object.assign({}, data, { photos: c.photos }));
+    }
+    return;
+  }
   if (op.kind === 'patch-component') {
     const data = await apiJson(`/api/components/${op.id}`, {
       method: 'PATCH',
@@ -579,7 +608,7 @@ async function rafraichirDossier() {
     if (!state.dossier || state.dossier.id !== id) return;
     state.dossier = dossierAvecEnAttente(dossier);
     state.batiment = parseJsonObject(state.dossier.batiment_info);
-    const tous = components.map(avecEnAttente);
+    const tous = avecCreations(components, id).map(avecEnAttente);
     state.components = tous.filter(c => c.actif !== 0);
     state.inactifs = tous.filter(c => c.actif === 0);
   } catch (e) { /* on garde l'affichage actuel */ }
@@ -764,13 +793,14 @@ async function selectDossier(id) {
       lireApi(`components:${id}`, `/api/dossiers/${id}/components`),
     ]);
     const dossier = dossierAvecEnAttente(dossierBrut);
-    const components = componentsBruts.map(avecEnAttente);
+    const components = avecCreations(componentsBruts, id).map(avecEnAttente);
     state.dossier = dossier;
     state.components = components.filter(c => c.actif !== 0);
     state.inactifs = components.filter(c => c.actif === 0);
     state.batiment = parseJsonObject(dossier.batiment_info);
     state.naChosen = {};
-    state.filter = 'all'; state.search = '';
+    state.filter = 'all'; state.search = ''; state.ajout = null;
+    chargerCatalogue(id);
     state.prepa = (await HL.lire(`prepa:${id}`)) || null;
     state.screen = 'accueil';
     render();
@@ -807,7 +837,10 @@ async function openFiche(id) {
   state.attrKeyDraft = ''; state.attrValDraft = ''; state.facetsOpen = false;
   render();
   try {
-    const comp = avecEnAttente(await lireApi(`component:${id}`, `/api/components/${id}`));
+    const enAttente = creationEnAttente(id);
+    const comp = avecEnAttente(enAttente
+      ? ((await HL.lire(`component:${id}`)) || enAttente.local)
+      : await lireApi(`component:${id}`, `/api/components/${id}`));
     state.activeComponent = comp;
     state.facetsOpen = !!(comp.position || comp.emplacement || comp.variante);
     state.ficheLoading = false;
@@ -900,6 +933,146 @@ async function setActif(id, actif) {
     state.screen = 'liste';
   }
   render();
+}
+
+/* ---------- Ajout d'une composante trouvée sur place ---------- */
+
+async function chargerCatalogue(id) {
+  try {
+    const liste = await lireApi(`catalogue:${id}`, `/api/dossiers/${id}/catalogue`);
+    if (state.dossier && state.dossier.id === id) { state.catalogue = liste; if (state.screen === 'ajout') renderSiPossible(); }
+  } catch (e) { /* l'ajout libre reste possible */ }
+}
+
+const sansAccents = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+function ouvrirAjout() {
+  state.ajout = { q: state.search || '', cat: '', vu: '', libre: false };
+  state.screen = 'ajout';
+  render();
+  const el = document.getElementById('ajoutSearch');
+  if (el) el.focus();
+}
+
+// Crée la composante et ouvre sa fiche. Sans réseau, elle existe tout de
+// suite sur l'appareil et part au serveur avec le reste de la file.
+async function creerComposante(modele) {
+  const d = state.dossier;
+  if (!d) return;
+  const name = String(modele.name || '').replace(/\s+/g, ' ').trim();
+  if (!name) { showToast('Donnez un nom à la composante.'); return; }
+  const cat = CATS[modele.cat] ? modele.cat : 'equipements';
+  const vu = toInt(modele.vu);
+  const id = nouvelIdComposante();
+  const body = { id, name, cat };
+  if (vu && vu > 0) body.useful_life_years = vu;
+  const ordre = state.components.concat(state.inactifs).reduce((m, c) => Math.max(m, c.sort_order || 0), -1) + 1;
+  const local = {
+    id, dossier_id: d.id, cat, name, qty: '—', done: 0, actif: 1, ai_suggested: 0, sort_order: ordre,
+    useful_life_years: vu || null, uniformat_code: modele.code || null, photos: [], entretien: [],
+    guide: { element: '', points: [], defauts: [], constats: [] },
+  };
+  let comp = null;
+  if (state.online && !state.envois.length) {
+    try {
+      comp = await apiJson(`/api/dossiers/${d.id}/components`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }, { timeout: 15000 });
+      HL.ecrire(`component:${id}`, comp);
+      const cle = `components:${d.id}`;
+      const liste = await HL.lire(cle);
+      if (Array.isArray(liste) && !liste.some(x => x.id === id)) {
+        const { guide, entretien, precedent, ...ligne } = comp;
+        HL.ecrire(cle, liste.concat([Object.assign(ligne, { photos: 0 })]));
+      }
+    } catch (e) {
+      if (!sansReseau(e)) {
+        if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
+        return;
+      }
+      state.reseauInstable = true;
+    }
+  }
+  if (!comp) {
+    await enfiler({ kind: 'create-component', id, dossierId: d.id, body, local });
+    await HL.ecrire(`component:${id}`, local);
+    comp = local;
+    synchroniser();
+  }
+  const { guide, entretien, precedent, ...ligne } = comp;
+  state.components = state.components.concat([Object.assign(ligne, { photos: Array.isArray(comp.photos) ? comp.photos.length : 0 })]);
+  state.ajout = null;
+  state.filter = 'all'; state.search = '';
+  showToast('Composante ajoutée à la visite');
+  openFiche(id);
+}
+
+async function reactiverEtOuvrir(id) {
+  await setActif(id, true);
+  if (state.inactifs.some(c => c.id === id)) return;
+  state.ajout = null;
+  openFiche(id);
+}
+
+function ajoutHtml() {
+  const a = state.ajout || { q: '', cat: '', vu: '' };
+  const q = sansAccents(a.q);
+  const trouve = (nom) => q.length >= 2 && q.split(' ').every(mot => sansAccents(nom).includes(mot));
+  const presents = new Set(state.components.concat(state.inactifs).map(c => sansAccents(c.name)));
+  const actives = state.components.filter(c => trouve(c.name)).slice(0, 5);
+  const inactives = state.inactifs.filter(c => trouve(c.name)).slice(0, 5);
+  const catalogue = (state.catalogue || [])
+    .map((item, i) => Object.assign({ i }, item))
+    .filter(item => trouve(item.name) && !presents.has(sansAccents(item.name)))
+    .slice(0, 12);
+  const ligne = (icone, nom, sous, bouton) => `
+    <div class="comp-row ajout-row">
+      <div class="comp-thumb" style="background:var(--ink-050);color:var(--ink-500)"><i data-lucide="${icone}"></i></div>
+      <div class="comp-mid"><div class="name">${esc(nom)}</div><div class="sub">${esc(sous)}</div></div>
+      <div class="comp-end">${bouton}</div>
+    </div>`;
+  const resultats = [
+    ...actives.map(c => ligne(catInfo(c.cat).icon, c.name, 'Déjà dans la visite',
+      `<button class="reactiver" data-action="open-fiche" data-id="${esc(c.id)}"><i data-lucide="chevron-right"></i>Ouvrir</button>`)),
+    ...inactives.map(c => ligne(catInfo(c.cat).icon, c.name, 'Désactivée pour cet immeuble',
+      `<button class="reactiver" data-action="ajout-reactiver" data-id="${esc(c.id)}"><i data-lucide="rotate-ccw"></i>Réactiver</button>`)),
+    ...catalogue.map(item => ligne(catInfo(item.cat).icon, item.name, `${catInfo(item.cat).pill}${item.vu ? ` · vie utile ${item.vu} ans` : ''}`,
+      `<button class="reactiver" data-action="ajout-catalogue" data-i="${item.i}"><i data-lucide="plus"></i>Ajouter</button>`)),
+  ].join('');
+  const nomLibre = a.q.replace(/\s+/g, ' ').trim();
+  const catChoisie = a.cat || '';
+  const replie = resultats && !a.libre;
+  const libre = nomLibre.length < 2 ? '' : replie
+    ? `<button class="btn-outline ajout-btn" data-action="ajout-ouvrir-libre"><i data-lucide="pencil"></i>Autre chose : créer « ${esc(nomLibre)} »</button>`
+    : `
+    <div class="card ajout-libre">
+      <div class="guide-lbl">Composante hors bibliothèque</div>
+      <div class="ajout-nom">« ${esc(nomLibre)} »</div>
+      <div class="guide-lbl">Catégorie</div>
+      <div class="quick-chips">${Object.keys(CATS).map(k => `<button class="quick-chip ${catChoisie === k ? 'on' : ''}" data-action="ajout-cat" data-val="${k}">${esc(CATS[k].pill)}</button>`).join('')}</div>
+      <div class="guide-lbl">Vie utile (années, facultatif)</div>
+      <input class="fld-input" id="ajoutVu" data-role="ajout-vu" inputmode="numeric" value="${esc(a.vu)}" placeholder="ex. 25">
+      <button class="btn-cta" data-action="ajout-libre" ${catChoisie ? '' : 'disabled'}><i data-lucide="plus"></i>Créer cette composante</button>
+      ${catChoisie ? '' : '<div class="attr-empty">Choisissez une catégorie.</div>'}
+    </div>`;
+  return `
+  <div class="scr-liste">
+    <div class="hdr">
+      <div class="hdr-row">
+        <button class="hdr-back" data-action="go-liste"><i data-lucide="chevron-left"></i>Composantes</button>
+      </div>
+      <h2>Ajouter une composante</h2>
+      <div class="search-box"><i data-lucide="search"></i><input id="ajoutSearch" data-role="ajout-q" placeholder="Ce que vous voyez — ex. génératrice" value="${esc(a.q)}" autocomplete="off"></div>
+    </div>
+    <div class="list-body">
+      ${q.length < 2
+        ? `<div class="empty-state">Tapez le nom de la composante trouvée sur place. La bibliothèque de votre firme est proposée d'abord${state.catalogue ? '' : ' (non disponible sur cet appareil pour l\'instant)'}.</div>`
+        : (resultats ? `<div class="grp"><div class="grp-hdr"><i data-lucide="library"></i><span class="lbl">Bibliothèque et visite</span><div class="rule"></div></div>${resultats}</div>` : `<div class="empty-state">Rien de semblable dans la bibliothèque.</div>`)}
+      ${libre}
+    </div>
+  </div>`;
 }
 
 // Enregistrement d'un champ de composante. Applique la valeur localement de façon
@@ -1505,6 +1678,7 @@ function bodyForScreen() {
     case 'accueil': return accueilHtml();
     case 'immeuble': return immeubleHtml();
     case 'liste': return listeHtml();
+    case 'ajout': return ajoutHtml();
     case 'fiche': return ficheHtml();
     case 'synthese': return syntheseHtml();
     case 'loading':
@@ -1854,6 +2028,7 @@ function listeHtml() {
     ${missingAI > 0 ? `<div class="missing-banner"><i data-lucide="scan-search"></i><div class="txt"><b>${missingAI} composante${missingAI > 1 ? 's' : ''} suggérée${missingAI > 1 ? 's' : ''}</b> par l'IA, non visitée${missingAI > 1 ? 's' : ''}</div></div>` : ''}
     <div class="list-body">
       ${groupsHtml || `<div class="empty-state">Aucune composante ne correspond à ce filtre.</div>`}
+      <button class="btn-outline ajout-btn" data-action="go-ajout"><i data-lucide="plus"></i>Ajouter une composante trouvée sur place</button>
     </div>
     <div class="bottom-bar"><button class="btn-dark" data-action="go-synth"><i data-lucide="flag"></i>Terminer la visite</button></div>
   </div>`;
@@ -2400,6 +2575,12 @@ function onRootClick(e) {
     case 'filter': state.filter = t.dataset.filter; render(); break;
     case 'desactiver': setActif(t.dataset.id, false); break;
     case 'reactiver': setActif(t.dataset.id, true); break;
+    case 'go-ajout': ouvrirAjout(); break;
+    case 'ajout-reactiver': reactiverEtOuvrir(t.dataset.id); break;
+    case 'ajout-catalogue': { const item = (state.catalogue || [])[Number(t.dataset.i)]; if (item) creerComposante(item); break; }
+    case 'ajout-ouvrir-libre': if (state.ajout) { state.ajout.libre = true; render(); } break;
+    case 'ajout-cat': if (state.ajout) { state.ajout.cat = t.dataset.val; render(); } break;
+    case 'ajout-libre': if (state.ajout && state.ajout.cat) creerComposante({ name: state.ajout.q, cat: state.ajout.cat, vu: state.ajout.vu }); break;
     case 'add-photo': triggerPhotoInput(); break;
     case 'analyze': analyze(); break;
     case 'apply-ai': applyAi(); break;
@@ -2457,6 +2638,10 @@ function onRootInput(e) {
     state.attrKeyDraft = t.value;
   } else if (t.matches('[data-role="attr-val-draft"]')) {
     state.attrValDraft = t.value;
+  } else if (t.matches('[data-role="ajout-q"]')) {
+    if (state.ajout) { state.ajout.q = t.value; render(); }
+  } else if (t.matches('[data-role="ajout-vu"]')) {
+    if (state.ajout) state.ajout.vu = t.value;
   } else if (t.matches('[data-role="tache-texte"]')) {
     if (state.tacheForm) state.tacheForm.x = t.value;
   } else if (t.matches('[data-role="login-email"]')) {
