@@ -2963,7 +2963,8 @@ const CATEGORIES = {
   equipements: { ordre: 7, label: "Appareils, installations et équipements spéciaux" },
   cvac: { ordre: 8, label: "Systèmes de chauffage et ventilation" },
   electrique: { ordre: 9, label: "Installations électriques" },
-  plomberie: { ordre: 10, label: "Installations de plomberie, d'eau et d'égout" }
+  plomberie: { ordre: 10, label: "Installations de plomberie, d'eau et d'égout" },
+  piscines: { ordre: 11, label: "Piscines et centre aquatique" }
 };
 const RATING_LABELS = {
   1: "Bon état",
@@ -2983,7 +2984,8 @@ const DEFAULT_USEFUL_LIFE_YEARS = {
   equipements: 15,
   cvac: 25,
   electrique: 30,
-  plomberie: 20
+  plomberie: 20,
+  piscines: 20
 };
 const ALLOCATION_USEFUL_LIFE = 10;
 const MODEL = "claude-sonnet-5";
@@ -3071,143 +3073,226 @@ function extractJson(text) {
 }
 // Liste de départ de toute nouvelle visite : l'onglet SOMM30 du gabarit de
 // calculs Condo Stratégis (« 4.11 CALCULS - 26-001 PGA (2026) », avril 2026),
-// dans son ordre et avec ses durées de vie. Elle est volontairement complète :
-// l'inspecteur retire sur place ce qui ne s'applique pas à l'immeuble, plutôt
-// que de devoir penser à ajouter ce qu'une présélection aurait oublié.
+// dans son ordre et avec ses durées de vie, noms corrigés. Les éléments de
+// piscine et de sauna, rangés en plomberie dans le gabarit, ont leur propre
+// catégorie, séparée entre piscine extérieure et intérieure.
 // Le gabarit ne porte pas de code Uniformat ; les lignes vides « nd » sont omises.
 const GABARIT_STRATEGIS = [
-  { cat: "terrain", name: "Stationnement et voies de circulation-Pavage", vu: 25 },
+  { cat: "terrain", name: "Stationnement et voies de circulation – Pavage", vu: 25 },
   { cat: "terrain", name: "Bordures de béton", vu: 35 },
   { cat: "terrain", name: "Voies de circulation", vu: 25 },
-  { cat: "terrain", name: "Allées piétonnières - béton", vu: 35 },
-  { cat: "terrain", name: "Murets de soutènement - Module de béton", vu: 40 },
-  { cat: "terrain", name: "Murets de soutènement - Bois traitées", vu: 25 },
+  { cat: "terrain", name: "Allées piétonnières – Béton", vu: 35 },
+  { cat: "terrain", name: "Murets de soutènement – Modules de béton", vu: 40 },
+  { cat: "terrain", name: "Murets de soutènement – Bois traité", vu: 25 },
   { cat: "terrain", name: "Garde-corps", vu: 40 },
-  { cat: "terrain", name: "Garde-corps - peinture - allocation", vu: 10 },
-  { cat: "terrain", name: "Terrasse sur sol -Pavé de béton", vu: 25 },
-  { cat: "terrain", name: "Clôture - Acier grillagé", vu: 30 },
-  { cat: "terrain", name: "Clôture - Bois", vu: 15 },
-  { cat: "terrain", name: "Structure de bois traitées", vu: 25 },
-  { cat: "structure", name: "Murs de fondation - Allocation", vu: 10 },
-  { cat: "structure", name: "Structure - Allocation", vu: 10 },
-  { cat: "structure", name: "Stationnement int. - Dalle sur sol et structurale - All.", vu: 20 },
-  { cat: "structure", name: "Stationnement Int. - Membrane de surface", vu: 35 },
-  { cat: "structure", name: "Stationnement Int. - Membrane Toit terrasse", vu: 40 },
-  { cat: "structure", name: "Inspection des stationnements étagées - Loi 122", vu: 5 },
-  { cat: "enveloppe", name: "Surface de toit plat - Membrane", vu: 35 },
-  { cat: "enveloppe", name: "Surface de toit en pente - Bardeaux de gravier fins", vu: 25 },
-  { cat: "enveloppe", name: "Gouttières - allocation", vu: 10 },
+  { cat: "terrain", name: "Garde-corps – Peinture – Allocation", vu: 10 },
+  { cat: "terrain", name: "Terrasse sur sol – Pavé de béton", vu: 25 },
+  { cat: "terrain", name: "Clôture – Acier grillagé", vu: 30 },
+  { cat: "terrain", name: "Clôture – Bois", vu: 15 },
+  { cat: "terrain", name: "Structures de bois traité", vu: 25 },
+  { cat: "structure", name: "Murs de fondation – Allocation", vu: 10 },
+  { cat: "structure", name: "Structure – Allocation", vu: 10 },
+  { cat: "structure", name: "Stationnement intérieur – Dalle sur sol et dalle structurale – Allocation", vu: 20 },
+  { cat: "structure", name: "Stationnement intérieur – Membrane de surface", vu: 35 },
+  { cat: "structure", name: "Stationnement intérieur – Membrane de toit-terrasse", vu: 40 },
+  { cat: "structure", name: "Inspection des stationnements étagés – Loi 122", vu: 5 },
+  { cat: "enveloppe", name: "Surface de toit plat – Membrane", vu: 35 },
+  { cat: "enveloppe", name: "Surface de toit en pente – Bardeaux de gravier fin", vu: 25 },
+  { cat: "enveloppe", name: "Gouttières – Allocation", vu: 10 },
   { cat: "enveloppe", name: "Puits de lumière", vu: 45 },
-  { cat: "enveloppe", name: "Toitures des saillies - Sous terrasses", vu: 30 },
-  { cat: "enveloppe", name: "Marquise - Panneau verre trempée", vu: 35 },
-  { cat: "enveloppe", name: "Marquise - Structure acier", vu: 50 },
-  { cat: "enveloppe", name: "Structure de services - bois traitée", vu: 30 },
-  { cat: "enveloppe", name: "Parement - Panneaux de béton préfabriquée", vu: 75 },
-  { cat: "enveloppe", name: "Parement - Maçonnerie - allocation", vu: 10 },
-  { cat: "enveloppe", name: "Parement - Lintaux - allocation", vu: 10 },
-  { cat: "enveloppe", name: "Parement - Scellants de rencontre", vu: 10 },
-  { cat: "enveloppe", name: "Inspections des façades (5 étages +) Loi 122", vu: 5 },
-  { cat: "enveloppe", name: "Parement - Métallique - allocation", vu: 20 },
-  { cat: "enveloppe", name: "Parement - Vinyle", vu: 35 },
-  { cat: "enveloppe", name: "Parement - Fibre de bois dur", vu: 30 },
-  { cat: "enveloppe", name: "Parement - Enduit d'acryllique - allocation", vu: 20 },
-  { cat: "enveloppe", name: "Parement - Agrégats - allocation", vu: 20 },
-  { cat: "ouvertures", name: "Portes d'entrées", vu: 45 },
-  { cat: "ouvertures", name: "Portes d'entrées - Allocation", vu: 10 },
+  { cat: "enveloppe", name: "Toitures des saillies – Sous-terrasses", vu: 30 },
+  { cat: "enveloppe", name: "Marquise – Panneaux de verre trempé", vu: 35 },
+  { cat: "enveloppe", name: "Marquise – Structure d'acier", vu: 50 },
+  { cat: "enveloppe", name: "Structure de services – Bois traité", vu: 30 },
+  { cat: "enveloppe", name: "Parement – Panneaux de béton préfabriqués", vu: 75 },
+  { cat: "enveloppe", name: "Parement – Maçonnerie – Allocation", vu: 10 },
+  { cat: "enveloppe", name: "Parement – Linteaux – Allocation", vu: 10 },
+  { cat: "enveloppe", name: "Parement – Scellants de rencontre", vu: 10 },
+  { cat: "enveloppe", name: "Inspection des façades (5 étages et plus) – Loi 122", vu: 5 },
+  { cat: "enveloppe", name: "Parement – Métallique – Allocation", vu: 20 },
+  { cat: "enveloppe", name: "Parement – Vinyle", vu: 35 },
+  { cat: "enveloppe", name: "Parement – Fibre de bois dur", vu: 30 },
+  { cat: "enveloppe", name: "Parement – Enduit acrylique – Allocation", vu: 20 },
+  { cat: "enveloppe", name: "Parement – Agrégats – Allocation", vu: 20 },
+  { cat: "ouvertures", name: "Portes d'entrée", vu: 45 },
+  { cat: "ouvertures", name: "Portes d'entrée – Allocation", vu: 10 },
   { cat: "ouvertures", name: "Porte et vitrage du vestibule intérieur", vu: 45 },
-  { cat: "ouvertures", name: "Porte et vitrage du vestibule intérieur - allocation", vu: 10 },
+  { cat: "ouvertures", name: "Porte et vitrage du vestibule intérieur – Allocation", vu: 10 },
   { cat: "ouvertures", name: "Blocs de verre", vu: 40 },
-  { cat: "ouvertures", name: "Portes de service - Acier", vu: 35 },
-  { cat: "ouvertures", name: "Portes de service - allocation", vu: 10 },
-  { cat: "ouvertures", name: "Portes-patio et portes balcon", vu: 40 },
-  { cat: "ouvertures", name: "Porte simple - Balcon", vu: 40 },
-  { cat: "ouvertures", name: "Fenêtre - Vinyle", vu: 40 },
-  { cat: "ouvertures", name: "Fenêtre et porte fenêtre - Aluminium", vu: 45 },
-  { cat: "ouvertures", name: "Fenêtre - allocation", vu: 10 },
-  { cat: "ouvertures", name: "Scellant d'ouverture - Allocation", vu: 7 },
+  { cat: "ouvertures", name: "Portes de service – Acier", vu: 35 },
+  { cat: "ouvertures", name: "Portes de service – Allocation", vu: 10 },
+  { cat: "ouvertures", name: "Portes-patio et portes de balcon", vu: 40 },
+  { cat: "ouvertures", name: "Porte simple – Balcon", vu: 40 },
+  { cat: "ouvertures", name: "Fenêtres – Vinyle", vu: 40 },
+  { cat: "ouvertures", name: "Fenêtres et portes-fenêtres – Aluminium", vu: 45 },
+  { cat: "ouvertures", name: "Fenêtres – Allocation", vu: 10 },
+  { cat: "ouvertures", name: "Scellants d'ouverture – Allocation", vu: 7 },
   { cat: "ouvertures", name: "Porte de garage", vu: 30 },
-  { cat: "ouvertures", name: "Porte de garage - Moteur - allocation", vu: 10 },
-  { cat: "ouvertures", name: "Mur rideau", vu: 75 },
-  { cat: "ouvertures", name: "Mur rideau - Allocation", vu: 20 },
-  { cat: "balcons", name: "Balcons - Acier - Membrures, escaliers", vu: 50 },
-  { cat: "balcons", name: "Balcons - Acier - Membrures, escaliers - Allocation", vu: 10 },
-  { cat: "balcons", name: "Balcon - Pontage en fibre de verre", vu: 25 },
-  { cat: "balcons", name: "Balcon - structure de bois", vu: 25 },
-  { cat: "balcons", name: "Balcons -Gardes-corps métallique", vu: 40 },
-  { cat: "balcons", name: "Balcons -Structure acier - allocations", vu: 15 },
-  { cat: "balcons", name: "Terrasses urbaines - Bois traitées", vu: 25 },
-  { cat: "balcons", name: "Terrasses urbaines - Garde-corps métallique", vu: 40 },
-  { cat: "interieur", name: "Revêtement de placoplâtre - Peinture - Allocation", vu: 15 },
-  { cat: "interieur", name: "Tuiles accoustiques suspendus - Allocation", vu: 20 },
-  { cat: "interieur", name: "Lambris de bois - Allocation", vu: 20 },
-  { cat: "interieur", name: "Revêtement de sol - Tapis", vu: 20 },
-  { cat: "interieur", name: "Revêtement de sol - Carreau de céramique - allocation", vu: 10 },
-  { cat: "interieur", name: "Revêtement de sol - Tuile de vinyle", vu: 20 },
-  { cat: "interieur", name: "Revêtement de sol - Bois durs", vu: 40 },
-  { cat: "interieur", name: "Revêtement de sol - Bois durs - allocation", vu: 10 },
-  { cat: "interieur", name: "Revêtement de sol - Béton - Allocation", vu: 5 },
-  { cat: "interieur", name: "Surface vitrée intérieur - Allocation", vu: 10 },
-  { cat: "interieur", name: "Escaliers intérieurs - Allocation", vu: 15 },
+  { cat: "ouvertures", name: "Porte de garage – Moteur – Allocation", vu: 10 },
+  { cat: "ouvertures", name: "Mur-rideau", vu: 75 },
+  { cat: "ouvertures", name: "Mur-rideau – Allocation", vu: 20 },
+  { cat: "balcons", name: "Balcons – Acier – Membrures et escaliers", vu: 50 },
+  { cat: "balcons", name: "Balcons – Acier – Membrures et escaliers – Allocation", vu: 10 },
+  { cat: "balcons", name: "Balcons – Pontage en fibre de verre", vu: 25 },
+  { cat: "balcons", name: "Balcons – Structure de bois", vu: 25 },
+  { cat: "balcons", name: "Balcons – Garde-corps métalliques", vu: 40 },
+  { cat: "balcons", name: "Balcons – Structure d'acier – Allocation", vu: 15 },
+  { cat: "balcons", name: "Terrasses urbaines – Bois traité", vu: 25 },
+  { cat: "balcons", name: "Terrasses urbaines – Garde-corps métalliques", vu: 40 },
+  { cat: "interieur", name: "Revêtement de placoplâtre – Peinture – Allocation", vu: 15 },
+  { cat: "interieur", name: "Tuiles acoustiques suspendues – Allocation", vu: 20 },
+  { cat: "interieur", name: "Lambris de bois – Allocation", vu: 20 },
+  { cat: "interieur", name: "Revêtement de sol – Tapis", vu: 20 },
+  { cat: "interieur", name: "Revêtement de sol – Carreaux de céramique – Allocation", vu: 10 },
+  { cat: "interieur", name: "Revêtement de sol – Tuiles de vinyle", vu: 20 },
+  { cat: "interieur", name: "Revêtement de sol – Bois franc", vu: 40 },
+  { cat: "interieur", name: "Revêtement de sol – Bois franc – Allocation", vu: 10 },
+  { cat: "interieur", name: "Revêtement de sol – Béton – Allocation", vu: 5 },
+  { cat: "interieur", name: "Surfaces vitrées intérieures – Allocation", vu: 10 },
+  { cat: "interieur", name: "Escaliers intérieurs – Allocation", vu: 15 },
   { cat: "interieur", name: "Portes des unités", vu: 50 },
-  { cat: "interieur", name: "Portes des unités - allocation", vu: 10 },
-  { cat: "interieur", name: "Portes de services intérieurs", vu: 50 },
-  { cat: "interieur", name: "Portes de services intérieurs - allocation", vu: 10 },
-  { cat: "interieur", name: "Porte de services - Bois", vu: 50 },
-  { cat: "interieur", name: "Porte de services - Bois - allocation", vu: 10 },
-  { cat: "equipements", name: "Système d’incendie – Éclairage d’urgence, Panneau sortie", vu: 10 },
-  { cat: "equipements", name: "Système incendie - Panneau central, stations, avertisseurs", vu: 10 },
-  { cat: "equipements", name: "Système incendie - Détecteurs d'incendie, extincteurs", vu: 10 },
-  { cat: "equipements", name: "Détecteur d'incendie - Privatif - Allocation", vu: 10 },
+  { cat: "interieur", name: "Portes des unités – Allocation", vu: 10 },
+  { cat: "interieur", name: "Portes de service intérieures", vu: 50 },
+  { cat: "interieur", name: "Portes de service intérieures – Allocation", vu: 10 },
+  { cat: "interieur", name: "Portes de service – Bois", vu: 50 },
+  { cat: "interieur", name: "Portes de service – Bois – Allocation", vu: 10 },
+  { cat: "equipements", name: "Système d'incendie – Éclairage d'urgence et panneaux de sortie", vu: 10 },
+  { cat: "equipements", name: "Système d'incendie – Panneau central, stations manuelles et avertisseurs", vu: 10 },
+  { cat: "equipements", name: "Système d'incendie – Détecteurs d'incendie et extincteurs", vu: 10 },
+  { cat: "equipements", name: "Détecteurs d'incendie – Privatifs – Allocation", vu: 10 },
   { cat: "equipements", name: "Interphones", vu: 20 },
-  { cat: "equipements", name: "Système de surveillance CCF", vu: 20 },
-  { cat: "equipements", name: "Casiers postaux - Allocation", vu: 10 },
-  { cat: "equipements", name: "Mobilier - Centre aquatique - Allocation", vu: 10 },
-  { cat: "equipements", name: "Mobilier - Espaces communs - Allocation", vu: 15 },
-  { cat: "equipements", name: "Mobilier fixes - Espaces communs - Allocation", vu: 20 },
-  { cat: "equipements", name: "Mobilier fixes - Portes rideaux", vu: 20 },
-  { cat: "equipements", name: "Équipements de buanderie - Allocation", vu: 15 },
-  { cat: "equipements", name: "Équipement sportif - Espaces communs - Allocation", vu: 10 },
-  { cat: "equipements", name: "Chute à déchets - Système de compacteurs", vu: 25 },
-  { cat: "equipements", name: "Chute à déchets - Allocation", vu: 10 },
-  { cat: "equipements", name: "Système d'ascenseur - Modernisation", vu: 35 },
-  { cat: "equipements", name: "Système de foyers et cheminées préfabriquées", vu: 10 },
+  { cat: "equipements", name: "Système de surveillance – Caméras en circuit fermé", vu: 20 },
+  { cat: "equipements", name: "Casiers postaux – Allocation", vu: 10 },
+  { cat: "equipements", name: "Mobilier – Espaces communs – Allocation", vu: 15 },
+  { cat: "equipements", name: "Mobilier fixe – Espaces communs – Allocation", vu: 20 },
+  { cat: "equipements", name: "Mobilier fixe – Portes-rideaux", vu: 20 },
+  { cat: "equipements", name: "Équipements de buanderie – Allocation", vu: 15 },
+  { cat: "equipements", name: "Équipements sportifs – Espaces communs – Allocation", vu: 10 },
+  { cat: "equipements", name: "Chute à déchets – Système de compacteur", vu: 25 },
+  { cat: "equipements", name: "Chute à déchets – Allocation", vu: 10 },
+  { cat: "equipements", name: "Système d'ascenseur – Modernisation", vu: 35 },
+  { cat: "equipements", name: "Foyers et cheminées préfabriqués", vu: 10 },
   { cat: "cvac", name: "Plinthes électriques", vu: 25 },
   { cat: "cvac", name: "Aérothermes muraux", vu: 25 },
-  { cat: "cvac", name: "Aérothermes suspendus - Stationnement intérieur", vu: 30 },
-  { cat: "cvac", name: "Système de ventilation - Privatif - Allocation", vu: 3 },
-  { cat: "cvac", name: "Chauffage CVAC - Communs - Toiture", vu: 35 },
-  { cat: "cvac", name: "Climatisation de zone - salles de services", vu: 25 },
+  { cat: "cvac", name: "Aérothermes suspendus – Stationnement intérieur", vu: 30 },
+  { cat: "cvac", name: "Système de ventilation – Privatif – Allocation", vu: 3 },
+  { cat: "cvac", name: "Chauffage CVAC – Communs – Toiture", vu: 35 },
+  { cat: "cvac", name: "Climatisation de zone – Salles de services", vu: 25 },
   { cat: "cvac", name: "Ventilation des salles de services", vu: 20 },
   { cat: "cvac", name: "Système de détection des gaz", vu: 25 },
   { cat: "cvac", name: "Ventilation du stationnement intérieur et volets motorisés", vu: 25 },
-  { cat: "cvac", name: "Dispositif d'obturation", vu: 50 },
-  { cat: "electrique", name: "Alimentation électrique principale - Allocaion", vu: 10 },
-  { cat: "electrique", name: "Alimentation gaz naturel - Allocation", vu: 10 },
-  { cat: "electrique", name: "Appareil d'éclairage intérieur", vu: 35 },
-  { cat: "electrique", name: "Appareil d'éclairage extérieur", vu: 25 },
-  { cat: "electrique", name: "Lampadaire", vu: 30 },
-  { cat: "electrique", name: "Alimentation d'urgence - Génératrice et moteurs", vu: 40 },
-  { cat: "electrique", name: "Alimentation d'urgence - Chargeur", vu: 35 },
-  { cat: "electrique", name: "Alimentation d'urgence - Interrupteur de transfert", vu: 40 },
-  { cat: "electrique", name: "Alimentation d'urgence - Conduit d'échappement", vu: 30 },
-  { cat: "electrique", name: "Alimentation d'urgence - Réservoir de mazout", vu: 25 },
-  { cat: "plomberie", name: "Système d'alimentation en eau potable - Allocation", vu: 10 },
-  { cat: "plomberie", name: "Inspection DAR", vu: 1 },
-  { cat: "plomberie", name: "Système d'évacuation pluviale et sanitaire - Allocation", vu: 10 },
-  { cat: "plomberie", name: "Syst. d'évacuation sanitaire - Nettoyage des colonnes - All.", vu: 5 },
-  { cat: "plomberie", name: "Équipement de plomberie - espace commun", vu: 25 },
-  { cat: "plomberie", name: "Réservoir d'eau chaude - Conciergerie", vu: 10 },
-  { cat: "plomberie", name: "Réservoir d'eau chaude - Communs immeuble", vu: 25 },
-  { cat: "plomberie", name: "Système d'incendie - Gicleurs et pompe - Allocation", vu: 10 },
-  { cat: "plomberie", name: "Sauna - Structure de bois", vu: 25 },
-  { cat: "plomberie", name: "Sauna - Système de chauffage", vu: 20 },
-  { cat: "plomberie", name: "Piscine - Enceinte toile - Allocation", vu: 10 },
-  { cat: "plomberie", name: "Piscine - Contour terrasse béton", vu: 50 },
-  { cat: "plomberie", name: "Piscine - Contour terrasse pavé de béton", vu: 25 },
-  { cat: "plomberie", name: "Piscine - Système de filtration", vu: 20 },
-  { cat: "plomberie", name: "Piscine - Système de chauffage TP", vu: 20 },
-  { cat: "plomberie", name: "Piscine - Système contrôle d'humidité", vu: 25 }
+  { cat: "cvac", name: "Dispositifs d'obturation", vu: 50 },
+  { cat: "electrique", name: "Alimentation électrique principale – Allocation", vu: 10 },
+  { cat: "electrique", name: "Alimentation en gaz naturel – Allocation", vu: 10 },
+  { cat: "electrique", name: "Appareils d'éclairage intérieurs", vu: 35 },
+  { cat: "electrique", name: "Appareils d'éclairage extérieurs", vu: 25 },
+  { cat: "electrique", name: "Lampadaires", vu: 30 },
+  { cat: "electrique", name: "Alimentation d'urgence – Génératrice et moteurs", vu: 40 },
+  { cat: "electrique", name: "Alimentation d'urgence – Chargeur", vu: 35 },
+  { cat: "electrique", name: "Alimentation d'urgence – Interrupteur de transfert", vu: 40 },
+  { cat: "electrique", name: "Alimentation d'urgence – Conduit d'échappement", vu: 30 },
+  { cat: "electrique", name: "Alimentation d'urgence – Réservoir de mazout", vu: 25 },
+  { cat: "plomberie", name: "Système d'alimentation en eau potable – Allocation", vu: 10 },
+  { cat: "plomberie", name: "Inspection des dispositifs antirefoulement (DAR)", vu: 1 },
+  { cat: "plomberie", name: "Système d'évacuation pluviale et sanitaire – Allocation", vu: 10 },
+  { cat: "plomberie", name: "Système d'évacuation sanitaire – Nettoyage des colonnes – Allocation", vu: 5 },
+  { cat: "plomberie", name: "Équipements de plomberie – Espaces communs", vu: 25 },
+  { cat: "plomberie", name: "Réservoir d'eau chaude – Conciergerie", vu: 10 },
+  { cat: "plomberie", name: "Réservoirs d'eau chaude – Communs de l'immeuble", vu: 25 },
+  { cat: "plomberie", name: "Système d'incendie – Gicleurs et pompe – Allocation", vu: 10 },
+  { cat: "piscines", name: "Piscine extérieure – Enceinte en toile – Allocation", vu: 10 },
+  { cat: "piscines", name: "Piscine extérieure – Contour de terrasse en béton", vu: 50 },
+  { cat: "piscines", name: "Piscine extérieure – Contour de terrasse en pavé de béton", vu: 25 },
+  { cat: "piscines", name: "Piscine extérieure – Système de filtration", vu: 20 },
+  { cat: "piscines", name: "Piscine extérieure – Système de chauffage (thermopompe)", vu: 20 },
+  { cat: "piscines", name: "Piscine intérieure – Système de filtration", vu: 20 },
+  { cat: "piscines", name: "Piscine intérieure – Système de chauffage", vu: 20 },
+  { cat: "piscines", name: "Piscine intérieure – Système de contrôle de l'humidité", vu: 25 },
+  { cat: "piscines", name: "Centre aquatique – Mobilier – Allocation", vu: 10 },
+  { cat: "piscines", name: "Sauna – Structure de bois", vu: 25 },
+  { cat: "piscines", name: "Sauna – Système de chauffage", vu: 20 }
 ];
+// Désactive, selon le profil du syndicat, les composantes du gabarit qui ont
+// peu de chances d'exister dans l'immeuble (ascenseur dans un triplex, piscine,
+// génératrice…). Rien n'est supprimé : une composante désactivée reste au
+// dossier et l'inspecteur la réactive en un geste s'il la trouve sur place.
+// On demande au modèle les numéros à DÉSACTIVER plutôt qu'à garder : une
+// réponse tronquée ou vide laisse alors trop de composantes, jamais trop peu.
+async function filtrerGabarit(apiKey, profil) {
+  const toutActif = (erreur) => ({ inactifs: new Set(), source: "gabarit", erreur });
+  if (!apiKey) return toutActif("aucune clé API configurée : aucune composante désactivée");
+  const liste = GABARIT_STRATEGIS
+    .map((item, i) => `${i + 1}. [${CATEGORIES[item.cat].label}] ${item.name}`)
+    .join("\n");
+  const prompt = `Tu es ingénieur en bâtiment spécialisé dans les études de fonds de prévoyance
+pour syndicats de copropriété au Québec. Voici l'immeuble à visiter :
+- ${profil.units ? `${profil.units} unités` : "nombre d'unités inconnu"}
+- ${profil.floors ? `${profil.floors} étages` : "nombre d'étages inconnu"}
+- ${profil.builtYear ? `construit en ${profil.builtYear}` : "année de construction inconnue"}
+
+Voici la liste maison des composantes, numérotées :
+${liste}
+
+Indique les numéros des composantes qui ont PEU DE CHANCES d'exister dans un immeuble
+de ce gabarit. Exemples de raisonnement : un petit immeuble de 3 étages ou moins n'a
+généralement ni ascenseur, ni génératrice, ni chute à déchets, ni mur-rideau, ni
+stationnement étagé ; l'inspection des façades de la Loi 122 ne vise que les
+bâtiments de 5 étages et plus ; une piscine, un sauna ou un centre aquatique ne se
+trouvent que dans les grands ensembles.
+
+Sois prudent : dans le doute, ne désactive pas. Une composante oubliée coûte plus
+cher qu'une composante en trop, que l'inspecteur retire sur place. Les variantes de
+matériau (vinyle, maçonnerie, aluminium…) restent actives sauf si l'époque ou la
+taille de l'immeuble les rend improbables.
+
+Réponds UNIQUEMENT par les numéros séparés par des virgules, ou par le mot AUCUNE.`;
+  let texte = null;
+  try {
+    texte = await callClaude(apiKey, { content: prompt, maxTokens: 1500 });
+    // On retient la plus longue suite « 12, 31, 47 » de la réponse : un nom
+    // recopié (« Loi 122 », « 5 étages ») ne doit pas passer pour un numéro.
+    const suites = texte.match(/\d+(?:\s*,\s*\d+)*/g) ?? [];
+    const suite = suites.reduce((max, x) => (x.split(",").length > max.split(",").length ? x : max), "");
+    const inactifs = new Set();
+    for (const brut of suite.split(",")) {
+      const n = Number(brut.trim());
+      if (Number.isInteger(n) && n >= 1 && n <= GABARIT_STRATEGIS.length) inactifs.add(n - 1);
+    }
+    if (inactifs.size === 0 && !/aucune/i.test(texte)) {
+      return toutActif(`réponse sans numéro exploitable | DÉBUT: « ${texte.slice(0, 200)} »`);
+    }
+    // Un filtre qui vide presque toute la liste est une réponse aberrante, pas
+    // un immeuble : mieux vaut tout présenter que de faire disparaître l'inventaire.
+    if (GABARIT_STRATEGIS.length - inactifs.size < 20) {
+      return toutActif(`filtre ignoré : ${inactifs.size} composantes sur ${GABARIT_STRATEGIS.length} auraient été désactivées`);
+    }
+    return { inactifs, source: "gabarit-filtre-ia", erreur: null };
+  } catch (e) {
+    const indice = texte ? ` | DÉBUT: « ${texte.slice(0, 200)} »` : "";
+    return toutActif(`${e && e.message}${indice}`);
+  }
+}
+// La colonne components.actif a été ajoutée après la mise en production. Elle
+// est créée au premier appel de chaque isolat plutôt que par une migration
+// manuelle : un déploiement ne peut pas précéder la base qu'il suppose.
+let colonneActifPrete = null;
+function assurerColonneActif(db) {
+  if (!colonneActifPrete) {
+    colonneActifPrete = (async () => {
+      const colonnes = await db.prepare("PRAGMA table_info(components)").all();
+      if (!colonnes.results.some((col) => col.name === "actif")) {
+        await db.prepare("ALTER TABLE components ADD COLUMN actif INTEGER NOT NULL DEFAULT 1").run();
+      }
+    })().catch((e) => {
+      colonneActifPrete = null;
+      throw e;
+    });
+  }
+  return colonneActifPrete;
+}
+function estActive(component) {
+  return component.actif !== 0;
+}
 const JARGON_STYLE_GUIDE = `Méthode et registre de la firme (Plan de gestion de l'actif — PGA) :
 
 ÉCHELLE D'ÉTAT (obligatoire, 4 niveaux + na) :
@@ -3559,7 +3644,7 @@ const ENTRETIEN_PAR_CODE = {
   "E30": ["neutre"],
   "F10": ["neutre"]
 };
-// Clé de recherche 3 — repli par catégorie maison (les 10 familles § 2.1).
+// Clé de recherche 3 — repli par catégorie maison (les familles § 2.1).
 const ENTRETIEN_PAR_CATEGORIE = {
   terrain: ["amenagement"],
   structure: ["structure"],
@@ -3570,7 +3655,8 @@ const ENTRETIEN_PAR_CATEGORIE = {
   equipements: ["neutre"],
   cvac: ["mecanique"],
   electrique: ["alimentationElectrique"],
-  plomberie: ["plomberie"]
+  plomberie: ["plomberie"],
+  piscines: ["mecanique"]
 };
 function blocsEntretien(component) {
   const nom = [component?.name, component?.variante].filter(Boolean).join(" ");
@@ -4086,7 +4172,8 @@ components.patch("/:id", async (c) => {
     "emplacement",
     "variante",
     "attributs",
-    "parent_id"
+    "parent_id",
+    "actif"
   ]) {
     if (key in body2) {
       fields.push(`${key} = ?${fields.length + 1}`);
@@ -44074,7 +44161,7 @@ async function dossierStats(db, dossierId) {
          SUM(done) AS done,
          SUM(CASE WHEN done = 1 AND rating >= 3 THEN 1 ELSE 0 END) AS critical,
          (SELECT COUNT(*) FROM photos p JOIN components c2 ON c2.id = p.component_id WHERE c2.dossier_id = ?1) AS photos_total
-       FROM components WHERE dossier_id = ?1`
+       FROM components WHERE dossier_id = ?1 AND actif = 1`
   ).bind(dossierId).first();
   const total = row?.total ?? 0;
   const done = row?.done ?? 0;
@@ -44118,21 +44205,32 @@ dossiers.post("/", async (c) => {
     user.id,
     user.company_id
   ).run();
-  // Le gabarit n'est pas une suggestion de l'IA : ai_suggested reste à 0 pour
-  // que le terrain n'affiche pas « Suggéré IA » sur chaque composante.
+  const filtre = await filtrerGabarit(c.env.ANTHROPIC_API_KEY, {
+    units: body2.units ?? 0,
+    floors: body2.floors ?? null,
+    builtYear: body2.built_year ?? null
+  });
+  // ai_suggested reste à 0 : la liste vient du gabarit, l'IA n'a fait que la filtrer.
   const stmt = c.env.DB.prepare(
-    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code) VALUES (?1, ?2, ?3, ?4, '—', 0, ?5, ?6, NULL)`
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code, actif) VALUES (?1, ?2, ?3, ?4, '—', 0, ?5, ?6, NULL, ?7)`
   );
   await c.env.DB.batch(
     GABARIT_STRATEGIS.map(
-      (item, i) => stmt.bind(newId("cmp"), id, item.cat, item.name, i, item.vu)
+      (item, i) => stmt.bind(newId("cmp"), id, item.cat, item.name, i, item.vu, filtre.inactifs.has(i) ? 0 : 1)
     )
   );
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
   return c.json({
     ...dossier,
     stats: await dossierStats(c.env.DB, id),
-    inventaire: { source: "gabarit", erreur: null, total: GABARIT_STRATEGIS.length }
+    // L'inspecteur doit savoir si la liste a été filtrée pour son immeuble ou
+    // s'il reçoit le gabarit complet : les deux ne se révisent pas de la même façon.
+    inventaire: {
+      source: filtre.source,
+      erreur: filtre.erreur,
+      total: GABARIT_STRATEGIS.length,
+      desactivees: filtre.inactifs.size
+    }
   }, 201);
 });
 async function getOwnedDossier(c, id) {
@@ -44155,8 +44253,9 @@ dossiers.get("/:id/components", async (c) => {
 async function buildReportContext(c) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return null;
-  const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(dossier.id).all();
-  const components2 = await listComponentsForDossier(c.env.DB, dossier.id);
+  // Une composante désactivée n'existe pas dans l'immeuble : ni au rapport, ni au fonds.
+  const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossier.id).all();
+  const components2 = (await listComponentsForDossier(c.env.DB, dossier.id)).filter(estActive);
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
@@ -44177,7 +44276,7 @@ async function buildReportContext(c) {
 dossiers.get("/:id/projection", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
-  const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(dossier.id).all();
+  const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossier.id).all();
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
@@ -44269,6 +44368,12 @@ app.use("/api/*", async (c, next) => {
   if (PUBLIC_PREFIXES.some((p) => c.req.path === p || c.req.path.startsWith(p + "/"))) return next();
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
+  return next();
+});
+app.use("/api/*", async (c, next) => {
+  if (c.req.path.startsWith("/api/dossiers") || c.req.path.startsWith("/api/components")) {
+    await assurerColonneActif(c.env.DB);
+  }
   return next();
 });
 app.route("/api/auth", auth);

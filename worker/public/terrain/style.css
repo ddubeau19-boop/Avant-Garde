@@ -248,6 +248,16 @@ input, textarea { font-family: var(--font-body); }
 .status-pill { font-family: var(--font-mono); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; padding: 4px 8px; border-radius: 999px; white-space: nowrap; }
 .r-pill { font-family: var(--font-mono); font-size: 10px; font-weight: 700; color: var(--orange); background: var(--orange-wash); padding: 2px 7px; border-radius: 999px; }
 
+.comp-row.inactif { cursor: default; border-style: dashed; }
+.comp-row.inactif .name { color: var(--ink-500); }
+.reactiver {
+  border: 1.5px solid var(--ink-200); background: #fff; color: var(--ink); border-radius: 999px;
+  font-size: 12px; font-weight: 600; padding: 7px 11px; cursor: pointer; display: flex; align-items: center; gap: 5px;
+}
+.reactiver:disabled { opacity: .5; cursor: default; }
+.reactiver i { width: 13px; height: 13px; }
+.btn-retirer { margin-top: 28px; color: var(--ink-600); }
+
 .empty-state { padding: 40px 20px; text-align: center; color: var(--ink-500); font-size: 13px; }
 
 .bottom-bar {

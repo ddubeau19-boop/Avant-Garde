@@ -10,7 +10,7 @@
 
 const TOKEN_KEY = 'cs_terrain_token';
 
-/* ---------- Taxonomie maison : 10 catégories ---------- */
+/* ---------- Taxonomie maison : 11 catégories ---------- */
 
 const CATS = {
   terrain:     { label: 'Terrain et aménagement',                                  pill: 'Terrain',        icon: 'trees' },
@@ -23,6 +23,7 @@ const CATS = {
   cvac:        { label: 'Systèmes de chauffage et ventilation',                    pill: 'CVAC',           icon: 'fan' },
   electrique:  { label: 'Installations électriques',                               pill: 'Électricité',    icon: 'zap' },
   plomberie:   { label: "Installations de plomberie, d'eau et d'égout",            pill: 'Plomberie',      icon: 'droplets' },
+  piscines:    { label: 'Piscines et centre aquatique',                            pill: 'Piscines',       icon: 'waves' },
 };
 
 const CAT_AUTRES = { label: 'Autres', pill: 'Autres', icon: 'box' };
@@ -144,7 +145,8 @@ const state = {
 
   dossiers: [],
   dossier: null,
-  components: [],
+  components: [],        // composantes actives de la visite
+  inactifs: [],          // composantes retirées de la visite, réactivables
   filter: 'all',
   search: '',
 
@@ -247,7 +249,7 @@ async function apiFetch(path, opts, config) {
   }
   if (auth && res.status === 401) {
     try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
-    state.token = null; state.user = null; state.dossier = null; state.dossiers = []; state.components = [];
+    state.token = null; state.user = null; state.dossier = null; state.dossiers = []; state.components = []; state.inactifs = [];
     state.screen = 'login';
     state.loginError = 'Votre session a expiré. Reconnectez-vous.';
     render();
@@ -369,7 +371,8 @@ async function selectDossier(id) {
       apiJson(`/api/dossiers/${id}/components`),
     ]);
     state.dossier = dossier;
-    state.components = components;
+    state.components = components.filter(c => c.actif !== 0);
+    state.inactifs = components.filter(c => c.actif === 0);
     state.batiment = parseJsonObject(dossier.batiment_info);
     state.naChosen = {};
     state.filter = 'all'; state.search = '';
@@ -456,6 +459,26 @@ async function patchComponent(id, patch) {
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     throw e;
   }
+}
+
+// Retire une composante de la visite (elle n'existe pas dans l'immeuble) ou l'y
+// remet. Elle n'est jamais supprimée : ses données restent si on la réactive.
+async function setActif(id, actif) {
+  try {
+    await patchComponent(id, { actif: actif ? 1 : 0 });
+  } catch (e) { return; }
+  const tous = state.components.concat(state.inactifs).map(c => (c.id === id ? Object.assign({}, c, { actif: actif ? 1 : 0 }) : c));
+  const ordre = (a, b) => (a.sort_order || 0) - (b.sort_order || 0);
+  state.components = tous.filter(c => c.actif !== 0).sort(ordre);
+  state.inactifs = tous.filter(c => c.actif === 0).sort(ordre);
+  if (actif) {
+    showToast('Composante réactivée');
+    if (!state.inactifs.length && state.filter === 'inactifs') state.filter = 'all';
+  } else {
+    showToast('Composante retirée de la visite');
+    state.screen = 'liste';
+  }
+  render();
 }
 
 // Enregistrement d'un champ de composante. Applique la valeur localement de façon
@@ -1093,8 +1116,8 @@ function accueilHtml() {
     <div class="ai-banner">
       <div class="icon"><i data-lucide="clipboard-list"></i></div>
       <div>
-        <div class="title">Liste du gabarit Condo Stratégis</div>
-        <div class="body">${st.total} composante${st.total > 1 ? 's' : ''} pour ce dossier. Retirez sur le terrain celles qui ne s'appliquent pas à l'immeuble.</div>
+        <div class="title">Liste des composantes</div>
+        <div class="body">${st.total} composante${st.total > 1 ? 's' : ''} pour ce dossier${state.inactifs.length ? `, ${state.inactifs.length} autre${state.inactifs.length > 1 ? 's' : ''} désactivée${state.inactifs.length > 1 ? 's' : ''} selon la taille de l'immeuble et réactivable${state.inactifs.length > 1 ? 's' : ''} depuis la liste` : ''}. Retirez sur le terrain celles qui ne s'appliquent pas.</div>
       </div>
     </div>
     <button class="btn-cta" data-action="go-liste"><i data-lucide="play"></i>Reprendre la visite</button>
@@ -1209,6 +1232,30 @@ function immeubleHtml() {
 
 /* ---------- Liste des composantes ---------- */
 
+function inactifsGroups() {
+  const q = state.search.trim().toLowerCase();
+  const fl = state.inactifs.filter(c => !q || `${c.name || ''} ${c.uniformat_code || ''}`.toLowerCase().includes(q));
+  const cles = Object.keys(CATS);
+  const groups = cles.map(k => ({ key: k, label: CATS[k].label, icon: CATS[k].icon, items: fl.filter(c => c.cat === k) }));
+  groups.push({ key: 'autres', label: CAT_AUTRES.label, icon: CAT_AUTRES.icon, items: fl.filter(c => !CATS[c.cat]) });
+  return groups
+    .filter(g => g.items.length > 0)
+    .map(g => Object.assign(g, { inactifs: true, done: 0, total: g.items.length }));
+}
+
+function inactifRowHtml(c) {
+  return `<div class="comp-row inactif">
+    <div class="comp-thumb" style="background:var(--ink-050);color:var(--ink-300)"><i data-lucide="${catInfo(c.cat).icon}"></i></div>
+    <div class="comp-mid">
+      <div class="name">${esc(c.name)}</div>
+      <div class="sub">Désactivée</div>
+    </div>
+    <div class="comp-end">
+      <button class="reactiver" data-action="reactiver" data-id="${esc(c.id)}" ${!state.online ? 'disabled' : ''}><i data-lucide="rotate-ccw"></i>Réactiver</button>
+    </div>
+  </div>`;
+}
+
 function listeHtml() {
   const st = computeStats();
   const chips = [
@@ -1217,14 +1264,18 @@ function listeHtml() {
     { key: 'done', label: 'Fait', count: st.done },
     { key: 'action', label: 'Action requise', count: st.critical },
   ];
+  if (state.inactifs.length) chips.push({ key: 'inactifs', label: 'Désactivées', count: state.inactifs.length });
   const chipsHtml = chips.map(c => `<button class="chip ${state.filter === c.key ? 'on' : ''}" data-action="filter" data-filter="${c.key}">${c.label} · ${c.count}</button>`).join('');
-  const groups = computeGroups();
+  const groups = state.filter === 'inactifs' ? inactifsGroups() : computeGroups();
   const missingAI = state.components.filter(c => c.ai_suggested && !c.done).length;
   const groupsHtml = groups.map(g => `
     <div class="grp">
       <div class="grp-hdr"><i data-lucide="${g.icon}"></i><span class="lbl">${esc(g.label)}</span><span class="cnt">${g.done}/${g.total}</span><div class="rule"></div></div>
-      ${g.items.map(rowHtml).join('')}
+      ${g.items.map(g.inactifs ? inactifRowHtml : rowHtml).join('')}
     </div>`).join('');
+  const inactifsNote = state.filter === 'inactifs'
+    ? `<div class="missing-banner"><i data-lucide="eye-off"></i><div class="txt">Composantes jugées peu probables pour cet immeuble. <b>Réactivez</b> celles que vous trouvez sur place.</div></div>`
+    : '';
   return `
   <div class="scr-liste">
     <div class="hdr">
@@ -1236,6 +1287,7 @@ function listeHtml() {
       <div class="search-box"><i data-lucide="search"></i><input id="searchInput" data-role="search-input" placeholder="Rechercher une composante…" value="${esc(state.search)}"></div>
       <div class="chip-row scr">${chipsHtml}</div>
     </div>
+    ${inactifsNote}
     ${missingAI > 0 ? `<div class="missing-banner"><i data-lucide="scan-search"></i><div class="txt"><b>${missingAI} composante${missingAI > 1 ? 's' : ''} suggérée${missingAI > 1 ? 's' : ''}</b> par l'IA, non visitée${missingAI > 1 ? 's' : ''}</div></div>` : ''}
     <div class="list-body">
       ${groupsHtml || `<div class="empty-state">Aucune composante ne correspond à ce filtre.</div>`}
@@ -1443,6 +1495,8 @@ function ficheHtml() {
       <div class="section-lbl" style="margin-top:26px">Note vocale</div>
       ${micSection}
       ${noteCard}
+
+      <button class="btn-outline btn-retirer" data-action="desactiver" data-id="${esc(c.id)}" ${!state.online ? 'disabled' : ''}><i data-lucide="eye-off"></i>Retirer de la visite (absente de l'immeuble)</button>
     </div>
     <div class="fiche-bottom">
       <button class="btn-cta" data-action="save-fiche" ${!state.online ? 'disabled' : ''}><i data-lucide="check"></i>Enregistrer &amp; suivante</button>
@@ -1560,6 +1614,8 @@ function onRootClick(e) {
     case 'go-synth': state.screen = 'synthese'; render(); break;
     case 'open-fiche': openFiche(t.dataset.id); break;
     case 'filter': state.filter = t.dataset.filter; render(); break;
+    case 'desactiver': setActif(t.dataset.id, false); break;
+    case 'reactiver': setActif(t.dataset.id, true); break;
     case 'add-photo': triggerPhotoInput(); break;
     case 'analyze': analyze(); break;
     case 'apply-ai': applyAi(); break;

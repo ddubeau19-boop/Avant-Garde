@@ -81,7 +81,8 @@ CREATE TABLE components (
   emplacement    TEXT,   -- corridors | escaliers | stationnement
   variante       TEXT,
   attributs      TEXT,   -- JSON : attributs typés propres à la composante
-  parent_id      TEXT
+  parent_id      TEXT,
+  actif          INTEGER NOT NULL DEFAULT 1   -- 0 : retirée de la visite, réactivable
 );
 
 CREATE TABLE photos (

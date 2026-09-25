@@ -5,9 +5,9 @@
 
 const TOKEN_KEY = 'cs_bureau_token';
 
-/* ---------- Taxonomie maison : les 10 catégories de la feuille « Relevé » ---------- */
+/* ---------- Taxonomie maison : les catégories de la feuille « Relevé », plus les piscines ---------- */
 
-const CAT_ORDER = ['terrain', 'structure', 'enveloppe', 'ouvertures', 'balcons', 'interieur', 'equipements', 'cvac', 'electrique', 'plomberie'];
+const CAT_ORDER = ['terrain', 'structure', 'enveloppe', 'ouvertures', 'balcons', 'interieur', 'equipements', 'cvac', 'electrique', 'plomberie', 'piscines'];
 const CATS = {
   terrain:     { label: 'Terrain et aménagement',                            short: 'Terrain',            icon: 'trees' },
   structure:   { label: 'Fondation, structure et stationnements intérieurs', short: 'Structure',          icon: 'layers' },
@@ -19,6 +19,7 @@ const CATS = {
   cvac:        { label: 'Systèmes de chauffage et ventilation',              short: 'CVAC',               icon: 'fan' },
   electrique:  { label: 'Installations électriques',                         short: 'Électricité',        icon: 'zap' },
   plomberie:   { label: "Installations de plomberie, d'eau et d'égout",      short: 'Plomberie',          icon: 'droplets' },
+  piscines:    { label: 'Piscines et centre aquatique',                      short: 'Piscines',           icon: 'waves' },
 };
 const CAT_AUTRES = { label: 'Autres', short: 'Autres', icon: 'box' };
 function catInfo(key) { return CATS[key] || CAT_AUTRES; }
@@ -492,7 +493,8 @@ async function loadDossierDetail(id) {
       apiJson(`/api/dossiers/${id}/projection`),
     ]);
     state.dossier = dossier;
-    state.components = Array.isArray(components) ? components : [];
+    // Les composantes retirées de la visite ne vont ni au rapport ni à la révision.
+    state.components = Array.isArray(components) ? components.filter(c => c.actif !== 0) : [];
     state.projection = projection;
     state.batiment = parseJsonObject(dossier && dossier.batiment_info);
     state.revisionLoading = false;
