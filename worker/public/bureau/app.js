@@ -1107,12 +1107,12 @@ async function doPublish() {
 async function downloadReport(kind) {
   const ext = kind === 'docx' ? 'docx' : 'xlsx';
   try {
-    const res = await apiRaw(`/api/dossiers/${state.dossierId}/report.${ext}`);
+    const res = await apiRaw(`/api/dossiers/${state.dossierId}/${kind === 'suivi' ? 'suivi-entretien.xlsx' : `report.${ext}`}`);
     if (!res.ok) throw new Error('Téléchargement impossible.');
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     const dossierNo = (state.dossier && state.dossier.dossier_no) || 'dossier';
-    const suffix = kind === 'docx' ? 'etude-fonds' : 'durees-vie';
+    const suffix = kind === 'docx' ? 'etude-fonds' : kind === 'suivi' ? 'suivi-entretien' : 'durees-vie';
     const a = document.createElement('a');
     a.href = url;
     a.download = `${dossierNo}-${suffix}.${ext}`;
@@ -1672,6 +1672,7 @@ function reportsCardHtml(allConf, remaining) {
       <div class="reports-eyebrow">Rapports finaux</div>
       <button class="report-item" data-action="download-docx"><div class="report-icon"><i data-lucide="file-text"></i></div><div style="flex:1"><div class="report-name">Étude de fonds</div><div class="report-sub">Word · .docx</div></div><i data-lucide="download"></i></button>
       <button class="report-item" data-action="download-xlsx"><div class="report-icon green"><i data-lucide="table-2"></i></div><div style="flex:1"><div class="report-name">Durées de vie + carnet</div><div class="report-sub">Excel · .xlsx</div></div><i data-lucide="download"></i></button>
+      <button class="report-item" data-action="download-suivi"><div class="report-icon"><i data-lucide="calendar-check"></i></div><div style="flex:1"><div class="report-name">Tableur suivi d'entretien</div><div class="report-sub">Excel · tâches par saison</div></div><i data-lucide="download"></i></button>
       <div class="reports-note ready"><i data-lucide="check-circle-2"></i>Texte confirmé — rapports générés et à jour à chaque édition.</div>
     </div>`;
   }
@@ -2376,6 +2377,9 @@ function initEvents() {
         break;
       case 'download-xlsx':
         downloadReport('xlsx');
+        break;
+      case 'download-suivi':
+        downloadReport('suivi');
         break;
       case 'toggle-detail': {
         const cid = btn.getAttribute('data-id');

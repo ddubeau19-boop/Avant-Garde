@@ -92,7 +92,8 @@ CREATE TABLE components (
   limite_detail      TEXT,
   nature_risque      TEXT,   -- securite | infiltration | degradation | conformite | esthetique
   source_annee       TEXT,   -- plaque | carnet | administration | estimee
-  projet_ca          TEXT    -- travaux planifiés par le conseil d'administration
+  projet_ca          TEXT,   -- travaux planifiés par le conseil d'administration
+  taches_entretien   TEXT    -- JSON : tâches du carnet retirées ou ajoutées par l'ingénieur
 );
 
 CREATE TABLE photos (
