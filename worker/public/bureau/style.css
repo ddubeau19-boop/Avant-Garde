@@ -675,3 +675,26 @@ details.ca-bloc summary { cursor: pointer; }
 .ca-actions { margin: 6px 0 10px; }
 .ca-hist { grid-template-columns: 1.4fr 1fr; }
 @media (max-width: 760px) { .ca-ligne { grid-template-columns: 1fr; } }
+
+/* Suivi des dossiers : tuiles, responsable et échéance */
+.tuiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 22px; }
+.tuile {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; cursor: pointer;
+  border: 1px solid var(--ink-200); background: #fff; border-radius: 14px; padding: 14px 16px; font: inherit; color: var(--ink);
+}
+.tuile:hover { border-color: var(--ink-400, #999); }
+.tuile.active { border-color: var(--ink); box-shadow: inset 0 0 0 1px var(--ink); }
+.tuile-n { font-family: var(--font-display); font-weight: 900; font-size: 28px; line-height: 1; }
+.tuile-lib { font-size: 12px; color: var(--ink-500); }
+.tuile.alerte .tuile-n { color: var(--accent-press); }
+.dt-row { grid-template-columns: 2fr .9fr 1fr 1.35fr 1.05fr 100px; }
+.dt-suivi { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.suivi-select, .suivi-date {
+  font: inherit; font-size: 12.5px; border: 1px solid var(--ink-200); border-radius: 8px; padding: 5px 8px; background: #fff; color: var(--ink); max-width: 100%;
+}
+.suivi-date.retard, .txt-retard { color: #B42318; }
+.suivi-date.retard { border-color: #F3B8B2; background: #FFF6F5; }
+.filtre-resp { margin-left: auto; border-radius: 999px; padding: 7px 12px; }
+.dt-resp { font-size: 13px; font-weight: 600; }
+.lien-mini { border: none; background: none; color: var(--ink-500); font-size: 11.5px; text-decoration: underline; cursor: pointer; padding: 0; }
+@media (max-width: 1100px) { .tuiles { grid-template-columns: repeat(3, minmax(0, 1fr)); } }

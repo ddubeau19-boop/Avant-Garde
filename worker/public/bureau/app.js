@@ -527,7 +527,7 @@ async function loadDossiers() {
   state.dossiersError = null;
   render();
   try {
-    const data = await apiJson('/api/dossiers');
+    const [data] = await Promise.all([apiJson('/api/dossiers'), chargerMembres()]);
     state.dossiers = Array.isArray(data) ? data : [];
     state.dossiersLoading = false;
     render();
@@ -536,6 +536,75 @@ async function loadDossiers() {
     state.dossiersError = e.message || 'Impossible de charger les dossiers.';
     render();
   }
+}
+
+// ---------------------------------------------------------------
+// Suivi des dossiers : responsable et échéance
+// ---------------------------------------------------------------
+const suivi = { membres: null, admin: false, moi: null, responsable: '', erreur: null };
+
+async function chargerMembres() {
+  if (suivi.membres || !idFirme()) return;
+  try {
+    const r = await apiJson(`/api/companies/${idFirme()}/membres`);
+    suivi.membres = r.membres || []; suivi.admin = !!r.admin; suivi.moi = r.moi;
+  } catch (e) { suivi.membres = null; }
+}
+
+async function majSuivi(id, corps) {
+  suivi.erreur = null;
+  try {
+    const r = await apiJson(`/api/dossiers/${id}/suivi`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(corps) });
+    state.dossiers = state.dossiers.map(d => (d.id === id ? Object.assign({}, d, { assigne_a: r.assigne_a, echeance: r.echeance, assigne: r.assigne }) : d));
+  } catch (e) {
+    suivi.erreur = e.message || 'Modification refusée.';
+  }
+  render();
+}
+
+const aujourdhui = () => new Date().toISOString().slice(0, 10);
+function dateCourte(iso) {
+  const d = new Date(`${iso}T12:00:00`);
+  return isNaN(d) ? iso : d.toLocaleDateString('fr-CA', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+const enRetard = (d) => !!d.echeance && !d.published_at && d.echeance < aujourdhui();
+
+function suiviCelluleHtml(d) {
+  const moi = suivi.moi;
+  const mien = d.assigne_a && d.assigne_a === moi;
+  const modifiable = suivi.admin || mien;
+  let qui;
+  if (suivi.admin && suivi.membres) {
+    qui = `<select class="suivi-select" data-role="suivi-assigne" data-id="${d.id}">
+      <option value="">Non assigné</option>
+      ${suivi.membres.map(m => `<option value="${escapeHtml(m.id)}" ${m.id === d.assigne_a ? 'selected' : ''}>${escapeHtml(m.name)}</option>`).join('')}
+      ${d.assigne_a && !suivi.membres.some(m => m.id === d.assigne_a) ? `<option value="${escapeHtml(d.assigne_a)}" selected>${escapeHtml((d.assigne && d.assigne.name) || 'Ancien membre')}</option>` : ''}
+    </select>`;
+  } else if (!d.assigne_a) {
+    qui = `<button class="lien-revision" data-action="suivi-prendre" data-id="${d.id}">Prendre ce dossier</button>`;
+  } else {
+    qui = `<div class="dt-resp">${escapeHtml((d.assigne && d.assigne.name) || '—')}${mien ? ` <button class="lien-mini" data-action="suivi-retirer" data-id="${d.id}">me retirer</button>` : ''}</div>`;
+  }
+  const retard = enRetard(d);
+  const date = modifiable
+    ? `<input type="date" class="suivi-date ${retard ? 'retard' : ''}" data-role="suivi-echeance" data-id="${d.id}" value="${escapeHtml(d.echeance || '')}" title="Échéance">`
+    : (d.echeance ? `<div class="dt-sub ${retard ? 'txt-retard' : ''}">Échéance ${escapeHtml(dateCourte(d.echeance))}</div>` : '');
+  return `${qui}${date}${retard ? '<div class="dt-sub txt-retard">En retard</div>' : ''}`;
+}
+
+function tuilesHtml(rows) {
+  const unAn = new Date(Date.now() - 365 * 864e5).toISOString();
+  const tuiles = [
+    { cle: 'field', lib: 'Sur le terrain', n: rows.filter(d => !d.published_at && d._pct < 100).length },
+    { cle: 'review', lib: 'À réviser au bureau', n: rows.filter(d => d._reviewReady).length },
+    { cle: 'late', lib: 'Échéance dépassée', n: rows.filter(enRetard).length, alerte: true },
+    { cle: 'due', lib: 'Révisions aux 5 ans dues', n: rows.filter(d => d.revision_due).length, alerte: true },
+    { cle: 'published', lib: 'Publiés depuis un an', n: rows.filter(d => d.published_at && d.published_at >= unAn).length },
+  ];
+  return `<div class="tuiles">${tuiles.map(t => `
+    <button class="tuile ${state.filter === t.cle ? 'active' : ''} ${t.alerte && t.n ? 'alerte' : ''}" data-action="filter" data-filter="${t.cle}">
+      <span class="tuile-n">${t.n}</span><span class="tuile-lib">${t.lib}</span>
+    </button>`).join('')}</div>`;
 }
 
 // ---------------------------------------------------------------
@@ -1558,26 +1627,46 @@ function renderDossiers() {
   }
   const rows = state.dossiers.map(enrichDossier);
   const reviewCount = rows.filter(d => d._reviewReady).length;
-  const fieldCount = rows.filter(d => d._pct < 100).length;
+  const fieldCount = rows.filter(d => !d.published_at && d._pct < 100).length;
+  const mineCount = rows.filter(d => d.assigne_a && d.assigne_a === suivi.moi).length;
   const allCount = rows.length;
+  const unAn = new Date(Date.now() - 365 * 864e5).toISOString();
   const filtered = rows.filter(d => {
+    if (suivi.responsable === '__aucun' && d.assigne_a) return false;
+    if (suivi.responsable && suivi.responsable !== '__aucun' && d.assigne_a !== suivi.responsable) return false;
     if (state.filter === 'review') return d._reviewReady;
-    if (state.filter === 'field') return d._pct < 100;
+    if (state.filter === 'field') return !d.published_at && d._pct < 100;
+    if (state.filter === 'mine') return d.assigne_a && d.assigne_a === suivi.moi;
+    if (state.filter === 'late') return enRetard(d);
+    if (state.filter === 'due') return d.revision_due;
+    if (state.filter === 'published') return d.published_at && d.published_at >= unAn;
     return true;
   });
+  // Les échéances les plus proches d'abord ; sans échéance, les plus récents.
+  if (['mine', 'late', 'field', 'review'].includes(state.filter)) {
+    filtered.sort((a, b) => (a.echeance || '9999') < (b.echeance || '9999') ? -1 : (a.echeance || '9999') > (b.echeance || '9999') ? 1 : 0);
+  }
   return `
   <div class="page-pad">
     <div class="eyebrow-orange">Tableau de bord</div>
     <h1 class="page-title">Dossiers</h1>
     <p class="page-lead">Révisez les données du terrain, ajustez le fonds de prévoyance et générez les rapports.</p>
     ${state.dossiersError ? errorBanner(state.dossiersError, 'retry-dossiers') : ''}
+    ${tuilesHtml(rows)}
+    ${suivi.erreur ? errorBanner(suivi.erreur) : ''}
     <div class="filters-row">
+      <button class="chip ${state.filter === 'mine' ? 'active' : ''}" data-action="filter" data-filter="mine">Mes dossiers · ${mineCount}</button>
       <button class="chip ${state.filter === 'review' ? 'active' : ''}" data-action="filter" data-filter="review">Prêts pour révision · ${reviewCount}</button>
       <button class="chip ${state.filter === 'field' ? 'active' : ''}" data-action="filter" data-filter="field">En cours sur le terrain · ${fieldCount}</button>
       <button class="chip ${state.filter === 'all' ? 'active' : ''}" data-action="filter" data-filter="all">Tous · ${allCount}</button>
+      ${suivi.membres && suivi.membres.length > 1 ? `<select class="suivi-select filtre-resp" data-role="suivi-filtre">
+        <option value="">Tous les responsables</option>
+        <option value="__aucun" ${suivi.responsable === '__aucun' ? 'selected' : ''}>Non assignés</option>
+        ${suivi.membres.map(m => `<option value="${escapeHtml(m.id)}" ${suivi.responsable === m.id ? 'selected' : ''}>${escapeHtml(m.name)}</option>`).join('')}
+      </select>` : ''}
     </div>
     <div class="dossiers-table">
-      <div class="dt-row dt-head"><div>Syndicat</div><div>Dossier</div><div>Documentées</div><div>Statut</div><div></div></div>
+      <div class="dt-row dt-head"><div>Syndicat</div><div>Dossier</div><div>Documentées</div><div>Responsable · échéance</div><div>Statut</div><div></div></div>
       ${filtered.length === 0 ? `<div class="empty-state">Aucun dossier dans cette catégorie.</div>` : filtered.map(d => `
       <div class="dt-row">
         <div><div class="dt-name">${escapeHtml(d.name || '—')}</div><div class="dt-sub">${escapeHtml(d.address || '')}${d.address && d.units ? ' · ' : ''}${d.units ? d.units + ' unités' : ''}</div>${d.revision_source ? `<div class="dt-sub" style="color:var(--accent-press)">Révision de l'étude ${escapeHtml(d.revision_source.dossier_no)} (${d.revision_source.annee})</div>` : ''}</div>
@@ -1586,6 +1675,7 @@ function renderDossiers() {
           <div class="prog-track"><div class="prog-fill" style="background:${d._barColor};width:${d._pct}%"></div></div>
           <span class="dt-doc-label">${d.stats ? d.stats.done + '/' + d.stats.total : '—'}</span>
         </div>
+        <div class="dt-suivi">${suiviCelluleHtml(d)}</div>
         <div>
           <span class="status-badge" style="background:${d._statusBg};color:${d._statusColor}">${d._statusLabel}</span>
           ${d.revision_due ? `<span class="status-badge" style="background:var(--orange-wash);color:var(--accent-press);margin-top:4px" title="Loi 16 : mise à jour au moins tous les cinq ans">Révision due · ${d.revision_echeance}</span>` : ''}
@@ -2606,6 +2696,9 @@ function initEvents() {
     if (t && t.matches && bib.change(t)) return;
     if (t && t.matches && t.matches('[data-role="equipe-role"]')) { equipe.form.role = t.value; return; }
     if (t && t.matches && t.matches('[data-role="carnet-dossier"]')) { ouvrirCarnet(t.value); return; }
+    if (t && t.matches && t.matches('[data-role="suivi-assigne"]')) { majSuivi(t.getAttribute('data-id'), { assigne_a: t.value || null }); return; }
+    if (t && t.matches && t.matches('[data-role="suivi-echeance"]')) { majSuivi(t.getAttribute('data-id'), { echeance: t.value || null }); return; }
+    if (t && t.matches && t.matches('[data-role="suivi-filtre"]')) { suivi.responsable = t.value; render(); return; }
     if (t && t.matches && t.matches('[data-role="carnet-defaut"]')) {
       if (t.value) carnet.edits.defauts[t.getAttribute('data-q')] = t.value; else delete carnet.edits.defauts[t.getAttribute('data-q')];
       carnet.dirty = true; render(); return;
@@ -2735,6 +2828,8 @@ function initEvents() {
       case 'open-dossier':
         openDossier(btn.getAttribute('data-id'));
         break;
+      case 'suivi-prendre': majSuivi(btn.getAttribute('data-id'), { assigne_a: suivi.moi }); break;
+      case 'suivi-retirer': majSuivi(btn.getAttribute('data-id'), { assigne_a: null }); break;
       case 'filter':
         state.filter = btn.getAttribute('data-filter');
         render();

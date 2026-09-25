@@ -100,7 +100,9 @@ CREATE TABLE dossiers (
   company_id           TEXT REFERENCES companies(id),
   batiment_info        TEXT,  -- JSON : fiche d'immeuble saisie en terrain
   revision_de          TEXT,  -- étude précédente du même immeuble (révision aux cinq ans)
-  rappel_revision_le   TEXT   -- dernier rappel de révision envoyé à la firme
+  rappel_revision_le   TEXT,  -- dernier rappel de révision envoyé à la firme
+  assigne_a            TEXT,  -- membre de la firme responsable du dossier
+  echeance             TEXT   -- date de livraison visée (AAAA-MM-JJ)
 );
 
 CREATE TABLE components (

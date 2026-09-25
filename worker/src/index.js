@@ -3640,7 +3640,10 @@ const COLONNES_AJOUTEES = [
   ["travaux_periode", "TEXT"],
   ["travaux_annee", "INTEGER"],
   // Dernier rappel envoyé à la firme pour une étude à réviser.
-  ["dossiers", "rappel_revision_le", "TEXT"]
+  ["dossiers", "rappel_revision_le", "TEXT"],
+  // Suivi des dossiers : qui s'en occupe, et pour quand.
+  ["dossiers", "assigne_a", "TEXT"],
+  ["dossiers", "echeance", "TEXT"]
 ];
 // Tables ajoutées après la mise en production, créées au premier appel.
 const TABLES_AJOUTEES = [
@@ -46857,6 +46860,16 @@ function membreEquipe(u) {
     actif: u.actif !== 0, invitation_en_attente: !!u.invitation_en_attente
   };
 }
+// L'équipe active, en noms seulement : de quoi choisir un responsable de dossier.
+companies.get("/:id/membres", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const rows = await c.env.DB.prepare(
+    "SELECT id, name, role FROM users WHERE company_id = ?1 AND actif = 1 AND role != 'portail' AND COALESCE(invitation_en_attente, 0) = 0 ORDER BY name"
+  ).bind(id).all();
+  return c.json({ membres: rows.results, moi: user.id, admin: peutAdministrerFirme(user, id) });
+});
 companies.get("/:id/equipe", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
@@ -47401,6 +47414,7 @@ async function dossierStats(db, dossierId) {
          COUNT(*) AS total,
          SUM(done) AS done,
          SUM(CASE WHEN done = 1 AND rating >= 3 THEN 1 ELSE 0 END) AS critical,
+         MAX(updated_at) AS derniere_modif,
          (SELECT COUNT(*) FROM photos p JOIN components c2 ON c2.id = p.component_id WHERE c2.dossier_id = ?1) AS photos_total
        FROM components WHERE dossier_id = ?1 AND actif = 1`
   ).bind(dossierId).first();
@@ -47412,6 +47426,7 @@ async function dossierStats(db, dossierId) {
     todo: total - done,
     critical: row?.critical ?? 0,
     photosTotal: row?.photos_total ?? 0,
+    derniereModif: row?.derniere_modif ?? null,
     pct: total > 0 ? Math.round(done / total * 100) : 0
   };
 }
@@ -47419,10 +47434,52 @@ dossiers.get("/", async (c) => {
   const user = await getCurrentUser(c);
   if (!user?.company_id) return c.json([]);
   const rows = await c.env.DB.prepare("SELECT * FROM dossiers WHERE company_id = ?1 ORDER BY created_at DESC").bind(user.company_id).all();
+  const noms = new Map((await c.env.DB.prepare("SELECT id, name FROM users WHERE company_id = ?1").bind(user.company_id).all()).results.map((u) => [u.id, u.name]));
   const withStats = await Promise.all(
     rows.results.map(async (d) => ({ ...d, stats: await dossierStats(c.env.DB, d.id) }))
   );
-  return c.json(withStats.map((d) => ({ ...d, ...infoRevision(d, rows.results) })));
+  return c.json(withStats.map((d) => ({
+    ...d,
+    ...infoRevision(d, rows.results),
+    assigne: d.assigne_a && noms.has(d.assigne_a) ? { id: d.assigne_a, name: noms.get(d.assigne_a) } : null
+  })));
+});
+// Suivi : responsable et échéance du dossier. Un administrateur de la firme
+// répartit les dossiers ; un ingénieur prend un dossier libre ou le sien, ou
+// s'en retire, et règle l'échéance de ceux qu'il porte.
+dossiers.patch("/:id/suivi", async (c) => {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const admin = peutAdministrerFirme(user, dossier.company_id);
+  const sets = [], vals = [];
+  if ("assigne_a" in body2) {
+    const cible = body2.assigne_a ? String(body2.assigne_a) : null;
+    if (!admin) {
+      const libreOuMien = !dossier.assigne_a || dossier.assigne_a === user.id;
+      if (!libreOuMien || (cible && cible !== user.id)) return c.json({ error: "seul un administrateur de la firme répartit les dossiers des autres" }, 403);
+    }
+    if (cible) {
+      const membre = await c.env.DB.prepare(
+        "SELECT id FROM users WHERE id = ?1 AND company_id = ?2 AND actif = 1 AND role != 'portail'"
+      ).bind(cible, dossier.company_id).first();
+      if (!membre) return c.json({ error: "cette personne ne fait pas partie de l'équipe active de la firme" }, 400);
+    }
+    sets.push(`assigne_a = ?${sets.length + 1}`); vals.push(cible);
+  }
+  if ("echeance" in body2) {
+    const e = body2.echeance ? String(body2.echeance) : null;
+    if (e && (!/^\d{4}-\d{2}-\d{2}$/.test(e) || Number.isNaN(Date.parse(`${e}T00:00:00Z`)))) return c.json({ error: "échéance invalide (AAAA-MM-JJ)" }, 400);
+    const porteur = ("assigne_a" in body2 ? body2.assigne_a : dossier.assigne_a) === user.id;
+    if (!admin && !porteur) return c.json({ error: "l'échéance se règle par le responsable du dossier ou un administrateur" }, 403);
+    sets.push(`echeance = ?${sets.length + 1}`); vals.push(e);
+  }
+  if (!sets.length) return c.json({ error: "rien à modifier" }, 400);
+  vals.push(dossier.id);
+  await c.env.DB.prepare(`UPDATE dossiers SET ${sets.join(", ")} WHERE id = ?${vals.length}`).bind(...vals).run();
+  const d = await c.env.DB.prepare("SELECT id, assigne_a, echeance FROM dossiers WHERE id = ?1").bind(dossier.id).first();
+  const nom = d.assigne_a ? (await c.env.DB.prepare("SELECT name FROM users WHERE id = ?1").bind(d.assigne_a).first())?.name : null;
+  return c.json({ ...d, assigne: d.assigne_a ? { id: d.assigne_a, name: nom } : null });
 });
 // Où en est le dossier dans le cycle des révisions : l'étude qu'il révise,
 // celle qui le révise, et si sa révision aux cinq ans est due.
