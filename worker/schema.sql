@@ -112,6 +112,18 @@ CREATE TABLE clients (
 );
 CREATE INDEX idx_clients_firme ON clients(company_id, nom);
 
+-- Inscriptions de firmes en attente : la firme et son administrateur ne sont
+-- créés qu'une fois l'adresse confirmée. id : empreinte SHA-256 du jeton.
+CREATE TABLE inscriptions (
+  id         TEXT PRIMARY KEY,
+  firme      TEXT NOT NULL,
+  nom        TEXT NOT NULL,
+  email      TEXT NOT NULL,
+  expire_le  INTEGER NOT NULL,
+  utilise_le TEXT,
+  cree_le    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE TABLE dossiers (
   id                   TEXT PRIMARY KEY,
   dossier_no           TEXT NOT NULL UNIQUE,

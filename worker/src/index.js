@@ -3190,6 +3190,118 @@ auth.post("/jeton/:jeton", async (c) => {
   const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
   return c.json({ token, user: await publicUser(c.env.DB, user) });
 });
+// ---- Inscription d'une firme ---------------------------------------------------
+// Une firme ouvre son compte seule. Rien n'est créé avant que l'adresse soit
+// confirmée par le lien reçu : la firme et son premier administrateur naissent
+// à ce moment. Le super admin est averti de chaque nouvelle firme.
+// INSCRIPTION_OUVERTE = "non" ferme la porte.
+const DUREE_INSCRIPTION = 48 * 3600e3;
+const inscriptionFermee = (env) => String(env.INSCRIPTION_OUVERTE ?? "oui").toLowerCase() === "non";
+async function lireInscription(db, jeton) {
+  if (!jeton || !/^[A-Za-z0-9_-]{30,60}$/.test(jeton)) return null;
+  const row = await db.prepare("SELECT * FROM inscriptions WHERE id = ?1").bind(await empreinteJeton(jeton)).first();
+  if (!row || row.utilise_le || Date.now() > Number(row.expire_le)) return null;
+  return row;
+}
+auth.get("/inscription", (c) => c.json({ ouverte: !inscriptionFermee(c.env), longueur_min: LONGUEUR_MIN_MOT_DE_PASSE }));
+auth.post("/inscription", async (c) => {
+  if (inscriptionFermee(c.env)) return c.json({ error: "Les inscriptions sont fermées pour l'instant. Écrivez-nous pour ouvrir un compte." }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const firme = String(body2.firme ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+  const nom = String(body2.nom ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+  const email = String(body2.email ?? "").trim().toLowerCase().slice(0, 160);
+  if (!firme || !nom) return c.json({ error: "Le nom de la firme et votre nom sont requis." }, 400);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return c.json({ error: "Adresse courriel invalide." }, 400);
+  const reponse = { ok: true, message: `Un courriel de confirmation vient d'être envoyé à ${email}. Le lien est valable 48 heures.` };
+  // Champ piège, invisible pour une personne : un robot le remplit.
+  if (body2.site) return c.json(reponse);
+  const ip = c.req.header("cf-connecting-ip") ?? "inconnue";
+  if (await tentativesRecentes(c.env.DB, `inscription:${email}`, 60) >= 3 || await tentativesRecentes(c.env.DB, `inscription-ip:${ip}`, 24 * 60) >= 10) {
+    return c.json({ error: "Trop de demandes d'inscription. Réessayez plus tard." }, 429);
+  }
+  await noterTentative(c.env.DB, `inscription:${email}`);
+  await noterTentative(c.env.DB, `inscription-ip:${ip}`);
+  const origine = origineDe(c);
+  try {
+    // Adresse déjà inscrite : même réponse, et un courriel qui le lui dit.
+    const existant = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(email).first();
+    if (existant) {
+      await envoyerCourriel(c.env, {
+        to: email,
+        subject: "Vous avez déjà un compte sur Condo Stratégis",
+        titre: "Vous avez déjà un compte",
+        paragraphes: [`Une inscription a été demandée pour ${email}, mais cette adresse a déjà un compte. Connectez-vous, ou choisissez un nouveau mot de passe si vous l'avez oublié.`],
+        bouton: { texte: "Mot de passe oublié", url: `${origine}/compte/?courriel=${encodeURIComponent(email)}` },
+        pied: "Si vous n'avez rien demandé, ignorez ce courriel."
+      });
+      return c.json(reponse);
+    }
+    const jeton = toBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+    await c.env.DB.prepare("INSERT INTO inscriptions (id, firme, nom, email, expire_le) VALUES (?1, ?2, ?3, ?4, ?5)")
+      .bind(await empreinteJeton(jeton), firme, nom, email, Date.now() + DUREE_INSCRIPTION).run();
+    await envoyerCourriel(c.env, {
+      to: email,
+      subject: `Confirmez l'inscription de ${firme}`,
+      titre: `Bienvenue, ${nom}`,
+      paragraphes: [
+        `Confirmez votre adresse pour ouvrir le compte de ${firme} sur Condo Stratégis. Vous en serez l'administrateur : vous inviterez ensuite votre équipe, importerez votre bibliothèque de composantes et réglerez l'identité de vos rapports.`
+      ],
+      bouton: { texte: "Confirmer et choisir mon mot de passe", url: `${origine}/compte/?inscription=${jeton}` },
+      pied: "Ce lien est valable 48 heures. Si vous n'avez rien demandé, ignorez ce courriel : aucun compte ne sera créé."
+    });
+  } catch (e) {
+    console.error("inscription : courriel non envoyé", e?.code, e?.message);
+    return c.json({ error: "Le courriel de confirmation n'a pas pu être envoyé. Réessayez dans quelques minutes." }, 502);
+  }
+  return c.json(reponse);
+});
+auth.get("/inscription/:jeton", async (c) => {
+  const i = await lireInscription(c.env.DB, c.req.param("jeton"));
+  if (!i) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Recommencez l'inscription." }, 404);
+  return c.json({ firme: i.firme, nom: i.nom, email: i.email, longueur_min: LONGUEUR_MIN_MOT_DE_PASSE });
+});
+auth.post("/inscription/:jeton", async (c) => {
+  const i = await lireInscription(c.env.DB, c.req.param("jeton"));
+  if (!i) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Recommencez l'inscription." }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const refus = motDePasseRefuse(body2.password);
+  if (refus) return c.json({ error: refus }, 400);
+  if (await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(i.email).first()) {
+    return c.json({ error: "Cette adresse a déjà un compte. Connectez-vous." }, 409);
+  }
+  // Marqué utilisé d'abord : deux clics simultanés ne créent qu'une firme.
+  const pris = await c.env.DB.prepare("UPDATE inscriptions SET utilise_le = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1 AND utilise_le IS NULL").bind(i.id).run();
+  if (!pris.meta?.changes) return c.json({ error: "Ce lien a déjà servi." }, 409);
+  const companyId = newId("com");
+  let slug = slugify(i.firme) || companyId;
+  if (await c.env.DB.prepare("SELECT id FROM companies WHERE slug = ?1").bind(slug).first()) slug = `${slug}-${companyId.slice(-5)}`;
+  const { hash, salt } = await hashPassword(body2.password);
+  const champ = (v, max) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null);
+  const userId = newId("usr");
+  await c.env.DB.batch([
+    c.env.DB.prepare("INSERT INTO companies (id, name, slug) VALUES (?1, ?2, ?3)").bind(companyId, i.firme, slug),
+    c.env.DB.prepare(
+      `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role, title, ordre_professionnel, no_membre)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'admin', ?7, ?8, ?9)`
+    ).bind(userId, i.email, i.nom, hash, salt, companyId, champ(body2.title, 60), champ(body2.ordre_professionnel, 10)?.toUpperCase() ?? null, champ(body2.no_membre, 30))
+  ]);
+  try {
+    const admins = (await c.env.DB.prepare("SELECT email FROM users WHERE role = 'super_admin' AND actif = 1").all()).results;
+    for (const a of admins) {
+      await envoyerCourriel(c.env, {
+        to: a.email,
+        subject: `Nouvelle firme inscrite : ${i.firme}`,
+        titre: "Nouvelle firme inscrite",
+        paragraphes: [`${i.nom} (${i.email}) vient d'ouvrir le compte de ${i.firme}.`],
+        bouton: { texte: "Ouvrir l'administration", url: `${origineDe(c)}/admin/` }
+      });
+    }
+  } catch (e) {
+    console.error("inscription : avis au super admin non envoyé", e?.message);
+  }
+  const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(userId).first();
+  return c.json({ token: await createSessionToken(userId, c.env.SESSION_SECRET), user: await publicUser(c.env.DB, user) }, 201);
+});
 // Changer son mot de passe (connecté) : les autres sessions se ferment, la
 // session courante reçoit un nouveau jeton.
 auth.post("/mot-de-passe", async (c) => {
@@ -3777,7 +3889,16 @@ const TABLES_AJOUTEES = [
      notes              TEXT,
      crm_id             TEXT,
      cree_le            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
-  `CREATE INDEX IF NOT EXISTS idx_clients_firme ON clients(company_id, nom)`
+  `CREATE INDEX IF NOT EXISTS idx_clients_firme ON clients(company_id, nom)`,
+  // Inscriptions de firmes en attente de confirmation de l'adresse.
+  `CREATE TABLE IF NOT EXISTS inscriptions (
+     id        TEXT PRIMARY KEY,
+     firme     TEXT NOT NULL,
+     nom       TEXT NOT NULL,
+     email     TEXT NOT NULL,
+     expire_le INTEGER NOT NULL,
+     utilise_le TEXT,
+     cree_le   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`
 ];
 let colonnesPretes = null;
 function assurerColonnes(db) {

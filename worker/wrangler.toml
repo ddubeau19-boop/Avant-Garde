@@ -27,6 +27,8 @@ database_id = "9bcbc6e3-574a-44f5-8d30-273906128282"
 
 [vars]
 CRM_COMPANY_ID = "com_980c47a26e91493593a8"
+# Inscription autonome des firmes (/compte/?nouvelle-firme=1) : « non » la ferme.
+INSCRIPTION_OUVERTE = "oui"
 # Adresse d'expédition des courriels (invitations, mots de passe). Tout
 # alias du domaine intégré à Email Service convient, sans boîte à créer.
 COURRIEL_EXPEDITEUR = "no-reply@stratege.io"

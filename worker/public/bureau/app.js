@@ -1286,12 +1286,12 @@ function renderLogin() {
         <p>Accès réservé aux ingénieurs.</p>
         ${state.loginError ? `<div class="login-error">${escapeHtml(state.loginError)}</div>` : ''}
         <label class="field-label" for="login-email">Courriel</label>
-        <div class="field-box"><i data-lucide="mail"></i><input id="login-email" data-role="login-email" name="email" type="email" autocomplete="username" placeholder="prenom.nom@condostrategis.ca" value="${escapeHtml(state.loginEmail || '')}" required></div>
+        <div class="field-box"><i data-lucide="mail"></i><input id="login-email" data-role="login-email" name="email" type="email" autocomplete="username" placeholder="prenom.nom@votrefirme.ca" value="${escapeHtml(state.loginEmail || '')}" required></div>
         <label class="field-label" for="login-password">Mot de passe</label>
         <div class="field-box"><i data-lucide="lock"></i><input id="login-password" data-role="login-password" name="password" type="password" autocomplete="current-password" placeholder="Mot de passe" value="${escapeHtml(state.loginPassword || '')}" required></div>
         <button type="submit" class="btn-primary" style="width:100%" ${state.loginLoading ? 'disabled' : ''}>${state.loginLoading ? 'Connexion…' : 'Se connecter'}<i data-lucide="${state.loginLoading ? 'loader-2' : 'arrow-right'}" class="${state.loginLoading ? 'spin' : ''}"></i></button>
         <a href="/compte/?retour=/bureau/" style="display:block;text-align:center;margin-top:14px;font-size:12.5px;color:var(--ink-500)">Mot de passe oublié ?</a>
-        <div class="login-forgot">Mot de passe oublié ?</div>
+        <div class="login-forgot">Votre firme n'a pas encore de compte ? <a href="/compte/?nouvelle-firme=1" style="color:var(--accent-press);font-weight:600">Ouvrir un compte</a></div>
       </form>
     </div>
   </div>`;
