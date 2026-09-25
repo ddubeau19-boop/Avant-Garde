@@ -3716,7 +3716,8 @@ const COLONNES_AJOUTEES = [
   ["dossiers", "rappel_revision_le", "TEXT"],
   // Suivi des dossiers : qui s'en occupe, et pour quand.
   ["dossiers", "assigne_a", "TEXT"],
-  ["dossiers", "echeance", "TEXT"]
+  ["dossiers", "echeance", "TEXT"],
+  ["dossiers", "client_id", "TEXT"]
 ];
 // Tables ajoutées après la mise en production, créées au premier appel.
 const TABLES_AJOUTEES = [
@@ -3760,7 +3761,23 @@ const TABLES_AJOUTEES = [
      action       TEXT NOT NULL,
      champs       TEXT,
      moment       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
-  `CREATE INDEX IF NOT EXISTS idx_journal_dossier ON journal(dossier_id, moment)`
+  `CREATE INDEX IF NOT EXISTS idx_journal_dossier ON journal(dossier_id, moment)`,
+  // Clients de la firme : les syndicats, leurs contacts et leurs études.
+  `CREATE TABLE IF NOT EXISTS clients (
+     id                 TEXT PRIMARY KEY,
+     company_id         TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+     nom                TEXT NOT NULL,
+     adresse            TEXT,
+     ville              TEXT,
+     code_postal        TEXT,
+     unites             INTEGER,
+     annee_construction INTEGER,
+     neq                TEXT,
+     contacts           TEXT,
+     notes              TEXT,
+     crm_id             TEXT,
+     cree_le            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
+  `CREATE INDEX IF NOT EXISTS idx_clients_firme ON clients(company_id, nom)`
 ];
 let colonnesPretes = null;
 function assurerColonnes(db) {
@@ -47250,6 +47267,215 @@ async function rappelsRevisions(env, origine) {
   console.log("rappels des révisions", JSON.stringify(bilan));
   return bilan;
 }
+// ============================================================================
+// CLIENTS — les syndicats de la firme : coordonnées, contacts, études.
+// Tout membre de la firme les tient à jour ; seul un administrateur en
+// supprime un, et jamais un client qui a encore des dossiers.
+// ============================================================================
+async function numeroPris(db, no) {
+  return !!await db.prepare("SELECT id FROM dossiers WHERE dossier_no = ?1").bind(String(no ?? "").trim()).first();
+}
+function texteClient(v, max = 200) {
+  const t = String(v ?? "").replace(/\s+/g, " ").trim();
+  return t ? t.slice(0, max) : null;
+}
+function entierClient(v, min, max) {
+  const n = Number(v);
+  return v === "" || v == null || !Number.isInteger(n) || n < min || n > max ? null : n;
+}
+function contactsClient(v) {
+  const liste = Array.isArray(v) ? v : [];
+  return liste.slice(0, 20).map((x) => ({
+    nom: texteClient(x?.nom, 120),
+    fonction: texteClient(x?.fonction, 80),
+    courriel: texteClient(x?.courriel, 160),
+    telephone: texteClient(x?.telephone, 40)
+  })).filter((x) => x.nom || x.courriel || x.telephone);
+}
+// Les champs d'une fiche, validés ; seuls ceux présents dans le corps.
+function champsClient(body2) {
+  const champs = {};
+  if ("nom" in body2) champs.nom = texteClient(body2.nom);
+  if ("adresse" in body2) champs.adresse = texteClient(body2.adresse);
+  if ("ville" in body2) champs.ville = texteClient(body2.ville, 80);
+  if ("code_postal" in body2) champs.code_postal = texteClient(body2.code_postal, 10)?.toUpperCase() ?? null;
+  if ("unites" in body2) champs.unites = entierClient(body2.unites, 1, 5000);
+  if ("annee_construction" in body2) champs.annee_construction = entierClient(body2.annee_construction, 1800, 2200);
+  if ("neq" in body2) champs.neq = texteClient(body2.neq, 20);
+  if ("contacts" in body2) champs.contacts = JSON.stringify(contactsClient(body2.contacts));
+  if ("notes" in body2) champs.notes = texteClient(body2.notes, 4000);
+  return champs;
+}
+function vueClient(r, dossiersDuClient = []) {
+  const tries = dossiersDuClient.slice().sort((a, b) => anneeEtude(b) - anneeEtude(a));
+  const actuel = tries.find((d) => !dossiersDuClient.some((x) => x.revision_de === d.id)) ?? tries[0] ?? null;
+  return {
+    id: r.id, nom: r.nom, adresse: r.adresse, ville: r.ville, code_postal: r.code_postal, unites: r.unites,
+    annee_construction: r.annee_construction, neq: r.neq, contacts: parseJsonArraySafe(r.contacts), notes: r.notes,
+    crm_id: r.crm_id, cree_le: r.cree_le,
+    dossiers: tries.map((d) => ({
+      id: d.id, dossier_no: d.dossier_no, name: d.name, annee: anneeEtude(d), published_at: d.published_at,
+      revision_de: d.revision_de, ...infoRevision(d, dossiersDuClient)
+    })),
+    etude_actuelle: actuel ? { id: actuel.id, dossier_no: actuel.dossier_no, annee: anneeEtude(actuel), publiee: !!actuel.published_at, ...infoRevision(actuel, dossiersDuClient) } : null
+  };
+}
+function parseJsonArraySafe(t) {
+  try { const v = JSON.parse(t || "[]"); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+async function clientDeFirme(c, id) {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return { user, client: null };
+  const client = await c.env.DB.prepare("SELECT * FROM clients WHERE id = ?1 AND company_id = ?2").bind(id, user.company_id).first();
+  return { user, client };
+}
+const clientsApi = new Hono();
+clientsApi.get("/", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json({ clients: [], sans_client: [] });
+  const [clients, dossiersFirme] = await Promise.all([
+    c.env.DB.prepare("SELECT * FROM clients WHERE company_id = ?1 ORDER BY nom COLLATE NOCASE").bind(user.company_id).all(),
+    c.env.DB.prepare("SELECT id, dossier_no, name, address, city, units, built_year, published_at, created_at, revision_de, client_id FROM dossiers WHERE company_id = ?1").bind(user.company_id).all()
+  ]);
+  const tous = dossiersFirme.results;
+  // Les dossiers sans client, regroupés par immeuble (une étude et ses révisions).
+  const racine = (d) => {
+    let r = d;
+    for (let i = 0; i < 20 && r.revision_de; i++) {
+      const precedent = tous.find((x) => x.id === r.revision_de);
+      if (!precedent) break;
+      r = precedent;
+    }
+    return r;
+  };
+  const groupes = new Map();
+  for (const d of tous.filter((x) => !x.client_id)) {
+    const r = racine(d);
+    if (!groupes.has(r.id)) groupes.set(r.id, { nom: d.name, adresse: d.address, ville: d.city, unites: d.units, annee_construction: d.built_year, dossiers: [] });
+    groupes.get(r.id).dossiers.push({ id: d.id, dossier_no: d.dossier_no, annee: anneeEtude(d) });
+  }
+  return c.json({
+    clients: clients.results.map((r) => vueClient(r, tous.filter((d) => d.client_id === r.id))),
+    sans_client: [...groupes.values()],
+    crm: !crmRefus(c, user)
+  });
+});
+clientsApi.post("/", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const champs = champsClient(body2);
+  if (!champs.nom) return c.json({ error: "le nom du syndicat est requis" }, 400);
+  const id = newId("cli");
+  const cols = Object.keys(champs);
+  await c.env.DB.prepare(`INSERT INTO clients (id, company_id, ${cols.join(", ")}) VALUES (?1, ?2, ${cols.map((_, i) => `?${i + 3}`).join(", ")})`)
+    .bind(id, user.company_id, ...cols.map((k) => champs[k])).run();
+  // Dossiers existants rattachés à la création (un immeuble et ses révisions).
+  const ids = Array.isArray(body2.dossiers) ? body2.dossiers.map(String).slice(0, 50) : [];
+  if (ids.length) {
+    await c.env.DB.batch(ids.map((d) => c.env.DB.prepare("UPDATE dossiers SET client_id = ?1 WHERE id = ?2 AND company_id = ?3").bind(id, d, user.company_id)));
+  }
+  const r = await c.env.DB.prepare("SELECT * FROM clients WHERE id = ?1").bind(id).first();
+  const siens = (await c.env.DB.prepare("SELECT * FROM dossiers WHERE client_id = ?1").bind(id).all()).results;
+  return c.json(vueClient(r, siens), 201);
+});
+// Syndicats du CRM Stratégis pas encore importés — Condo Stratégis seulement.
+clientsApi.get("/crm", async (c) => {
+  const user = await getCurrentUser(c);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const deja = new Set((await c.env.DB.prepare("SELECT crm_id FROM clients WHERE company_id = ?1 AND crm_id IS NOT NULL").bind(user.company_id).all()).results.map((r) => r.crm_id));
+  const rows = (await c.env.CRM.prepare(
+    `SELECT id, nom, address, city, units, neq, annee_construction, gestionnaire_name, gestionnaire_email FROM syndicats
+       WHERE actif = 1 AND superseded_by_syndicat_id IS NULL ORDER BY nom COLLATE NOCASE LIMIT 2000`
+  ).all()).results;
+  return c.json(rows.filter((r) => !deja.has(r.id)).map((r) => ({ id: r.id, nom: r.nom, adresse: r.address, ville: r.city, unites: r.units, gestionnaire: r.gestionnaire_name })));
+});
+clientsApi.post("/crm", async (c) => {
+  const user = await getCurrentUser(c);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const ids = Array.isArray(body2.ids) ? [...new Set(body2.ids.map(String))].slice(0, 500) : [];
+  if (!ids.length) return c.json({ error: "aucun syndicat choisi" }, 400);
+  const deja = new Set((await c.env.DB.prepare("SELECT crm_id FROM clients WHERE company_id = ?1 AND crm_id IS NOT NULL").bind(user.company_id).all()).results.map((r) => r.crm_id));
+  const lignes = [];
+  for (let i = 0; i < ids.length; i += 90) {
+    const lot = ids.slice(i, i + 90);
+    lignes.push(...(await c.env.CRM.prepare(
+      `SELECT id, nom, address, city, units, neq, annee_construction, gestionnaire_name, gestionnaire_email FROM syndicats WHERE id IN (${lot.map((_, k) => `?${k + 1}`).join(", ")})`
+    ).bind(...lot).all()).results);
+  }
+  const nouveaux = lignes.filter((r) => !deja.has(r.id));
+  const stmt = c.env.DB.prepare(
+    `INSERT INTO clients (id, company_id, nom, adresse, ville, unites, annee_construction, neq, contacts, crm_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+  );
+  for (let i = 0; i < nouveaux.length; i += 50) {
+    await c.env.DB.batch(nouveaux.slice(i, i + 50).map((r) => {
+      const ch = champsClient({ nom: r.nom, adresse: r.address, ville: r.city, unites: r.units, annee_construction: r.annee_construction, neq: r.neq,
+        contacts: r.gestionnaire_name || r.gestionnaire_email ? [{ nom: r.gestionnaire_name, fonction: "Gestionnaire", courriel: r.gestionnaire_email }] : [] });
+      return stmt.bind(newId("cli"), user.company_id, ch.nom ?? "Syndicat sans nom", ch.adresse, ch.ville, ch.unites, ch.annee_construction, ch.neq, ch.contacts, r.id);
+    }));
+  }
+  return c.json({ importes: nouveaux.length, deja: lignes.length - nouveaux.length });
+});
+clientsApi.get("/:id", async (c) => {
+  const { client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const siens = (await c.env.DB.prepare("SELECT * FROM dossiers WHERE client_id = ?1").bind(client.id).all()).results;
+  return c.json(vueClient(client, siens));
+});
+clientsApi.patch("/:id", async (c) => {
+  const { client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const champs = champsClient(await c.req.json().catch(() => ({})));
+  if ("nom" in champs && !champs.nom) return c.json({ error: "le nom du syndicat est requis" }, 400);
+  const cols = Object.keys(champs);
+  if (!cols.length) return c.json({ error: "rien à modifier" }, 400);
+  await c.env.DB.prepare(`UPDATE clients SET ${cols.map((k, i) => `${k} = ?${i + 1}`).join(", ")} WHERE id = ?${cols.length + 1}`)
+    .bind(...cols.map((k) => champs[k]), client.id).run();
+  const r = await c.env.DB.prepare("SELECT * FROM clients WHERE id = ?1").bind(client.id).first();
+  const siens = (await c.env.DB.prepare("SELECT * FROM dossiers WHERE client_id = ?1").bind(client.id).all()).results;
+  return c.json(vueClient(r, siens));
+});
+clientsApi.delete("/:id", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  if (!peutAdministrerFirme(user, client.company_id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const n = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM dossiers WHERE client_id = ?1").bind(client.id).first();
+  if (n?.n) return c.json({ error: "ce client a des dossiers : détachez-les d'abord" }, 409);
+  await c.env.DB.prepare("DELETE FROM clients WHERE id = ?1").bind(client.id).run();
+  return c.json({ ok: true });
+});
+// Rattacher un dossier (avec ses révisions) à ce client, ou l'en détacher.
+clientsApi.put("/:id/dossiers/:dossierId", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const d = await c.env.DB.prepare("SELECT id FROM dossiers WHERE id = ?1 AND company_id = ?2").bind(c.req.param("dossierId"), user.company_id).first();
+  if (!d) return c.json({ error: "dossier introuvable" }, 404);
+  await c.env.DB.prepare("UPDATE dossiers SET client_id = ?1 WHERE id = ?2").bind(client.id, d.id).run();
+  return c.json({ ok: true });
+});
+clientsApi.delete("/:id/dossiers/:dossierId", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  await c.env.DB.prepare("UPDATE dossiers SET client_id = NULL WHERE id = ?1 AND client_id = ?2 AND company_id = ?3").bind(c.req.param("dossierId"), client.id, user.company_id).run();
+  return c.json({ ok: true });
+});
+// Nouvelle étude pour ce client : le dossier reprend ses coordonnées.
+clientsApi.post("/:id/dossiers", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const no = texteClient(body2.dossier_no, 40);
+  if (!no) return c.json({ error: "numéro de dossier requis" }, 400);
+  if (await numeroPris(c.env.DB, no)) return c.json({ error: `le numéro de dossier ${no} est déjà utilisé` }, 409);
+  const floors = entierClient(body2.floors, 1, 200);
+  return c.json(await creerDossier(c, user, {
+    dossier_no: no, name: client.nom, address: client.adresse, city: client.ville, units: client.unites ?? 0,
+    floors, built_year: client.annee_construction, client_id: client.id
+  }), 201);
+});
 // ---- Côté firme : membres et répartition, depuis la console bureau -------------
 async function dossierPortail(c, { ecriture = false } = {}) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
@@ -47607,9 +47833,9 @@ dossiers.post("/:id/revision", async (c) => {
   const facteur = facteurIndexation(anneeSource, annee);
   const id = newId("dos");
   await c.env.DB.prepare(
-    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id, batiment_info, revision_de)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`
-  ).bind(id, dossierNo, source.name, source.address, source.city, source.units ?? 0, source.floors, source.built_year, user.id, source.company_id, source.batiment_info, source.id).run();
+    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id, batiment_info, revision_de, client_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`
+  ).bind(id, dossierNo, source.name, source.address, source.city, source.units ?? 0, source.floors, source.built_year, user.id, source.company_id, source.batiment_info, source.id, source.client_id ?? null).run();
   const anciennes = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 ORDER BY sort_order ASC, created_at ASC").bind(source.id).all();
   const nouveauxIds = new Map(anciennes.results.map((comp) => [comp.id, newId("cmp")]));
   const colonnes = ["id", "dossier_id", ...CHAMPS_REPRIS_REVISION, "replacement_cost", "parent_id", "origine_id"];
@@ -47642,10 +47868,19 @@ dossiers.post("/", async (c) => {
   if (!user.company_id) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
   const body2 = await c.req.json();
   if (!body2.dossier_no || !body2.name) return c.json({ error: "dossier_no et name requis" }, 400);
+  if (await numeroPris(c.env.DB, body2.dossier_no)) return c.json({ error: `le numéro de dossier ${body2.dossier_no} est déjà utilisé` }, 409);
+  if (body2.client_id && !await c.env.DB.prepare("SELECT id FROM clients WHERE id = ?1 AND company_id = ?2").bind(body2.client_id, user.company_id).first()) {
+    return c.json({ error: "client introuvable" }, 404);
+  }
+  return c.json(await creerDossier(c, user, body2), 201);
+});
+// Nouveau dossier et sa liste de départ : celle de la firme, filtrée pour
+// l'immeuble par l'IA quand une clé est configurée.
+async function creerDossier(c, user, body2) {
   const id = newId("dos");
   await c.env.DB.prepare(
-    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id, client_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`
   ).bind(
     id,
     body2.dossier_no,
@@ -47656,7 +47891,8 @@ dossiers.post("/", async (c) => {
     body2.floors ?? null,
     body2.built_year ?? null,
     user.id,
-    user.company_id
+    user.company_id,
+    body2.client_id ?? null
   ).run();
   const regles = evaluerRegles({ floors: body2.floors ?? null, batiment_info: null });
   // La liste de la firme, si elle en a importé une ; sinon celle de Condo Stratégis.
@@ -47682,7 +47918,7 @@ dossiers.post("/", async (c) => {
   );
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
   await noterJournal(c.env.DB, { dossierId: id, userId: user.id, action: "creation", champs: [] });
-  return c.json({
+  return {
     ...dossier,
     stats: await dossierStats(c.env.DB, id),
     // L'inspecteur doit savoir si la liste a été filtrée pour son immeuble ou
@@ -47693,8 +47929,8 @@ dossiers.post("/", async (c) => {
       total: gabarit.length,
       desactivees: filtre.inactifs.size
     }
-  }, 201);
-});
+  };
+}
 async function getOwnedDossier(c, id) {
   const user = await getCurrentUser(c);
   if (!user) return { user: null, dossier: null };
@@ -48755,7 +48991,7 @@ app.use("/api/*", async (c, next) => {
   return next();
 });
 app.use("/api/*", async (c, next) => {
-  if (["/api/dossiers", "/api/components", "/api/companies", "/api/auth", "/api/portail"].some((p) => c.req.path.startsWith(p))) {
+  if (["/api/dossiers", "/api/components", "/api/companies", "/api/auth", "/api/portail", "/api/clients"].some((p) => c.req.path.startsWith(p))) {
     await assurerColonnes(c.env.DB);
   }
   return next();
@@ -48768,6 +49004,7 @@ app.route("/api/components", components);
 app.route("/api/photos", photos);
 app.route("/api/prix", prix);
 app.route("/api/portail", portail);
+app.route("/api/clients", clientsApi);
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 const index = {
   fetch: app.fetch,

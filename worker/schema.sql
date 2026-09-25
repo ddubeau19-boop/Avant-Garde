@@ -94,6 +94,24 @@ CREATE TABLE journal (
 );
 CREATE INDEX idx_journal_dossier ON journal(dossier_id, moment);
 
+-- Clients de la firme : les syndicats, leurs coordonnées et leurs contacts.
+CREATE TABLE clients (
+  id                 TEXT PRIMARY KEY,
+  company_id         TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  nom                TEXT NOT NULL,
+  adresse            TEXT,
+  ville              TEXT,
+  code_postal        TEXT,
+  unites             INTEGER,
+  annee_construction INTEGER,
+  neq                TEXT,
+  contacts           TEXT,   -- JSON : [{ nom, fonction, courriel, telephone }]
+  notes              TEXT,
+  crm_id             TEXT,   -- syndicat du CRM Stratégis, s'il en vient
+  cree_le            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX idx_clients_firme ON clients(company_id, nom);
+
 CREATE TABLE dossiers (
   id                   TEXT PRIMARY KEY,
   dossier_no           TEXT NOT NULL UNIQUE,
@@ -115,7 +133,8 @@ CREATE TABLE dossiers (
   revision_de          TEXT,  -- étude précédente du même immeuble (révision aux cinq ans)
   rappel_revision_le   TEXT,  -- dernier rappel de révision envoyé à la firme
   assigne_a            TEXT,  -- membre de la firme responsable du dossier
-  echeance             TEXT   -- date de livraison visée (AAAA-MM-JJ)
+  echeance             TEXT,  -- date de livraison visée (AAAA-MM-JJ)
+  client_id            TEXT   -- syndicat client (clients.id)
 );
 
 CREATE TABLE components (
