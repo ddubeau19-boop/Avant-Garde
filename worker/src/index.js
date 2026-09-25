@@ -3411,6 +3411,8 @@ Réponds UNIQUEMENT par les numéros séparés par des virgules, ou par le mot A
 // créées au premier appel de chaque isolat plutôt que par une migration
 // manuelle : un déploiement ne peut pas précéder la base qu'il suppose.
 const COLONNES_AJOUTEES = [
+  ["companies", "theme", "TEXT"],
+  ["companies", "mise_en_page", "TEXT"],
   ["actif", "INTEGER NOT NULL DEFAULT 1"],
   ["etendue", "TEXT"],
   ["etendue_qte", "TEXT"],
@@ -3424,10 +3426,19 @@ let colonnesPretes = null;
 function assurerColonnes(db) {
   if (!colonnesPretes) {
     colonnesPretes = (async () => {
-      const colonnes = await db.prepare("PRAGMA table_info(components)").all();
-      const presentes = new Set(colonnes.results.map((col) => col.name));
-      for (const [nom, type] of COLONNES_AJOUTEES) {
-        if (!presentes.has(nom)) await db.prepare(`ALTER TABLE components ADD COLUMN ${nom} ${type}`).run();
+      // Entrées [colonne, type] : table components ; [table, colonne, type] sinon.
+      const parTable = new Map();
+      for (const entree of COLONNES_AJOUTEES) {
+        const [table, nom, type] = entree.length === 3 ? entree : ["components", ...entree];
+        if (!parTable.has(table)) parTable.set(table, []);
+        parTable.get(table).push([nom, type]);
+      }
+      for (const [table, colonnes] of parTable) {
+        const infos = await db.prepare(`PRAGMA table_info(${table})`).all();
+        const presentes = new Set(infos.results.map((col) => col.name));
+        for (const [nom, type] of colonnes) {
+          if (!presentes.has(nom)) await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${nom} ${type}`).run();
+        }
       }
     })().catch((e) => {
       colonnesPretes = null;
@@ -4218,7 +4229,8 @@ function blocsEtat(component, dossier, description) {
   const cote = coteRapport(component?.rating);
   const projet = phraseFinale(component?.projet_ca);
   const information = guide.information ? INFORMATIONS_REGLEMENTAIRES[guide.information]?.(dossier) : null;
-  return assembler([
+  // L'avis réglementaire forme son propre paragraphe : le rapport Word l'encadre.
+  return paragraphes([assembler([
     description || descriptionDeterministe(component),
     phraseLimite(component),
     guide.portee.join(" "),
@@ -4226,9 +4238,8 @@ function blocsEtat(component, dossier, description) {
     phraseAnnee(component),
     cote === "Bon" ? "Autre que l'entretien régulier, aucun suivi n'est prévu cette année." : null,
     LIMITE_RELEVE[component?.cat] ?? null,
-    projet ? `Selon les informations obtenues, le conseil d'administration planifie ${projet.charAt(0).toLowerCase()}${projet.slice(1)}` : null,
-    information
-  ]);
+    projet ? `Selon les informations obtenues, le conseil d'administration planifie ${projet.charAt(0).toLowerCase()}${projet.slice(1)}` : null
+  ]), information]);
 }
 function etatDeterministe(component, dossier) {
   return blocsEtat(component, dossier, null);
@@ -23074,10 +23085,6 @@ _defineProperty(Packer, "compiler", new Compiler());
 const LOGO_BASE64 = "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";
 const LOGO_WIDTH = 155;
 const LOGO_HEIGHT = 343;
-const ORANGE = "FF5E39";
-const DARK = "1A1A1A";
-const GREY = "6B6B6B";
-const FONT = "Barlow";
 const ETAT_LABELS$1 = ["Excellent", "Bon", "Moyen", "Mauvais", "Critique"];
 function base64ToUint8Array(base64) {
   const bin = atob(base64);
@@ -23087,40 +23094,6 @@ function base64ToUint8Array(base64) {
 }
 function money(n) {
   return n.toLocaleString("fr-CA", { style: "currency", currency: "CAD", maximumFractionDigits: 0 });
-}
-function heading(text) {
-  return new Paragraph({
-    heading: HeadingLevel.HEADING_1,
-    spacing: { before: 320, after: 160 },
-    children: [new TextRun({ text, bold: true, color: ORANGE, font: FONT, size: 24 })]
-  });
-}
-function body(text, opts = {}) {
-  return new Paragraph({
-    spacing: { after: 100 },
-    children: [
-      new TextRun({ text, font: FONT, bold: opts.bold, color: opts.color ?? DARK, size: opts.size ?? 20 })
-    ]
-  });
-}
-function cell(text, opts = {}) {
-  return new TableCell({
-    shading: opts.header ? { type: ShadingType.CLEAR, fill: DARK } : void 0,
-    margins: { top: 60, bottom: 60, left: 80, right: 80 },
-    children: [
-      new Paragraph({
-        children: [
-          new TextRun({
-            text,
-            font: FONT,
-            size: 16,
-            bold: opts.header,
-            color: opts.header ? "FFFFFF" : opts.color ?? DARK
-          })
-        ]
-      })
-    ]
-  });
 }
 // ============================================================================
 // LE RAPPORT .DOCX — plan de gestion de l'actif, ossature maison
@@ -23655,39 +23628,709 @@ function peutGererEntreprise(user, companyId) {
   if (user.role === "super_admin") return true;
   return user.company_id === companyId;
 }
-function titre2(text) {
-  return new Paragraph({
-    spacing: { before: 240, after: 100 },
-    children: [new TextRun({ text, bold: true, color: DARK, font: FONT, size: 22 })]
-  });
-}
-function titre3(text) {
-  return new Paragraph({
-    spacing: { before: 160, after: 60 },
-    children: [new TextRun({ text, bold: true, color: ORANGE, font: FONT, size: 19 })]
-  });
-}
-function paras(texte, opts = {}) {
-  if (!texte) return [];
-  return String(texte).split(/\n{2,}/).map((bloc) => bloc.trim()).filter(Boolean).flatMap((bloc) => bloc.split("\n").map((ligne) => body(ligne.trim(), opts)));
-}
-function puce(text) {
-  return body(`· ${text}`);
-}
-function tableauMaison(entetes, lignes) {
-  return new Table({
-    width: { size: 100, type: WidthType.PERCENTAGE },
-    rows: [
-      new TableRow({ children: entetes.map((h) => cell(h, { header: true })) }),
-      ...lignes.map((ligne) => new TableRow({ children: ligne.map((v) => cell(String(v))) }))
-    ]
-  });
-}
 function pourcent(taux) {
   return `${(taux * 100).toFixed(2).replace(".", ",").replace(/,00$/, "")}${NBSP}%`;
 }
-async function generateReportDocx(ctx) {
+// ============================================================================
+// IDENTITÉ DU RAPPORT — thème de la firme, fiche composante, composition Word
+// ----------------------------------------------------------------------------
+// Chaque firme hébergée publie ses rapports à son image : couleurs, polices,
+// coordonnées et logo viennent de sa fiche d'entreprise (companies.theme), et
+// non plus de constantes Condo Stratégis codées en dur. Une firme peut aussi
+// fournir son propre gabarit Word de mise en page (companies.mise_en_page) :
+// ses pages liminaires, ses champs {{…}} et son repère {{RAPPORT}}, où la
+// plateforme verse le rapport qu'elle a rédigé, dans les styles de la firme.
+// ============================================================================
+const THEME_DEFAUT = {
+  accent: "FF5E39",
+  encre: "0A0A0A",
+  gris: "6B6B6B",
+  filet: "E0E0E0",
+  fond: "F7F7F7",
+  vert: "1F8A4E",
+  vertPale: "E6F2EB",
+  police: "Inter Tight",
+  policeTitres: "Archivo",
+  policeMono: "JetBrains Mono",
+  adresse: "",
+  telephone: "",
+  courriel: "",
+  site: ""
+};
+// Coordonnées historiques de Condo Stratégis : reprises seulement pour cette
+// firme tant qu'elle ne les a pas saisies à sa fiche, pour que ses rapports ne
+// perdent pas leur pied de page le jour du déploiement.
+const COORDONNEES_STRATEGIS = {
+  adresse: "82, rue de Brésol, Montréal, Québec, H2Y 1V5",
+  telephone: "(514) 508-6987",
+  courriel: "info@condostrategis.ca"
+};
+const CHAMPS_THEME_COULEUR = ["accent", "encre", "gris"];
+const CHAMPS_THEME_POLICE = ["police", "policeTitres", "policeMono"];
+const CHAMPS_THEME_TEXTE = ["adresse", "telephone", "courriel", "site"];
+function estStrategis(nom) {
+  return /strat[ée]gis/i.test(String(nom ?? ""));
+}
+function nettoyerTheme(brut) {
+  const src = objetJson(brut);
+  const theme = {};
+  for (const k of CHAMPS_THEME_COULEUR) {
+    const v = String(src[k] ?? "").trim().replace(/^#/, "").toUpperCase();
+    if (/^[0-9A-F]{6}$/.test(v)) theme[k] = v;
+  }
+  for (const k of CHAMPS_THEME_POLICE) {
+    const v = String(src[k] ?? "").trim();
+    if (/^[\p{L}0-9 \-]{1,40}$/u.test(v)) theme[k] = v;
+  }
+  for (const k of CHAMPS_THEME_TEXTE) {
+    const v = String(src[k] ?? "").trim().slice(0, 160);
+    if (v) theme[k] = v;
+  }
+  return theme;
+}
+function themeDeFirme(company) {
+  const propre = nettoyerTheme(company?.theme);
+  const theme = { ...THEME_DEFAUT, ...propre, nom: String(company?.name ?? "").trim() };
+  if (estStrategis(theme.nom)) {
+    for (const [k, v] of Object.entries(COORDONNEES_STRATEGIS)) if (!propre[k]) theme[k] = v;
+  }
+  return theme;
+}
+function coordonneesFirme(theme) {
+  return [theme.nom, theme.adresse, theme.telephone, theme.courriel, theme.site].filter(Boolean).join(" — ");
+}
+// Dimensions d'une image PNG ou JPEG, lues dans son en-tête : ImageRun exige
+// une taille, et une photo de téléphone n'a jamais les proportions du cadre.
+function imageDocx(bytes) {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (b.length > 24 && b[0] === 137 && b[1] === 80 && b[2] === 78 && b[3] === 71) {
+    const vue = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    return { data: b, type: "png", largeur: vue.getUint32(16), hauteur: vue.getUint32(20) };
+  }
+  if (b.length > 4 && b[0] === 255 && b[1] === 216) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 255) { i++; continue; }
+      const marqueur = b[i + 1];
+      const longueur = (b[i + 2] << 8) + b[i + 3];
+      // SOF0 à SOF15, sauf DHT (C4), JPG (C8) et DAC (CC).
+      if (marqueur >= 192 && marqueur <= 207 && marqueur !== 196 && marqueur !== 200 && marqueur !== 204) {
+        return { data: b, type: "jpg", largeur: (b[i + 7] << 8) + b[i + 8], hauteur: (b[i + 5] << 8) + b[i + 6] };
+      }
+      i += 2 + longueur;
+    }
+  }
+  return null;
+}
+function tailleImage(image, largeurMax, hauteurMax) {
+  const ratio = image.largeur > 0 && image.hauteur > 0 ? image.hauteur / image.largeur : 0.75;
+  let largeur = largeurMax;
+  let hauteur = Math.round(largeur * ratio);
+  if (hauteur > hauteurMax) {
+    hauteur = hauteurMax;
+    largeur = Math.round(hauteur / ratio);
+  }
+  return { width: largeur, height: hauteur };
+}
+const SANS_BORDURE = { style: BorderStyle.NONE, size: 0, color: "FFFFFF" };
+// Outils de mise en forme, liés au thème d'un rapport. `modeStyles` : le rapport
+// sera versé dans le gabarit Word d'une firme — les titres portent alors les
+// styles Titre 1 à 3 et le texte courant hérite de ses polices, au lieu de
+// formats directs qui écraseraient sa mise en page.
+function outilsDocx(t, { modeStyles = false } = {}) {
+  const police = modeStyles ? void 0 : t.police;
+  const policeTitres = modeStyles ? void 0 : t.policeTitres;
+  const policeMono = modeStyles ? void 0 : t.policeMono;
+  const run = (text, o = {}) => new TextRun({
+    text,
+    font: o.font === void 0 ? police : o.font,
+    bold: o.bold,
+    italics: o.italics,
+    allCaps: o.allCaps,
+    characterSpacing: o.characterSpacing,
+    color: o.color === void 0 ? (modeStyles ? void 0 : t.encre) : o.color,
+    size: o.size === void 0 ? (modeStyles ? void 0 : 20) : o.size
+  });
+  const bordures = {
+    top: SANS_BORDURE,
+    left: SANS_BORDURE,
+    right: SANS_BORDURE,
+    insideVertical: SANS_BORDURE,
+    bottom: { style: BorderStyle.SINGLE, size: 4, color: t.filet },
+    insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: t.filet }
+  };
+  const sansBordures = { top: SANS_BORDURE, bottom: SANS_BORDURE, left: SANS_BORDURE, right: SANS_BORDURE, insideHorizontal: SANS_BORDURE, insideVertical: SANS_BORDURE };
+  function heading(text, o = {}) {
+    return new Paragraph({
+      heading: HeadingLevel.HEADING_1,
+      pageBreakBefore: !o.sansSaut,
+      keepNext: true,
+      spacing: { before: 120, after: 200 },
+      border: modeStyles ? void 0 : { bottom: { style: BorderStyle.SINGLE, size: 12, color: t.accent, space: 6 } },
+      children: [modeStyles ? new TextRun({ text }) : run(text, { font: policeTitres, bold: true, size: 32, allCaps: true })]
+    });
+  }
+  function titre2(text) {
+    return new Paragraph({
+      // Le bundle ne garde que HeadingLevel.HEADING_1 : identifiant de style direct.
+      heading: "Heading2",
+      keepNext: true,
+      spacing: { before: 280, after: 100 },
+      children: [modeStyles ? new TextRun({ text }) : run(text, { font: policeTitres, bold: true, size: 24 })]
+    });
+  }
+  function titre3(text) {
+    return new Paragraph({
+      heading: "Heading3",
+      keepNext: true,
+      spacing: { before: 160, after: 60 },
+      children: [modeStyles ? new TextRun({ text }) : run(text, { font: policeTitres, bold: true, color: t.accent, size: 20 })]
+    });
+  }
+  function body(text, o = {}) {
+    return new Paragraph({
+      spacing: { after: 100 },
+      children: [run(text, { bold: o.bold, color: o.color, size: o.size })]
+    });
+  }
+  function puce(text) {
+    return new Paragraph({
+      spacing: { after: 60 },
+      indent: { left: 360, hanging: 200 },
+      children: [run(`·\t${text}`)],
+      tabStops: [{ type: TabStopType.LEFT, position: 360 }]
+    });
+  }
+  // Avis réglementaire : filet de la couleur d'accent à gauche, sur fond blanc
+  // — le gabarit maison ne pose jamais de texte sur un fond teinté.
+  function encadre(text) {
+    return new Paragraph({
+      spacing: { before: 120, after: 160 },
+      indent: { left: 220 },
+      border: { left: { style: BorderStyle.SINGLE, size: 18, color: t.accent, space: 10 } },
+      children: [run(text, { size: 17 })]
+    });
+  }
+  function paras(texte, o = {}) {
+    if (!texte) return [];
+    return String(texte).split(/\n{2,}/).map((bloc) => bloc.trim()).filter(Boolean).flatMap((bloc) => bloc.split("\n").map((ligne) => {
+      const l = ligne.trim();
+      if (/^INFORMATION\s*:/.test(l)) return encadre(l);
+      if (/^[·•]\s*/.test(l)) return puce(l.replace(/^[·•]\s*/, ""));
+      return body(l, o);
+    }));
+  }
+  function cell(text, o = {}) {
+    return new TableCell({
+      shading: o.header ? { type: ShadingType.CLEAR, fill: t.fond, color: "auto" } : void 0,
+      margins: { top: 70, bottom: 70, left: 100, right: 100 },
+      children: [new Paragraph({
+        alignment: o.droite ? AlignmentType.RIGHT : void 0,
+        children: [o.header
+          ? run(text, { font: policeMono, size: 14, color: t.gris, allCaps: true, characterSpacing: 10 })
+          : run(text, { size: 17, color: o.color })]
+      })]
+    });
+  }
+  function tableauMaison(entetes, lignes, o = {}) {
+    const droite = new Set(o.colonnesDroite ?? []);
+    return new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      borders: bordures,
+      rows: [
+        new TableRow({ tableHeader: true, children: entetes.map((h, i) => cell(h, { header: true, droite: droite.has(i) })) }),
+        ...lignes.map((ligne) => new TableRow({ cantSplit: true, children: ligne.map((v, i) => cell(String(v), { droite: droite.has(i) })) }))
+      ]
+    });
+  }
+  function etiquette(text) {
+    return new Paragraph({
+      keepNext: true,
+      spacing: { before: 220, after: 70 },
+      children: [run(text, { font: policeMono, size: 16, bold: true, color: t.accent, allCaps: true, characterSpacing: 20 })]
+    });
+  }
+  // Bandeau de synthèse : ce qu'on doit lire d'un coup d'œil en feuilletant.
+  function bandeau(cases) {
+    const cellules = cases.map((c) => {
+      const teinte = c.teinte ?? null;
+      return new TableCell({
+        shading: teinte?.fond ? { type: ShadingType.CLEAR, fill: teinte.fond, color: "auto" } : void 0,
+        margins: { top: 80, bottom: 80, left: 110, right: 110 },
+        children: [
+          // keepNext : le bandeau ne reste jamais seul en bas de page.
+          new Paragraph({ keepNext: true, children: [run(c.libelle, { font: policeMono, size: 13, color: teinte?.libelle ?? t.gris, allCaps: true, characterSpacing: 10 })] }),
+          new Paragraph({ keepNext: true, spacing: { before: 30 }, children: [run(c.valeur, { bold: true, size: 18, color: teinte?.texte ?? t.encre })] })
+        ]
+      });
+    });
+    return new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      borders: {
+        top: { style: BorderStyle.SINGLE, size: 4, color: t.filet },
+        bottom: { style: BorderStyle.SINGLE, size: 4, color: t.filet },
+        left: SANS_BORDURE,
+        right: SANS_BORDURE,
+        insideHorizontal: SANS_BORDURE,
+        insideVertical: { style: BorderStyle.SINGLE, size: 4, color: t.filet }
+      },
+      rows: [new TableRow({ cantSplit: true, children: cellules })]
+    });
+  }
+  function teinteCote(cote) {
+    if (cote === "Bon") return { fond: t.vertPale, texte: t.vert, libelle: t.vert };
+    if (cote === "Passable") return { fond: null, texte: t.accent, libelle: t.accent };
+    if (cote === "Mauvais") return { fond: t.accent, texte: "FFFFFF", libelle: "FFFFFF" };
+    return null;
+  }
+  function photoBloc(photo, largeurMax, hauteurMax) {
+    return [
+      new Paragraph({
+        keepNext: true,
+        spacing: { after: 30 },
+        children: [new ImageRun({ data: photo.image.data, type: photo.image.type, transformation: tailleImage(photo.image, largeurMax, hauteurMax) })]
+      }),
+      new Paragraph({
+        spacing: { after: 120 },
+        children: [run(sansNotesInternes(photo.tag ?? "Photo"), { font: policeMono, size: 13, color: t.gris, allCaps: true, characterSpacing: 10 })]
+      })
+    ];
+  }
+  // Fiche composante — gabarit « classique éditorial » de la firme : surtitre
+  // catégorie · code, titre, filet court, bandeau de synthèse, puis les quatre
+  // sections. Les photos sont celles de l'ingénieur ; sans photo, le texte prend
+  // toute la largeur plutôt que de laisser un cadre vide dans un rapport livré.
+  function ficheDocx({ numero, nom, categorie, code, cote, ligne, component, fiche, photos }) {
+    const blocs = [];
+    blocs.push(new Paragraph({
+      keepNext: true,
+      spacing: { before: 420, after: 40 },
+      children: [run(`${categorie.toUpperCase()}${code ? ` · ${code}` : ""}`, { font: policeMono, size: 14, color: t.gris, characterSpacing: 20 })]
+    }));
+    blocs.push(new Paragraph({
+      heading: "Heading3",
+      keepNext: true,
+      spacing: { after: 40 },
+      children: [modeStyles ? new TextRun({ text: `${numero} ${nom}` }) : run(`${numero} ${nom}`, { font: policeTitres, bold: true, size: 30, allCaps: true })]
+    }));
+    // Filet court : la bordure d'un paragraphe fait toute sa largeur, un
+    // retrait à droite la ramène à environ 2,5 cm.
+    blocs.push(new Paragraph({
+      keepNext: true,
+      spacing: { after: 160 },
+      indent: { right: 8200 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 12, color: t.accent, space: 1 } },
+      children: []
+    }));
+    const delai = DELAIS_MAISON.find((d) => d.libelle === component?.delai_suggere);
+    blocs.push(bandeau([
+      { libelle: "Cote", valeur: cote ?? "Non cotée", teinte: teinteCote(cote) },
+      { libelle: "Origine", valeur: ligne.anneeInstall != null ? String(ligne.anneeInstall) : ligne.anneeReference != null ? `${ligne.anneeReference} (calcul)` : "—" },
+      { libelle: ligne.allocation ? "Cycle" : "Durée de vie", valeur: `${ligne.duree} ans` },
+      { libelle: ligne.allocation ? "Débutant en" : "Remplacement", valeur: ligne.annee != null ? String(ligne.annee) : "à confirmer" },
+      { libelle: "Délai", valeur: delai ? delai.libelle.replace(/\s*\(.*\)$/, "") : sansNotesInternes(component?.delai_suggere ?? "") || "—" }
+    ]));
+    for (const section of fiche.sections) {
+      blocs.push(etiquette(section.cle === "etat" ? "État de l'actif" : section.cle === "duree_vie" ? "Durée de vie et remplacement" : section.cle === "entretien" ? "Commentaires d'entretien" : "Attention spéciale"));
+      const texte = paras(section.texte);
+      if (section.cle === "etat" && photos.length > 0) {
+        const aCote = photos.slice(0, 2);
+        const dessous = photos.slice(2, 4);
+        blocs.push(new Table({
+          width: { size: 100, type: WidthType.PERCENTAGE },
+          borders: sansBordures,
+          rows: [new TableRow({
+            children: [
+              new TableCell({ width: { size: 62, type: WidthType.PERCENTAGE }, margins: { right: 200 }, children: texte.length ? texte : [new Paragraph({ children: [] })] }),
+              new TableCell({ width: { size: 38, type: WidthType.PERCENTAGE }, children: aCote.flatMap((p) => photoBloc(p, 215, 170)) })
+            ]
+          })]
+        }));
+        if (dessous.length) {
+          blocs.push(new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            borders: sansBordures,
+            rows: [new TableRow({
+              cantSplit: true,
+              children: [0, 1].map((i) => new TableCell({
+                width: { size: 50, type: WidthType.PERCENTAGE },
+                children: dessous[i] ? photoBloc(dessous[i], 300, 220) : [new Paragraph({ children: [] })]
+              }))
+            })]
+          }));
+        }
+      } else {
+        blocs.push(...texte);
+      }
+      if (section.cle === "duree_vie") {
+        blocs.push(tableauMaison(
+          ["Élément", "Type", ligne.allocation ? "Cycle" : "Durée de vie", ligne.allocation ? "Débutant en" : "Remplacement", ligne.libelleMontant],
+          [[
+            titreTableauMaison(component, ligne),
+            ligne.reglementaire ? ligne.reglementaire.libelle : ligne.allocation ? "Allocation" : "Remplacement",
+            `${ligne.duree} ans`,
+            ligne.annee != null ? String(ligne.annee) : "à confirmer",
+            montantMaison(ligne.cout) ?? `-${NBSP}$`
+          ]],
+          { colonnesDroite: [4] }
+        ));
+      }
+    }
+    return blocs;
+  }
+  return { run, heading, titre2, titre3, body, puce, encadre, paras, cell, tableauMaison, etiquette, ficheDocx, bordures };
+}
+// ----------------------------------------------------------------------------
+// Post-traitement du .docx produit : table des matières, sommaire exécutif,
+// et composition dans le gabarit Word de la firme.
+// ----------------------------------------------------------------------------
+const MARQUE_TDM = "§§TABLE_DES_MATIERES§§";
+const MARQUE_DEBUT_SOMMAIRE = "§§DEBUT_SOMMAIRE§§";
+const MARQUE_FIN_SOMMAIRE = "§§FIN_SOMMAIRE§§";
+const MARQUE_BLOC = (nom) => `§§BLOC_${nom}§§`;
+const BLOCS_GABARIT = ["rapport", "table_des_matieres", "sommaire_executif"];
+// docx produit toutes ses images avec <wp:docPr id="1"> ; Word exige des
+// identifiants uniques et « répare » sinon le document à l'ouverture.
+function renumeroterDessins(xml) {
+  let n = 0;
+  return xml.replace(/<wp:docPr id="\d+"/g, () => `<wp:docPr id="${++n}"`);
+}
+function echapperXml(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function champTableDesMatieres() {
+  return '<w:p><w:r><w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \\o "1-3" \\h \\z \\u </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t xml:space="preserve">Table des matières : si elle n\'apparaît pas, faites un clic droit ici puis « Mettre à jour les champs ».</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>';
+}
+// Bornes du paragraphe <w:p> qui contient la position `pos`.
+function paragrapheAutour(xml, pos) {
+  const a = xml.lastIndexOf("<w:p>", pos);
+  const b = xml.lastIndexOf("<w:p ", pos);
+  const debut = Math.max(a, b);
+  const fin = xml.indexOf("</w:p>", pos);
+  if (debut < 0 || fin < 0) return null;
+  return { debut, fin: fin + 6 };
+}
+function remplacerParagraphe(xml, marque, remplacement) {
+  const pos = xml.indexOf(marque);
+  if (pos < 0) return { xml, trouve: false };
+  const p = paragrapheAutour(xml, pos);
+  if (!p) return { xml, trouve: false };
+  return { xml: xml.slice(0, p.debut) + remplacement + xml.slice(p.fin), trouve: true };
+}
+// Champs {{cle}} d'un XML Word. Word coupe souvent un champ en plusieurs <w:t>
+// dès qu'on change la mise en forme ou que le correcteur passe dessus : on lit
+// donc le texte de tous les <w:t> bout à bout, on y repère les champs, puis on
+// reporte la valeur dans le premier morceau et on vide les suivants.
+const RE_WT = /<w:t(\s[^>]*)?>([\s\S]*?)<\/w:t>|<w:t(\s[^>]*)?\/>/g;
+function remplacerChampsXml(xml, valeurPour) {
+  const noeuds = [];
+  let m;
+  RE_WT.lastIndex = 0;
+  while ((m = RE_WT.exec(xml))) {
+    noeuds.push({ debut: m.index, fin: m.index + m[0].length, texte: decodeEntitesXml(m[2] ?? "") });
+  }
+  const trouves = [];
+  if (!noeuds.length) return { xml, trouves };
+  const bornes = [];
+  let complet = "";
+  for (const n of noeuds) {
+    bornes.push(complet.length);
+    complet += n.texte;
+  }
+  const indexNoeud = (pos) => {
+    for (let i = noeuds.length - 1; i >= 0; i--) {
+      if (bornes[i] <= pos && pos < bornes[i] + noeuds[i].texte.length) return i;
+    }
+    return -1;
+  };
+  const remplacements = [];
+  const re = /\{\{\s*([A-Za-zÀ-ÿ_][A-Za-zÀ-ÿ0-9_]*)\s*\}\}/g;
+  while ((m = re.exec(complet))) {
+    const cle = m[1].toLowerCase();
+    trouves.push(cle);
+    const valeur = valeurPour(cle);
+    if (valeur == null) continue;
+    remplacements.push({ debut: m.index, fin: m.index + m[0].length, texte: String(valeur) });
+  }
+  if (!remplacements.length) return { xml, trouves };
+  const textes = noeuds.map((n) => n.texte);
+  const touches = new Set();
+  for (const r of remplacements.reverse()) {
+    const iDeb = indexNoeud(r.debut);
+    const iFin = indexNoeud(r.fin - 1);
+    if (iDeb < 0 || iFin < 0) continue;
+    const offDeb = r.debut - bornes[iDeb];
+    const offFin = r.fin - bornes[iFin];
+    if (iDeb === iFin) {
+      textes[iDeb] = textes[iDeb].slice(0, offDeb) + r.texte + textes[iDeb].slice(offFin);
+    } else {
+      textes[iDeb] = textes[iDeb].slice(0, offDeb) + r.texte;
+      for (let k = iDeb + 1; k < iFin; k++) { textes[k] = ""; touches.add(k); }
+      textes[iFin] = textes[iFin].slice(offFin);
+      touches.add(iFin);
+    }
+    touches.add(iDeb);
+  }
+  let sortie = "";
+  let curseur = 0;
+  noeuds.forEach((n, i) => {
+    if (!touches.has(i)) return;
+    sortie += xml.slice(curseur, n.debut) + `<w:t xml:space="preserve">${echapperXml(textes[i])}</w:t>`;
+    curseur = n.fin;
+  });
+  sortie += xml.slice(curseur);
+  return { xml: sortie, trouves };
+}
+function texteVisibleXml(xml) {
+  const morceaux = [];
+  let m;
+  RE_WT.lastIndex = 0;
+  while ((m = RE_WT.exec(xml))) morceaux.push(decodeEntitesXml(m[2] ?? ""));
+  return morceaux.join("");
+}
+function ajouterMiseAJourDesChamps(settingsXml) {
+  if (!settingsXml || settingsXml.includes("w:updateFields")) return settingsXml;
+  return settingsXml.replace(/(<w:settings\b[^>]*>)/, '$1<w:updateFields w:val="true"/>');
+}
+// Contenu du <w:body> d'un document.xml, sans son sectPr final.
+function corpsDocument(xml) {
+  const debut = xml.indexOf("<w:body>");
+  const fin = xml.lastIndexOf("</w:body>");
+  let corps = xml.slice(debut + 8, fin);
+  const sect = corps.lastIndexOf("<w:sectPr");
+  if (sect >= 0 && corps.slice(sect).trim().endsWith("</w:sectPr>")) corps = corps.slice(0, sect);
+  return corps;
+}
+// Extrait le sommaire exécutif balisé du corps : [corps sans sommaire, sommaire].
+function extraireSommaire(corps) {
+  const i = corps.indexOf(MARQUE_DEBUT_SOMMAIRE);
+  const j = corps.indexOf(MARQUE_FIN_SOMMAIRE);
+  if (i < 0 || j < 0) return [corps, ""];
+  const pDeb = paragrapheAutour(corps, i);
+  const pFin = paragrapheAutour(corps, j);
+  if (!pDeb || !pFin) return [corps, ""];
+  return [corps.slice(0, pDeb.debut) + corps.slice(pFin.fin), corps.slice(pDeb.fin, pFin.debut)];
+}
+function sansMarquesSommaire(corps) {
+  let xml = corps;
+  for (const marque of [MARQUE_DEBUT_SOMMAIRE, MARQUE_FIN_SOMMAIRE]) xml = remplacerParagraphe(xml, marque, "").xml;
+  return xml;
+}
+// Rapport autonome : on remplace la marque de table des matières par le champ
+// Word et on demande à Word de mettre les champs à jour à l'ouverture.
+async function finaliserRapportDocx(bytes) {
+  const JSZip = import_jszip_min.default;
+  const zip = await JSZip.loadAsync(bytes);
+  let doc = await zip.file("word/document.xml").async("string");
+  doc = remplacerParagraphe(doc, MARQUE_TDM, champTableDesMatieres()).xml;
+  const corps = corpsDocument(doc);
+  const nouveau = sansMarquesSommaire(corps);
+  doc = renumeroterDessins(doc.replace(corps, () => nouveau));
+  zip.file("word/document.xml", doc);
+  const settings = zip.file("word/settings.xml");
+  if (settings) zip.file("word/settings.xml", ajouterMiseAJourDesChamps(await settings.async("string")));
+  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+// Styles de titre : on relie Heading1..3 du rapport aux styles de la firme par
+// leur nom interne (« heading 1 »), puisque l'identifiant est traduit dans un
+// Word en français (« Titre1 »). Un style absent est copié du rapport.
+function relierStyles(stylesFirme, stylesRapport, corps) {
+  const parNom = new Map();
+  const defs = new Map();
+  const re = /<w:style\b([^>]*)>([\s\S]*?)<\/w:style>/g;
+  let m;
+  while ((m = re.exec(stylesFirme))) {
+    const type = /w:type="([^"]+)"/.exec(m[1])?.[1];
+    const id = /w:styleId="([^"]+)"/.exec(m[1])?.[1];
+    const nom = /<w:name w:val="([^"]+)"/.exec(m[2])?.[1];
+    if (type === "paragraph" && id && nom) parNom.set(nom.toLowerCase(), id);
+  }
+  re.lastIndex = 0;
+  while ((m = re.exec(stylesRapport))) {
+    const id = /w:styleId="([^"]+)"/.exec(m[1])?.[1];
+    if (id) defs.set(id, m[0]);
+  }
+  let styles = stylesFirme;
+  let xml = corps;
+  for (const niveau of [1, 2, 3]) {
+    const idRapport = `Heading${niveau}`;
+    const idFirme = parNom.get(`heading ${niveau}`);
+    if (idFirme) {
+      if (idFirme !== idRapport) xml = xml.split(`<w:pStyle w:val="${idRapport}"/>`).join(`<w:pStyle w:val="${idFirme}"/>`);
+    } else if (defs.has(idRapport) && !styles.includes(`w:styleId="${idRapport}"`)) {
+      const def = defs.get(idRapport);
+      styles = styles.replace("</w:styles>", () => `${def}</w:styles>`);
+    }
+  }
+  return { styles, corps: xml };
+}
+// Verse le rapport produit par la plateforme dans le gabarit Word de la firme :
+// champs remplis, blocs {{RAPPORT}}, {{SOMMAIRE_EXECUTIF}} et
+// {{TABLE_DES_MATIERES}} placés, images et relations recopiées.
+async function composerAvecGabarit(rapportBytes, gabaritBytes, valeurs) {
+  const JSZip = import_jszip_min.default;
+  const [rapport, gabarit] = await Promise.all([JSZip.loadAsync(rapportBytes), JSZip.loadAsync(gabaritBytes)]);
+  const docRapport = await rapport.file("word/document.xml").async("string");
+  let [corps, sommaire] = extraireSommaire(corpsDocument(docRapport));
+  // Images du rapport : recopiées sous un nom et un identifiant propres, pour
+  // ne jamais entrer en collision avec celles de la firme.
+  const relsRapport = await rapport.file("word/_rels/document.xml.rels").async("string");
+  const cheminRels = "word/_rels/document.xml.rels";
+  let relsFirme = await gabarit.file(cheminRels).async("string");
+  const extensions = new Set();
+  let n = 0;
+  const remplacerIds = async (xml) => {
+    const ids = [...new Set([...xml.matchAll(/r:embed="([^"]+)"/g)].map((x) => x[1]))];
+    for (const id of ids) {
+      const rel = new RegExp(`<Relationship\\b[^>]*Id="${id}"[^>]*/>`).exec(relsRapport)?.[0];
+      const cible = rel && /Target="([^"]+)"/.exec(rel)?.[1];
+      const fichier = cible && rapport.file(`word/${cible.replace(/^\//, "").replace(/^word\//, "")}`);
+      if (!fichier) continue;
+      n += 1;
+      const ext = (cible.split(".").pop() || "png").toLowerCase();
+      extensions.add(ext);
+      const nom = `media/plateforme-${n}.${ext}`;
+      gabarit.file(`word/${nom}`, await fichier.async("uint8array"));
+      const nouvelId = `rIdPlateforme${n}`;
+      relsFirme = relsFirme.replace("</Relationships>", `<Relationship Id="${nouvelId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${nom}"/></Relationships>`);
+      xml = xml.split(`r:embed="${id}"`).join(`r:embed="${nouvelId}"`);
+    }
+    return xml;
+  };
+  corps = await remplacerIds(corps);
+  sommaire = await remplacerIds(sommaire);
+  gabarit.file(cheminRels, relsFirme);
+  const ct = gabarit.file("[Content_Types].xml");
+  if (ct) {
+    let types = await ct.async("string");
+    const mime = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif" };
+    for (const ext of extensions) {
+      if (!new RegExp(`Extension="${ext}"`, "i").test(types) && mime[ext]) {
+        types = types.replace("</Types>", `<Default Extension="${ext}" ContentType="${mime[ext]}"/></Types>`);
+      }
+    }
+    gabarit.file("[Content_Types].xml", types);
+  }
+  // Styles de titre de la firme.
+  const stylesFirmeFichier = gabarit.file("word/styles.xml");
+  const stylesRapportFichier = rapport.file("word/styles.xml");
+  if (stylesFirmeFichier && stylesRapportFichier) {
+    const relie = relierStyles(await stylesFirmeFichier.async("string"), await stylesRapportFichier.async("string"), corps + MARQUE_DEBUT_SOMMAIRE + sommaire);
+    gabarit.file("word/styles.xml", relie.styles);
+    [corps, sommaire] = relie.corps.split(MARQUE_DEBUT_SOMMAIRE);
+  }
+  // Champs, puis blocs.
+  const valeurPour = (cle) => BLOCS_GABARIT.includes(cle) ? MARQUE_BLOC(cle) : Object.prototype.hasOwnProperty.call(valeurs, cle) ? valeurs[cle] : null;
+  const cheminDoc = "word/document.xml";
+  let doc = remplacerChampsXml(await gabarit.file(cheminDoc).async("string"), valeurPour).xml;
+  let placeSommaire = remplacerParagraphe(doc, MARQUE_BLOC("sommaire_executif"), sommaire);
+  doc = placeSommaire.xml;
+  doc = remplacerParagraphe(doc, MARQUE_BLOC("table_des_matieres"), champTableDesMatieres()).xml;
+  // Sans {{SOMMAIRE_EXECUTIF}} dans le gabarit, le sommaire reste en tête du rapport.
+  const contenu = placeSommaire.trouve ? corps : sommaire + corps;
+  const place = remplacerParagraphe(doc, MARQUE_BLOC("rapport"), contenu);
+  if (place.trouve) {
+    doc = place.xml;
+  } else {
+    // Sans repère, le rapport suit les pages de la firme, sur une nouvelle page.
+    const saut = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
+    const corpsFirme = corpsDocument(doc);
+    const pos = doc.indexOf(corpsFirme) + corpsFirme.length;
+    doc = doc.slice(0, pos) + saut + contenu + doc.slice(pos);
+  }
+  // Préfixes d'espaces de noms employés par le rapport et absents du gabarit.
+  const racineRapport = /<w:document\b[^>]*>/.exec(docRapport)?.[0] ?? "";
+  const racineFirme = /<w:document\b[^>]*>/.exec(doc)?.[0] ?? "";
+  let racine = racineFirme;
+  for (const [, prefixe, uri] of racineRapport.matchAll(/xmlns:([A-Za-z0-9]+)="([^"]+)"/g)) {
+    if (!racine.includes(`xmlns:${prefixe}=`)) racine = racine.replace(/>$/, ` xmlns:${prefixe}="${uri}">`);
+  }
+  if (racine !== racineFirme) doc = doc.replace(racineFirme, () => racine);
+  gabarit.file(cheminDoc, renumeroterDessins(doc));
+  // Champs aussi dans les en-têtes et pieds de page de la firme.
+  for (const chemin of Object.keys(gabarit.files).filter((f) => /^word\/(header|footer)\d*\.xml$/.test(f))) {
+    const xml = await gabarit.file(chemin).async("string");
+    gabarit.file(chemin, remplacerChampsXml(xml, (cle) => Object.prototype.hasOwnProperty.call(valeurs, cle) ? valeurs[cle] : null).xml);
+  }
+  const settings = gabarit.file("word/settings.xml");
+  if (settings) gabarit.file("word/settings.xml", ajouterMiseAJourDesChamps(await settings.async("string")));
+  return gabarit.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+// Champs offerts aux gabarits de firme. Une clé inconnue reste visible telle
+// quelle dans le document produit, pour que la firme la repère.
+const CHAMPS_GABARIT = [
+  ["immeuble", "Nom du syndicat ou de l'immeuble"],
+  ["adresse", "Adresse de l'immeuble"],
+  ["ville", "Ville"],
+  ["adresse_complete", "Adresse et ville"],
+  ["dossier", "Numéro de dossier"],
+  ["unites", "Nombre d'unités"],
+  ["etages", "Nombre d'étages"],
+  ["annee_construction", "Année de construction"],
+  ["date_rapport", "Date du rapport (ex. 25 septembre 2026)"],
+  ["annee", "Année courante"],
+  ["signataire", "Nom du signataire"],
+  ["signataire_titre", "Titre du signataire (ex. ing.)"],
+  ["ordre", "Ordre professionnel (OIQ, OTPQ…)"],
+  ["no_membre", "Numéro de membre"],
+  ["firme", "Nom de la firme"],
+  ["firme_adresse", "Adresse de la firme"],
+  ["firme_telephone", "Téléphone de la firme"],
+  ["firme_courriel", "Courriel de la firme"],
+  ["firme_site", "Site Web de la firme"],
+  ["solde_fonds", "Solde actuel du fonds de prévoyance"],
+  ["cotisation_actuelle", "Cotisation annuelle actuelle"],
+  ["cotisation_recommandee", "Cotisation annuelle recommandée (an 1)"],
+  ["cotisation_mensuelle_unite", "Cotisation mensuelle moyenne par unité"]
+];
+const BLOCS_GABARIT_LIBELLES = [
+  ["rapport", "Où la plateforme insère le rapport (sinon, à la fin du document)"],
+  ["sommaire_executif", "Sommaire exécutif — scénario de financement sur 5 ans"],
+  ["table_des_matieres", "Table des matières Word, mise à jour à l'ouverture"]
+];
+function dateLongue(date) {
+  return date.toLocaleDateString("fr-CA", { day: "numeric", month: "long", year: "numeric" });
+}
+// Analyse d'un gabarit importé : champs reconnus, inconnus, repère présent,
+// et notes de rédaction internes laissées dans les pages liminaires — elles
+// seraient reprises telles quelles dans chaque rapport livré.
+async function analyserGabaritMiseEnPage(bytes) {
+  const JSZip = import_jszip_min.default;
+  const zip = await JSZip.loadAsync(bytes);
+  const doc = zip.file("word/document.xml");
+  if (!doc) throw new Error("ce fichier n'est pas un document Word (.docx)");
+  const xml = await doc.async("string");
+  const extras = [];
+  for (const chemin of Object.keys(zip.files).filter((f) => /^word\/(header|footer)\d*\.xml$/.test(f))) {
+    extras.push(await zip.file(chemin).async("string"));
+  }
+  const trouves = new Set();
+  for (const source of [xml, ...extras]) for (const cle of remplacerChampsXml(source, () => null).trouves) trouves.add(cle);
+  const connus = new Set([...CHAMPS_GABARIT.map(([k]) => k), ...BLOCS_GABARIT]);
+  const texte = texteVisibleXml(xml);
+  const phrases = texte.split(/(?<=[.!?;])\s+|\s{2,}/).map((s) => s.trim()).filter(Boolean);
+  const notes = phrases.filter((s) => NOTES_INTERNES.some((re) => re.test(s)) || /\?\?/.test(s)).slice(0, 12).map((s) => s.slice(0, 160));
+  return {
+    champs: [...trouves].filter((k) => connus.has(k) && !BLOCS_GABARIT.includes(k)),
+    blocs: [...trouves].filter((k) => BLOCS_GABARIT.includes(k)),
+    inconnus: [...trouves].filter((k) => !connus.has(k)),
+    repere: trouves.has("rapport"),
+    notes
+  };
+}
+async function generateReportDocx(ctx, opts = {}) {
   const { dossier, components: components2, projection } = ctx;
+  // Thème de la firme : couleurs, polices, coordonnées. Les outils de mise en
+  // forme sont liés à ce thème et masquent ici les helpers de module du même nom.
+  const theme = ctx.theme ?? themeDeFirme(null);
+  const pourGabarit = !!opts.pourGabarit;
+  const outils = outilsDocx(theme, { modeStyles: pourGabarit });
+  const { heading, titre2, titre3, body, puce, paras, tableauMaison } = outils;
+  const ORANGE = theme.accent;
+  const DARK = theme.encre;
+  const GREY = theme.gris;
+  const FONT = pourGabarit ? void 0 : theme.police;
+  const nomFirme = theme.nom || "La firme";
   // Gabarit de la firme propriétaire du dossier, ou le gabarit intégré si elle
   // n'en a pas importé. Résolu en amont (buildReportContext) : la génération ne
   // doit pas dépendre d'un accès à la base au milieu de la rédaction.
@@ -23700,56 +24343,47 @@ async function generateReportDocx(ctx) {
   const anneeCourante = maintenant.getFullYear();
   const today = maintenant.toLocaleDateString("fr-CA");
   const info = infoBatiment(dossier);
-  const nomSignataire = ctx.engineerName || "Condo Stratégis";
+  const nomSignataire = ctx.engineerName || nomFirme;
+  // Page de garde : logo et coordonnées de la firme, jamais ceux d'une autre.
+  const logo = ctx.logo ?? null;
   const cover = [
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 200 },
-      children: [
-        new ImageRun({
-          data: base64ToUint8Array(LOGO_BASE64),
-          transformation: { width: LOGO_WIDTH * 0.5, height: LOGO_HEIGHT * 0.5 },
-          type: "png"
-        })
-      ]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 60 },
-      children: [new TextRun({ text: "PLAN DE GESTION DE L'ACTIF", bold: true, color: ORANGE, font: FONT, size: 20 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 40 },
-      children: [new TextRun({ text: dossier.name.toUpperCase(), bold: true, color: DARK, font: FONT, size: 40 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 400 },
-      children: [
-        new TextRun({
-          text: `${dossier.address ?? ""}${dossier.city ? ", " + dossier.city : ""}`,
-          color: GREY,
-          font: FONT,
-          size: 20
-        })
-      ]
-    }),
-    body("Inclus à votre Plan de gestion de l'actif : Carnet d'entretien · Étude en fonds de prévoyance · Scénario de financement · Tableur suivi d'entretien", { color: GREY, size: 18 }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [new TextRun({ text: `Notre dossier : ${dossier.dossier_no}`, color: GREY, font: FONT, size: 18 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 40 },
-      children: [new TextRun({ text: `Préparé le ${today} · Rédigé par ${nomSignataire}`, color: GREY, font: FONT, size: 18 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
+    ...logo ? [new Paragraph({
+      alignment: AlignmentType.LEFT,
       spacing: { after: 600 },
-      children: [new TextRun({ text: "Condo Stratégis — 82, rue de Brésol, Montréal, Québec, H2Y 1V5 — (514) 508-6987 — info@condostrategis.ca", color: GREY, font: FONT, size: 16 })]
+      children: [new ImageRun({ data: logo.data, type: logo.type, transformation: tailleImage(logo, 170, 110) })]
+    })] : [],
+    new Paragraph({
+      spacing: { before: logo ? 0 : 1200, after: 120 },
+      children: [outils.run("PLAN DE GESTION DE L'ACTIF", { font: theme.policeMono, bold: true, color: ORANGE, size: 20, characterSpacing: 30 })]
+    }),
+    new Paragraph({
+      spacing: { after: 120 },
+      children: [outils.run(dossier.name, { font: theme.policeTitres, bold: true, size: 52, allCaps: true })]
+    }),
+    new Paragraph({
+      spacing: { after: 480 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 12, color: ORANGE, space: 12 } },
+      children: [outils.run(`${dossier.address ?? ""}${dossier.city ? ", " + dossier.city : ""}`, { color: GREY, size: 22 })]
+    }),
+    outils.tableauMaison(
+      ["Notre dossier", "Préparé le", "Rédigé par"],
+      [[dossier.dossier_no, dateLongue(maintenant), nomSignataire]]
+    ),
+    new Paragraph({ spacing: { before: 360, after: 80 }, children: [outils.run("Inclus à votre Plan de gestion de l'actif", { font: theme.policeMono, size: 15, color: GREY, allCaps: true, characterSpacing: 20 })] }),
+    ...["Carnet d'entretien", "Étude du fonds de prévoyance", "Scénario de financement", "Tableur suivi d'entretien"].map((t) => puce(t)),
+    new Paragraph({
+      spacing: { before: 720 },
+      children: [outils.run(coordonneesFirme(theme), { color: GREY, size: 16 })]
     })
+  ];
+  const tableDesMatieres = [
+    new Paragraph({
+      pageBreakBefore: true,
+      spacing: { after: 240 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 12, color: ORANGE, space: 6 } },
+      children: [outils.run("Table des matières", { font: theme.policeTitres, bold: true, size: 32, allCaps: true })]
+    }),
+    new Paragraph({ children: [new TextRun({ text: MARQUE_TDM })] })
   ];
   // ---- Lecture du moteur financier ---------------------------------------
   // Le moteur simule plusieurs scénarios de financement. La rédaction s'appuie
@@ -23771,7 +24405,7 @@ async function generateReportDocx(ctx) {
   const anneeConstruction = anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier.built_year);
   const sommaireMandat = [
     heading("1.0 Sommaire du mandat"),
-    body(`Condo Stratégis a été retenue par le conseil d'administration du ${dossier.name}${dossier.address ? `, ${dossier.address}` : ""}${dossier.city ? ` à ${dossier.city}` : ""}, Qc, pour effectuer une étude du Plan de gestion de l'actif.`),
+    body(`${nomFirme} a été retenue par le conseil d'administration du ${dossier.name}${dossier.address ? `, ${dossier.address}` : ""}${dossier.city ? ` à ${dossier.city}` : ""}, Qc, pour effectuer une étude du Plan de gestion de l'actif.`),
     body("Le mandat est soumis aux particularités décrites à la section Méthodologie (2.0) et Limitations légales (7.0) et présentées à l'offre de service."),
     titre2("1.1 Description de l'immeuble"),
     body(assembler([
@@ -23867,17 +24501,17 @@ async function generateReportDocx(ctx) {
       const fiche = parId.get(comp.id);
       if (!fiche) continue;
       numeroElement += 1;
-      observation.push(titre3(`4.${numeroCategorie}.${numeroElement} ${fiche.titre}`));
-      if (fiche.coteRapport) observation.push(body(`Cote au rapport : ${COTES_RAPPORT[fiche.coteRapport]}`, { bold: true }));
-      for (const section of fiche.sections) {
-        observation.push(body(section.titre, { bold: true }));
-        observation.push(...paras(section.texte));
-        if (section.tableau) {
-          observation.push(body(titreTableauMaison(comp, ligneDureeVie(comp, dossier)), { bold: true, size: 18 }));
-          observation.push(tableauMaison(section.tableau.entetes, section.tableau.lignes));
-          observation.push(body(""));
-        }
-      }
+      observation.push(...outils.ficheDocx({
+        numero: `4.${numeroCategorie}.${numeroElement}`,
+        nom: sansNotesInternes(comp.name ?? "Élément"),
+        categorie: CATEGORIES[cle].label,
+        code: sansNotesInternes(comp.uniformat_code ?? ""),
+        cote: fiche.coteRapport,
+        ligne: ligneDureeVie(comp, dossier),
+        component: comp,
+        fiche,
+        photos: ctx.photos?.get(comp.id) ?? []
+      }));
     }
   }
   // ---- 5.0 Résultats et scénarios de financement --------------------------
@@ -24074,6 +24708,51 @@ async function generateReportDocx(ctx) {
       body("")
     ])
   ];
+  // ---- Sommaire exécutif — 5 ans -----------------------------------------
+  // Balisé pour qu'un gabarit de firme puisse le placer où il veut
+  // ({{SOMMAIRE_EXECUTIF}}) ; sinon il ouvre le rapport.
+  const travauxParAnnee = new Map();
+  const inclus = new Set(projection.includedComponentIds ?? []);
+  for (const comp of components2) {
+    if (!inclus.has(comp.id)) continue;
+    for (const ev of replacementEventsForComponent(comp, projection.params).events) {
+      if (ev.year > 5) continue;
+      if (!travauxParAnnee.has(ev.year)) travauxParAnnee.set(ev.year, []);
+      travauxParAnnee.get(ev.year).push(`${sansNotesInternes(comp.name)} — ${montantMaison(ev.cost) ?? `-${NBSP}$`}`);
+    }
+  }
+  const sommaireExecutif = [
+    new Paragraph({ children: [new TextRun({ text: MARQUE_DEBUT_SOMMAIRE })] }),
+    heading("Sommaire exécutif — 5 ans — Scénario de financement", { sansSaut: pourGabarit }),
+    body(`Le sommaire exécutif permet une appréciation succincte des ajustements aux cotisations du fonds de prévoyance et des projets de remplacement prévus au cours des cinq prochaines années${scenarioPrefere ? `, selon le scénario de financement de préférence (${scenarioPrefere.code})` : ""}.`),
+    ...scenarioPrefere ? [tableauMaison(
+      ["Année", "Augmentation", "Cotisation annuelle", "Travaux prévus"],
+      anneesScenario.slice(0, 5).map((y) => [
+        String(anneeCourante + y.year - 1),
+        `${y.pctAugmentation.toFixed(1).replace(".", ",")}${NBSP}%`,
+        montantMaison(y.cotisation) ?? `-${NBSP}$`,
+        (travauxParAnnee.get(y.year) ?? []).join(" · ") || "Aucun remplacement"
+      ]),
+      { colonnesDroite: [2] }
+    )] : [body("Aucun des scénarios simulés ne satisfait le double critère d'acceptation : le sommaire exécutif sera établi après la révision du calcul de financement.", { bold: true, color: ORANGE })],
+    body("Pour toute divergence avec le scénario de financement, ce dernier devra être considéré comme conforme à l'étude.", { color: GREY, size: 18 }),
+    new Paragraph({ children: [new TextRun({ text: MARQUE_FIN_SOMMAIRE })] })
+  ];
+  // Un seul flux paginé : chaque grande section s'ouvre sur une nouvelle page
+  // (saut avant les titres de niveau 1) et les fiches se suivent sans page
+  // blanche. Le pied de page porte la firme et la pagination continue.
+  const piedDePage = {
+    options: {
+      children: [new Paragraph({
+        border: { top: { style: BorderStyle.SINGLE, size: 4, color: THEME_DEFAUT.filet, space: 6 } },
+        tabStops: [{ type: TabStopType.RIGHT, position: 9360 }],
+        children: [
+          outils.run(`${nomFirme} — Plan de gestion de l'actif — ${dossier.dossier_no}`, { font: theme.policeMono, size: 14, color: GREY }),
+          new TextRun({ children: ["\t", PageNumber.CURRENT], font: theme.policeMono, size: 14, color: GREY })
+        ]
+      })]
+    }
+  };
   const doc = new File$1({
     styles: {
       default: {
@@ -24081,21 +24760,26 @@ async function generateReportDocx(ctx) {
       }
     },
     background: { color: "FFFFFF" },
-    sections: [
-      { children: cover },
-      { children: sommaireMandat },
-      { children: methodologie },
-      { children: commentLire },
-      { children: observation },
-      { children: resultats },
-      { children: conclusion },
-      { children: limitations },
-      { children: declaration },
-      { children: suivi },
-      { children: lexique },
-      { children: annexeA },
-      { children: annexeB }
-    ]
+    sections: [{
+      properties: { page: { margin: { top: 1080, right: 1080, bottom: 1080, left: 1080 } } },
+      footers: pourGabarit ? void 0 : { default: piedDePage },
+      children: [
+        ...pourGabarit ? [] : [...cover, ...tableDesMatieres],
+        ...sommaireExecutif,
+        ...sommaireMandat,
+        ...methodologie,
+        ...commentLire,
+        ...observation,
+        ...resultats,
+        ...conclusion,
+        ...limitations,
+        ...declaration,
+        ...suivi,
+        ...lexique,
+        ...annexeA,
+        ...annexeB
+      ]
+    }]
   });
   return Packer.toBuffer(doc);
 }
@@ -44650,6 +45334,78 @@ companies.delete("/:id/template", async (c) => {
   await c.env.DB.prepare("DELETE FROM company_templates WHERE company_id = ?1").bind(id).run();
   return c.json({ ok: true, retour: "gabarit intégré" });
 });
+// Identité du rapport : couleurs, polices et coordonnées de la firme.
+companies.get("/:id/theme", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT id, name, theme FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  return c.json({ theme: nettoyerTheme(company.theme), effectif: themeDeFirme(company), defauts: THEME_DEFAUT });
+});
+companies.patch("/:id/theme", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const theme = nettoyerTheme(await c.req.json());
+  await c.env.DB.prepare(
+    "UPDATE companies SET theme = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
+  ).bind(JSON.stringify(theme), id).run();
+  const company = await c.env.DB.prepare("SELECT id, name, theme FROM companies WHERE id = ?1").bind(id).first();
+  return c.json({ theme, effectif: themeDeFirme(company), defauts: THEME_DEFAUT });
+});
+// Gabarit Word de mise en page : pages liminaires, champs {{…}} et repère
+// {{RAPPORT}}. Distinct du gabarit de textes (/template), qui alimente les
+// sections rédigées ; celui-ci est repris tel quel autour du rapport.
+companies.get("/:id/mise-en-page", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT mise_en_page FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  const miseEnPage = objetJson(company.mise_en_page);
+  return c.json({
+    importe: !!miseEnPage.r2_key,
+    ...miseEnPage.r2_key ? { filename: miseEnPage.filename, imported_at: miseEnPage.imported_at, analyse: miseEnPage.analyse } : {},
+    champs: CHAMPS_GABARIT,
+    blocs: BLOCS_GABARIT_LIBELLES
+  });
+});
+companies.post("/:id/mise-en-page", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 20 * 1024 * 1024) return c.json({ error: "document trop volumineux (max 20 Mo)" }, 413);
+  let analyse;
+  try {
+    analyse = await analyserGabaritMiseEnPage(new Uint8Array(buffer));
+  } catch (e) {
+    return c.json({ error: `lecture du .docx impossible : ${e.message}` }, 400);
+  }
+  const r2Key = `company-layouts/${id}.docx`;
+  await c.env.PHOTOS.put(r2Key, buffer, { httpMetadata: { contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" } });
+  const miseEnPage = { r2_key: r2Key, filename: file.name || "gabarit.docx", imported_at: new Date().toISOString(), analyse };
+  await c.env.DB.prepare(
+    "UPDATE companies SET mise_en_page = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
+  ).bind(JSON.stringify(miseEnPage), id).run();
+  return c.json({ importe: true, filename: miseEnPage.filename, imported_at: miseEnPage.imported_at, analyse, champs: CHAMPS_GABARIT, blocs: BLOCS_GABARIT_LIBELLES });
+});
+companies.delete("/:id/mise-en-page", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT mise_en_page FROM companies WHERE id = ?1").bind(id).first();
+  const r2Key = objetJson(company?.mise_en_page).r2_key;
+  if (r2Key) await c.env.PHOTOS.delete(r2Key);
+  await c.env.DB.prepare(
+    "UPDATE companies SET mise_en_page = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1"
+  ).bind(id).run();
+  return c.json({ importe: false, champs: CHAMPS_GABARIT, blocs: BLOCS_GABARIT_LIBELLES });
+});
 companies.get("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
@@ -44853,9 +45609,61 @@ dossiers.post("/:id/components/import", async (c) => {
     stats: await dossierStats(c.env.DB, dossier.id)
   });
 });
-async function buildReportContext(c) {
+// Photos d'un rapport : au plus 4 par fiche, dans l'ordre des étiquettes du
+// terrain, sous un budget total — un Worker n'a que 128 Mo, et un rapport de
+// 150 fiches en photos de téléphone pleine résolution ne tiendrait pas.
+const PHOTOS_PAR_FICHE = 4;
+const PHOTO_MAX_OCTETS = 4 * 1024 * 1024;
+const PHOTOS_BUDGET_OCTETS = 40 * 1024 * 1024;
+async function photosDuRapport(env, components2) {
+  const parComposante = new Map();
+  if (!components2.length) return parComposante;
+  const ids = components2.map((comp) => comp.id);
+  const lignes = [];
+  for (let i = 0; i < ids.length; i += 90) {
+    const lot = ids.slice(i, i + 90);
+    const r = await env.DB.prepare(
+      `SELECT id, component_id, r2_key, tag, created_at FROM photos WHERE component_id IN (${lot.map((_, k) => `?${k + 1}`).join(", ")}) ORDER BY created_at ASC`
+    ).bind(...lot).all();
+    lignes.push(...r.results);
+  }
+  const rang = (tag) => {
+    const i = TAG_ORDER.indexOf(tag);
+    return i < 0 ? TAG_ORDER.length : i;
+  };
+  const choisies = [];
+  for (const id of ids) {
+    const siennes = lignes.filter((l) => l.component_id === id).sort((a, b) => rang(a.tag) - rang(b.tag)).slice(0, PHOTOS_PAR_FICHE);
+    choisies.push(...siennes);
+  }
+  let budget = PHOTOS_BUDGET_OCTETS;
+  const chargees = await enParallele(choisies, 6, async (ligne) => {
+    const obj = await env.PHOTOS.get(ligne.r2_key);
+    if (!obj || obj.size > PHOTO_MAX_OCTETS || obj.size > budget) return null;
+    budget -= obj.size;
+    const image = imageDocx(new Uint8Array(await obj.arrayBuffer()));
+    return image ? { ligne, image } : null;
+  });
+  for (const p of chargees) {
+    if (!p) continue;
+    if (!parComposante.has(p.ligne.component_id)) parComposante.set(p.ligne.component_id, []);
+    parComposante.get(p.ligne.component_id).push({ image: p.image, tag: p.ligne.tag });
+  }
+  return parComposante;
+}
+async function logoDeFirme(env, company) {
+  if (company?.logo_r2_key) {
+    const obj = await env.PHOTOS.get(company.logo_r2_key);
+    const image = obj ? imageDocx(new Uint8Array(await obj.arrayBuffer())) : null;
+    if (image) return image;
+  }
+  // Le logo intégré est celui de Condo Stratégis : jamais sur le rapport d'une autre firme.
+  return estStrategis(company?.name) ? imageDocx(base64ToUint8Array(LOGO_BASE64)) : null;
+}
+async function buildReportContext(c, opts = {}) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return null;
+  const company = dossier.company_id ? await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(dossier.company_id).first() : null;
   // Une composante désactivée n'existe pas dans l'immeuble : ni au rapport, ni au fonds.
   const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossier.id).all();
   const components2 = (await listComponentsForDossier(c.env.DB, dossier.id)).filter(estActive);
@@ -44871,10 +45679,61 @@ async function buildReportContext(c) {
     texteMaison: await texteMaisonPour(c.env.DB, dossier.company_id),
     banque: await banquePour(c.env.DB, dossier.company_id),
     textesValides: await textesValidesPour(c.env.DB, dossier.id),
-    engineerName: user?.name ?? "Condo Stratégis",
+    engineerName: user?.name ?? company?.name ?? "",
     signataire: user ?? null,
-    apiKey: c.env.ANTHROPIC_API_KEY ?? null
+    apiKey: c.env.ANTHROPIC_API_KEY ?? null,
+    company,
+    theme: themeDeFirme(company),
+    ...opts.word ? {
+      logo: await logoDeFirme(c.env, company),
+      photos: await photosDuRapport(c.env, components2)
+    } : {}
   };
+}
+// Valeurs des champs {{…}} d'un gabarit de firme.
+function valeursChamps(ctx) {
+  const { dossier, projection, theme, signataire } = ctx;
+  const info = infoBatiment(dossier);
+  const ordre = ordreDuSignataire(signataire);
+  const scenario = projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
+    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  const cotisation = scenario?.years?.[0]?.cotisation ?? null;
+  const unites = Number(dossier.units);
+  const valeur = (v) => v == null || v === "" ? "" : String(v);
+  return {
+    immeuble: valeur(dossier.name),
+    adresse: valeur(dossier.address),
+    ville: valeur(dossier.city),
+    adresse_complete: [dossier.address, dossier.city].filter(Boolean).join(", "),
+    dossier: valeur(dossier.dossier_no),
+    unites: valeur(dossier.units || ""),
+    etages: valeur(dossier.floors),
+    annee_construction: valeur(anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier.built_year)),
+    date_rapport: dateLongue(new Date()),
+    annee: String(new Date().getFullYear()),
+    signataire: valeur(signataire?.name ?? ctx.engineerName),
+    signataire_titre: valeur(signataire?.title),
+    ordre: valeur(signataire?.ordre_professionnel ?? ordre?.sigle),
+    no_membre: valeur(signataire?.no_membre),
+    firme: valeur(theme.nom),
+    firme_adresse: valeur(theme.adresse),
+    firme_telephone: valeur(theme.telephone),
+    firme_courriel: valeur(theme.courriel),
+    firme_site: valeur(theme.site),
+    solde_fonds: montantMaison(dossier.current_fund_balance) ?? "",
+    cotisation_actuelle: montantMaison(dossier.cotisation_annuelle) ?? "",
+    cotisation_recommandee: montantMaison(cotisation) ?? "",
+    cotisation_mensuelle_unite: cotisation != null && unites > 0 ? montantMaison(cotisation / 12 / unites) ?? "" : ""
+  };
+}
+// Le rapport Word livré : autonome aux couleurs de la firme, ou versé dans son
+// gabarit de mise en page quand elle en a importé un.
+async function produireRapportDocx(c, ctx) {
+  const miseEnPage = objetJson(ctx.company?.mise_en_page);
+  const gabarit = miseEnPage.r2_key ? await c.env.PHOTOS.get(miseEnPage.r2_key) : null;
+  if (!gabarit) return finaliserRapportDocx(await generateReportDocx(ctx));
+  const rapport = await generateReportDocx(ctx, { pourGabarit: true });
+  return composerAvecGabarit(rapport, new Uint8Array(await gabarit.arrayBuffer()), valeursChamps(ctx));
 }
 dossiers.get("/:id/projection", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
@@ -44888,9 +45747,9 @@ dossiers.get("/:id/projection", async (c) => {
   return c.json(projection);
 });
 dossiers.get("/:id/report.docx", async (c) => {
-  const ctx = await buildReportContext(c);
+  const ctx = await buildReportContext(c, { word: true });
   if (!ctx) return c.json({ error: "dossier introuvable" }, 404);
-  const bytes = await generateReportDocx(ctx);
+  const bytes = await produireRapportDocx(c, ctx);
   return new Response(new Blob([new Uint8Array(bytes)]), {
     headers: {
       "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -45589,7 +46448,7 @@ app.use("/api/*", async (c, next) => {
   return next();
 });
 app.use("/api/*", async (c, next) => {
-  if (c.req.path.startsWith("/api/dossiers") || c.req.path.startsWith("/api/components")) {
+  if (c.req.path.startsWith("/api/dossiers") || c.req.path.startsWith("/api/components") || c.req.path.startsWith("/api/companies")) {
     await assurerColonnes(c.env.DB);
   }
   return next();

@@ -12,7 +12,9 @@ CREATE TABLE companies (
   slug        TEXT NOT NULL UNIQUE,
   logo_r2_key TEXT,
   created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  theme        TEXT,   -- JSON : couleurs, polices et coordonnées du rapport de la firme
+  mise_en_page TEXT    -- JSON : gabarit Word de mise en page importé (clé R2, analyse)
 );
 
 CREATE TABLE users (

@@ -596,6 +596,29 @@ function triggerPhotoInput() {
   if (input) input.click();
 }
 
+// Réduit une photo de téléphone (souvent 3 à 5 Mo) à 1600 px de côté en JPEG
+// avant l'envoi : le rapport Word les intègre toutes, et un Worker n'a que
+// 128 Mo de mémoire. En cas d'échec (format non décodable), l'original part.
+async function reduirePhoto(file) {
+  const COTE_MAX = 1600;
+  try {
+    if (!window.createImageBitmap || !file.type.startsWith('image/')) return file;
+    const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    const echelle = Math.min(1, COTE_MAX / Math.max(bitmap.width, bitmap.height));
+    if (echelle === 1 && file.size < 700 * 1024 && file.type === 'image/jpeg') { bitmap.close && bitmap.close(); return file; }
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bitmap.width * echelle);
+    canvas.height = Math.round(bitmap.height * echelle);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close && bitmap.close();
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.82));
+    if (!blob) return file;
+    return new File([blob], (file.name || 'photo').replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' });
+  } catch (err) {
+    return file;
+  }
+}
+
 async function onPhotoFileChange(e) {
   const file = e.target.files && e.target.files[0];
   e.target.value = '';
@@ -603,7 +626,7 @@ async function onPhotoFileChange(e) {
   state.uploadingPhoto = true; state.error = null; render();
   try {
     const fd = new FormData();
-    fd.append('file', file);
+    fd.append('file', await reduirePhoto(file));
     const res = await apiFetch(`/api/components/${state.activeId}/photos`, { method: 'POST', body: fd });
     let data = null;
     try { data = await res.json(); } catch (e2) {}
