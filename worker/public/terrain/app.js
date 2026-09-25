@@ -10,7 +10,7 @@
 
 const TOKEN_KEY = 'cs_terrain_token';
 
-/* ---------- Taxonomie maison : 10 catégories ---------- */
+/* ---------- Taxonomie maison : 11 catégories ---------- */
 
 const CATS = {
   terrain:     { label: 'Terrain et aménagement',                                  pill: 'Terrain',        icon: 'trees' },
@@ -23,6 +23,7 @@ const CATS = {
   cvac:        { label: 'Systèmes de chauffage et ventilation',                    pill: 'CVAC',           icon: 'fan' },
   electrique:  { label: 'Installations électriques',                               pill: 'Électricité',    icon: 'zap' },
   plomberie:   { label: "Installations de plomberie, d'eau et d'égout",            pill: 'Plomberie',      icon: 'droplets' },
+  piscines:    { label: 'Piscines et centre aquatique',                            pill: 'Piscines',       icon: 'waves' },
 };
 
 const CAT_AUTRES = { label: 'Autres', pill: 'Autres', icon: 'box' };
@@ -61,7 +62,14 @@ const EMPLACEMENTS = [
   { v: 'stationnement',label: 'Stationnement' },
 ];
 
-const DELAIS = ['à court terme', 'dans les 5 ans', 'à planifier', 'aucun suivi particulier'];
+/* ---------- Gabarit de réponse : vocabulaire fermé, identique pour toutes les composantes ---------- */
+
+const DELAIS = ['Immédiat (moins de 1 an)', 'Court terme (1 à 2 ans)', 'Moyen terme (3 à 5 ans)', 'Long terme (plus de 5 ans)', 'Aucun suivi particulier'];
+const ETENDUES = [['ponctuel', 'Ponctuel'], ['localise', 'Localisé'], ['generalise', 'Généralisé']];
+const LIMITES_OBS = [['de_pres', 'De près'], ['distance', 'À distance'], ['partiel', 'Partiellement accessible'], ['inaccessible', 'Non accessible']];
+const RISQUES = [['securite', 'Sécurité des personnes'], ['infiltration', "Infiltration d'eau"], ['degradation', 'Dégradation accélérée'], ['conformite', 'Conformité réglementaire'], ['esthetique', 'Esthétique']];
+const SOURCES_ANNEE = [['plaque', 'Plaque signalétique'], ['carnet', "Carnet d'entretien"], ['administration', 'Administration'], ['estimee', 'Estimée']];
+const libelleDe = (liste, cle) => { const x = liste.find(([k]) => k === cle); return x ? x[1] : ''; };
 
 const ATTR_SUGGESTIONS = ['Année', 'Marque', 'Modèle', 'Capacité', 'Nombre', "D'origine"];
 
@@ -144,7 +152,8 @@ const state = {
 
   dossiers: [],
   dossier: null,
-  components: [],
+  components: [],        // composantes actives de la visite
+  inactifs: [],          // composantes retirées de la visite, réactivables
   filter: 'all',
   search: '',
 
@@ -247,7 +256,7 @@ async function apiFetch(path, opts, config) {
   }
   if (auth && res.status === 401) {
     try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
-    state.token = null; state.user = null; state.dossier = null; state.dossiers = []; state.components = [];
+    state.token = null; state.user = null; state.dossier = null; state.dossiers = []; state.components = []; state.inactifs = [];
     state.screen = 'login';
     state.loginError = 'Votre session a expiré. Reconnectez-vous.';
     render();
@@ -369,7 +378,8 @@ async function selectDossier(id) {
       apiJson(`/api/dossiers/${id}/components`),
     ]);
     state.dossier = dossier;
-    state.components = components;
+    state.components = components.filter(c => c.actif !== 0);
+    state.inactifs = components.filter(c => c.actif === 0);
     state.batiment = parseJsonObject(dossier.batiment_info);
     state.naChosen = {};
     state.filter = 'all'; state.search = '';
@@ -456,6 +466,26 @@ async function patchComponent(id, patch) {
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     throw e;
   }
+}
+
+// Retire une composante de la visite (elle n'existe pas dans l'immeuble) ou l'y
+// remet. Elle n'est jamais supprimée : ses données restent si on la réactive.
+async function setActif(id, actif) {
+  try {
+    await patchComponent(id, { actif: actif ? 1 : 0 });
+  } catch (e) { return; }
+  const tous = state.components.concat(state.inactifs).map(c => (c.id === id ? Object.assign({}, c, { actif: actif ? 1 : 0 }) : c));
+  const ordre = (a, b) => (a.sort_order || 0) - (b.sort_order || 0);
+  state.components = tous.filter(c => c.actif !== 0).sort(ordre);
+  state.inactifs = tous.filter(c => c.actif === 0).sort(ordre);
+  if (actif) {
+    showToast('Composante réactivée');
+    if (!state.inactifs.length && state.filter === 'inactifs') state.filter = 'all';
+  } else {
+    showToast('Composante retirée de la visite');
+    state.screen = 'liste';
+  }
+  render();
 }
 
 // Enregistrement d'un champ de composante. Applique la valeur localement de façon
@@ -624,7 +654,11 @@ async function applyAi() {
   if (typeof r.rating === 'number' && r.rating >= 1 && r.rating <= 4) patch.rating = r.rating;
   if (typeof r.observation === 'string' && r.observation.trim()) patch.observation = r.observation.trim();
   if (typeof r.causePossible === 'string' && r.causePossible.trim()) patch.cause_possible = r.causePossible.trim();
-  if (typeof r.delaiSuggere === 'string' && r.delaiSuggere.trim()) patch.delai_suggere = r.delaiSuggere.trim();
+  if (typeof r.delaiSuggere === 'string' && DELAIS.includes(r.delaiSuggere)) patch.delai_suggere = r.delaiSuggere;
+  if (r.etendue && libelleDe(ETENDUES, r.etendue)) patch.etendue = r.etendue;
+  if (typeof r.etendueQte === 'string' && r.etendueQte.trim()) patch.etendue_qte = r.etendueQte.trim();
+  if (r.limiteObservation && libelleDe(LIMITES_OBS, r.limiteObservation)) patch.limite_observation = r.limiteObservation;
+  if (r.natureRisque && libelleDe(RISQUES, r.natureRisque)) patch.nature_risque = r.natureRisque;
   if (typeof r.consequences === 'string' && r.consequences.trim()) patch.consequences = r.consequences.trim();
   if (typeof r.costEstimate === 'number' && !isNaN(r.costEstimate)) patch.replacement_cost = Math.round(r.costEstimate);
   if (!Object.keys(patch).length) { state.aiResult = null; showToast('Rien à appliquer.'); return; }
@@ -719,6 +753,23 @@ function immSetLocal(sec, key, val) {
   if (!Object.keys(state.batiment[sec]).length) delete state.batiment[sec];
 }
 
+// Une réponse de la fiche d'immeuble (« piscine extérieure : non », nombre
+// d'ascenseurs…) peut activer ou désactiver des composantes côté serveur :
+// on recharge alors la liste pour que l'écran suive.
+async function suivreRegles(data) {
+  const n = data && data.composantes_mises_a_jour;
+  if (!n || !state.dossier) return;
+  try {
+    const components = await apiJson(`/api/dossiers/${state.dossier.id}/components`);
+    state.components = components.filter(c => c.actif !== 0);
+    state.inactifs = components.filter(c => c.actif === 0);
+    showToast(`${n} composante${n > 1 ? 's' : ''} ajustée${n > 1 ? 's' : ''} selon la fiche d'immeuble`);
+    render();
+  } catch (e) {
+    if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
+  }
+}
+
 async function saveBatiment() {
   if (!state.dossier) return;
   if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
@@ -732,6 +783,7 @@ async function saveBatiment() {
     });
     if (data && typeof data === 'object') state.dossier = Object.assign({}, state.dossier, data);
     setSaveStatus('immStatus', 'Enregistré');
+    await suivreRegles(data);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     setSaveStatus('immStatus', '');
@@ -765,6 +817,7 @@ async function saveDossierField(field, value) {
     });
     state.dossier = Object.assign({}, state.dossier, patch, (data && typeof data === 'object') ? data : {});
     setSaveStatus('immStatus', 'Enregistré');
+    await suivreRegles(data);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     setSaveStatus('immStatus', '');
@@ -1091,10 +1144,10 @@ function accueilHtml() {
       <i data-lucide="chevron-right" class="go"></i>
     </button>
     <div class="ai-banner">
-      <div class="icon"><i data-lucide="sparkles"></i></div>
+      <div class="icon"><i data-lucide="clipboard-list"></i></div>
       <div>
-        <div class="title">Checklist générée par l'IA</div>
-        <div class="body">${st.total} composante${st.total > 1 ? 's' : ''} identifiée${st.total > 1 ? 's' : ''} pour ce dossier. Ajustez sur le terrain au fil de la visite.</div>
+        <div class="title">Liste des composantes</div>
+        <div class="body">${st.total} composante${st.total > 1 ? 's' : ''} pour ce dossier${state.inactifs.length ? `, ${state.inactifs.length} autre${state.inactifs.length > 1 ? 's' : ''} désactivée${state.inactifs.length > 1 ? 's' : ''} selon la taille de l'immeuble et réactivable${state.inactifs.length > 1 ? 's' : ''} depuis la liste` : ''}. Retirez sur le terrain celles qui ne s'appliquent pas.</div>
       </div>
     </div>
     <button class="btn-cta" data-action="go-liste"><i data-lucide="play"></i>Reprendre la visite</button>
@@ -1209,6 +1262,30 @@ function immeubleHtml() {
 
 /* ---------- Liste des composantes ---------- */
 
+function inactifsGroups() {
+  const q = state.search.trim().toLowerCase();
+  const fl = state.inactifs.filter(c => !q || `${c.name || ''} ${c.uniformat_code || ''}`.toLowerCase().includes(q));
+  const cles = Object.keys(CATS);
+  const groups = cles.map(k => ({ key: k, label: CATS[k].label, icon: CATS[k].icon, items: fl.filter(c => c.cat === k) }));
+  groups.push({ key: 'autres', label: CAT_AUTRES.label, icon: CAT_AUTRES.icon, items: fl.filter(c => !CATS[c.cat]) });
+  return groups
+    .filter(g => g.items.length > 0)
+    .map(g => Object.assign(g, { inactifs: true, done: 0, total: g.items.length }));
+}
+
+function inactifRowHtml(c) {
+  return `<div class="comp-row inactif">
+    <div class="comp-thumb" style="background:var(--ink-050);color:var(--ink-300)"><i data-lucide="${catInfo(c.cat).icon}"></i></div>
+    <div class="comp-mid">
+      <div class="name">${esc(c.name)}</div>
+      <div class="sub">Désactivée</div>
+    </div>
+    <div class="comp-end">
+      <button class="reactiver" data-action="reactiver" data-id="${esc(c.id)}" ${!state.online ? 'disabled' : ''}><i data-lucide="rotate-ccw"></i>Réactiver</button>
+    </div>
+  </div>`;
+}
+
 function listeHtml() {
   const st = computeStats();
   const chips = [
@@ -1217,14 +1294,18 @@ function listeHtml() {
     { key: 'done', label: 'Fait', count: st.done },
     { key: 'action', label: 'Action requise', count: st.critical },
   ];
+  if (state.inactifs.length) chips.push({ key: 'inactifs', label: 'Désactivées', count: state.inactifs.length });
   const chipsHtml = chips.map(c => `<button class="chip ${state.filter === c.key ? 'on' : ''}" data-action="filter" data-filter="${c.key}">${c.label} · ${c.count}</button>`).join('');
-  const groups = computeGroups();
+  const groups = state.filter === 'inactifs' ? inactifsGroups() : computeGroups();
   const missingAI = state.components.filter(c => c.ai_suggested && !c.done).length;
   const groupsHtml = groups.map(g => `
     <div class="grp">
       <div class="grp-hdr"><i data-lucide="${g.icon}"></i><span class="lbl">${esc(g.label)}</span><span class="cnt">${g.done}/${g.total}</span><div class="rule"></div></div>
-      ${g.items.map(rowHtml).join('')}
+      ${g.items.map(g.inactifs ? inactifRowHtml : rowHtml).join('')}
     </div>`).join('');
+  const inactifsNote = state.filter === 'inactifs'
+    ? `<div class="missing-banner"><i data-lucide="eye-off"></i><div class="txt">Composantes jugées peu probables pour cet immeuble. <b>Réactivez</b> celles que vous trouvez sur place.</div></div>`
+    : '';
   return `
   <div class="scr-liste">
     <div class="hdr">
@@ -1236,6 +1317,7 @@ function listeHtml() {
       <div class="search-box"><i data-lucide="search"></i><input id="searchInput" data-role="search-input" placeholder="Rechercher une composante…" value="${esc(state.search)}"></div>
       <div class="chip-row scr">${chipsHtml}</div>
     </div>
+    ${inactifsNote}
     ${missingAI > 0 ? `<div class="missing-banner"><i data-lucide="scan-search"></i><div class="txt"><b>${missingAI} composante${missingAI > 1 ? 's' : ''} suggérée${missingAI > 1 ? 's' : ''}</b> par l'IA, non visitée${missingAI > 1 ? 's' : ''}</div></div>` : ''}
     <div class="list-body">
       ${groupsHtml || `<div class="empty-state">Aucune composante ne correspond à ce filtre.</div>`}
@@ -1280,6 +1362,23 @@ function ratingListHtml(c) {
       ${naOn ? `<i data-lucide="check"></i>` : ''}
     </button>`;
   return `<div class="rating-list">${opts}${na}</div>`;
+}
+
+function choixHtml(field, liste, valeur) {
+  return `<div class="quick-chips">${liste.map(([k, lib]) => `<button class="quick-chip ${valeur === k ? 'on' : ''}" data-action="set-facet" data-field="${esc(field)}" data-val="${esc(k)}">${esc(lib)}</button>`).join('')}</div>`;
+}
+
+// Ajoute un défaut de la grille de la firme comme nouvelle ligne de constat ;
+// l'inspecteur y précise la localisation.
+function ajouterConstat(terme) {
+  const c = state.activeComponent;
+  if (!c || !terme) return;
+  const actuel = String(c.observation || '').replace(/\s+$/, '');
+  const ligne = `${terme.charAt(0).toUpperCase()}${terme.slice(1)} – `;
+  saveCompField('observation', actuel ? `${actuel}\n${ligne}` : ligne, { force: true });
+  render();
+  const el = document.getElementById('observationInput');
+  if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
 }
 
 function obsFieldHtml(id, role, field, label, value, placeholder) {
@@ -1351,7 +1450,9 @@ function ficheHtml() {
 
   const noteCard = c.note ? `<div class="note-card"><div class="note-card-hdr"><i data-lucide="sparkles"></i><span>Note structurée</span></div><div class="note-card-body">${esc(c.note)}</div></div>` : '';
 
-  const delaiChips = DELAIS.map(d => `<button class="quick-chip ${c.delai_suggere === d ? 'on' : ''}" data-action="pick-delai" data-val="${esc(d)}">${esc(d)}</button>`).join('');
+  const delaiChips = DELAIS.map(d => `<button class="quick-chip ${c.delai_suggere === d ? 'on' : ''}" data-action="set-facet" data-field="delai_suggere" data-val="${esc(d)}">${esc(d)}</button>`).join('');
+  const guide = c.guide || {};
+  const defautsChips = (guide.defauts || []).map(d => `<button class="quick-chip" data-action="add-constat" data-val="${esc(d)}">${esc(d)}</button>`).join('');
 
   const rep = replacementYear(c);
   const repSub = rep
@@ -1393,17 +1494,42 @@ function ficheHtml() {
       </div>
       ${ratingListHtml(c)}
 
-      <div class="section-lbl" style="margin-top:26px">Observations</div>
-      ${obsFieldHtml('observationInput', 'comp-textarea', 'observation', 'Observation', c.observation, 'Ce qui est constaté sur place…')}
-      ${obsFieldHtml('causeInput', 'comp-textarea', 'cause_possible', 'Cause possible', c.cause_possible, 'Origine probable du constat…')}
+      <div class="section-lbl" style="margin-top:26px">Relevé</div>
+      ${guide.points ? `<div class="guide-hint"><b>À décrire</b> ${esc(guide.points)}</div>` : ''}
 
       <div class="obs-field">
-        <label for="delaiInput">Délai suggéré</label>
-        <input id="delaiInput" class="fld-input" data-role="comp-text" data-field="delai_suggere" value="${esc(c.delai_suggere || '')}" placeholder="ex. à court terme">
+        <label for="observationInput">Constats — un par ligne</label>
+        <textarea id="observationInput" data-role="comp-textarea" data-field="observation" placeholder="Localisation – ce qui est observé&#10;ex. Façade arrière – joints de mortier effrités" rows="4">${esc(c.observation || '')}</textarea>
+        ${defautsChips ? `<div class="guide-lbl">À surveiller — touchez pour ajouter</div><div class="quick-chips">${defautsChips}</div>` : ''}
+      </div>
+
+      <div class="obs-field">
+        <label>Étendue</label>
+        ${choixHtml('etendue', ETENDUES, c.etendue)}
+        <input class="fld-input" style="margin-top:8px" data-role="comp-text" data-field="etendue_qte" value="${esc(c.etendue_qte || '')}" placeholder="Quantité touchée — ex. ≈ 4 m², 3 fenêtres, 20 %">
+      </div>
+
+      <div class="obs-field">
+        <label>Limite d'observation</label>
+        ${choixHtml('limite_observation', LIMITES_OBS, c.limite_observation)}
+        ${c.limite_observation && c.limite_observation !== 'de_pres' ? `<input class="fld-input" style="margin-top:8px" data-role="comp-text" data-field="limite_detail" value="${esc(c.limite_detail || '')}" placeholder="Raison ou méthode — ex. du sol à l'aide de jumelles, local verrouillé">` : ''}
+      </div>
+
+      ${obsFieldHtml('causeInput', 'comp-textarea', 'cause_possible', 'Cause possible', c.cause_possible, 'Origine probable, modalisée — ex. semble provenir de…')}
+
+      <div class="obs-field">
+        <label>Nature du risque</label>
+        ${choixHtml('nature_risque', RISQUES, c.nature_risque)}
+      </div>
+
+      <div class="obs-field">
+        <label>Délai suggéré</label>
         <div class="quick-chips">${delaiChips}</div>
+        ${c.delai_suggere && !DELAIS.includes(c.delai_suggere) ? `<div class="guide-lbl">Valeur antérieure : ${esc(c.delai_suggere)}</div>` : ''}
       </div>
 
       ${obsFieldHtml('consequencesInput', 'comp-textarea', 'consequences', 'Conséquences additionnelles', c.consequences, 'Si rien n’est fait…')}
+      ${obsFieldHtml('projetCaInput', 'comp-textarea', 'projet_ca', 'Travaux planifiés par le conseil', c.projet_ca, 'ex. le remplacement des fenêtres pour 2027')}
 
       <div class="sec-head" style="margin-top:26px">
         <span class="section-lbl" style="margin:0">Précisions</span>
@@ -1431,6 +1557,11 @@ function ficheHtml() {
         </div>
       </div>
 
+      <div class="obs-field" style="margin-top:14px">
+        <label>Source de l'année</label>
+        ${choixHtml('source_annee', SOURCES_ANNEE, c.source_annee)}
+      </div>
+
       <div class="derived-card ${rep && rep.delta < 0 ? 'late' : ''}">
         <div class="k">Année anticipée de remplacement</div>
         <div class="v">${rep ? rep.year : '—'}</div>
@@ -1443,6 +1574,8 @@ function ficheHtml() {
       <div class="section-lbl" style="margin-top:26px">Note vocale</div>
       ${micSection}
       ${noteCard}
+
+      <button class="btn-outline btn-retirer" data-action="desactiver" data-id="${esc(c.id)}" ${!state.online ? 'disabled' : ''}><i data-lucide="eye-off"></i>Retirer de la visite (absente de l'immeuble)</button>
     </div>
     <div class="fiche-bottom">
       <button class="btn-cta" data-action="save-fiche" ${!state.online ? 'disabled' : ''}><i data-lucide="check"></i>Enregistrer &amp; suivante</button>
@@ -1463,8 +1596,11 @@ function aiResultHtml(r, c) {
         <div><div class="k">Composante</div><div class="v">${esc(c.name)}</div></div>
         <div><div class="k">Cote proposée</div><div class="v" style="color:${rInfo ? rInfo.color : 'var(--ink-500)'}">${esc(label)}</div></div>
       </div>
-      ${line('Observation', r.observation)}
+      ${line('Constats', r.observation)}
+      ${line('Étendue', [libelleDe(ETENDUES, r.etendue), r.etendueQte].filter(Boolean).join(' · '))}
+      ${line("Limite d'observation", libelleDe(LIMITES_OBS, r.limiteObservation))}
       ${line('Cause possible', r.causePossible)}
+      ${line('Nature du risque', libelleDe(RISQUES, r.natureRisque))}
       ${line('Délai suggéré', r.delaiSuggere)}
       ${line('Conséquences', r.consequences)}
       ${line('Coût de remplacement', cost)}
@@ -1560,6 +1696,8 @@ function onRootClick(e) {
     case 'go-synth': state.screen = 'synthese'; render(); break;
     case 'open-fiche': openFiche(t.dataset.id); break;
     case 'filter': state.filter = t.dataset.filter; render(); break;
+    case 'desactiver': setActif(t.dataset.id, false); break;
+    case 'reactiver': setActif(t.dataset.id, true); break;
     case 'add-photo': triggerPhotoInput(); break;
     case 'analyze': analyze(); break;
     case 'apply-ai': applyAi(); break;
@@ -1567,7 +1705,7 @@ function onRootClick(e) {
     case 'toggle-rflag': onRflagClick(); break;
     case 'set-facet': onFacetClick(t.dataset.field, t.dataset.val); break;
     case 'toggle-facets': state.facetsOpen = !state.facetsOpen; render(); break;
-    case 'pick-delai': if (saveCompField('delai_suggere', t.dataset.val, { force: true })) render(); break;
+    case 'add-constat': ajouterConstat(t.dataset.val); break;
     case 'attr-add': onAttrAdd(); break;
     case 'attr-del': onAttrDelete(t.dataset.key); break;
     case 'attr-suggest': {

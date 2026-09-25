@@ -5,9 +5,9 @@
 
 const TOKEN_KEY = 'cs_bureau_token';
 
-/* ---------- Taxonomie maison : les 10 catégories de la feuille « Relevé » ---------- */
+/* ---------- Taxonomie maison : les catégories de la feuille « Relevé », plus les piscines ---------- */
 
-const CAT_ORDER = ['terrain', 'structure', 'enveloppe', 'ouvertures', 'balcons', 'interieur', 'equipements', 'cvac', 'electrique', 'plomberie'];
+const CAT_ORDER = ['terrain', 'structure', 'enveloppe', 'ouvertures', 'balcons', 'interieur', 'equipements', 'cvac', 'electrique', 'plomberie', 'piscines'];
 const CATS = {
   terrain:     { label: 'Terrain et aménagement',                            short: 'Terrain',            icon: 'trees' },
   structure:   { label: 'Fondation, structure et stationnements intérieurs', short: 'Structure',          icon: 'layers' },
@@ -19,6 +19,7 @@ const CATS = {
   cvac:        { label: 'Systèmes de chauffage et ventilation',              short: 'CVAC',               icon: 'fan' },
   electrique:  { label: 'Installations électriques',                         short: 'Électricité',        icon: 'zap' },
   plomberie:   { label: "Installations de plomberie, d'eau et d'égout",      short: 'Plomberie',          icon: 'droplets' },
+  piscines:    { label: 'Piscines et centre aquatique',                      short: 'Piscines',           icon: 'waves' },
 };
 const CAT_AUTRES = { label: 'Autres', short: 'Autres', icon: 'box' };
 function catInfo(key) { return CATS[key] || CAT_AUTRES; }
@@ -748,7 +749,8 @@ async function loadDossierDetail(id) {
       apiJson(`/api/dossiers/${id}/projection`),
     ]);
     state.dossier = dossier;
-    state.components = Array.isArray(components) ? components : [];
+    // Les composantes retirées de la visite ne vont ni au rapport ni à la révision.
+    state.components = Array.isArray(components) ? components.filter(c => c.actif !== 0) : [];
     state.projection = projection;
     state.batiment = parseJsonObject(dossier && dossier.batiment_info);
     state.revisionLoading = false;
@@ -1704,6 +1706,17 @@ function ratingPillHtml(c) {
   return `<span class="rating-pill" style="background:${r.bg};color:${r.color}">${escapeHtml(r.pill)}</span>`;
 }
 
+/* ---------- Gabarit de réponse : même vocabulaire fermé qu'au terrain ---------- */
+const DELAIS = ['Immédiat (moins de 1 an)', 'Court terme (1 à 2 ans)', 'Moyen terme (3 à 5 ans)', 'Long terme (plus de 5 ans)', 'Aucun suivi particulier'];
+const ETENDUES = [['ponctuel', 'Ponctuel'], ['localise', 'Localisé'], ['generalise', 'Généralisé']];
+const LIMITES_OBS = [['de_pres', 'De près'], ['distance', 'À distance'], ['partiel', 'Partiel'], ['inaccessible', 'Non accessible']];
+const RISQUES = [['securite', 'Sécurité'], ['infiltration', "Infiltration d'eau"], ['degradation', 'Dégradation'], ['conformite', 'Conformité'], ['esthetique', 'Esthétique']];
+const SOURCES_ANNEE = [['plaque', 'Plaque'], ['carnet', 'Carnet'], ['administration', 'Administration'], ['estimee', 'Estimée']];
+
+function choixHtml(c, field, liste) {
+  return `<div class="seg seg-wrap">${liste.map(([k, lib]) => `<button class="seg-btn ${c[field] === k ? 'on' : ''}" data-action="set-facet" data-id="${c.id}" data-field="${field}" data-val="${escapeHtml(k)}">${escapeHtml(lib)}</button>`).join('')}</div>`;
+}
+
 function obsFieldHtml(c, field, label, placeholder) {
   const id = `obs_${c.id}_${field}`;
   return `<div class="obs-field">
@@ -1721,15 +1734,33 @@ function compDetailHtml(c) {
   return `
   <div class="comp-detail">
     <div class="comp-detail-col">
-      <div class="detail-eyebrow">Observations</div>
-      ${obsFieldHtml(c, 'observation', 'Observation', 'Ce qui a été constaté sur place…')}
-      ${obsFieldHtml(c, 'cause_possible', 'Cause possible', 'Origine probable du constat…')}
-      <div class="obs-field">
-        <label for="obs_${c.id}_delai_suggere">Délai suggéré</label>
-        <input id="obs_${c.id}_delai_suggere" class="detail-input" data-role="comp-text" data-id="${c.id}" data-field="delai_suggere"
-          value="${escapeHtml(c.delai_suggere || '')}" placeholder="ex. à court terme">
+      <div class="detail-eyebrow">Relevé</div>
+      ${obsFieldHtml(c, 'observation', 'Constats — un par ligne', 'Localisation – ce qui est observé')}
+      <div class="facet-block">
+        <div class="facet-lbl">Étendue</div>
+        ${choixHtml(c, 'etendue', ETENDUES)}
+        <input class="detail-input" style="margin-top:6px" data-role="comp-text" data-id="${c.id}" data-field="etendue_qte" value="${escapeHtml(c.etendue_qte || '')}" placeholder="Quantité touchée — ex. ≈ 4 m²">
+      </div>
+      <div class="facet-block">
+        <div class="facet-lbl">Limite d'observation</div>
+        ${choixHtml(c, 'limite_observation', LIMITES_OBS)}
+        <input class="detail-input" style="margin-top:6px" data-role="comp-text" data-id="${c.id}" data-field="limite_detail" value="${escapeHtml(c.limite_detail || '')}" placeholder="Raison ou méthode">
+      </div>
+      ${obsFieldHtml(c, 'cause_possible', 'Cause possible', 'Origine probable, modalisée…')}
+      <div class="facet-block">
+        <div class="facet-lbl">Nature du risque</div>
+        ${choixHtml(c, 'nature_risque', RISQUES)}
+      </div>
+      <div class="facet-block">
+        <div class="facet-lbl">Délai suggéré${c.delai_suggere && !DELAIS.includes(c.delai_suggere) ? ` <span style="font-weight:400">(antérieur : ${escapeHtml(c.delai_suggere)})</span>` : ''}</div>
+        ${choixHtml(c, 'delai_suggere', DELAIS.map(d => [d, d]))}
       </div>
       ${obsFieldHtml(c, 'consequences', 'Conséquences', "Si rien n'est fait…")}
+      ${obsFieldHtml(c, 'projet_ca', 'Travaux planifiés par le conseil', 'ex. le remplacement des fenêtres pour 2027')}
+      <div class="facet-block">
+        <div class="facet-lbl">Source de l'année</div>
+        ${choixHtml(c, 'source_annee', SOURCES_ANNEE)}
+      </div>
     </div>
     <div class="comp-detail-col">
       <div class="detail-eyebrow">Facettes</div>
@@ -1772,7 +1803,7 @@ function compRowHtml(c, excluded) {
   const repColor = !rep ? 'var(--ink-400)' : rep.delta < 0 ? 'var(--accent-press)' : rep.delta <= 5 ? 'var(--orange)' : 'var(--ink-700)';
   const open = !!state.expanded[c.id];
   const facets = facetSuffix(c);
-  const obsCount = ['observation', 'cause_possible', 'delai_suggere', 'consequences'].filter(f => c[f]).length;
+  const obsCount = ['observation', 'etendue', 'limite_observation', 'cause_possible', 'nature_risque', 'delai_suggere', 'consequences'].filter(f => c[f]).length;
   return `
   <div class="comp-row-wrap ${open ? 'open' : ''}">
     <div class="comp-grid comp-row">
