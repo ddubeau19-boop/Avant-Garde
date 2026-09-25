@@ -4,6 +4,7 @@
 // ============================================================
 
 import { creerBibliotheque } from '../shared/bibliotheque.js';
+import { creerModeles } from '../shared/modeles.js';
 
 const TOKEN_KEY = 'cs_bureau_token';
 
@@ -1277,7 +1278,7 @@ function railHtml() {
     ...(estAdminFirme() ? [{ key: 'equipe', label: 'Équipe', icon: 'users-round', action: 'go-equipe', active: state.screen === 'equipe' }] : []),
     { key: 'clients', label: 'Clients', icon: 'users', action: 'go-clients', active: state.screen === 'clients' },
     { key: 'carnet', label: "Carnet d'entretien", icon: 'calendar-clock', action: 'go-carnet', active: state.screen === 'carnet' },
-    { key: 'modeles', label: 'Modèles', icon: 'file-stack', disabled: true },
+    { key: 'modeles', label: 'Modèles', icon: 'file-stack', action: 'go-modeles', active: state.screen === 'modeles' },
   ];
   const initials = initialsOf(state.user && state.user.name);
   return `
@@ -1311,6 +1312,7 @@ function renderShell() {
   else if (state.screen === 'equipe') main = renderEquipe();
   else if (state.screen === 'carnet') main = renderCarnet();
   else if (state.screen === 'clients') main = renderClients();
+  else if (state.screen === 'modeles') main = renderModeles();
   else if (state.screen === 'bibliotheque') main = `<div class="page-pad cscr" style="padding:0">${bib.html({ eyebrow: (state.user && state.user.company && state.user.company.name) || '' })}</div>`;
   return `<div class="shell">${railHtml()}<div class="main">${main}</div></div>`;
 }
@@ -1329,6 +1331,53 @@ const bib = creerBibliotheque({
   spinnerBlock: (x) => spinnerBlock(x),
   companyId: () => state.user && state.user.company && state.user.company.id,
 });
+
+// ---------------------------------------------------------------
+// Modèles de rapport : identité, mise en page Word et texte de fond.
+// Tous les consultent ; un administrateur de la firme les modifie.
+// ---------------------------------------------------------------
+const modeles = creerModeles({
+  apiJson: (path, opts) => apiJson(path, opts),
+  render: () => render(),
+  escapeHtml: (x) => escapeHtml(x),
+  fmtDate: (iso) => {
+    const d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleDateString('fr-CA', { day: 'numeric', month: 'short', year: 'numeric' });
+  },
+  spinnerBlock: (x) => spinnerBlock(x),
+  companyId: () => idFirme(),
+});
+const logoFirme = { envoi: false, erreur: null };
+
+async function envoyerLogo(file) {
+  logoFirme.envoi = true; logoFirme.erreur = null; render();
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    await apiJson(`/api/companies/${idFirme()}/logo`, { method: 'POST', body: fd });
+    if (state.user && state.user.company) state.user.company.hasLogo = true;
+    await loadCompanyLogo();
+  } catch (e) { logoFirme.erreur = e.message || "Échec de l'envoi du logo."; }
+  logoFirme.envoi = false; render();
+}
+
+function renderModeles() {
+  const admin = estAdminFirme();
+  return `
+  <div class="page-pad cscr modeles-page ${admin ? '' : 'lecture-seule'}">
+    <div class="eyebrow-orange">${escapeHtml((state.user && state.user.company && state.user.company.name) || '')}</div>
+    <h1 class="page-title">Modèles</h1>
+    <p class="eq-lead">Ce que chaque rapport Word de la firme reprend : son logo et ses couleurs, ses pages liminaires et le texte de fond des sections.${admin ? '' : " Seul un administrateur de la firme les modifie."}</p>
+    <div class="eng-section-head"><span class="lbl">Logo</span><div class="rule"></div>
+      ${admin ? `<label class="btn-pill-sm">${logoFirme.envoi ? 'Envoi…' : 'Changer le logo'}<input type="file" accept="image/png,image/jpeg" data-role="logo-firme" style="display:none" ${logoFirme.envoi ? 'disabled' : ''}></label>` : ''}
+    </div>
+    ${logoFirme.erreur ? errorBanner(logoFirme.erreur) : ''}
+    <div class="logo-apercu">${state.companyLogoUrl ? `<img src="${state.companyLogoUrl}" alt="Logo de la firme">` : '<span class="dt-sub">Aucun logo : les rapports paraissent sans logo.</span>'}</div>
+    ${modeles.themeCardHtml()}
+    ${modeles.miseEnPageCardHtml()}
+    ${modeles.templateCardHtml()}
+  </div>`;
+}
 
 // ---------------------------------------------------------------
 // Équipe de la firme : l'administrateur invite ses ingénieurs par
@@ -2945,6 +2994,7 @@ function initEvents() {
     if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
     else if (bib.input(t)) return;
+    else if (state.screen === 'modeles' && modeles.input(t)) return;
     else if (t.matches('[data-role="equipe-name"]')) equipe.form.name = t.value;
     else if (t.matches('[data-role="clients-recherche"]')) { clients.recherche = t.value; render(); }
     else if (t.id && t.id.startsWith('cli-') && clients.courant) lireFormClient();
@@ -2964,6 +3014,8 @@ function initEvents() {
   app.addEventListener('change', (e) => {
     const t = e.target;
     if (t && t.matches && bib.change(t)) return;
+    if (t && t.matches && state.screen === 'modeles' && modeles.change(t)) return;
+    if (t && t.matches && t.matches('[data-role="logo-firme"]')) { const f = t.files && t.files[0]; t.value = ''; if (f) envoyerLogo(f); return; }
     if (t && t.matches && t.matches('[data-role="equipe-role"]')) { equipe.form.role = t.value; return; }
     if (t && t.matches && t.matches('[data-role="carnet-dossier"]')) { ouvrirCarnet(t.value); return; }
     if (t && t.matches && t.matches('[data-role="suivi-assigne"]')) { majSuivi(t.getAttribute('data-id'), { assigne_a: t.value || null }); return; }
@@ -2996,6 +3048,7 @@ function initEvents() {
     if (!btn) return;
     const action = btn.getAttribute('data-action');
     if (bib.click(action, btn)) return;
+    if (state.screen === 'modeles' && modeles.click(action, btn)) return;
     switch (action) {
       case 'go-carnet':
         leaveReviewIA();
@@ -3008,6 +3061,13 @@ function initEvents() {
       case 'carnet-membre': actionMembrePortail(btn.getAttribute('data-id'), btn.getAttribute('data-op')); break;
       case 'nouvelle-revision':
         nouvelleRevision(btn.getAttribute('data-id'));
+        break;
+      case 'go-modeles':
+        leaveReviewIA();
+        state.screen = 'modeles';
+        modeles.reset();
+        render();
+        modeles.charger();
         break;
       case 'go-clients':
         leaveReviewIA();

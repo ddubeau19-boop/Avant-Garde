@@ -46635,19 +46635,29 @@ companies.patch("/:id", async (c) => {
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
   return c.json({ ...company, hasLogo: !!company.logo_r2_key });
 });
+// Le super admin, ou un administrateur de la firme. Celui-ci n'envoie qu'une
+// image PNG ou JPEG vérifiée : un SVG servi depuis le domaine de la plateforme
+// peut porter du script.
 companies.post("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
-  const deny = requireSuperAdmin(c, user);
-  if (deny) return deny;
   const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const company = await c.env.DB.prepare("SELECT id FROM companies WHERE id = ?1").bind(id).first();
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
   const form = await c.req.formData();
   const file = form.get("file");
   if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
-  const ext = file.type === "image/png" ? "png" : file.type === "image/svg+xml" ? "svg" : "jpg";
+  const octets = await file.arrayBuffer();
+  if (octets.byteLength > 5 * 1024 * 1024) return c.json({ error: "logo trop volumineux (max 5 Mo)" }, 413);
+  const t = new Uint8Array(octets.slice(0, 8));
+  const png = t[0] === 0x89 && t[1] === 0x50 && t[2] === 0x4e && t[3] === 0x47;
+  const jpeg = t[0] === 0xff && t[1] === 0xd8 && t[2] === 0xff;
+  const svg = file.type === "image/svg+xml" && user.role === "super_admin";
+  if (!png && !jpeg && !svg) return c.json({ error: "le logo doit être une image PNG ou JPEG" }, 400);
+  const ext = png ? "png" : jpeg ? "jpg" : "svg";
   const r2Key = `company-logos/${id}.${ext}`;
-  await c.env.PHOTOS.put(r2Key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type || "image/png" } });
+  await c.env.PHOTOS.put(r2Key, octets, { httpMetadata: { contentType: png ? "image/png" : jpeg ? "image/jpeg" : "image/svg+xml" } });
   await c.env.DB.prepare(
     "UPDATE companies SET logo_r2_key = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
   ).bind(r2Key, id).run();
@@ -46903,7 +46913,13 @@ companies.get("/:id/logo", async (c) => {
   const obj = await c.env.PHOTOS.get(company.logo_r2_key);
   if (!obj) return c.notFound();
   return new Response(obj.body, {
-    headers: { "content-type": obj.httpMetadata?.contentType ?? "image/png", "cache-control": "private, max-age=3600" }
+    headers: {
+      "content-type": obj.httpMetadata?.contentType ?? "image/png",
+      "cache-control": "private, max-age=3600",
+      // Une image, jamais un document actif, même ouverte directement.
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+      "x-content-type-options": "nosniff"
+    }
   });
 });
 companies.get("/:id/engineers", async (c) => {

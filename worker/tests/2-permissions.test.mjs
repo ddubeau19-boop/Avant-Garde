@@ -62,3 +62,23 @@ test('la console d\'administration est réservée au super admin', async () => {
 test('un compte désactivé est refusé, même avec une session encore valide', async () => {
   assert.equal((await api('/api/auth/me', { session: jeton(IDS.ingDesactive) })).statut, 401);
 });
+
+test('logo : l\'administrateur de la firme envoie un PNG ou un JPEG vérifié ; ni SVG, ni ingénieur, ni autre firme', async () => {
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da6364f8ffff3f0005fe02fea7d6a4a70000000049454e44ae426082', 'hex');
+  const envoi = (octets, type, nom, session) => {
+    const f = new FormData();
+    f.append('file', new Blob([octets], { type }), nom);
+    return api(`/api/companies/${IDS.firmeA}/logo`, { methode: 'POST', session, formulaire: f });
+  };
+  assert.equal((await envoi(png, 'image/png', 'logo.png', ingA)).statut, 403);
+  assert.equal((await envoi(png, 'image/png', 'logo.png', ingB)).statut, 404);
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>';
+  assert.equal((await envoi(svg, 'image/svg+xml', 'logo.svg', adminA)).statut, 400);
+  // Un fichier déguisé : type annoncé PNG, contenu quelconque.
+  assert.equal((await envoi('pas une image', 'image/png', 'logo.png', adminA)).statut, 400);
+  assert.equal((await envoi(png, 'image/png', 'logo.png', adminA)).statut, 200);
+  const lu = await api(`/api/companies/${IDS.firmeA}/logo`, { session: ingA, brut: true });
+  assert.equal(lu.status, 200);
+  assert.equal(lu.headers.get('content-type'), 'image/png');
+  assert.match(lu.headers.get('content-security-policy') || '', /sandbox/);
+});
