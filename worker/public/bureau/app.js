@@ -1201,6 +1201,34 @@ async function downloadReport(kind) {
   }
 }
 
+// Téléchargement d'un fichier de l'API sous le nom donné.
+async function telecharger(chemin, nom) {
+  const res = await apiRaw(chemin);
+  if (!res.ok) {
+    let msg = 'Téléchargement impossible.';
+    try { msg = (await res.json()).error || msg; } catch (e) { /* pas du JSON */ }
+    throw new Error(msg);
+  }
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement('a');
+  a.href = url; a.download = nom;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+const exportFirme = { enCours: false, erreur: null };
+async function exporterFirme() {
+  exportFirme.enCours = true; exportFirme.erreur = null; render();
+  try { await telecharger(`/api/companies/${idFirme()}/export.zip`, `export-${new Date().toISOString().slice(0, 10)}.zip`); }
+  catch (e) { exportFirme.erreur = e.message; }
+  exportFirme.enCours = false; render();
+}
+async function archiverDossier() {
+  state.archiveEnCours = true; render();
+  try { await telecharger(`/api/dossiers/${state.dossierId}/archive.zip`, `archive-${(state.dossier && state.dossier.dossier_no) || 'dossier'}.zip`); }
+  catch (e) { state.revisionFlashError = e.message; }
+  state.archiveEnCours = false; render();
+}
+
 // ---------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------
@@ -1490,6 +1518,10 @@ function renderEquipe() {
     ${equipe.note ? `<div class="temp-pass-warn" style="margin:12px 0"><i data-lucide="${equipe.lien ? 'alert-triangle' : 'check'}"></i><span>${escapeHtml(equipe.note)}${equipe.lien ? `<br><input class="eq-lien" readonly value="${escapeHtml(equipe.lien)}" onclick="this.select()">` : ''}</span></div>` : ''}
     ${d && !d.courriel ? `<div class="temp-pass-warn"><i data-lucide="info"></i><span>L'envoi de courriels n'est pas configuré : chaque invitation affichera un lien à transmettre vous-même.</span></div>` : ''}
 
+    <div class="eng-section-head" style="margin-top:22px"><span class="lbl">Données de la firme</span><div class="rule"></div>
+      <button class="btn-pill-sm" data-action="export-firme" ${exportFirme.enCours ? 'disabled' : ''}>${exportFirme.enCours ? 'Préparation…' : "Télécharger l'export (.zip)"}</button></div>
+    <p class="eq-lead" style="margin-bottom:6px">Tout ce que la firme a confié à la plateforme — clients, dossiers, composantes, historique, carnets, banque de prix — en JSON, avec les dossiers et les composantes en CSV pour Excel. Les photos se téléchargent dossier par dossier (« Archive du dossier »). Une sauvegarde complète de la plateforme est aussi faite chaque semaine.</p>
+    ${exportFirme.erreur ? errorBanner(exportFirme.erreur) : ''}
     ${!d ? spinnerBlock("Chargement de l'équipe…") : `
     <div class="dossiers-table" style="margin-top:18px">
       <div class="dt-row eq-row dt-head"><div>Nom</div><div>Rôle</div><div>Statut</div><div></div></div>
@@ -2330,6 +2362,10 @@ function executiveSummaryHtml(proj, selectedCode) {
   </div>`;
 }
 
+function archiveHtml() {
+  return `<button class="report-item" data-action="archive-dossier" ${state.archiveEnCours ? 'disabled' : ''}><div class="report-icon"><i data-lucide="archive"></i></div><div style="flex:1"><div class="report-name">${state.archiveEnCours ? 'Préparation de l\'archive…' : 'Archive du dossier'}</div><div class="report-sub">Données et photos · .zip</div></div><i data-lucide="download"></i></button>`;
+}
+
 function reportsCardHtml(allConf, remaining) {
   if (allConf) {
     return `
@@ -2338,6 +2374,7 @@ function reportsCardHtml(allConf, remaining) {
       <button class="report-item" data-action="download-docx"><div class="report-icon"><i data-lucide="file-text"></i></div><div style="flex:1"><div class="report-name">Étude de fonds</div><div class="report-sub">Word · .docx</div></div><i data-lucide="download"></i></button>
       <button class="report-item" data-action="download-xlsx"><div class="report-icon green"><i data-lucide="table-2"></i></div><div style="flex:1"><div class="report-name">Durées de vie + carnet</div><div class="report-sub">Excel · .xlsx</div></div><i data-lucide="download"></i></button>
       <button class="report-item" data-action="download-suivi"><div class="report-icon"><i data-lucide="calendar-check"></i></div><div style="flex:1"><div class="report-name">Tableur suivi d'entretien</div><div class="report-sub">Excel · tâches par saison</div></div><i data-lucide="download"></i></button>
+      ${archiveHtml()}
       <div class="reports-note ready"><i data-lucide="check-circle-2"></i>Texte confirmé — rapports générés et à jour à chaque édition.</div>
     </div>`;
   }
@@ -2346,6 +2383,7 @@ function reportsCardHtml(allConf, remaining) {
     <div class="reports-eyebrow">Rapports finaux</div>
     <div class="report-item locked"><div class="report-icon locked"><i data-lucide="file-text"></i></div><div style="flex:1"><div class="report-name muted">Étude de fonds</div><div class="report-sub muted">Word · verrouillé</div></div><i data-lucide="lock"></i></div>
     <div class="report-item locked"><div class="report-icon locked"><i data-lucide="table-2"></i></div><div style="flex:1"><div class="report-name muted">Durées de vie + carnet</div><div class="report-sub muted">Excel · verrouillé</div></div><i data-lucide="lock"></i></div>
+    ${archiveHtml()}
     <div class="reports-note locked"><i data-lucide="alert-circle"></i>Confirmez le texte des ${remaining} composante(s) restante(s) pour générer les rapports.</div>
   </div>`;
 }
@@ -3062,6 +3100,8 @@ function initEvents() {
       case 'nouvelle-revision':
         nouvelleRevision(btn.getAttribute('data-id'));
         break;
+      case 'export-firme': exporterFirme(); break;
+      case 'archive-dossier': archiverDossier(); break;
       case 'go-modeles':
         leaveReviewIA();
         state.screen = 'modeles';

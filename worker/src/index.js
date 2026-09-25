@@ -46982,6 +46982,22 @@ function membreEquipe(u) {
     actif: u.actif !== 0, invitation_en_attente: !!u.invitation_en_attente
   };
 }
+companies.get("/:id/export.zip", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const d = await donneesDeFirme(c.env.DB, id);
+  if (!d.firme) return c.json({ error: "entreprise introuvable" }, 404);
+  const noParDossier = new Map(d.dossiers.map((x) => [x.id, x.dossier_no]));
+  const octets = await zipper([
+    ["LISEZ-MOI.txt", LISEZ_MOI_EXPORT],
+    ["donnees.json", JSON.stringify(d, null, 1)],
+    ["dossiers.csv", csvExcel(CSV_DOSSIERS, d.dossiers)],
+    ["composantes.csv", csvExcel(CSV_COMPOSANTES, d.composantes.map((x) => ({ ...x, dossier_no: noParDossier.get(x.dossier_id) })))]
+  ]);
+  return reponseZip(octets, `export-${d.firme.slug || id}-${new Date().toISOString().slice(0, 10)}.zip`);
+});
 // L'équipe active, en noms seulement : de quoi choisir un responsable de dossier.
 companies.get("/:id/membres", async (c) => {
   const user = await getCurrentUser(c);
@@ -47492,6 +47508,166 @@ clientsApi.post("/:id/dossiers", async (c) => {
     floors, built_year: client.annee_construction, client_id: client.id
   }), 201);
 });
+// ============================================================================
+// EXPORT ET SAUVEGARDES
+// ----------------------------------------------------------------------------
+// Export : tout ce qu'une firme a confié à la plateforme, pour qu'elle le
+// garde ou le reprenne ailleurs — sans mot de passe ni jeton. Archive d'un
+// dossier : ses données et ses photos. Sauvegarde : chaque semaine, toute la
+// base dans R2, conservée six mois, en plus du retour dans le temps de D1.
+// ============================================================================
+const EXPORT_VERSION = 1;
+const COLONNES_SECRETES = new Set(["password_hash", "password_salt", "sessions_apres"]);
+const sansSecrets = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).filter(([k]) => !COLONNES_SECRETES.has(k))));
+async function toutes(db, sql, ...params) {
+  return (await db.prepare(sql).bind(...params).all()).results;
+}
+async function donneesDeFirme(db, companyId) {
+  const dossiersFirme = `SELECT id FROM dossiers WHERE company_id = ?1`;
+  const [firme, equipe, clients2, dossiers2, composantes, photos2, journal2, regles, suivi2, portail2, gabarit, redactions2, prix2, sources] = await Promise.all([
+    db.prepare("SELECT * FROM companies WHERE id = ?1").bind(companyId).first(),
+    toutes(db, "SELECT * FROM users WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM clients WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM dossiers WHERE company_id = ?1", companyId),
+    toutes(db, `SELECT * FROM components WHERE dossier_id IN (${dossiersFirme}) ORDER BY dossier_id, sort_order`, companyId),
+    toutes(db, `SELECT p.* FROM photos p JOIN components cmp ON cmp.id = p.component_id WHERE cmp.dossier_id IN (${dossiersFirme})`, companyId),
+    toutes(db, `SELECT * FROM journal WHERE dossier_id IN (${dossiersFirme}) ORDER BY moment`, companyId),
+    toutes(db, `SELECT * FROM carnet_regles WHERE dossier_id IN (${dossiersFirme})`, companyId),
+    toutes(db, `SELECT * FROM carnet_suivi WHERE dossier_id IN (${dossiersFirme})`, companyId),
+    toutes(db, `SELECT a.dossier_id, a.fonction, a.cree_le, u.id AS user_id, u.name, u.email, u.actif FROM portail_acces a JOIN users u ON u.id = a.user_id WHERE a.dossier_id IN (${dossiersFirme})`, companyId),
+    db.prepare("SELECT company_id, sections, source_filename, imported_at, updated_at FROM company_templates WHERE company_id = ?1").bind(companyId).first(),
+    toutes(db, "SELECT * FROM redactions WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM price_observations WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM price_observation_sources WHERE company_id = ?1", companyId)
+  ]);
+  return {
+    format: "condo-strategis-export", version: EXPORT_VERSION, exporte_le: (/* @__PURE__ */ new Date()).toISOString(),
+    firme, equipe: sansSecrets(equipe), clients: clients2, dossiers: dossiers2, composantes, photos: photos2,
+    journal: journal2, carnet: { regles, suivi: suivi2 }, portail: portail2, gabarit_texte: gabarit ?? null,
+    redactions: redactions2, prix: { observations: prix2, sources }
+  };
+}
+// CSV pour Excel en français : point-virgule, BOM UTF-8, virgule décimale.
+function csvExcel(entetes, lignes) {
+  const cellule = (v) => {
+    if (v == null) return "";
+    const t = typeof v === "number" ? String(v).replace(".", ",") : String(v);
+    return /[;"\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  return "\uFEFF" + [entetes.map(([, lib]) => cellule(lib)).join(";"), ...lignes.map((l) => entetes.map(([k]) => cellule(l[k])).join(";"))].join("\r\n");
+}
+const CSV_DOSSIERS = [["dossier_no", "Dossier"], ["name", "Syndicat"], ["address", "Adresse"], ["city", "Ville"], ["units", "Unités"], ["floors", "Étages"], ["built_year", "Construction"], ["current_fund_balance", "Solde du fonds"], ["cotisation_annuelle", "Cotisation annuelle"], ["published_at", "Publié le"], ["created_at", "Créé le"], ["id", "Identifiant"]];
+const CSV_COMPOSANTES = [["dossier_no", "Dossier"], ["cat", "Catégorie"], ["name", "Composante"], ["uniformat_code", "Uniformat"], ["actif", "Dans la visite"], ["done", "Documentée"], ["rating", "Cote"], ["install_year", "Année d'installation"], ["useful_life_years", "Vie utile"], ["replacement_cost", "Coût de remplacement"], ["qty", "Quantité"], ["observation", "Constats"], ["id", "Identifiant"]];
+const LISEZ_MOI_EXPORT = `Export des données — Condo Stratégis
+
+donnees.json     Toutes les données de la firme : équipe (sans mots de passe), clients,
+                 dossiers, composantes, métadonnées des photos, historique des
+                 modifications, carnets d'entretien, membres des portails, textes du
+                 rapport, rédactions et banque de prix.
+dossiers.csv     Les dossiers, à ouvrir dans Excel.
+composantes.csv  Les composantes de tous les dossiers, à ouvrir dans Excel.
+
+Les photos ne sont pas dans cet export : elles se téléchargent dossier par
+dossier (« Archive du dossier », dans la console bureau), avec les données du
+dossier.
+`;
+async function zipper(fichiers) {
+  const JSZip = import_jszip_min.default;
+  const zip = new JSZip();
+  for (const [nom, contenu, opts] of fichiers) zip.file(nom, contenu, opts);
+  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+function reponseZip(octets, nom) {
+  return new Response(octets, {
+    headers: {
+      "content-type": "application/zip",
+      "content-disposition": `attachment; filename="${nom.replace(/[^A-Za-z0-9._-]/g, "_")}"`,
+      "cache-control": "no-store"
+    }
+  });
+}
+// Budget des photos d'une archive : un Worker n'a que 128 Mo de mémoire.
+const ARCHIVE_PHOTOS_OCTETS = 60 * 1024 * 1024;
+async function archiveDossier(env, dossier) {
+  const [composantes, photos2, journal2, regles, suivi2] = await Promise.all([
+    toutes(env.DB, "SELECT * FROM components WHERE dossier_id = ?1 ORDER BY sort_order", dossier.id),
+    toutes(env.DB, "SELECT p.* FROM photos p JOIN components cmp ON cmp.id = p.component_id WHERE cmp.dossier_id = ?1 ORDER BY p.created_at", dossier.id),
+    toutes(env.DB, "SELECT * FROM journal WHERE dossier_id = ?1 ORDER BY moment", dossier.id),
+    toutes(env.DB, "SELECT * FROM carnet_regles WHERE dossier_id = ?1", dossier.id),
+    toutes(env.DB, "SELECT * FROM carnet_suivi WHERE dossier_id = ?1", dossier.id)
+  ]);
+  const noms = new Map(composantes.map((c) => [c.id, c]));
+  const fichiers = [];
+  let budget = ARCHIVE_PHOTOS_OCTETS;
+  const absentes = [];
+  const rang = new Map();
+  for (const p of photos2) {
+    const c = noms.get(p.component_id);
+    const n = (rang.get(p.component_id) ?? 0) + 1;
+    rang.set(p.component_id, n);
+    const obj = await env.PHOTOS.get(p.r2_key);
+    if (!obj || obj.size > budget) { absentes.push(p.id); continue; }
+    budget -= obj.size;
+    const ext = p.r2_key.endsWith(".png") ? "png" : "jpg";
+    const dossierPhoto = `${String((c?.sort_order ?? 0) + 1).padStart(3, "0")} ${(c?.name ?? "composante").replace(/[\\/:*?"<>|]/g, "-").slice(0, 80)}`;
+    p.fichier = `photos/${dossierPhoto}/${n}${p.tag ? ` - ${String(p.tag).replace(/[\\/:*?"<>|]/g, "-")}` : ""}.${ext}`;
+    // Déjà compressées : stockées telles quelles.
+    fichiers.push([p.fichier, new Uint8Array(await obj.arrayBuffer()), { compression: "STORE" }]);
+  }
+  const donnees = { format: "condo-strategis-dossier", version: EXPORT_VERSION, exporte_le: (/* @__PURE__ */ new Date()).toISOString(), dossier, composantes, photos: photos2, journal: journal2, carnet: { regles, suivi: suivi2 }, photos_non_incluses: absentes };
+  fichiers.unshift(
+    ["donnees.json", JSON.stringify(donnees, null, 1)],
+    ["composantes.csv", csvExcel(CSV_COMPOSANTES, composantes.map((c) => ({ ...c, dossier_no: dossier.dossier_no })))]
+  );
+  if (absentes.length) fichiers.push(["PHOTOS-MANQUANTES.txt", `${absentes.length} photo(s) n'ont pas pu être incluses (taille de l'archive limitée à 60 Mo, ou fichier absent). Leurs identifiants sont dans donnees.json, clé photos_non_incluses.\n`]);
+  return zipper(fichiers);
+}
+// Sauvegarde complète : chaque table, chaque ligne, en JSON compressé.
+const SAUVEGARDES_GARDEES = 26;
+const CRON_SAUVEGARDE = "0 7 * * 0";
+async function sauvegarderBase(env) {
+  const tables = (await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'd1_%' ORDER BY name"
+  ).all()).results.map((r) => r.name);
+  const contenu = { format: "condo-strategis-sauvegarde", version: EXPORT_VERSION, cree_le: (/* @__PURE__ */ new Date()).toISOString(), tables: {} };
+  for (const t of tables) {
+    const lignes = [];
+    for (let depart = 0; ; depart += 1000) {
+      const lot = (await env.DB.prepare(`SELECT * FROM "${t.replace(/"/g, "")}" LIMIT 1000 OFFSET ?1`).bind(depart).all()).results;
+      lignes.push(...lot);
+      if (lot.length < 1000) break;
+    }
+    contenu.tables[t] = lignes;
+  }
+  const flux = new Blob([JSON.stringify(contenu)]).stream().pipeThrough(new CompressionStream("gzip"));
+  const octets = new Uint8Array(await new Response(flux).arrayBuffer());
+  const cle = `sauvegardes/stratege-fp-${contenu.cree_le.slice(0, 19).replace(/[:T]/g, "-")}.json.gz`;
+  await env.PHOTOS.put(cle, octets, { httpMetadata: { contentType: "application/gzip" }, customMetadata: { tables: String(tables.length) } });
+  // Les plus anciennes au-delà de six mois de sauvegardes hebdomadaires.
+  const liste = (await env.PHOTOS.list({ prefix: "sauvegardes/" })).objects.sort((a, b) => a.key < b.key ? -1 : 1);
+  for (const vieille of liste.slice(0, Math.max(0, liste.length - SAUVEGARDES_GARDEES))) await env.PHOTOS.delete(vieille.key);
+  console.log("sauvegarde", cle, octets.length, "octets", tables.length, "tables");
+  return { cle, octets: octets.length, tables: tables.length };
+}
+// Liste et téléchargement des sauvegardes : super admin seulement.
+const sauvegardes = new Hono();
+sauvegardes.use("*", async (c, next) => {
+  const user = await getCurrentUser(c);
+  if (user?.role !== "super_admin") return c.json({ error: "réservé au super administrateur" }, 403);
+  return next();
+});
+sauvegardes.get("/", async (c) => {
+  const liste = (await c.env.PHOTOS.list({ prefix: "sauvegardes/" })).objects.sort((a, b) => a.key < b.key ? 1 : -1);
+  return c.json(liste.map((o) => ({ nom: o.key.slice("sauvegardes/".length), octets: o.size, le: o.uploaded })));
+});
+sauvegardes.post("/", async (c) => c.json(await sauvegarderBase(c.env), 201));
+sauvegardes.get("/:nom", async (c) => {
+  const nom = c.req.param("nom");
+  if (!/^stratege-fp-[\d-]+\.json\.gz$/.test(nom)) return c.json({ error: "nom invalide" }, 400);
+  const obj = await c.env.PHOTOS.get(`sauvegardes/${nom}`);
+  if (!obj) return c.json({ error: "sauvegarde introuvable" }, 404);
+  return new Response(obj.body, { headers: { "content-type": "application/gzip", "content-disposition": `attachment; filename="${nom}"`, "cache-control": "no-store" } });
+});
 // ---- Côté firme : membres et répartition, depuis la console bureau -------------
 async function dossierPortail(c, { ecriture = false } = {}) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
@@ -47993,6 +48169,11 @@ dossiers.get("/:id/journal", async (c) => {
       apres: x.champ === "rating" && x.apres ? RATING_LABELS[x.apres] ?? x.apres : x.apres
     }))
   })));
+});
+dossiers.get("/:id/archive.zip", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  return reponseZip(await archiveDossier(c.env, dossier), `archive-${dossier.dossier_no}.zip`);
 });
 // Catalogue de la firme pour l'ajout sur le terrain : sa bibliothèque, ou la
 // liste de Condo Stratégis quand elle n'en a pas importé.
@@ -49021,13 +49202,16 @@ app.route("/api/photos", photos);
 app.route("/api/prix", prix);
 app.route("/api/portail", portail);
 app.route("/api/clients", clientsApi);
+app.route("/api/sauvegardes", sauvegardes);
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 const index = {
   fetch: app.fetch,
   // Le 1er de chaque mois : les tâches du carnet partent par courriel aux
   // membres des portails.
+  // Le dimanche : sauvegarde complète de la base dans R2.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(rappelsMensuels(env));
+    if (event.cron === CRON_SAUVEGARDE) ctx.waitUntil(sauvegarderBase(env));
+    else ctx.waitUntil(rappelsMensuels(env));
   }
 };
 export {

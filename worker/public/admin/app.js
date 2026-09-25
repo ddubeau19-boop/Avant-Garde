@@ -259,6 +259,42 @@ function doLogout() {
 // ---------------------------------------------------------------
 // Actions — companies list
 // ---------------------------------------------------------------
+// Sauvegardes hebdomadaires de la base (R2) : liste, téléchargement, sauvegarde immédiate.
+const sauv = { liste: null, erreur: null, enCours: false };
+async function chargerSauvegardes() {
+  try { sauv.liste = await apiJson('/api/sauvegardes'); sauv.erreur = null; }
+  catch (e) { sauv.erreur = e.message || 'Impossible de lister les sauvegardes.'; }
+  render();
+}
+async function sauvegarderMaintenant() {
+  sauv.enCours = true; sauv.erreur = null; render();
+  try { await apiJson('/api/sauvegardes', { method: 'POST' }); await chargerSauvegardes(); }
+  catch (e) { sauv.erreur = e.message || 'La sauvegarde a échoué.'; }
+  sauv.enCours = false; render();
+}
+async function telechargerSauvegarde(nom) {
+  try {
+    const res = await apiRaw(`/api/sauvegardes/${encodeURIComponent(nom)}`);
+    if (!res.ok) throw new Error('Téléchargement impossible.');
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement('a'); a.href = url; a.download = nom;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  } catch (e) { sauv.erreur = e.message; render(); }
+}
+function sauvegardesHtml() {
+  const taille = (o) => o < 1024 * 1024 ? `${Math.max(1, Math.round(o / 1024))} Ko` : `${(o / 1024 / 1024).toFixed(1).replace('.', ',')} Mo`;
+  return `
+    <div class="eng-section-head"><span class="lbl">Sauvegardes de la base</span><div class="rule"></div>
+      <button class="btn-row-action" data-action="sauvegarder" ${sauv.enCours ? 'disabled' : ''}>${sauv.enCours ? 'Sauvegarde…' : 'Sauvegarder maintenant'}</button></div>
+    <div class="tpl-lead">Chaque dimanche, toute la base est copiée dans R2 (26 dernières gardées, six mois). D1 permet aussi de revenir à n'importe quel moment des 30 derniers jours. Procédure de restauration : <code>worker/SAUVEGARDES.md</code>.</div>
+    ${sauv.erreur ? `<div class="login-error" style="margin:10px 0">${escapeHtml(sauv.erreur)}</div>` : ''}
+    ${!sauv.liste ? spinnerBlock('Chargement…') : sauv.liste.length ? `
+    <div class="dossiers-table">${sauv.liste.slice(0, 8).map(x => `
+      <div class="dt-row champ-row"><div class="mono-cell">${escapeHtml(x.nom)}</div><div style="display:flex;justify-content:space-between;align-items:center"><span class="dt-sub">${fmtDate(x.le)} · ${taille(x.octets)}</span><button class="btn-row-action" data-action="sauvegarde-dl" data-nom="${escapeHtml(x.nom)}">Télécharger</button></div></div>`).join('')}
+    </div>` : '<div class="tpl-lead">Aucune sauvegarde pour l\'instant : la première aura lieu dimanche, ou maintenant.</div>'}`;
+}
+
 async function loadCompanies() {
   state.companiesLoading = true;
   state.companiesError = null;
@@ -269,6 +305,7 @@ async function loadCompanies() {
     state.companiesLoading = false;
     render();
     loadListLogos(state.companies);
+    chargerSauvegardes();
   } catch (e) {
     state.companiesLoading = false;
     state.companiesError = e.message || 'Impossible de charger les entreprises.';
@@ -663,6 +700,7 @@ function renderCompanies() {
         <div><button class="btn-row-action" data-action="open-company" data-id="${c.id}">Ouvrir</button></div>
       </div>`).join('')}
     </div>`}
+    ${sauvegardesHtml()}
   </div>`;
 }
 
@@ -855,6 +893,8 @@ function initEvents() {
     if (bib.click(action, btn)) return;
     if (modeles.click(action, btn)) return;
     switch (action) {
+      case 'sauvegarder': sauvegarderMaintenant(); break;
+      case 'sauvegarde-dl': telechargerSauvegarde(btn.getAttribute('data-nom')); break;
       case 'logout':
         doLogout();
         break;

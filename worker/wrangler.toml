@@ -47,10 +47,11 @@ bucket_name = "stratege-fp-photos"
 pattern = "pga.stratege.io"
 custom_domain = true
 
-# Rappels du carnet d'entretien aux membres des portails : le 1er de chaque
-# mois, 11 h UTC (7 h à Montréal l'été, 6 h l'hiver).
+# Tâches planifiées (heures UTC ; 11 h UTC = 7 h à Montréal l'été, 6 h l'hiver).
 [triggers]
-crons = ["0 11 1 * *"]
+# Le 1er du mois à 11 h UTC : rappels du carnet et des révisions. Le dimanche
+# à 7 h UTC : sauvegarde complète de la base dans R2 (sauvegardes/).
+crons = ["0 11 1 * *", "0 7 * * 0"]
 
 [observability]
 enabled = true
