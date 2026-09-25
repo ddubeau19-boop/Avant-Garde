@@ -3638,7 +3638,9 @@ const COLONNES_AJOUTEES = [
   ["dossiers", "revision_de", "TEXT"],
   ["origine_id", "TEXT"],
   ["travaux_periode", "TEXT"],
-  ["travaux_annee", "INTEGER"]
+  ["travaux_annee", "INTEGER"],
+  // Dernier rappel envoyé à la firme pour une étude à réviser.
+  ["dossiers", "rappel_revision_le", "TEXT"]
 ];
 // Tables ajoutées après la mise en production, créées au premier appel.
 const TABLES_AJOUTEES = [
@@ -47051,6 +47053,67 @@ async function rappelsMensuels(env) {
       console.error("rappels du carnet en échec", dossier.id, e?.code, e?.message);
     }
   }
+  await rappelsRevisions(env, origine);
+}
+// Études publiées dont la révision aux cinq ans arrive (ou est dépassée) et
+// n'est pas commencée : un résumé par firme à ses administrateurs. Chaque
+// étude revient au plus une fois par trimestre, pas chaque mois.
+const RAPPEL_REVISION_JOURS = 90;
+async function rappelsRevisions(env, origine) {
+  const annee = (/* @__PURE__ */ new Date()).getUTCFullYear();
+  const limite = new Date(Date.now() - RAPPEL_REVISION_JOURS * 864e5).toISOString();
+  const dus = (await env.DB.prepare(
+    `SELECT d.* FROM dossiers d
+       WHERE d.published_at IS NOT NULL AND d.company_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM dossiers r WHERE r.revision_de = d.id)
+         AND (d.rappel_revision_le IS NULL OR d.rappel_revision_le < ?1)`
+  ).bind(limite).all()).results.filter((d) => anneeEtude(d) + 5 <= annee + 1);
+  const parFirme = new Map();
+  for (const d of dus) {
+    if (!parFirme.has(d.company_id)) parFirme.set(d.company_id, []);
+    parFirme.get(d.company_id).push(d);
+  }
+  const bilan = [];
+  for (const [firmeId, liste] of parFirme) {
+    try {
+      const comptes = (await env.DB.prepare(
+        `SELECT id, name, email, role FROM users
+           WHERE company_id = ?1 AND actif = 1 AND COALESCE(invitation_en_attente, 0) = 0 AND role != 'portail'`
+      ).bind(firmeId).all()).results;
+      // Les administrateurs de la firme ; à défaut, toute l'équipe.
+      const admins = comptes.filter((u) => u.role === "admin" || u.role === "super_admin");
+      const destinataires = admins.length ? admins : comptes;
+      if (!destinataires.length) continue;
+      liste.sort((a, b) => anneeEtude(a) - anneeEtude(b));
+      const ligne = (d) => {
+        const echeance = anneeEtude(d) + 5;
+        const quand = echeance < annee ? `en retard depuis ${echeance}` : echeance === annee ? `due cette année` : `due en ${echeance}`;
+        return `${d.dossier_no} — ${d.name}${d.city ? `, ${d.city}` : ""} : étude de ${anneeEtude(d)}, révision ${quand}`;
+      };
+      const n = liste.length;
+      for (const u of destinataires) {
+        await envoyerCourriel(env, {
+          to: u.email,
+          subject: n > 1 ? `${n} études de fonds de prévoyance à réviser` : `Étude à réviser — ${liste[0].name}`,
+          titre: n > 1 ? `${n} études arrivent à leur révision` : "Une étude arrive à sa révision",
+          paragraphes: [
+            `Bonjour ${u.name}, la loi demande de mettre à jour l'étude du fonds de prévoyance tous les cinq ans. ${n > 1 ? "Ces études de votre firme arrivent" : "Cette étude de votre firme arrive"} à échéance et aucune révision n'a encore été commencée.`,
+            "La révision reprend l'inventaire et les coûts indexés de l'étude précédente : il reste à revoir l'immeuble sur place."
+          ],
+          liste: [...liste.slice(0, 40).map(ligne), ...n > 40 ? [`… et ${n - 40} autres études, dans la console bureau`] : []],
+          bouton: { texte: "Ouvrir la console bureau", url: `${origine}/bureau/` },
+          pied: "Ce rappel revient chaque trimestre tant que la révision n'est pas commencée."
+        });
+      }
+      const maintenant = (/* @__PURE__ */ new Date()).toISOString();
+      await env.DB.batch(liste.map((d) => env.DB.prepare("UPDATE dossiers SET rappel_revision_le = ?1 WHERE id = ?2").bind(maintenant, d.id)));
+      bilan.push({ firme: firmeId, etudes: n, destinataires: destinataires.length });
+    } catch (e) {
+      console.error("rappel des révisions en échec", firmeId, e?.message);
+    }
+  }
+  console.log("rappels des révisions", JSON.stringify(bilan));
+  return bilan;
 }
 // ---- Côté firme : membres et répartition, depuis la console bureau -------------
 async function dossierPortail(c, { ecriture = false } = {}) {
