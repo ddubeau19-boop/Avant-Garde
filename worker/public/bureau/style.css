@@ -659,3 +659,5 @@ button { font-family: inherit; }
 .eq-lien { width: 100%; margin-top: 8px; border: 1.5px solid var(--ink-200); border-radius: 8px; padding: 8px 10px; font-family: var(--font-mono); font-size: 12px; background: #fff; }
 a.btn-logout { display: inline-flex; }
 @media (max-width: 760px) { .eq-row { grid-template-columns: 1fr; gap: 6px; } .eq-actions { justify-content: flex-start; } }
+
+.lien-revision { display: block; border: none; background: none; padding: 4px 0 0; font: inherit; font-size: 12px; font-weight: 600; color: var(--accent-press); cursor: pointer; }

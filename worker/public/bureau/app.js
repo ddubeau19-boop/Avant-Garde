@@ -1383,6 +1383,23 @@ function renderEquipe() {
   </div>`;
 }
 
+// Révision aux cinq ans : un nouveau dossier qui part de cette étude
+// (composantes, années, coûts indexés, fiche d'immeuble, carnet).
+async function nouvelleRevision(id) {
+  const d = state.dossiers.find(x => x.id === id);
+  if (!d) return;
+  const suggestion = `${String(new Date().getFullYear()).slice(2)}-`;
+  const no = prompt(`Révision de l'étude ${d.dossier_no} — ${d.name}\n\nLe nouveau dossier reprend les composantes, les années, les durées de vie, les coûts (indexés à ${new Date().getFullYear()}), la fiche d'immeuble et le carnet d'entretien. L'inspecteur verra sur le terrain ce qui avait été observé.\n\nNuméro du nouveau dossier :`, suggestion);
+  if (!no || !no.trim() || no.trim() === suggestion) return;
+  try {
+    const r = await apiJson(`/api/dossiers/${id}/revision`, { method: 'POST', body: JSON.stringify({ dossier_no: no.trim() }) });
+    await loadDossiers();
+    alert(`Dossier ${r.dossier_no} créé : ${r.revision.composantes} composantes reprises, coûts indexés de ${(r.revision.indexation * 100).toFixed(1).replace('.', ',')} %. La visite peut commencer dans l'application terrain.`);
+  } catch (e) {
+    alert(e.message || 'La création de la révision a échoué.');
+  }
+}
+
 function renderDossiers() {
   if (state.dossiersLoading && state.dossiers.length === 0) {
     return `<div class="page-pad">${spinnerBlock('Chargement des dossiers…')}</div>`;
@@ -1411,13 +1428,17 @@ function renderDossiers() {
       <div class="dt-row dt-head"><div>Syndicat</div><div>Dossier</div><div>Documentées</div><div>Statut</div><div></div></div>
       ${filtered.length === 0 ? `<div class="empty-state">Aucun dossier dans cette catégorie.</div>` : filtered.map(d => `
       <div class="dt-row">
-        <div><div class="dt-name">${escapeHtml(d.name || '—')}</div><div class="dt-sub">${escapeHtml(d.address || '')}${d.address && d.units ? ' · ' : ''}${d.units ? d.units + ' unités' : ''}</div></div>
+        <div><div class="dt-name">${escapeHtml(d.name || '—')}</div><div class="dt-sub">${escapeHtml(d.address || '')}${d.address && d.units ? ' · ' : ''}${d.units ? d.units + ' unités' : ''}</div>${d.revision_source ? `<div class="dt-sub" style="color:var(--accent-press)">Révision de l'étude ${escapeHtml(d.revision_source.dossier_no)} (${d.revision_source.annee})</div>` : ''}</div>
         <div class="dt-no">${escapeHtml(d.dossier_no || '—')}</div>
         <div class="dt-doc">
           <div class="prog-track"><div class="prog-fill" style="background:${d._barColor};width:${d._pct}%"></div></div>
           <span class="dt-doc-label">${d.stats ? d.stats.done + '/' + d.stats.total : '—'}</span>
         </div>
-        <div><span class="status-badge" style="background:${d._statusBg};color:${d._statusColor}">${d._statusLabel}</span></div>
+        <div>
+          <span class="status-badge" style="background:${d._statusBg};color:${d._statusColor}">${d._statusLabel}</span>
+          ${d.revision_due ? `<span class="status-badge" style="background:var(--orange-wash);color:var(--accent-press);margin-top:4px" title="Loi 16 : mise à jour au moins tous les cinq ans">Révision due · ${d.revision_echeance}</span>` : ''}
+          ${d.revise_par ? `<div class="dt-sub">Révisée : ${escapeHtml(d.revise_par.dossier_no)}</div>` : (d.published_at || d._pct === 100) ? `<button class="lien-revision" data-action="nouvelle-revision" data-id="${d.id}">Nouvelle révision →</button>` : ''}
+        </div>
         <div><button class="btn-row-action ${d._reviewReady ? 'primary' : ''}" data-action="open-dossier" data-id="${d.id}">${d._reviewReady ? 'Réviser' : 'Ouvrir'}</button></div>
       </div>`).join('')}
     </div>
@@ -2439,6 +2460,9 @@ function initEvents() {
     const action = btn.getAttribute('data-action');
     if (bib.click(action, btn)) return;
     switch (action) {
+      case 'nouvelle-revision':
+        nouvelleRevision(btn.getAttribute('data-id'));
+        break;
       case 'go-equipe':
         leaveReviewIA();
         state.screen = 'equipe';

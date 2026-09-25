@@ -68,7 +68,8 @@ CREATE TABLE dossiers (
   cotisation_annuelle  REAL,
   published_at         TEXT,
   company_id           TEXT REFERENCES companies(id),
-  batiment_info        TEXT   -- JSON : fiche d'immeuble saisie en terrain
+  batiment_info        TEXT,  -- JSON : fiche d'immeuble saisie en terrain
+  revision_de          TEXT   -- étude précédente du même immeuble (révision aux cinq ans)
 );
 
 CREATE TABLE components (
@@ -112,7 +113,11 @@ CREATE TABLE components (
   nature_risque      TEXT,   -- securite | infiltration | degradation | conformite | esthetique
   source_annee       TEXT,   -- plaque | carnet | administration | estimee
   projet_ca          TEXT,   -- travaux planifiés par le conseil d'administration
-  taches_entretien   TEXT    -- JSON : tâches du carnet retirées ou ajoutées par l'ingénieur
+  taches_entretien   TEXT,   -- JSON : tâches du carnet retirées ou ajoutées par l'ingénieur
+  -- Révision aux cinq ans
+  origine_id         TEXT,    -- composante de l'étude précédente
+  travaux_periode    TEXT,    -- fait | reporte | abandonne : travaux prévus à l'étude précédente
+  travaux_annee      INTEGER  -- année des travaux réalisés
 );
 
 CREATE TABLE photos (
