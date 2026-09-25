@@ -2989,36 +2989,97 @@ const DEFAULT_USEFUL_LIFE_YEARS = {
 };
 const ALLOCATION_USEFUL_LIFE = 10;
 const MODEL = "claude-sonnet-5";
+function attendre(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Lit le flux SSE de l'API Messages et reconstitue le texte complet. Passer
+// par le streaming (plutôt qu'une réponse tamponnée) évite qu'un appel à
+// forte sortie — comme la répartition d'un gros gabarit importé, à
+// max_tokens 16000 — dépasse la fenêtre de timeout du gateway avant le
+// premier octet et échoue en 524.
+async function lireFluxClaude(corpsReponse) {
+  const lecteur = corpsReponse.pipeThrough(new TextDecoderStream()).getReader();
+  let tampon = "";
+  let texte = "";
+  let raisonArret = null;
+  let tokensSortis = null;
+  const typesBloc = [];
+  while (true) {
+    const { done, value } = await lecteur.read();
+    if (done) break;
+    tampon += value;
+    let fin;
+    while ((fin = tampon.indexOf("\n\n")) !== -1) {
+      const evenement = tampon.slice(0, fin);
+      tampon = tampon.slice(fin + 2);
+      const ligneDonnees = evenement.split("\n").find((l) => l.startsWith("data:"));
+      if (!ligneDonnees) continue;
+      const donnees = JSON.parse(ligneDonnees.slice(5).trim());
+      if (donnees.type === "content_block_start" && donnees.content_block?.type) {
+        typesBloc.push(donnees.content_block.type);
+      } else if (donnees.type === "content_block_delta" && donnees.delta?.type === "text_delta") {
+        texte += donnees.delta.text;
+      } else if (donnees.type === "message_delta") {
+        raisonArret = donnees.delta?.stop_reason ?? raisonArret;
+        tokensSortis = donnees.usage?.output_tokens ?? tokensSortis;
+      } else if (donnees.type === "error") {
+        throw new Error(`Anthropic API error en cours de flux : ${donnees.error?.message ?? JSON.stringify(donnees.error)}`);
+      }
+    }
+  }
+  return { texte, raisonArret, tokensSortis, typesBloc };
+}
+
 async function callClaude(apiKey, opts) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: opts.maxTokens,
-      system: opts.system,
-      messages: [{ role: "user", content: opts.content }]
-    })
+  const corps = JSON.stringify({
+    model: MODEL,
+    max_tokens: opts.maxTokens,
+    system: opts.system,
+    stream: true,
+    // Sonnet 5 pense par défaut (adaptatif) même sans le demander. Sur un gros
+    // classement déterministe (répartir un document dans des sections fixes),
+    // cette réflexion peut engloutir tout le budget de sortie avant le premier
+    // mot — d'où un stop_reason "max_tokens" avec pour seul bloc "thinking" et
+    // zéro texte. Les appelants qui n'ont pas besoin de raisonnement la
+    // désactivent via opts.thinking.
+    ...(opts.thinking ? { thinking: opts.thinking } : {}),
+    messages: [{ role: "user", content: opts.content }]
   });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`Anthropic API error (${res.status}): ${detail}`);
+  let derniereErreur;
+  // Jusqu'à 3 tentatives : un 524/529/502/503 est un incident d'infrastructure
+  // passager — plus probable sur un gros document — pas une erreur de
+  // contenu. Une deuxième tentative suffit presque toujours.
+  for (let essai = 0; essai < 3; essai++) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: corps
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      derniereErreur = new Error(`Anthropic API error (${res.status}): ${detail}`);
+      if (res.status >= 500 && essai < 2) {
+        await attendre(500 * 2 ** essai);
+        continue;
+      }
+      throw derniereErreur;
+    }
+    const { texte, raisonArret, tokensSortis, typesBloc } = await lireFluxClaude(res.body);
+    if (!texte) {
+      // Une réponse sans bloc de texte renvoyait une chaîne vide, que chaque
+      // appelant interprétait comme « le modèle n'a rien d'utile à dire » et
+      // traitait par un repli silencieux. Le plus souvent, max_tokens a été
+      // épuisé avant le premier mot : il faut le dire, pas le taire.
+      throw new Error(`réponse sans texte (stop_reason: ${raisonArret}, blocs: ${typesBloc.join(", ") || "aucun"}, jetons sortis: ${tokensSortis})`);
+    }
+    return texte;
   }
-  const data = await res.json();
-  const texte = data.content?.find((c) => c.type === "text")?.text ?? "";
-  if (!texte) {
-    // Une réponse 200 sans bloc de texte renvoyait une chaîne vide, que chaque
-    // appelant interprétait comme « le modèle n'a rien d'utile à dire » et
-    // traitait par un repli silencieux. Le plus souvent, max_tokens a été
-    // épuisé avant le premier mot : il faut le dire, pas le taire.
-    const blocs = (data.content ?? []).map((c) => c.type).join(", ") || "aucun";
-    throw new Error(`réponse sans texte (stop_reason: ${data.stop_reason}, blocs: ${blocs}, jetons sortis: ${data.usage?.output_tokens})`);
-  }
-  return texte;
+  throw derniereErreur;
 }
 // Récupère les objets complets d'un tableau JSON tronqué. Une réponse coupée en
 // plein milieu d'un objet faisait perdre la totalité de l'inventaire ; garder
@@ -23440,6 +23501,106 @@ function paragraphesDocx(xml) {
   return paras;
 }
 
+// Un tableau Word contient des <w:p> comme le reste du document : les
+// aplatir avec paragraphesDocx mélangerait les cellules d'une même ligne
+// avec celles de la ligne suivante. On garde ici la structure
+// tableau > ligne > cellule pour pouvoir reconstituer les colonnes.
+function tableauxDocx(xml) {
+  const tableaux = [];
+  for (const tbl of xml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>/g)) {
+    const lignes = [];
+    for (const tr of tbl[0].matchAll(/<w:tr[ >][\s\S]*?<\/w:tr>|<w:tr\/>/g)) {
+      const cellules = [];
+      for (const tc of tr[0].matchAll(/<w:tc[ >][\s\S]*?<\/w:tc>|<w:tc\/>/g)) {
+        const morceaux = [...tc[0].matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)].map((m) => m[1]);
+        cellules.push(decodeEntitesXml(morceaux.join("")).replace(/\s+/g, " ").trim());
+      }
+      if (cellules.length) lignes.push(cellules);
+    }
+    if (lignes.length) tableaux.push(lignes);
+  }
+  return tableaux;
+}
+
+// Une composante par ligne « categorie|nom|code|durée de vie|quantité » : une
+// ligne tronquée se jette seule et les autres tiennent.
+function parseLignesChecklist(texte) {
+  const items = [];
+  for (const brut of String(texte ?? "").split("\n")) {
+    const ligne = brut.trim();
+    if (!ligne || !ligne.includes("|")) continue;
+    const champs = ligne.split("|").map((x) => x.trim());
+    if (champs.length < 2) continue;
+    const [cat, name, code, vu, qty] = champs;
+    // Une catégorie inconnue signalerait une ligne mal formée autant qu'une
+    // hallucination : on retombe sur « équipements », comme à l'insertion.
+    if (!name) continue;
+    const duree = Number(vu);
+    items.push({
+      cat: CATEGORIES[cat] ? cat : "equipements",
+      name,
+      code: code && code !== "-" && code !== "—" ? code : null,
+      vu: Number.isFinite(duree) && duree > 0 ? Math.round(duree) : null,
+      qty: qty || "—"
+    });
+  }
+  return items;
+}
+
+
+// Reconnaît les composantes d'un document existant (ex. une étude
+// antérieure du même bâtiment) pour amorcer l'inventaire d'un dossier
+// précis. Contrairement au gabarit de rapport, qui trie du texte déjà
+// écrit, on demande ici au modèle de repérer des lignes de composantes
+// dans un tableau — ça reste un classement, donc la réflexion reste
+// désactivée pour ne pas répéter l'échec de sectionsDepuisTexte.
+async function composantesDepuisDocument(apiKey, { tableaux, paragraphes }) {
+  if (!apiKey) {
+    return { items: [], note: "Aucune clé API n'est configurée : impossible d'extraire les composantes automatiquement." };
+  }
+  let corpus;
+  if (tableaux.length > 0) {
+    // Le plus grand tableau du document est presque toujours celui des
+    // composantes ; les petits tableaux (page de garde, résumé financier)
+    // n'ont pas assez de lignes pour rivaliser.
+    const plusGrand = tableaux.reduce((a, b) => (b.length > a.length ? b : a));
+    corpus = plusGrand.map((ligne) => ligne.join(" | ")).join("\n");
+  } else {
+    corpus = paragraphes.join("\n");
+  }
+  corpus = corpus.slice(0, 60000);
+  const prompt = `Voici un extrait d'un document d'étude de fonds de prévoyance pour un
+immeuble résidentiel québécois — probablement le tableau des composantes
+(Uniformat II) d'une étude antérieure de CE bâtiment.
+
+Catégories valides (utilise exactement ces clés) :
+${Object.entries(CATEGORIES).map(([k, v]) => `${v.ordre}. ${k} — ${v.label}`).join("\n")}
+
+Extrait CHAQUE ligne qui décrit une composante réelle du bâtiment (ignore les
+en-têtes de colonnes, les titres de section, les totaux et les lignes vides).
+Ne complète PAS la liste avec des composantes typiques absentes du texte : si
+le document n'en mentionne que 12, réponds 12 lignes.
+
+Réponds UNIQUEMENT par une liste, UNE COMPOSANTE PAR LIGNE, au format exact :
+
+categorie|nom|code Uniformat|durée de vie|quantité
+
+Exemple de ligne : enveloppe|Surface de toit principal, solins|B30.10-40|35|—
+
+Mets un tiret « - » pour tout champ absent du document plutôt que d'inventer
+une valeur. Aucun en-tête, aucune numérotation, aucun commentaire.
+
+TEXTE :
+${corpus}`;
+  try {
+    const texte = await callClaude(apiKey, { content: prompt, maxTokens: 12000, thinking: { type: "disabled" } });
+    const items = parseLignesChecklist(texte);
+    return { items, note: items.length === 0 ? `aucune composante reconnue dans ce document (${texte.length} caractères reçus)` : null };
+  } catch (e) {
+    return { items: [], note: `l'extraction a échoué (${e && e.message})` };
+  }
+}
+
 // Répartit le texte importé sur les sections du rapport. Le modèle trie ; il ne
 // réécrit pas : c'est le texte de la firme qui doit ressortir, pas une
 // paraphrase.
@@ -23481,7 +23642,11 @@ TEXTE DU GABARIT :
 ${corpus}
 
 Réponds UNIQUEMENT avec un objet JSON dont les clés sont prises dans la liste ci-dessus.`;
-  const brut = await callClaude(apiKey, { content: prompt, maxTokens: 16000 });
+  // Répartir un texte déjà écrit dans des sections fixes est un classement, pas
+  // un problème à raisonner : désactiver la réflexion laisse tout le budget de
+  // sortie au JSON attendu, plutôt que de risquer qu'elle l'épuise avant le
+  // premier mot sur un gros document.
+  const brut = await callClaude(apiKey, { content: prompt, maxTokens: 16000, thinking: { type: "disabled" } });
   return { sections: nettoyerSections(extractJson(brut)), note: null };
 }
 
@@ -44635,6 +44800,59 @@ dossiers.get("/:id/components", async (c) => {
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
 });
+dossiers.post("/:id/components/import", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 20 * 1024 * 1024) return c.json({ error: "document trop volumineux (max 20 Mo)" }, 413);
+  let xml;
+  try {
+    xml = await lireDocx(buffer);
+  } catch (e) {
+    return c.json({ error: `lecture du .docx impossible : ${e.message}` }, 400);
+  }
+  const tableaux = tableauxDocx(xml);
+  const paragraphes = paragraphesDocx(xml);
+  if (tableaux.length === 0 && paragraphes.length === 0) {
+    return c.json({ error: "aucun texte trouvé dans ce document" }, 400);
+  }
+
+  const { items, note } = await composantesDepuisDocument(c.env.ANTHROPIC_API_KEY, { tableaux, paragraphes });
+  if (items.length === 0) {
+    return c.json({ ok: false, composantes_importees: 0, note: note || "aucune composante reconnue dans ce document." });
+  }
+
+  // On ajoute à la suite de l'inventaire existant plutôt que de l'écraser :
+  // un dossier peut déjà avoir des composantes documentées sur le terrain.
+  const depart = await c.env.DB.prepare(
+    "SELECT COALESCE(MAX(sort_order), -1) AS m FROM components WHERE dossier_id = ?1"
+  ).bind(dossier.id).first();
+  const base = (depart?.m ?? -1) + 1;
+  const stmt = c.env.DB.prepare(
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)`
+  );
+  await c.env.DB.batch(
+    items.map((item, i) => stmt.bind(
+      newId("cmp"),
+      dossier.id,
+      CATEGORIES[item.cat] ? item.cat : "equipements",
+      item.name,
+      item.qty ?? "—",
+      base + i,
+      item.vu ?? DEFAULT_USEFUL_LIFE_YEARS[item.cat] ?? ALLOCATION_USEFUL_LIFE,
+      item.code ?? null
+    ))
+  );
+  return c.json({
+    ok: true,
+    composantes_importees: items.length,
+    note,
+    stats: await dossierStats(c.env.DB, dossier.id)
+  });
+});
 async function buildReportContext(c) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return null;
@@ -44769,6 +44987,596 @@ photos.get("/:id/file", async (c) => {
     }
   });
 });
+// ── Banque de prix ───────────────────────────────────────────────────────────
+// Ce que la firme a réellement payé, ramené à un prix unitaire indexé. La
+// collecte seulement : aucune de ces routes n'écrit dans components — le coût
+// de remplacement reste saisi à la main tant qu'on n'aura pas vu ce que la
+// banque vaut sur un échantillon réel.
+const prix = new Hono();
+const PRIX_UNITES = {
+  pi2: { label: "pi²", quantifie: true },
+  pi_lin: { label: "pi lin.", quantifie: true },
+  unite: { label: "unité", quantifie: true },
+  forfait: { label: "forfait", quantifie: false }
+};
+const PRIX_PORTEES = {
+  complet: "Remplacement complet",
+  partiel: "Remplacement partiel",
+  reparation: "Réparation"
+};
+const PRIX_SOURCES = { facture: "Facture", soumission: "Soumission" };
+const PRIX_ECHANTILLON_MINCE = 5;   // en deçà, la médiane est indicative, pas une référence
+
+// Le coût par porte est le dénominateur qu'on possède toujours : le nombre
+// d'unités est connu de chaque syndicat, alors qu'une superficie de toit ne
+// l'est presque jamais. Il ne remplace pas le prix au pi² — la surface d'un toit
+// ne suit pas le nombre de portes — mais pour tout ce qui va par immeuble
+// (ascenseur, chaufferie, interphone) ou par porte, il se compare directement.
+//
+// Encore faut-il comparer ce qui se compare : un ascenseur dans un 8 portes et
+// dans un 120 portes n'est pas le même ouvrage. D'où les tranches.
+const PRIX_TRANCHES = [
+  { cle: "petit", label: "Moins de 12 portes", min: 1, max: 11 },
+  { cle: "moyen", label: "12 à 49 portes", min: 12, max: 49 },
+  { cle: "grand", label: "50 portes et plus", min: 50, max: null }
+];
+
+function trancheDe(unites) {
+  if (!unites || unites <= 0) return null;
+  return PRIX_TRANCHES.find((t) => unites >= t.min && (t.max == null || unites <= t.max)) ?? null;
+}
+
+function anneeCourante() {
+  return new Date().getUTCFullYear();
+}
+
+// Prix unitaire en dollars de l'année des travaux. Un forfait n'a pas de
+// quantité : son prix unitaire est le montant lui-même.
+function prixUnitaire(row) {
+  if (!PRIX_UNITES[row.unite]?.quantifie) return row.montant;
+  if (!row.quantite || row.quantite <= 0) return null;
+  return row.montant / row.quantite;
+}
+
+// Ramené en dollars d'aujourd'hui au même taux que la projection du fonds : un
+// prix de 2019 comparé tel quel à un prix de 2025 sous-estime le remplacement.
+// Taux constant — approximation assumée, l'indice réel varie d'une année à l'autre.
+function prixIndexe(montant, annee, anneeCible, taux) {
+  if (montant == null || !annee) return null;
+  return montant * Math.pow(1 + taux, anneeCible - annee);
+}
+
+function quantile(triees, q) {
+  if (triees.length === 0) return null;
+  const pos = (triees.length - 1) * q;
+  const bas = Math.floor(pos);
+  const haut = Math.ceil(pos);
+  if (bas === haut) return triees[bas];
+  return triees[bas] + (triees[haut] - triees[bas]) * (pos - bas);
+}
+
+function prixPublic(row, anneeCible, taux) {
+  const unitaire = prixUnitaire(row);
+  const parPorte = row.unites > 0 ? row.montant / row.unites : null;
+  const tranche = trancheDe(row.unites);
+  return {
+    ...row,
+    prix_unitaire: unitaire,
+    prix_unitaire_indexe: prixIndexe(unitaire, row.annee, anneeCible, taux),
+    prix_par_porte: parPorte,
+    prix_par_porte_indexe: prixIndexe(parPorte, row.annee, anneeCible, taux),
+    tranche: tranche?.cle ?? null,
+    tranche_label: tranche?.label ?? null,
+    unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite
+  };
+}
+
+function nombreOuNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Valide et normalise ce qui arrive du formulaire. Renvoie { erreur } ou { valeurs }.
+function lirePrixBody(body2, { partiel = false } = {}) {
+  const v = {};
+  const presence = (cle) => cle in body2;
+
+  if (!partiel || presence("description")) {
+    const description = String(body2.description ?? "").trim();
+    if (!description) return { erreur: "description requise" };
+    v.description = description;
+  }
+  if (!partiel || presence("annee")) {
+    const annee = nombreOuNull(body2.annee);
+    const max = anneeCourante() + 1;
+    if (annee == null || annee < 1980 || annee > max) return { erreur: `année des travaux invalide (1980 à ${max})` };
+    v.annee = Math.round(annee);
+  }
+  if (!partiel || presence("montant")) {
+    const montant = nombreOuNull(body2.montant);
+    if (montant == null || montant <= 0) return { erreur: "montant des travaux requis" };
+    v.montant = montant;
+  }
+  if (!partiel || presence("unite")) {
+    const unite = String(body2.unite ?? "").trim();
+    if (!PRIX_UNITES[unite]) return { erreur: "unité inconnue" };
+    v.unite = unite;
+  }
+  if (!partiel || presence("quantite")) {
+    v.quantite = nombreOuNull(body2.quantite);
+    if (v.quantite != null && v.quantite <= 0) return { erreur: "quantité invalide" };
+  }
+  if (presence("unites")) {
+    const unites = nombreOuNull(body2.unites);
+    if (unites != null && unites <= 0) return { erreur: "nombre de portes invalide" };
+    v.unites = unites == null ? null : Math.round(unites);
+  }
+  if (presence("portee")) {
+    const portee = body2.portee ? String(body2.portee) : null;
+    if (portee && !PRIX_PORTEES[portee]) return { erreur: "portée inconnue" };
+    v.portee = portee;
+  }
+  if (!partiel || presence("source")) {
+    const source = String(body2.source ?? "facture");
+    if (!PRIX_SOURCES[source]) return { erreur: "source inconnue" };
+    v.source = source;
+  }
+  if (presence("negocie")) v.negocie = body2.negocie ? 1 : 0;
+  if (presence("valide")) v.valide = body2.valide ? 1 : 0;
+  for (const cle of ["cat", "uniformat_code", "fournisseur", "ville", "source_ref", "note", "dossier_id"]) {
+    if (!partiel || presence(cle)) {
+      const brut = body2[cle];
+      v[cle] = brut === null || brut === undefined || String(brut).trim() === "" ? null : String(brut).trim();
+    }
+  }
+  return { valeurs: v };
+}
+
+// Une unité quantifiée sans quantité ne donne aucun prix unitaire : la ligne
+// serait dans la banque sans pouvoir servir. On la refuse à la saisie.
+function quantiteManquante(unite, quantite) {
+  return PRIX_UNITES[unite]?.quantifie && (quantite == null || quantite <= 0);
+}
+
+async function prixCompany(c) {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return null;
+  return user;
+}
+
+prix.get("/", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const filtres = ["company_id = ?1"];
+  const valeurs = [user.company_id];
+  const valide = c.req.query("valide");
+  if (valide === "1" || valide === "0") {
+    filtres.push(`valide = ?${valeurs.length + 1}`);
+    valeurs.push(Number(valide));
+  }
+  const code = c.req.query("code");
+  if (code) {
+    filtres.push(`uniformat_code = ?${valeurs.length + 1}`);
+    valeurs.push(code);
+  }
+  const rows = await c.env.DB.prepare(
+    `SELECT * FROM price_observations WHERE ${filtres.join(" AND ")}
+      ORDER BY created_at DESC LIMIT 500`
+  ).bind(...valeurs).all();
+  const anneeCible = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+
+  // Les pièces du CRM derrière chaque ligne, pour que l'ingénieur voie ce qui a
+  // été fusionné avant de valider un montant.
+  const sources = await c.env.DB.prepare(
+    `SELECT s.* FROM price_observation_sources s
+       JOIN price_observations o ON o.id = s.observation_id
+      WHERE o.company_id = ?1
+      ORDER BY s.date_piece ASC`
+  ).bind(user.company_id).all();
+  const parObservation = new Map();
+  for (const s of sources.results) {
+    if (!parObservation.has(s.observation_id)) parObservation.set(s.observation_id, []);
+    parObservation.get(s.observation_id).push(s);
+  }
+
+  return c.json(rows.results.map((r) => ({
+    ...prixPublic(r, anneeCible, taux),
+    pieces: parObservation.get(r.id) ?? []
+  })));
+});
+
+// Ce que la banque sait dire aujourd'hui, par code Uniformat et par unité.
+// Les prix négociés sont écartés par défaut : un prix de portefeuille n'est pas
+// la juste valeur marchande qu'une étude doit retenir. On les compte quand même,
+// pour que la firme voie ce qui a été mis de côté.
+prix.get("/resume", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const inclureNegocies = c.req.query("negocie") === "inclus";
+  const rows = await c.env.DB.prepare(
+    "SELECT * FROM price_observations WHERE company_id = ?1"
+  ).bind(user.company_id).all();
+
+  const anneeCible = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+  const parUnite = new Map();
+  const parPorte = new Map();
+  let total = 0, valides = 0, negociesEcartes = 0, sansPrix = 0, sansPortes = 0;
+
+  const ajouter = (index, cle, base, valeur, annee) => {
+    if (!index.has(cle)) index.set(cle, { ...base, cle, prix: [], annees: [] });
+    const g = index.get(cle);
+    g.prix.push(valeur);
+    g.annees.push(annee);
+  };
+
+  for (const row of rows.results) {
+    total += 1;
+    if (row.valide !== 1) continue;
+    valides += 1;
+    if (row.negocie === 1 && !inclureNegocies) { negociesEcartes += 1; continue; }
+    const code = row.uniformat_code ?? row.cat ?? "—";
+
+    const indexe = prixIndexe(prixUnitaire(row), row.annee, anneeCible, taux);
+    if (indexe == null) sansPrix += 1;
+    else ajouter(parUnite, `${code}|${row.unite}`, {
+      uniformat_code: row.uniformat_code ?? null,
+      cat: row.cat ?? null,
+      unite: row.unite,
+      unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite,
+      exemple: row.description
+    }, indexe, row.annee);
+
+    // Le coût par porte se calcule sur le montant entier, quelle que soit
+    // l'unité : c'est ce que l'immeuble a déboursé, divisé par ses portes.
+    const tranche = trancheDe(row.unites);
+    const porte = tranche ? prixIndexe(row.montant / row.unites, row.annee, anneeCible, taux) : null;
+    if (porte == null) sansPortes += 1;
+    else ajouter(parPorte, `${code}|${tranche.cle}`, {
+      uniformat_code: row.uniformat_code ?? null,
+      cat: row.cat ?? null,
+      tranche: tranche.cle,
+      tranche_label: tranche.label,
+      exemple: row.description
+    }, porte, row.annee);
+  }
+
+  const statistiques = (index) => [...index.values()].map((g) => {
+    const triees = g.prix.slice().sort((a, b) => a - b);
+    const { prix, annees, ...reste } = g;
+    return {
+      ...reste,
+      n: triees.length,
+      mince: triees.length < PRIX_ECHANTILLON_MINCE,
+      mediane: quantile(triees, 0.5),
+      p25: quantile(triees, 0.25),
+      p75: quantile(triees, 0.75),
+      annee_min: Math.min(...annees),
+      annee_max: Math.max(...annees)
+    };
+  });
+
+  // Les références au pi² se lisent par volume d'échantillon ; celles par porte
+  // se lisent par composante, pour que les trois tailles d'immeuble se suivent
+  // et que l'économie d'échelle saute aux yeux.
+  const ordreTranche = new Map(PRIX_TRANCHES.map((t, i) => [t.cle, i]));
+  const parVolume = (a, b) => b.n - a.n;
+  const parComposante = (a, b) => {
+    const codeA = a.uniformat_code ?? a.cat ?? "";
+    const codeB = b.uniformat_code ?? b.cat ?? "";
+    if (codeA !== codeB) return codeA.localeCompare(codeB);
+    return (ordreTranche.get(a.tranche) ?? 0) - (ordreTranche.get(b.tranche) ?? 0);
+  };
+
+  return c.json({
+    total,
+    valides,
+    a_valider: total - valides,
+    negocies_ecartes: negociesEcartes,
+    sans_prix_unitaire: sansPrix,
+    sans_cout_par_porte: sansPortes,
+    annee_reference: anneeCible,
+    taux_indexation: taux,
+    source_indexation: RESERVE_FUND_PARAMS.inflationSource,
+    echantillon_mince: PRIX_ECHANTILLON_MINCE,
+    tranches: PRIX_TRANCHES.map((t) => ({ cle: t.cle, label: t.label })),
+    lignes: statistiques(parUnite).sort(parVolume),
+    portes: statistiques(parPorte).sort(parComposante)
+  });
+});
+
+prix.post("/", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const { erreur, valeurs } = lirePrixBody(await c.req.json());
+  if (erreur) return c.json({ error: erreur }, 400);
+  if (quantiteManquante(valeurs.unite, valeurs.quantite)) {
+    return c.json({ error: "quantité requise pour cette unité" }, 400);
+  }
+
+  // Le dossier donne le contexte du bâtiment — un prix au pi² de toiture ne se
+  // compare qu'entre immeubles comparables. On en fige une copie : le dossier
+  // peut changer, la facture, elle, a été payée dans ce contexte-là.
+  let contexte = null;
+  if (valeurs.dossier_id) {
+    const dossier = await c.env.DB.prepare(
+      "SELECT * FROM dossiers WHERE id = ?1 AND company_id = ?2"
+    ).bind(valeurs.dossier_id, user.company_id).first();
+    if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+    contexte = JSON.stringify({
+      units: dossier.units ?? null,
+      floors: dossier.floors ?? null,
+      built_year: dossier.built_year ?? null,
+      city: dossier.city ?? null
+    });
+    if (!valeurs.ville) valeurs.ville = dossier.city ?? null;
+    // Le nombre de portes du dossier devient le dénominateur de la ligne, sauf
+    // si l'ingénieur en a saisi un autre — c'est lui qui a la facture sous les yeux.
+    if (valeurs.unites == null) valeurs.unites = dossier.units || null;
+  }
+
+  const id = newId("prx");
+  await c.env.DB.prepare(
+    `INSERT INTO price_observations
+       (id, company_id, dossier_id, cat, uniformat_code, description, fournisseur, annee,
+        montant, quantite, unite, portee, source, negocie, ville, unites, contexte, source_ref, note,
+        valide, created_by)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)`
+  ).bind(
+    id, user.company_id, valeurs.dossier_id ?? null, valeurs.cat ?? null, valeurs.uniformat_code ?? null,
+    valeurs.description, valeurs.fournisseur ?? null, valeurs.annee, valeurs.montant,
+    valeurs.quantite ?? null, valeurs.unite, valeurs.portee ?? null, valeurs.source,
+    valeurs.negocie ?? 0, valeurs.ville ?? null, valeurs.unites ?? null, contexte,
+    valeurs.source_ref ?? null, valeurs.note ?? null, valeurs.valide ?? 0, user.id
+  ).run();
+
+  const row = await c.env.DB.prepare("SELECT * FROM price_observations WHERE id = ?1").bind(id).first();
+  return c.json(prixPublic(row, anneeCourante(), RESERVE_FUND_PARAMS.inflationRate), 201);
+});
+
+// Correction d'une ligne, et validation : c'est ce geste-là qui la fait entrer
+// dans la banque.
+prix.patch("/:id", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const id = c.req.param("id");
+  const existante = await c.env.DB.prepare(
+    "SELECT * FROM price_observations WHERE id = ?1 AND company_id = ?2"
+  ).bind(id, user.company_id).first();
+  if (!existante) return c.json({ error: "ligne introuvable" }, 404);
+
+  const { erreur, valeurs } = lirePrixBody(await c.req.json(), { partiel: true });
+  if (erreur) return c.json({ error: erreur }, 400);
+  const cles = Object.keys(valeurs);
+  if (cles.length === 0) return c.json({ error: "aucun champ à mettre à jour" }, 400);
+
+  const fusionnee = { ...existante, ...valeurs };
+  if (quantiteManquante(fusionnee.unite, fusionnee.quantite)) {
+    return c.json({ error: "quantité requise pour cette unité" }, 400);
+  }
+  if (valeurs.dossier_id) {
+    const dossier = await c.env.DB.prepare(
+      "SELECT id FROM dossiers WHERE id = ?1 AND company_id = ?2"
+    ).bind(valeurs.dossier_id, user.company_id).first();
+    if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  }
+
+  const bind = cles.map((cle, i) => `${cle} = ?${i + 1}`);
+  const args = cles.map((cle) => valeurs[cle]);
+  args.push(id);
+  await c.env.DB.prepare(
+    `UPDATE price_observations SET ${bind.join(", ")},
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?${args.length}`
+  ).bind(...args).run();
+
+  const row = await c.env.DB.prepare("SELECT * FROM price_observations WHERE id = ?1").bind(id).first();
+  return c.json(prixPublic(row, anneeCourante(), RESERVE_FUND_PARAMS.inflationRate));
+});
+
+// ── Import depuis le CRM ─────────────────────────────────────────────────────
+// Le CRM Stratégis rattache déjà ses factures à un code de composante. On y lit
+// ces rattachements — jamais on n'y écrit — pour éviter de ressaisir à la main
+// ce qui est déjà classé. Ce que le CRM ne donne pas, c'est la quantité : une
+// ligne importée arrive donc à valider, et c'est l'ingénieur qui ajoute la
+// superficie sans laquelle il n'y a pas de prix unitaire.
+const CRM_CONFIANCE = "haute";
+const CRM_CANDIDATS_MAX = 400;
+
+// Le binding porte les factures d'une seule entreprise. Une autre firme
+// locataire de l'application ne doit pas les atteindre, binding ou pas.
+function crmRefus(c, user) {
+  if (!c.env.CRM) return "la base du CRM n'est pas liée à ce worker";
+  if (!c.env.CRM_COMPANY_ID || user.company_id !== c.env.CRM_COMPANY_ID) {
+    return "l'import depuis le CRM n'est pas ouvert à cette entreprise";
+  }
+  return null;
+}
+
+// Une facture de travaux est souvent payée en versements : quatre lignes, même
+// syndicat, même composante, le même mois, pour un seul toit. Prises une à une
+// elles donneraient quatre prix de toiture. La clé regroupe donc le travail,
+// et le détail des pièces reste visible pour qu'une fusion abusive se voie.
+function crmCle(piece) {
+  const syndicat = piece.syndicat_id ?? piece.syndicat_name ?? "sans-syndicat";
+  const mois = (piece.date ?? "").slice(0, 7);
+  return `${syndicat}|${piece.component_code}|${mois}`;
+}
+
+async function crmCandidats(c, user) {
+  const rows = await c.env.CRM.prepare(
+    `SELECT m.source_type, m.source_id, m.component_code, m.amount, m.description,
+            m.reference_url, m.document_date, m.syndicat_name,
+            f.numero_facture, f.vendor_name, f.date_facture, f.syndicat_id,
+            s.nom AS syndicat_nom, s.units, s.city
+       FROM component_cost_matches m
+       LEFT JOIN syndicat_factures f
+              ON f.id = m.source_id AND m.source_type = 'syndicat_facture'
+       LEFT JOIN syndicats s ON s.id = f.syndicat_id
+      WHERE m.confidence = ?1
+        AND m.amount > 0
+        AND (m.source_type <> 'syndicat_facture' OR f.deleted_at IS NULL)
+      ORDER BY COALESCE(f.date_facture, m.document_date) DESC
+      LIMIT ?2`
+  ).bind(CRM_CONFIANCE, CRM_CANDIDATS_MAX).all();
+
+  const dejaImportees = await c.env.DB.prepare(
+    "SELECT source_type, source_id FROM price_observation_sources WHERE company_id = ?1"
+  ).bind(user.company_id).all();
+  const vues = new Set(dejaImportees.results.map((r) => `${r.source_type}:${r.source_id}`));
+
+  const groupes = new Map();
+  let sansDate = 0, dejaVues = 0;
+
+  for (const row of rows.results) {
+    if (vues.has(`${row.source_type}:${row.source_id}`)) { dejaVues += 1; continue; }
+    const date = row.date_facture ?? row.document_date ?? null;
+    // Sans date, pas d'année de travaux — donc pas d'indexation possible.
+    if (!date) { sansDate += 1; continue; }
+    const piece = {
+      source_type: row.source_type,
+      source_id: row.source_id,
+      component_code: row.component_code,
+      montant: row.amount,
+      date: date.slice(0, 10),
+      description: row.description ?? null,
+      reference: row.numero_facture ?? row.reference_url ?? null,
+      fournisseur: row.vendor_name ?? null,
+      syndicat_id: row.syndicat_id ?? null,
+      syndicat_name: row.syndicat_nom ?? row.syndicat_name ?? null,
+      units: row.units ?? null,
+      city: row.city ?? null
+    };
+    const cle = crmCle(piece);
+    if (!groupes.has(cle)) {
+      groupes.set(cle, {
+        cle,
+        component_code: piece.component_code,
+        syndicat: piece.syndicat_name,
+        units: piece.units,
+        ville: piece.city,
+        mois: piece.date.slice(0, 7),
+        annee: Number(piece.date.slice(0, 4)),
+        pieces: []
+      });
+    }
+    const g = groupes.get(cle);
+    g.pieces.push(piece);
+    if (piece.units != null && g.units == null) g.units = piece.units;
+    if (piece.city && !g.ville) g.ville = piece.city;
+    if (piece.syndicat_name && !g.syndicat) g.syndicat = piece.syndicat_name;
+  }
+
+  const lignes = [...groupes.values()].map((g) => {
+    // Une facture payée l'emporte sur une soumission : c'est un prix conclu,
+    // pas un prix demandé.
+    const estFacture = g.pieces.some((p) => p.source_type === "syndicat_facture");
+    // La description la plus longue est celle qui dit le plus de la portée —
+    // l'objet d'un courriel dit rarement ce qui a été fait.
+    const description = g.pieces
+      .map((p) => (p.description ?? "").trim())
+      .sort((a, b) => b.length - a.length)[0] || `Travaux ${g.component_code}`;
+    return {
+      ...g,
+      total: g.pieces.reduce((s, p) => s + p.montant, 0),
+      source: estFacture ? "facture" : "soumission",
+      description: description.slice(0, 200),
+      fournisseur: g.pieces.find((p) => p.fournisseur)?.fournisseur ?? null,
+      reference: g.pieces.find((p) => p.reference)?.reference ?? null
+    };
+  }).sort((a, b) => (a.mois < b.mois ? 1 : a.mois > b.mois ? -1 : b.total - a.total));
+
+  return { lignes, sansDate, dejaVues };
+}
+
+prix.get("/crm", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const { lignes, sansDate, dejaVues } = await crmCandidats(c, user);
+  return c.json({
+    confiance: CRM_CONFIANCE,
+    candidats: lignes.length,
+    pieces_sans_date: sansDate,
+    pieces_deja_importees: dejaVues,
+    lignes
+  });
+});
+
+// L'import ne fait pas entrer un prix dans la banque : il crée une ligne à
+// valider, en forfait faute de quantité, avec ses pièces attachées.
+prix.post("/crm/import", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+
+  const body2 = await c.req.json();
+  const demandees = Array.isArray(body2.cles) ? body2.cles.map(String) : [];
+  if (demandees.length === 0) return c.json({ error: "aucun candidat demandé" }, 400);
+
+  // Les groupes sont recalculés ici : le total versé à la banque doit venir du
+  // CRM, jamais d'un montant envoyé par le navigateur.
+  const { lignes } = await crmCandidats(c, user);
+  const parCle = new Map(lignes.map((l) => [l.cle, l]));
+  const importees = [];
+  const ignorees = [];
+
+  for (const cle of demandees) {
+    const groupe = parCle.get(cle);
+    if (!groupe) { ignorees.push(cle); continue; }
+    const id = newId("prx");
+    const contexte = JSON.stringify({
+      units: groupe.units ?? null,
+      city: groupe.ville ?? null,
+      syndicat: groupe.syndicat ?? null,
+      crm_mois: groupe.mois
+    });
+    const note = `Importé du CRM — ${groupe.pieces.length} pièce(s) : ` + groupe.pieces
+      .map((p) => `${p.reference ?? p.source_id} (${Math.round(p.montant)} $, ${p.date})`)
+      .join(", ");
+
+    const instructions = [
+      c.env.DB.prepare(
+        `INSERT INTO price_observations
+           (id, company_id, uniformat_code, description, fournisseur, annee, montant,
+            quantite, unite, source, ville, unites, contexte, source_ref, note, valide, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'forfait', ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14)`
+      ).bind(
+        id, user.company_id, groupe.component_code, groupe.description,
+        groupe.fournisseur, groupe.annee, groupe.total, groupe.source,
+        groupe.ville ?? null, groupe.units ?? null, contexte, groupe.reference ?? null,
+        note, user.id
+      )
+    ];
+    for (const p of groupe.pieces) {
+      instructions.push(c.env.DB.prepare(
+        `INSERT INTO price_observation_sources
+           (observation_id, company_id, source_type, source_id, montant, reference, date_piece, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+      ).bind(id, user.company_id, p.source_type, p.source_id, p.montant,
+             p.reference ?? null, p.date, p.description ?? null));
+    }
+    await c.env.DB.batch(instructions);
+    importees.push({ cle, id, montant: groupe.total, pieces: groupe.pieces.length });
+  }
+
+  return c.json({ importees: importees.length, ignorees: ignorees.length, lignes: importees }, 201);
+});
+
+prix.delete("/:id", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const res = await c.env.DB.prepare(
+    "DELETE FROM price_observations WHERE id = ?1 AND company_id = ?2"
+  ).bind(c.req.param("id"), user.company_id).run();
+  if (!res.meta?.changes) return c.json({ error: "ligne introuvable" }, 404);
+  return c.json({ ok: true });
+});
+
 globalThis.process = _process;
 globalThis.console = workerdConsole;
 const app = new Hono();
@@ -44791,6 +45599,7 @@ app.route("/api/companies", companies);
 app.route("/api/dossiers", dossiers);
 app.route("/api/components", components);
 app.route("/api/photos", photos);
+app.route("/api/prix", prix);
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 const index = {
   fetch: app.fetch

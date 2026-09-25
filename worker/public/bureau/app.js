@@ -130,6 +130,31 @@ const IMM_ENTRETIENS = [
 const IMM_DOC_VALS = { oui: 'Reçu', non: 'Non reçu', nd: 'Non disponible' };
 const IMM_OUI_NON = { oui: 'Oui', non: 'Non', nd: 'nd' };
 
+// --- Banque de prix ---
+// Une unité non quantifiée (le forfait) n'a pas de prix au pi² : le montant
+// est son propre prix unitaire, et la quantité n'est pas demandée.
+const PRIX_UNITES = [
+  { v: 'pi2', label: 'pi²', quantifie: true },
+  { v: 'pi_lin', label: 'pi lin.', quantifie: true },
+  { v: 'unite', label: 'unité', quantifie: true },
+  { v: 'forfait', label: 'forfait', quantifie: false },
+];
+const PRIX_PORTEES = [
+  { v: 'complet', label: 'Remplacement complet' },
+  { v: 'partiel', label: 'Remplacement partiel' },
+  { v: 'reparation', label: 'Réparation' },
+];
+const PRIX_SOURCES = [
+  { v: 'facture', label: 'Facture' },
+  { v: 'soumission', label: 'Soumission' },
+];
+function prixUniteInfo(v) { return PRIX_UNITES.find(u => u.v === v) || PRIX_UNITES[0]; }
+const PRIX_FORM_VIDE = {
+  description: '', cat: '', uniformat_code: '', dossier_id: '', annee: '',
+  montant: '', quantite: '', unite: 'pi2', portee: 'complet', source: 'facture',
+  negocie: false, fournisseur: '', ville: '', unites: '', source_ref: '', note: '',
+};
+
 // ---------------------------------------------------------------
 // State
 // ---------------------------------------------------------------
@@ -162,6 +187,9 @@ const state = {
   expanded: {},            // id de composante -> panneau de détail ouvert
   batiment: {},            // contenu de dossiers.batiment_info (lecture seule ici)
   batimentOpen: false,
+  composantesImportUploading: false,
+  composantesImportError: null,
+  composantesImportNote: null,
 
   reviewIdx: 0,
   reviewPhotos: [],
@@ -177,6 +205,26 @@ const state = {
 
   publishing: false,
   publishError: null,
+
+  prixRows: [],
+  prixResume: null,
+  prixLoading: false,
+  prixError: null,
+  prixFilter: 'a_valider',   // a_valider | valides | tous
+  prixForm: Object.assign({}, PRIX_FORM_VIDE),
+  prixFormOpen: false,
+  prixFormError: null,
+  prixSaving: false,
+  prixBusyId: null,          // ligne en cours de validation ou de suppression
+  prixEditId: null,          // ligne en cours de modification (sinon : saisie neuve)
+
+  prixCrm: null,             // candidats servis par /api/prix/crm
+  prixCrmDispo: true,        // false quand l'entreprise n'a pas accès au CRM
+  prixCrmLoading: false,
+  prixCrmError: null,
+  prixCrmSel: {},            // clé de candidat -> sélectionné
+  prixCrmDetail: {},         // clé de candidat -> pièces dépliées
+  prixCrmImporting: false,
 };
 
 // ---------------------------------------------------------------
@@ -192,6 +240,23 @@ function parseNum(text) {
   if (cleaned === '') return null;
   const n = parseInt(cleaned, 10);
   return isNaN(n) ? null : n;
+}
+// Les montants d'une facture ont des décimales et arrivent à la québécoise
+// (« 12 450,75 $ ») : parseNum, qui ne garde que les chiffres, les fausserait.
+function parseDecimal(text) {
+  if (text == null) return null;
+  const cleaned = String(text).replace(/\s/g, '').replace(/[^0-9,.-]/g, '').replace(',', '.');
+  if (cleaned === '' || cleaned === '-') return null;
+  const n = Number(cleaned);
+  return isNaN(n) ? null : n;
+}
+// Un prix unitaire sous 100 $ se lit aux cents ; au-delà, l'arrondi au dollar suffit.
+function fmtPrix(n) {
+  if (n == null || isNaN(n)) return '—';
+  if (Math.abs(n) < 100) {
+    return (Math.round(n * 100) / 100).toLocaleString('fr-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  return fmt(n);
 }
 // L'année de construction ou de réparation accepte une valeur libre
 // (« vers 1998 », « inconnue ») comme sur le terrain.
@@ -270,7 +335,10 @@ async function apiRaw(path, opts) {
 }
 async function apiJson(path, opts) {
   opts = opts || {};
-  const headers = authHeaders(Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {}));
+  const isForm = opts.body instanceof FormData;
+  const headers = isForm
+    ? authHeaders(opts.headers || {})
+    : authHeaders(Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {}));
   const res = await fetch(path, Object.assign({}, opts, { headers }));
   if (res.status === 401) {
     handleUnauthorized();
@@ -466,6 +534,194 @@ async function loadDossiers() {
   }
 }
 
+// ---------------------------------------------------------------
+// Banque de prix
+// ---------------------------------------------------------------
+async function loadPrix() {
+  state.prixLoading = true;
+  state.prixError = null;
+  render();
+  try {
+    const [rows, resume] = await Promise.all([apiJson('/api/prix'), apiJson('/api/prix/resume')]);
+    state.prixRows = Array.isArray(rows) ? rows : [];
+    state.prixResume = resume || null;
+  } catch (e) {
+    state.prixError = e.message || 'Impossible de charger la banque de prix.';
+  }
+  state.prixLoading = false;
+  render();
+  // Le formulaire rattache une ligne à un dossier : sans la liste, le champ
+  // serait vide alors que la firme a bel et bien des dossiers.
+  if (state.dossiers.length === 0 && !state.dossiersLoading) loadDossiers();
+  loadPrixCrm();
+}
+
+// Les factures que le CRM a déjà rattachées à une composante. Une entreprise
+// sans accès au CRM reçoit un 403 : ce n'est pas une panne, la section
+// n'existe simplement pas pour elle.
+async function loadPrixCrm() {
+  state.prixCrmLoading = true;
+  state.prixCrmError = null;
+  render();
+  try {
+    const res = await apiRaw('/api/prix/crm');
+    if (res.status === 403) {
+      state.prixCrmDispo = false;
+      state.prixCrm = null;
+    } else {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data && data.error ? data.error : `Erreur ${res.status}`);
+      state.prixCrmDispo = true;
+      state.prixCrm = data;
+    }
+  } catch (e) {
+    state.prixCrmError = e.message || 'Impossible de joindre le CRM.';
+  }
+  state.prixCrmLoading = false;
+  render();
+}
+
+function prixCrmSelection() {
+  return Object.keys(state.prixCrmSel).filter(k => state.prixCrmSel[k]);
+}
+
+async function importerPrixCrm() {
+  const cles = prixCrmSelection();
+  if (cles.length === 0 || state.prixCrmImporting) return;
+  state.prixCrmImporting = true;
+  state.prixCrmError = null;
+  render();
+  try {
+    await apiJson('/api/prix/crm/import', { method: 'POST', body: JSON.stringify({ cles }) });
+    state.prixCrmSel = {};
+    state.prixCrmImporting = false;
+    state.prixFilter = 'a_valider';
+    await loadPrix();
+  } catch (e) {
+    state.prixCrmImporting = false;
+    state.prixCrmError = e.message || "L'import a échoué.";
+    render();
+  }
+}
+
+// Une ligne importée arrive sans quantité : la modification est ce qui lui
+// permet d'en recevoir une, et donc de devenir un prix unitaire.
+function ouvrirPrixEdition(id) {
+  const row = state.prixRows.find(r => r.id === id);
+  if (!row) return;
+  state.prixForm = {
+    description: row.description || '',
+    cat: row.cat || '',
+    uniformat_code: row.uniformat_code || '',
+    dossier_id: row.dossier_id || '',
+    annee: row.annee == null ? '' : String(row.annee),
+    montant: row.montant == null ? '' : String(row.montant),
+    quantite: row.quantite == null ? '' : String(row.quantite),
+    unite: row.unite || 'pi2',
+    portee: row.portee || '',
+    source: row.source || 'facture',
+    negocie: row.negocie === 1,
+    fournisseur: row.fournisseur || '',
+    ville: row.ville || '',
+    unites: row.unites == null ? '' : String(row.unites),
+    source_ref: row.source_ref || '',
+    note: row.note || '',
+  };
+  state.prixEditId = id;
+  state.prixFormOpen = true;
+  state.prixFormError = null;
+  render();
+}
+
+function fermerPrixForm() {
+  state.prixFormOpen = false;
+  state.prixEditId = null;
+  state.prixFormError = null;
+  state.prixForm = Object.assign({}, PRIX_FORM_VIDE);
+  render();
+}
+
+function prixFormPayload() {
+  const f = state.prixForm;
+  const quantifie = prixUniteInfo(f.unite).quantifie;
+  return {
+    description: f.description,
+    cat: f.cat || null,
+    uniformat_code: f.uniformat_code || null,
+    dossier_id: f.dossier_id || null,
+    annee: parseDecimal(f.annee),
+    montant: parseDecimal(f.montant),
+    quantite: quantifie ? parseDecimal(f.quantite) : null,
+    unite: f.unite,
+    portee: f.portee || null,
+    source: f.source,
+    negocie: f.negocie ? 1 : 0,
+    fournisseur: f.fournisseur || null,
+    ville: f.ville || null,
+    unites: parseDecimal(f.unites),
+    source_ref: f.source_ref || null,
+    note: f.note || null,
+  };
+}
+
+async function submitPrix() {
+  if (state.prixSaving) return;
+  state.prixSaving = true;
+  state.prixFormError = null;
+  render();
+  const edition = state.prixEditId;
+  try {
+    await apiJson(edition ? `/api/prix/${edition}` : '/api/prix', {
+      method: edition ? 'PATCH' : 'POST',
+      body: JSON.stringify(prixFormPayload()),
+    });
+    state.prixForm = Object.assign({}, PRIX_FORM_VIDE);
+    state.prixFormOpen = false;
+    state.prixEditId = null;
+    state.prixSaving = false;
+    await loadPrix();
+  } catch (e) {
+    state.prixSaving = false;
+    state.prixFormError = e.message || "Impossible d'enregistrer la ligne.";
+    render();
+  }
+}
+
+// La validation est le geste qui fait entrer la ligne dans la banque — et la
+// dévalidation, celui qui l'en sort sans la perdre.
+async function setPrixValide(id, valide) {
+  if (state.prixBusyId) return;
+  state.prixBusyId = id;
+  render();
+  try {
+    await apiJson(`/api/prix/${id}`, { method: 'PATCH', body: JSON.stringify({ valide: valide ? 1 : 0 }) });
+    state.prixBusyId = null;
+    await loadPrix();
+  } catch (e) {
+    state.prixBusyId = null;
+    state.prixError = e.message || 'Impossible de mettre la ligne à jour.';
+    render();
+  }
+}
+
+async function deletePrix(id) {
+  const row = state.prixRows.find(r => r.id === id);
+  const quoi = row ? `« ${row.description} »` : 'cette ligne';
+  if (!window.confirm(`Supprimer ${quoi} de la banque de prix ? Cette action est définitive.`)) return;
+  if (state.prixBusyId) return;
+  state.prixBusyId = id;
+  render();
+  try {
+    await apiJson(`/api/prix/${id}`, { method: 'DELETE' });
+    state.prixBusyId = null;
+    await loadPrix();
+  } catch (e) {
+    state.prixBusyId = null;
+    state.prixError = e.message || 'Impossible de supprimer la ligne.';
+    render();
+  }
+}
+
 async function openDossier(id) {
   revokeReviewPhotos();
   state.dossierId = id;
@@ -504,6 +760,34 @@ async function loadDossierDetail(id) {
     state.revisionError = e.message || 'Impossible de charger ce dossier.';
     render();
   }
+}
+
+async function uploadComposantesImport(file) {
+  if (!file || state.composantesImportUploading || !state.dossierId) return;
+  state.composantesImportUploading = true;
+  state.composantesImportError = null;
+  state.composantesImportNote = null;
+  render();
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await apiJson(`/api/dossiers/${state.dossierId}/components/import`, { method: 'POST', body: fd });
+    state.composantesImportNote = res.note
+      || `${res.composantes_importees} composante${res.composantes_importees > 1 ? 's' : ''} ajoutée${res.composantes_importees > 1 ? 's' : ''} à l'inventaire. Relisez-les avant de confirmer.`;
+    // On recharge juste le dossier et ses composantes, sans repasser par
+    // revisionLoading : un plein écran de chargement effacerait la note
+    // qu'on vient d'afficher.
+    const [dossier, components] = await Promise.all([
+      apiJson(`/api/dossiers/${state.dossierId}`),
+      apiJson(`/api/dossiers/${state.dossierId}/components`)
+    ]);
+    state.dossier = dossier;
+    state.components = Array.isArray(components) ? components : [];
+  } catch (e) {
+    state.composantesImportError = e.message || "L'import du document a échoué.";
+  }
+  state.composantesImportUploading = false;
+  render();
 }
 
 async function refreshProjection() {
@@ -910,22 +1194,22 @@ function renderLogin() {
 }
 
 function railHtml() {
+  const dossiersActive = ['dossiers', 'revision', 'publier', 'reviewIA'].includes(state.screen);
   const items = [
-    { key: 'dossiers', label: 'Dossiers', icon: 'folder', disabled: false },
+    { key: 'dossiers', label: 'Dossiers', icon: 'folder', action: 'go-dossiers', active: dossiersActive },
+    { key: 'prix', label: 'Banque de prix', icon: 'receipt', action: 'go-prix', active: state.screen === 'prix' },
     { key: 'clients', label: 'Clients', icon: 'users', disabled: true },
     { key: 'carnet', label: "Carnet d'entretien", icon: 'calendar-clock', disabled: true },
     { key: 'modeles', label: 'Modèles', icon: 'file-stack', disabled: true },
   ];
-  const dossiersActive = ['dossiers', 'revision', 'publier', 'reviewIA'].includes(state.screen);
   const initials = initialsOf(state.user && state.user.name);
   return `
   <div class="rail">
     <div class="rail-brand"><img src="${state.companyLogoUrl || '../assets/logo-mark.png'}" alt=""><span>${escapeHtml((state.user && state.user.company && state.user.company.name) || 'Condo Stratégis')}</span></div>
     <div class="rail-section-label">Console bureau</div>
-    ${items.map(n => {
-      const active = n.key === 'dossiers' && dossiersActive;
-      return `<button class="rail-nav-item ${active ? 'active' : ''}" ${n.disabled ? 'disabled title="Bientôt disponible"' : 'data-action="go-dossiers"'}><i data-lucide="${n.icon}"></i><span class="label">${n.label}</span></button>`;
-    }).join('')}
+    ${items.map(n =>
+      `<button class="rail-nav-item ${n.active ? 'active' : ''}" ${n.disabled ? 'disabled title="Bientôt disponible"' : `data-action="${n.action}"`}><i data-lucide="${n.icon}"></i><span class="label">${n.label}</span></button>`
+    ).join('')}
     <div class="rail-footer">
       <div class="rail-user-row">
         <div class="avatar-badge">${initials}</div>
@@ -942,6 +1226,7 @@ function railHtml() {
 function renderShell() {
   let main = '';
   if (state.screen === 'dossiers') main = renderDossiers();
+  else if (state.screen === 'prix') main = renderPrix();
   else if (state.screen === 'revision') main = renderRevision();
   else if (state.screen === 'publier') main = renderPublier();
   else if (state.screen === 'reviewIA') main = renderReviewIA();
@@ -987,6 +1272,276 @@ function renderDossiers() {
       </div>`).join('')}
     </div>
   </div>`;
+}
+
+// ---------------------------------------------------------------
+// Banque de prix — rendu
+// ---------------------------------------------------------------
+function renderPrix() {
+  if (state.prixLoading && !state.prixResume) {
+    return `<div class="page-pad">${spinnerBlock('Chargement de la banque de prix…')}</div>`;
+  }
+  const r = state.prixResume;
+  const taux = r && r.taux_indexation != null ? Math.round(r.taux_indexation * 10000) / 100 : null;
+  const rows = state.prixRows.filter(row => {
+    if (state.prixFilter === 'a_valider') return row.valide !== 1;
+    if (state.prixFilter === 'valides') return row.valide === 1;
+    return true;
+  });
+  return `
+  <div class="page-pad">
+    <div class="eyebrow-orange">Banque de prix</div>
+    <h1 class="page-title">Prix payés</h1>
+    <p class="page-lead">Chaque ligne est un travail facturé, ramené à un prix unitaire et indexé en dollars d'aujourd'hui. Seules les lignes validées comptent dans les médianes.</p>
+    ${state.prixError ? errorBanner(state.prixError, 'retry-prix') : ''}
+
+    <div class="prix-stats">
+      <div class="prix-stat"><div class="prix-stat-k">Lignes</div><div class="prix-stat-v">${r ? r.total : 0}</div></div>
+      <div class="prix-stat"><div class="prix-stat-k">Validées</div><div class="prix-stat-v">${r ? r.valides : 0}</div></div>
+      <div class="prix-stat"><div class="prix-stat-k">À valider</div><div class="prix-stat-v">${r ? r.a_valider : 0}</div></div>
+      <div class="prix-stat"><div class="prix-stat-k">Références</div><div class="prix-stat-v">${r && r.lignes ? r.lignes.length : 0}</div></div>
+    </div>
+    ${r ? `<div class="metho-source" style="margin:-8px 0 24px">Indexation à ${r.annee_reference} au taux d'inflation construction de ${taux} % — ${escapeHtml(r.source_indexation || '')}. ${r.negocies_ecartes ? `${r.negocies_ecartes} ligne${r.negocies_ecartes > 1 ? 's' : ''} à prix négocié écartée${r.negocies_ecartes > 1 ? 's' : ''} des médianes.` : ''}${r.sans_prix_unitaire ? ` ${r.sans_prix_unitaire} ligne(s) validée(s) sans prix unitaire calculable.` : ''}</div>` : ''}
+
+    ${prixResumeHtml(r)}
+
+    ${prixPortesHtml(r)}
+
+    ${prixCrmHtml()}
+
+    <div class="comp-section-head" style="margin-top:32px">
+      <span class="lbl">Lignes saisies</span><span class="rule"></span>
+      <button class="btn-primary" data-action="prix-toggle-form" style="padding:8px 16px;font-size:12px">
+        <i data-lucide="${state.prixFormOpen ? 'x' : 'plus'}"></i>${state.prixFormOpen ? 'Annuler' : 'Ajouter une ligne'}
+      </button>
+    </div>
+    ${state.prixFormOpen ? prixFormHtml() : ''}
+
+    <div class="filters-row" style="margin-top:20px">
+      <button class="chip ${state.prixFilter === 'a_valider' ? 'active' : ''}" data-action="prix-filter" data-filter="a_valider">À valider · ${r ? r.a_valider : 0}</button>
+      <button class="chip ${state.prixFilter === 'valides' ? 'active' : ''}" data-action="prix-filter" data-filter="valides">Validées · ${r ? r.valides : 0}</button>
+      <button class="chip ${state.prixFilter === 'tous' ? 'active' : ''}" data-action="prix-filter" data-filter="tous">Toutes · ${r ? r.total : 0}</button>
+    </div>
+    ${prixRowsHtml(rows)}
+  </div>`;
+}
+
+function prixCrmHtml() {
+  if (!state.prixCrmDispo) return '';
+  const crm = state.prixCrm;
+  const selection = prixCrmSelection();
+  const lignes = (crm && crm.lignes) || [];
+  const corps = state.prixCrmLoading && !crm
+    ? spinnerBlock('Lecture des rattachements du CRM…')
+    : lignes.length === 0
+      ? `<div class="empty-state">Rien de neuf : toutes les factures rattachées par le CRM ont déjà été importées.</div>`
+      : `
+      <div class="prix-table">
+        <div class="prix-crm-row prix-head">
+          <div class="prix-cell"></div>
+          <div class="prix-cell">Travaux</div>
+          <div class="prix-cell">Syndicat</div>
+          <div class="prix-cell right">Période</div>
+          <div class="prix-cell right">Total</div>
+          <div class="prix-cell">Nature</div>
+        </div>
+        ${lignes.map(l => {
+          const ouvert = !!state.prixCrmDetail[l.cle];
+          const multi = l.pieces.length > 1;
+          return `
+          <div class="prix-crm-row ${state.prixCrmSel[l.cle] ? 'choisi' : ''}">
+            <div class="prix-cell"><input type="checkbox" class="prix-crm-check" data-action="prix-crm-choisir" data-cle="${escapeHtml(l.cle)}" ${state.prixCrmSel[l.cle] ? 'checked' : ''}></div>
+            <div class="prix-cell">
+              <div class="prix-name">${escapeHtml(l.description)}</div>
+              <div class="prix-sub-line">
+                <b>${escapeHtml(l.component_code || '—')}</b>
+                ${multi ? ` · <button class="prix-lien" data-action="prix-crm-detail" data-cle="${escapeHtml(l.cle)}">${l.pieces.length} versements ${ouvert ? '▲' : '▼'}</button>` : ' · 1 pièce'}
+              </div>
+              ${ouvert ? `<div class="prix-pieces">${l.pieces.map(p => `
+                <div><span>${escapeHtml(p.reference || p.source_id)}</span><span>${escapeHtml(p.date)}</span><span class="mono">${fmt(p.montant)} $</span></div>`).join('')}</div>` : ''}
+            </div>
+            <div class="prix-cell">${escapeHtml(l.syndicat || '—')}${l.units ? `<div class="prix-sub-line">${l.units} unités${l.ville ? ' · ' + escapeHtml(l.ville) : ''}</div>` : ''}</div>
+            <div class="prix-cell right mono">${escapeHtml(l.mois || '—')}</div>
+            <div class="prix-cell right mono"><b>${fmt(l.total)} $</b></div>
+            <div class="prix-cell"><span class="prix-pill">${l.source === 'facture' ? 'Facture' : 'Soumission'}</span></div>
+          </div>`;
+        }).join('')}
+      </div>`;
+  return `
+  <div class="comp-section-head" style="margin-top:32px">
+    <span class="lbl">À importer du CRM</span><span class="rule"></span>
+    ${crm ? `<span class="hint">${crm.candidats} candidat(s)${crm.pieces_deja_importees ? ` · ${crm.pieces_deja_importees} pièce(s) déjà importée(s)` : ''}${crm.pieces_sans_date ? ` · ${crm.pieces_sans_date} sans date, non importable(s)` : ''}</span>` : ''}
+    <button class="icon-btn" data-action="prix-crm-refresh" title="Relire le CRM" ${state.prixCrmLoading ? 'disabled' : ''}><i data-lucide="refresh-cw"></i></button>
+    <button class="btn-primary" data-action="prix-crm-importer" style="padding:8px 16px;font-size:12px" ${selection.length === 0 || state.prixCrmImporting ? 'disabled' : ''}>
+      ${state.prixCrmImporting ? 'Import…' : `Importer la sélection${selection.length ? ' · ' + selection.length : ''}`}
+    </button>
+  </div>
+  <p class="prix-hint" style="margin:-6px 0 14px">Le CRM ne fournit aucune quantité : une ligne importée arrive en forfait, à valider, et c'est la superficie que vous ajouterez qui en fera un prix unitaire.</p>
+  ${state.prixCrmError ? errorBanner(state.prixCrmError, 'prix-crm-refresh') : ''}
+  ${corps}`;
+}
+
+// Le coût par porte : la référence qu'on peut produire sans superficie, à
+// condition de ne comparer qu'entre immeubles de taille voisine.
+function prixPortesHtml(r) {
+  const lignes = (r && r.portes) || [];
+  if (lignes.length === 0) return '';
+  const mince = r.echantillon_mince || 5;
+  return `
+  <div class="comp-section-head" style="margin-top:28px">
+    <span class="lbl">Au coût par porte</span><span class="rule"></span>
+    <span class="hint">Utile quand la superficie manque — solide pour ce qui va par immeuble ou par porte, trompeur pour une toiture.</span>
+  </div>
+  <div class="prix-table">
+    <div class="prix-portes-row prix-head">
+      <div class="prix-cell">Code · catégorie</div>
+      <div class="prix-cell">Taille d'immeuble</div>
+      <div class="prix-cell right">n</div>
+      <div class="prix-cell right">Médiane par porte</div>
+      <div class="prix-cell right">Plage P25 – P75</div>
+      <div class="prix-cell right">Années</div>
+    </div>
+    ${lignes.map(l => `
+    <div class="prix-portes-row">
+      <div class="prix-cell"><b>${escapeHtml(l.uniformat_code || '—')}</b>${l.cat ? `<span class="prix-sub">${escapeHtml(catInfo(l.cat).label)}</span>` : ''}</div>
+      <div class="prix-cell">${escapeHtml(l.tranche_label || '—')}</div>
+      <div class="prix-cell right mono">${l.n}${l.mince ? `<span class="prix-warn" title="Moins de ${mince} observations : médiane indicative, pas une référence">indicatif</span>` : ''}</div>
+      <div class="prix-cell right mono"><b>${fmtPrix(l.mediane)} $</b><span class="prix-sub">/ porte</span></div>
+      <div class="prix-cell right mono">${fmtPrix(l.p25)} – ${fmtPrix(l.p75)} $</div>
+      <div class="prix-cell right mono">${l.annee_min === l.annee_max ? l.annee_min : `${l.annee_min}–${l.annee_max}`}</div>
+    </div>`).join('')}
+  </div>`;
+}
+
+function prixResumeHtml(r) {
+  const lignes = (r && r.lignes) || [];
+  if (lignes.length === 0) {
+    return `<div class="empty-state">Aucune référence encore. Validez des lignes pour que la banque commence à donner des médianes.</div>`;
+  }
+  const mince = r.echantillon_mince || 5;
+  return `
+  <div class="prix-table">
+    <div class="prix-resume-row prix-head">
+      <div class="prix-cell">Code · catégorie</div>
+      <div class="prix-cell">Exemple</div>
+      <div class="prix-cell right">n</div>
+      <div class="prix-cell right">Médiane indexée</div>
+      <div class="prix-cell right">Plage P25 – P75</div>
+      <div class="prix-cell right">Années</div>
+    </div>
+    ${lignes.map(l => `
+    <div class="prix-resume-row">
+      <div class="prix-cell"><b>${escapeHtml(l.uniformat_code || '—')}</b>${l.cat ? `<span class="prix-sub">${escapeHtml(catInfo(l.cat).label)}</span>` : ''}</div>
+      <div class="prix-cell">${escapeHtml(l.exemple || '')}</div>
+      <div class="prix-cell right mono">${l.n}${l.mince ? `<span class="prix-warn" title="Moins de ${mince} observations : médiane indicative, pas une référence">indicatif</span>` : ''}</div>
+      <div class="prix-cell right mono"><b>${fmtPrix(l.mediane)} $</b><span class="prix-sub">/ ${escapeHtml(l.unite_label)}</span></div>
+      <div class="prix-cell right mono">${fmtPrix(l.p25)} – ${fmtPrix(l.p75)} $</div>
+      <div class="prix-cell right mono">${l.annee_min === l.annee_max ? l.annee_min : `${l.annee_min}–${l.annee_max}`}</div>
+    </div>`).join('')}
+  </div>`;
+}
+
+function prixRowsHtml(rows) {
+  if (rows.length === 0) {
+    return `<div class="empty-state">Aucune ligne dans cette catégorie.</div>`;
+  }
+  return `
+  <div class="prix-table">
+    <div class="prix-obs-row prix-head">
+      <div class="prix-cell">Élément</div>
+      <div class="prix-cell right">Année</div>
+      <div class="prix-cell right">Montant</div>
+      <div class="prix-cell right">Quantité</div>
+      <div class="prix-cell right">Prix unitaire indexé</div>
+      <div class="prix-cell right">Par porte</div>
+      <div class="prix-cell">Nature</div>
+      <div class="prix-cell right"></div>
+    </div>
+    ${rows.map(row => {
+      const busy = state.prixBusyId === row.id;
+      const portee = PRIX_PORTEES.find(p => p.v === row.portee);
+      const source = PRIX_SOURCES.find(s => s.v === row.source);
+      return `
+      <div class="prix-obs-row ${row.valide === 1 ? 'valide' : ''}">
+        <div class="prix-cell">
+          <div class="prix-name">${escapeHtml(row.description || '—')}</div>
+          <div class="prix-sub-line">${[row.uniformat_code, row.cat ? catInfo(row.cat).label : null, row.fournisseur, row.ville].filter(Boolean).map(escapeHtml).join(' · ') || '—'}${row.pieces && row.pieces.length ? ` · <span class="prix-pill">CRM · ${row.pieces.length} pièce(s)</span>` : ''}</div>
+        </div>
+        <div class="prix-cell right mono">${row.annee || '—'}</div>
+        <div class="prix-cell right mono">${fmt(row.montant)} $</div>
+        <div class="prix-cell right mono">${row.quantite != null ? `${fmtPrix(row.quantite)} ${escapeHtml(row.unite_label || '')}` : '—'}</div>
+        <div class="prix-cell right mono">${row.prix_unitaire_indexe != null ? `<b>${fmtPrix(row.prix_unitaire_indexe)} $</b><span class="prix-sub">/ ${escapeHtml(row.unite_label || '')}</span>` : '—'}</div>
+        <div class="prix-cell right mono">${row.prix_par_porte_indexe != null ? `${fmtPrix(row.prix_par_porte_indexe)} $<span class="prix-sub">/ ${row.unites} portes</span>` : '—'}</div>
+        <div class="prix-cell">
+          <span class="prix-pill">${escapeHtml(source ? source.label : (row.source || '—'))}</span>
+          ${portee ? `<span class="prix-pill">${escapeHtml(portee.label)}</span>` : ''}
+          ${row.negocie === 1 ? `<span class="prix-pill neg" title="Prix de portefeuille — écarté des médianes">Négocié</span>` : ''}
+        </div>
+        <div class="prix-cell right prix-actions">
+          <button class="btn-row-action ${row.valide === 1 ? '' : 'primary'}" data-action="prix-valide" data-id="${row.id}" data-valide="${row.valide === 1 ? '0' : '1'}" ${busy ? 'disabled' : ''}>${row.valide === 1 ? 'Retirer' : 'Valider'}</button>
+          <button class="icon-btn" data-action="prix-modifier" data-id="${row.id}" title="Modifier" ${busy ? 'disabled' : ''}><i data-lucide="pencil"></i></button>
+          <button class="icon-btn" data-action="prix-supprimer" data-id="${row.id}" title="Supprimer" ${busy ? 'disabled' : ''}><i data-lucide="trash-2"></i></button>
+        </div>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+
+function prixChamp(cle, label, opts) {
+  opts = opts || {};
+  const val = state.prixForm[cle] == null ? '' : String(state.prixForm[cle]);
+  const attrs = `id="prix-f-${cle}" data-role="prix-field" data-field="${cle}"`;
+  let champ;
+  if (opts.options) {
+    champ = `<select class="detail-input" ${attrs}>
+      ${(opts.vide ? [{ v: '', label: opts.vide }] : []).concat(opts.options).map(o =>
+        `<option value="${escapeHtml(o.v)}" ${o.v === val ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}
+    </select>`;
+  } else if (opts.textarea) {
+    champ = `<textarea class="detail-input" rows="2" ${attrs} placeholder="${escapeHtml(opts.placeholder || '')}">${escapeHtml(val)}</textarea>`;
+  } else {
+    champ = `<input class="detail-input" type="text" ${attrs} value="${escapeHtml(val)}" placeholder="${escapeHtml(opts.placeholder || '')}" ${opts.disabled ? 'disabled' : ''}>`;
+  }
+  return `<div class="prix-field ${opts.large ? 'large' : ''}">
+    <label class="field-label" for="prix-f-${cle}">${escapeHtml(label)}</label>
+    ${champ}
+    ${opts.hint ? `<div class="prix-hint">${escapeHtml(opts.hint)}</div>` : ''}
+  </div>`;
+}
+
+function prixFormHtml() {
+  const quantifie = prixUniteInfo(state.prixForm.unite).quantifie;
+  const dossierOptions = state.dossiers.map(d => ({ v: d.id, label: `${d.dossier_no || ''} — ${d.name || ''}`.trim() }));
+  const catOptions = CAT_ORDER.map(k => ({ v: k, label: CATS[k].label }));
+  return `
+  <form class="prix-form" id="prix-form" novalidate>
+    ${state.prixEditId ? `<div class="prix-field large"><span class="field-label">Modification d'une ligne existante</span></div>` : ''}
+    ${state.prixFormError ? `<div class="login-error" style="grid-column:1/-1">${escapeHtml(state.prixFormError)}</div>` : ''}
+    ${prixChamp('description', 'Travaux facturés', { large: true, placeholder: 'ex. Réfection complète de la toiture — membrane élastomère' })}
+    ${prixChamp('cat', 'Catégorie', { options: catOptions, vide: '—' })}
+    ${prixChamp('uniformat_code', 'Code Uniformat', { placeholder: 'ex. B3010' })}
+    ${prixChamp('dossier_id', 'Dossier', { options: dossierOptions, vide: 'Aucun', hint: 'Fige le contexte du bâtiment avec la ligne.' })}
+    ${prixChamp('annee', 'Année des travaux', { placeholder: 'ex. 2024' })}
+    ${prixChamp('montant', 'Montant des travaux ($)', { placeholder: 'ex. 148 500', hint: 'Travaux seuls — taxes, honoraires et contingence retirés.' })}
+    ${prixChamp('unite', 'Unité', { options: PRIX_UNITES.map(u => ({ v: u.v, label: u.label })) })}
+    ${prixChamp('quantite', 'Quantité', quantifie
+      ? { placeholder: 'ex. 4 200' }
+      : { disabled: true, placeholder: 'sans objet', hint: 'Un forfait est son propre prix unitaire.' })}
+    ${prixChamp('portee', 'Portée', { options: PRIX_PORTEES, vide: '—', hint: 'Une réparation ne se compare pas à un remplacement.' })}
+    ${prixChamp('source', 'Source', { options: PRIX_SOURCES })}
+    ${prixChamp('fournisseur', 'Entrepreneur', { placeholder: 'ex. Toitures X inc.' })}
+    ${prixChamp('ville', 'Ville', { placeholder: 'ex. Longueuil' })}
+    ${prixChamp('unites', 'Portes de l\'immeuble', { placeholder: 'ex. 48', hint: 'Donne un coût par porte même sans superficie.' })}
+    ${prixChamp('source_ref', 'Pièce', { placeholder: 'no de facture' })}
+    ${prixChamp('note', 'Note', { large: true, textarea: true, placeholder: "Ce qui a été retiré du montant, accès difficile, portée particulière…" })}
+    <div class="prix-form-foot">
+      <label class="prix-check">
+        <input type="checkbox" data-role="prix-field" data-field="negocie" ${state.prixForm.negocie ? 'checked' : ''}>
+        <span>Prix négocié (portefeuille) — écarté des médianes de marché</span>
+      </label>
+      <button type="submit" class="btn-primary" ${state.prixSaving ? 'disabled' : ''}>${state.prixSaving ? 'Enregistrement…' : 'Enregistrer'}<i data-lucide="${state.prixSaving ? 'loader-2' : 'check'}" class="${state.prixSaving ? 'spin' : ''}"></i></button>
+    </div>
+  </form>`;
 }
 
 function saveIndicatorHtml() {
@@ -1410,7 +1965,10 @@ function renderRevision() {
         <span class="lbl">Composantes · ${docCount}/${total} documentées</span>
         <div class="rule"></div>
         <span class="hint">Édition directe des cellules</span>
+        <label class="btn-pill-sm">${state.composantesImportUploading ? 'Lecture du document…' : 'Importer un .docx'}<input type="file" accept=".docx" data-role="composantes-import-file" style="display:none" ${state.composantesImportUploading ? 'disabled' : ''}></label>
       </div>
+      ${state.composantesImportError ? errorBanner(state.composantesImportError) : ''}
+      ${state.composantesImportNote ? `<div class="temp-pass-warn" style="margin-bottom:14px"><i data-lucide="info"></i><span>${escapeHtml(state.composantesImportNote)}</span></div>` : ''}
 
       <div class="comp-table">
         <div class="comp-grid comp-thead">
@@ -1685,6 +2243,9 @@ function initEvents() {
       const email = document.getElementById('login-email').value.trim();
       const password = document.getElementById('login-password').value;
       doLogin(email, password);
+    } else if (e.target && e.target.id === 'prix-form') {
+      e.preventDefault();
+      submitPrix();
     }
   });
 
@@ -1696,6 +2257,21 @@ function initEvents() {
     if (!t || !t.matches) return;
     if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
+    else if (t.matches('[data-role="prix-field"]')) {
+      const champ = t.getAttribute('data-field');
+      state.prixForm[champ] = t.type === 'checkbox' ? t.checked : t.value;
+      // L'unité commande la présence du champ quantité : elle seule redessine.
+      if (champ === 'unite') render();
+    }
+  });
+
+  app.addEventListener('change', (e) => {
+    const t = e.target;
+    if (t && t.matches && t.matches('[data-role="composantes-import-file"]')) {
+      const f = t.files && t.files[0];
+      t.value = '';
+      if (f) uploadComposantesImport(f);
+    }
   });
 
   app.addEventListener('click', (e) => {
@@ -1708,6 +2284,54 @@ function initEvents() {
         state.screen = 'dossiers';
         render();
         loadDossiers();
+        break;
+      case 'go-prix':
+        leaveReviewIA();
+        state.screen = 'prix';
+        render();
+        loadPrix();
+        break;
+      case 'retry-prix':
+        loadPrix();
+        break;
+      case 'prix-toggle-form':
+        if (state.prixFormOpen) { fermerPrixForm(); break; }
+        state.prixFormOpen = true;
+        state.prixFormError = null;
+        render();
+        break;
+      case 'prix-modifier':
+        ouvrirPrixEdition(btn.getAttribute('data-id'));
+        break;
+      case 'prix-crm-refresh':
+        loadPrixCrm();
+        break;
+      case 'prix-crm-detail': {
+        const cle = btn.getAttribute('data-cle');
+        if (state.prixCrmDetail[cle]) delete state.prixCrmDetail[cle];
+        else state.prixCrmDetail[cle] = true;
+        render();
+        break;
+      }
+      case 'prix-crm-choisir': {
+        const cle = btn.getAttribute('data-cle');
+        if (state.prixCrmSel[cle]) delete state.prixCrmSel[cle];
+        else state.prixCrmSel[cle] = true;
+        render();
+        break;
+      }
+      case 'prix-crm-importer':
+        importerPrixCrm();
+        break;
+      case 'prix-filter':
+        state.prixFilter = btn.getAttribute('data-filter');
+        render();
+        break;
+      case 'prix-valide':
+        setPrixValide(btn.getAttribute('data-id'), btn.getAttribute('data-valide') === '1');
+        break;
+      case 'prix-supprimer':
+        deletePrix(btn.getAttribute('data-id'));
         break;
       case 'go-revision':
         leaveReviewIA();
