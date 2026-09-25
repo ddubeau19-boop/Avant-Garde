@@ -12,7 +12,9 @@ CREATE TABLE companies (
   slug        TEXT NOT NULL UNIQUE,
   logo_r2_key TEXT,
   created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  theme        TEXT,   -- JSON : couleurs, polices et coordonnées du rapport de la firme
+  mise_en_page TEXT    -- JSON : gabarit Word de mise en page importé (clé R2, analyse)
 );
 
 CREATE TABLE users (
@@ -90,7 +92,8 @@ CREATE TABLE components (
   limite_detail      TEXT,
   nature_risque      TEXT,   -- securite | infiltration | degradation | conformite | esthetique
   source_annee       TEXT,   -- plaque | carnet | administration | estimee
-  projet_ca          TEXT    -- travaux planifiés par le conseil d'administration
+  projet_ca          TEXT,   -- travaux planifiés par le conseil d'administration
+  taches_entretien   TEXT    -- JSON : tâches du carnet retirées ou ajoutées par l'ingénieur
 );
 
 CREATE TABLE photos (

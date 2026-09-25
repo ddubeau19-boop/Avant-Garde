@@ -152,6 +152,7 @@ const state = {
 
   dossiers: [],
   dossier: null,
+  tacheForm: null,       // { x, f, q, mois: [] } — ajout d'une tâche au carnet
   components: [],        // composantes actives de la visite
   inactifs: [],          // composantes retirées de la visite, réactivables
   filter: 'all',
@@ -412,7 +413,7 @@ async function loadProjection(id) {
 
 async function openFiche(id) {
   state.activeId = id; state.screen = 'fiche'; state.aiResult = null;
-  state.analyzing = false; state.recording = false; state.noteDraft = '';
+  state.analyzing = false; state.recording = false; state.noteDraft = ''; state.tacheForm = null;
   state.ficheLoading = true; state.activeComponent = null; state.error = null;
   state.attrKeyDraft = ''; state.attrValDraft = ''; state.facetsOpen = false;
   render();
@@ -596,6 +597,29 @@ function triggerPhotoInput() {
   if (input) input.click();
 }
 
+// Réduit une photo de téléphone (souvent 3 à 5 Mo) à 1600 px de côté en JPEG
+// avant l'envoi : le rapport Word les intègre toutes, et un Worker n'a que
+// 128 Mo de mémoire. En cas d'échec (format non décodable), l'original part.
+async function reduirePhoto(file) {
+  const COTE_MAX = 1600;
+  try {
+    if (!window.createImageBitmap || !file.type.startsWith('image/')) return file;
+    const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    const echelle = Math.min(1, COTE_MAX / Math.max(bitmap.width, bitmap.height));
+    if (echelle === 1 && file.size < 700 * 1024 && file.type === 'image/jpeg') { bitmap.close && bitmap.close(); return file; }
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bitmap.width * echelle);
+    canvas.height = Math.round(bitmap.height * echelle);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close && bitmap.close();
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.82));
+    if (!blob) return file;
+    return new File([blob], (file.name || 'photo').replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' });
+  } catch (err) {
+    return file;
+  }
+}
+
 async function onPhotoFileChange(e) {
   const file = e.target.files && e.target.files[0];
   e.target.value = '';
@@ -603,7 +627,7 @@ async function onPhotoFileChange(e) {
   state.uploadingPhoto = true; state.error = null; render();
   try {
     const fd = new FormData();
-    fd.append('file', file);
+    fd.append('file', await reduirePhoto(file));
     const res = await apiFetch(`/api/components/${state.activeId}/photos`, { method: 'POST', body: fd });
     let data = null;
     try { data = await res.json(); } catch (e2) {}
@@ -959,16 +983,17 @@ function computeDecades(projection) {
 async function downloadReport(kind) {
   if (!state.dossier) return;
   if (!state.online) { showToast('Téléchargement indisponible hors connexion.'); return; }
-  const key = kind === 'docx' ? 'downloadingDocx' : 'downloadingXlsx';
+  const key = kind === 'docx' ? 'downloadingDocx' : kind === 'suivi' ? 'downloadingSuivi' : 'downloadingXlsx';
   state[key] = true; state.error = null; render();
   try {
-    const res = await apiFetch(`/api/dossiers/${state.dossier.id}/report.${kind}`);
+    const chemin = kind === 'suivi' ? 'suivi-entretien.xlsx' : `report.${kind}`;
+    const res = await apiFetch(`/api/dossiers/${state.dossier.id}/${chemin}`);
     if (!res.ok) throw new Error("Le rapport n'est pas disponible pour le moment.");
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${slug(state.dossier.name)}-rapport.${kind}`;
+    a.download = kind === 'suivi' ? `${slug(state.dossier.name)}-suivi-entretien.xlsx` : `${slug(state.dossier.name)}-rapport.${kind}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -1381,6 +1406,86 @@ function ajouterConstat(terme) {
   if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
 }
 
+/* ---------- Carnet d'entretien de la composante ---------- */
+
+const FREQ_TACHE = [['H', 'Chaque semaine'], ['M', 'Chaque mois'], ['S', 'Une fois dans la saison'], ['A', 'Annuelle'], ['AS', 'Annuelle, par un entrepreneur'], ['A5', 'Aux 5 ans']];
+const QUI_TACHE = [['', 'Syndicat / gestionnaire'], ['Ménagers', 'Entretien ménager'], ['Contrat', 'Entrepreneur (contrat)']];
+const MOIS_COURTS = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
+
+function persoEntretien(c) {
+  const p = parseJsonObject(c && c.taches_entretien);
+  return { retirees: Array.isArray(p.retirees) ? p.retirees.slice() : [], ajoutees: Array.isArray(p.ajoutees) ? p.ajoutees.slice() : [] };
+}
+// Retirer, rétablir ou ajouter : on renvoie tout le réglage de la composante ;
+// le serveur le valide et répond avec la liste de tâches recalculée.
+async function enregistrerEntretien(perso) {
+  const c = state.activeComponent;
+  if (!c) return;
+  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
+  try {
+    await patchComponent(c.id, { taches_entretien: JSON.stringify(perso) });
+    render();
+  } catch (e) { /* erreur déjà affichée */ }
+}
+function retirerTache(id) {
+  const c = state.activeComponent; if (!c) return;
+  const p = persoEntretien(c);
+  if (id.startsWith('p_')) p.ajoutees = p.ajoutees.filter(t => t.id !== id);
+  else if (!p.retirees.includes(id)) p.retirees.push(id);
+  enregistrerEntretien(p);
+}
+function retablirTache(id) {
+  const c = state.activeComponent; if (!c) return;
+  const p = persoEntretien(c);
+  p.retirees = p.retirees.filter(x => x !== id);
+  enregistrerEntretien(p);
+}
+function ajouterTache() {
+  const c = state.activeComponent; const f = state.tacheForm;
+  if (!c || !f) return;
+  if (!f.x.trim()) { showToast('Décrivez la tâche.'); return; }
+  if (!f.mois.length) { showToast('Choisissez au moins un mois.'); return; }
+  const p = persoEntretien(c);
+  p.ajoutees.push({ x: f.x.trim(), f: f.f, q: f.q, mois: f.mois.slice().sort((a, b) => a - b) });
+  state.tacheForm = null;
+  enregistrerEntretien(p);
+}
+
+function carnetHtml(c) {
+  const toutes = Array.isArray(c.entretien) ? c.entretien : [];
+  const actives = toutes.filter(t => !t.retiree);
+  const retirees = toutes.filter(t => t.retiree);
+  const ligne = (t) => `
+    <div class="tache-row">
+      <div class="tache-mid">
+        <div class="tache-texte">${esc(t.texte)}${t.perso ? '<span class="tache-perso">ajoutée</span>' : ''}</div>
+        <div class="tache-sub">${esc(t.frequence)} · ${esc(t.quand)} · ${esc(t.responsable)}${t.aPreciser ? ' · <b>mois à préciser</b>' : ''}</div>
+      </div>
+      <button class="tache-x" data-action="tache-retirer" data-id="${esc(t.id)}" aria-label="Retirer cette tâche" ${!state.online ? 'disabled' : ''}><i data-lucide="x"></i></button>
+    </div>`;
+  const f = state.tacheForm;
+  const formulaire = f ? `
+    <div class="tache-form">
+      <input class="fld-input" data-role="tache-texte" value="${esc(f.x)}" placeholder="Tâche — ex. Vérifier l'étanchéité des joints de la margelle">
+      <div class="guide-lbl">Fréquence</div>
+      <div class="quick-chips">${FREQ_TACHE.map(([k, l]) => `<button class="quick-chip ${f.f === k ? 'on' : ''}" data-action="tache-freq" data-val="${k}">${esc(l)}</button>`).join('')}</div>
+      <div class="guide-lbl">Mois</div>
+      <div class="quick-chips">${MOIS_COURTS.map((m, i) => `<button class="quick-chip ${f.mois.includes(i + 1) ? 'on' : ''}" data-action="tache-mois" data-val="${i + 1}">${m}</button>`).join('')}</div>
+      <div class="guide-lbl">Responsable</div>
+      <div class="quick-chips">${QUI_TACHE.map(([k, l]) => `<button class="quick-chip ${f.q === k ? 'on' : ''}" data-action="tache-qui" data-val="${esc(k)}">${esc(l)}</button>`).join('')}</div>
+      <div class="tache-actions">
+        <button class="btn-outline" style="margin-top:0" data-action="tache-annuler">Annuler</button>
+        <button class="btn-cta" data-action="tache-ajouter" ${!state.online ? 'disabled' : ''}><i data-lucide="plus"></i>Ajouter</button>
+      </div>
+    </div>` : `<button class="btn-outline" data-action="tache-form"><i data-lucide="plus"></i>Ajouter une tâche</button>`;
+  return `
+    ${actives.length ? actives.map(ligne).join('') : '<div class="attr-empty">Aucune tâche du carnet pour cette composante.</div>'}
+    ${retirees.length ? `<details class="tache-retirees"><summary>Tâches retirées (${retirees.length})</summary>${retirees.map(t => `
+      <div class="tache-row retiree"><div class="tache-mid"><div class="tache-texte">${esc(t.texte)}</div><div class="tache-sub">${esc(t.frequence)} · ${esc(t.quand)}</div></div>
+      <button class="reactiver" data-action="tache-retablir" data-id="${esc(t.id)}"><i data-lucide="rotate-ccw"></i>Rétablir</button></div>`).join('')}</details>` : ''}
+    ${formulaire}`;
+}
+
 function obsFieldHtml(id, role, field, label, value, placeholder) {
   return `<div class="obs-field">
     <label for="${id}">${esc(label)}</label>
@@ -1568,6 +1673,9 @@ function ficheHtml() {
         <div class="s">${esc(repSub)}</div>
       </div>
 
+      <div class="section-lbl" style="margin-top:26px">Carnet d'entretien (${(c.entretien || []).filter(t => !t.retiree).length})</div>
+      ${carnetHtml(c)}
+
       <div class="section-lbl" style="margin-top:26px">Attributs</div>
       ${attributsHtml(c)}
 
@@ -1667,6 +1775,11 @@ function syntheseHtml() {
           <div class="mid"><div class="t">Durées de vie + carnet</div><div class="s">Excel (.xlsx)</div></div>
           <button class="dl" data-action="download-xlsx" ${state.downloadingXlsx || !state.online ? 'disabled' : ''}><i data-lucide="${state.downloadingXlsx ? 'loader-2' : 'download'}"></i>${state.downloadingXlsx ? '…' : 'Télécharger'}</button>
         </div>
+        <div class="report-row">
+          <div class="icon" style="background:var(--orange)"><i data-lucide="calendar-check"></i></div>
+          <div class="mid"><div class="t">Tableur suivi d'entretien</div><div class="s">Excel (.xlsx) · tâches par saison</div></div>
+          <button class="dl" data-action="download-suivi" ${state.downloadingSuivi || !state.online ? 'disabled' : ''}><i data-lucide="${state.downloadingSuivi ? 'loader-2' : 'download'}"></i>${state.downloadingSuivi ? '…' : 'Télécharger'}</button>
+        </div>
       </div>
 
       <div class="differentiator">
@@ -1706,6 +1819,18 @@ function onRootClick(e) {
     case 'set-facet': onFacetClick(t.dataset.field, t.dataset.val); break;
     case 'toggle-facets': state.facetsOpen = !state.facetsOpen; render(); break;
     case 'add-constat': ajouterConstat(t.dataset.val); break;
+    case 'tache-retirer': retirerTache(t.dataset.id); break;
+    case 'tache-retablir': retablirTache(t.dataset.id); break;
+    case 'tache-form': state.tacheForm = { x: '', f: 'S', q: '', mois: [] }; render(); break;
+    case 'tache-annuler': state.tacheForm = null; render(); break;
+    case 'tache-ajouter': ajouterTache(); break;
+    case 'tache-freq': if (state.tacheForm) { state.tacheForm.f = t.dataset.val; render(); } break;
+    case 'tache-qui': if (state.tacheForm) { state.tacheForm.q = t.dataset.val; render(); } break;
+    case 'tache-mois': if (state.tacheForm) {
+      const m = Number(t.dataset.val); const l = state.tacheForm.mois;
+      state.tacheForm.mois = l.includes(m) ? l.filter(x => x !== m) : l.concat([m]);
+      render();
+    } break;
     case 'attr-add': onAttrAdd(); break;
     case 'attr-del': onAttrDelete(t.dataset.key); break;
     case 'attr-suggest': {
@@ -1722,6 +1847,7 @@ function onRootClick(e) {
     case 'save-fiche': saveFiche(); break;
     case 'download-docx': downloadReport('docx'); break;
     case 'download-xlsx': downloadReport('xlsx'); break;
+    case 'download-suivi': downloadReport('suivi'); break;
     case 'generate-reports': generateReports(); break;
     case 'dismiss-error': state.error = null; render(); break;
     case 'logout': logout(); break;
@@ -1740,6 +1866,8 @@ function onRootInput(e) {
     state.attrKeyDraft = t.value;
   } else if (t.matches('[data-role="attr-val-draft"]')) {
     state.attrValDraft = t.value;
+  } else if (t.matches('[data-role="tache-texte"]')) {
+    if (state.tacheForm) state.tacheForm.x = t.value;
   } else if (t.matches('[data-role="login-email"]')) {
     state.loginEmail = t.value;
   } else if (t.matches('[data-role="login-password"]')) {

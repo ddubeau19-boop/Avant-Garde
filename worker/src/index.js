@@ -3411,6 +3411,8 @@ Réponds UNIQUEMENT par les numéros séparés par des virgules, ou par le mot A
 // créées au premier appel de chaque isolat plutôt que par une migration
 // manuelle : un déploiement ne peut pas précéder la base qu'il suppose.
 const COLONNES_AJOUTEES = [
+  ["companies", "theme", "TEXT"],
+  ["companies", "mise_en_page", "TEXT"],
   ["actif", "INTEGER NOT NULL DEFAULT 1"],
   ["etendue", "TEXT"],
   ["etendue_qte", "TEXT"],
@@ -3418,16 +3420,26 @@ const COLONNES_AJOUTEES = [
   ["limite_detail", "TEXT"],
   ["nature_risque", "TEXT"],
   ["source_annee", "TEXT"],
-  ["projet_ca", "TEXT"]
+  ["projet_ca", "TEXT"],
+  ["taches_entretien", "TEXT"]
 ];
 let colonnesPretes = null;
 function assurerColonnes(db) {
   if (!colonnesPretes) {
     colonnesPretes = (async () => {
-      const colonnes = await db.prepare("PRAGMA table_info(components)").all();
-      const presentes = new Set(colonnes.results.map((col) => col.name));
-      for (const [nom, type] of COLONNES_AJOUTEES) {
-        if (!presentes.has(nom)) await db.prepare(`ALTER TABLE components ADD COLUMN ${nom} ${type}`).run();
+      // Entrées [colonne, type] : table components ; [table, colonne, type] sinon.
+      const parTable = new Map();
+      for (const entree of COLONNES_AJOUTEES) {
+        const [table, nom, type] = entree.length === 3 ? entree : ["components", ...entree];
+        if (!parTable.has(table)) parTable.set(table, []);
+        parTable.get(table).push([nom, type]);
+      }
+      for (const [table, colonnes] of parTable) {
+        const infos = await db.prepare(`PRAGMA table_info(${table})`).all();
+        const presentes = new Set(infos.results.map((col) => col.name));
+        for (const [nom, type] of colonnes) {
+          if (!presentes.has(nom)) await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${nom} ${type}`).run();
+        }
       }
     })().catch((e) => {
       colonnesPretes = null;
@@ -3624,6 +3636,371 @@ const INFORMATIONS_REGLEMENTAIRES = {
   },
   rbq_clapets: () => "INFORMATION : La Régie du bâtiment du Québec (RBQ) rappelle aux propriétaires que dans un réseau de plomberie, il est obligatoire de bien protéger les appareils sanitaires contre le refoulement potentiel des égouts. En effet, les refoulements des eaux d'égout et des eaux de pluie sont à l'origine de bien des dommages à l'intérieur des bâtiments. Ces refoulements constituent d'ailleurs une des causes de réclamation les plus fréquentes auprès des compagnies d'assurance habitation."
 };
+// ============================================================================
+// CARNET D'ENTRETIEN — tâches par composante
+// ----------------------------------------------------------------------------
+// Bibliothèque tirée de la partie officielle (colonnes O et suivantes) du
+// gabarit « 5.10 - Suivi d'entretien 26-000 CE et CE MB - avr 2026 » de la
+// firme. Les onglets CE et CE MB y sont identiques, à deux lignes près ; la
+// section des heures (colonnes A à N) n'est pas reprise.
+//   e  — élément du carnet ; c — catégorie ; re — composantes rattachées
+//   t  — tâches : id stable, x texte, f fréquence, q responsable,
+//        o occurrences [saison, mois (1-12), mois connus ?, responsable propre ?]
+// Lecture du gabarit : le préfixe donne le rythme (H hebdomadaire, M mensuel,
+// S une fois dans la saison, A annuel, AS annuel par entrepreneur, A5 aux
+// 5 ans) et les cases grises de la colonne « Entretien » donnent les mois.
+// Les 81 cas incomplets du gabarit (texte sans case grise, case grise sans
+// texte) ont reçu leurs mois selon le climat québécois : scellants et
+// teintures en septembre, irrigation ouverte en mai et fermée en octobre,
+// inspections aux 5 ans planifiées en février… Les rappels « en cas de doute,
+// contacter Hydro-Québec, le fournisseur de gaz, la Ville » deviennent des
+// consignes en tout temps (C). Une case grise restée sans texte est ignorée.
+// ============================================================================
+const TACHES_ENTRETIEN = [
+  { e: "Aménagement", c: "Terrain et aménagement", re: /aménagement paysager/i, t: [{"id":"cf7ac983","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"5280e42d","x":"Tonte des pelouses et arrangements floraux","f":"S","q":"Contrat","o":[["ete",[7,8,9],true]]},{"id":"7dcd31f4","x":"Ouverture du système d'irrigation","f":"S","q":"Contrat","o":[["printemps",[5],true]]},{"id":"24573b12","x":"Fermeture du système d'irrigation","f":"S","q":"Contrat","o":[["automne",[10],true]]},{"id":"3d6e8907","x":"Retirer les clôtures à neige, en protection des arbustes et plates-bandes","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"dfe3c18d","x":"Installer des clôtures à neige en protection des arbustes et plates-bandes","f":"S","q":"Contrat","o":[["automne",[10],true]]},{"id":"4435195f","x":"Vérifier que la végétation n'est pas en contact avec le bâtiment, élaguer au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"e44a7e71","x":"Vérifier l'état général des arbres, bois mort","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"57e84d0c","x":"Vérifier l'état général des pelouses, déchaumage, fertilisation","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"0325b9a9","x":"Vérifier les secteurs exposés aux grands vents : arbres, branches et éléments susceptibles de se détacher","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"3ffb7862","x":"Vérifier les secteurs à risque d'inondation : drainage, pentes et accumulations d'eau","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Pentes du sol - Aménagement", c: "Terrain et aménagement", re: /aménagement paysager/i, t: [{"id":"e84bdb01","x":"S'assurer que la pente du sol est positive, ajuster au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"813c8dd2","x":"S'assurer de conserver un dégagement d'au moins 6 pouces entre le sol et les revêtements et structures, consulter un professionnel au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Stationnement et voie de circulation", c: "Terrain et aménagement", re: /^stationnement et voies|^voies de circulation|bordures|lignage/i, t: [{"id":"89bafc5e","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"a6e94766","x":"Vérifier la surface du pavage : fissuration, soulèvement, crevasses…","f":"A","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"a70645d8","x":"Vérifier les lignes de stationnement et les indicateurs de directions","f":"A","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"dfc3a3fa","x":"Vérifier les bordures de béton : fissuration, soulèvement, effritement…","f":"A","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"b00452cf","x":"Nettoyer les surfaces asphaltées","f":"AS","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"13615836","x":"Faire nettoyer les regards et les fosses de captation du réseau pluvial","f":"AS","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"2059527c","x":"Libérer de la neige les fosses de captation du réseau pluvial","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["automne",[11,12],true]]},{"id":"66929e30","x":"Faire déneiger les stationnements et voies de circulation","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true]]}] },
+  { e: "Allées piétonnières", c: "Terrain et aménagement", re: /allées piétonnières|^garde-corps/i, t: [{"id":"fe824712","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11],true]]},{"id":"57218be6","x":"Nettoyer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"181871be","x":"Vérifier la surface des allées de béton : fissures, affaissement, éclatement","f":"A","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"2d43e8c5","x":"Vérifier les surfaces des pavés de béton: fissures, affaissement, instabilité","f":"A","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"8435289e","x":"Réparer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"325d1da0","x":"Vérifier la solidité et la stabilité des garde-corps","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"8a1cbb0a","x":"Vérifier pour toute trace de corrosion","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"d3ab17a2","x":"Gratter la corrosion et appliquer une peinture antirouille","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"6f519bf5","x":"Voir à faire stabiliser et solidifier les structures","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"b8af9609","x":"Faire déneiger les passages piétonniers et rampes d'accès","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true]]}] },
+  { e: "Terrasses sur sol", c: "Terrain et aménagement", re: /terrasse sur sol/i, t: [{"id":"a387b33f","x":"Nettoyer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"99666ee0","x":"Vérifier la surface des pavés, remettre de niveau au besoin","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"0870f396","x":"S'assurer que la pente des dalles est positive et faire corriger au besoin","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"c295c40d","x":"Béton-Vérifier et documenter toute fissure, éclats et détérioration","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"b32aeed1","x":"Vérifier la solidité et la stabilité des garde-corps et faire réparer au besoin","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"0aad78b9","x":"Vérifier l'adhérence de la peinture et faire corriger au besoin","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"b01e177d","x":"Gratter la corrosion et poser une peinture antirouille","f":"S","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Escaliers", c: "Terrain et aménagement", re: /escaliers et perrons|^structures de bois traité|structure en acier galvanisé/i, t: [{"id":"8d5f877c","x":"Nettoyer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"f1612b16","x":"Vérifier la stabilité, solidité, ancrages et faire réparer au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"8c93c430","x":"Vérifier l'adhérence de la peinture et faire corriger au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Murets de soutènement", c: "Terrain et aménagement", re: /murets/i, t: [{"id":"d334c6bc","x":"Vérifier les murets de soutènement: déformation, soulèvement, inclinaison, fissuration, détachement","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"91255979","x":"Vérifier le ruissellement au haut du mur et pour tout indice d'érosion","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"a44d0c25","x":"Vérifier l'efficacité du système de drainage au bas des murs","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"3f5389b9","x":"Vérifier la solidité et la stabilité des garde-corps, attaches, charnières, quincaillerie. Tout muret de plus de 20 pouces de hauteur doit être protégé avec un garde-corps","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Clôture", c: "Terrain et aménagement", re: /clôture/i, t: [{"id":"3ede48b6","x":"Nettoyer et retirer les herbes","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"1a7b3864","x":"Vérifier le fonctionnement des portes","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"a98f62be","x":"Vérifier la stabilité des poteaux, des attaches et de la quincaillerie","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Structure", c: "Fondation - structure et stationnement intérieur", re: /^structure – allocation/i, t: [{"id":"f38598c3","x":"Vérifier et documenter toute fissure ou indices d'infiltration d'eau aux finis intérieurs et structures accessibles","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Fondation", c: "Fondation - structure et stationnement intérieur", re: /murs de fondation|drain français/i, t: [{"id":"04b9533d","x":"Nettoyer et retirer les herbes","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"11265172","x":"Vérifier et documenter la face extérieure pour toutes fissures, éclats, etc","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"6f35ae2a","x":"Vérifier et documenter tout risque d'accumulation d'eau près de la fondation","f":"S","q":"","o":[["printemps",[4,5,6],true],["automne",[10,11,12],true]]},{"id":"ed986335","x":"Colmater les fissures au besoin. Des travaux d'excavation sont possible","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"d23a91be","x":"Vérifier les murs intérieurs et noter toute fissure, trace d'humidité, efflorescence, etc. Colmater les fissures au besoin. Des travaux d'excavation sont possible","f":"S","q":"","o":[["printemps",[4,5,6],true],["automne",[10,11,12],true]]},{"id":"80528851","x":"Vérifier les espaces sous-terrains et vides sanitaire pour tout indice d'infiltration ou accumulation d'humidité","f":"S","q":"","o":[["printemps",[4,5,6],true],["automne",[10,11,12],true]]}] },
+  { e: "Margelle", c: "Fondation - structure et stationnement intérieur", re: /murs de fondation/i, t: [{"id":"3602f3f7","x":"Nettoyer et retirer les herbes","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"13e26058","x":"Vérifier que les margelles sont plus haut que le niveau du sol","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"72b798f1","x":"Vérifier que le drain de margelle soit dégagé et fonctionnel","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"4234cb65","x":"Nettoyer les margelles","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"1e58221e","x":"Vérifier à conserver un dégagement d'au moins 6 pouces entre le sol et les fenêtres","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Stationnement intérieur - Rampe d'accès", c: "Fondation - structure et stationnement intérieur", re: /stationnement intérieur – dalle/i, t: [{"id":"c58f4499","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7,8,9],true],["automne",[10,11],true]]},{"id":"4f412640","x":"Vérifier l'état de la surface pour toute fissuration, infiltration, détérioration, déformation","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"fb26bb11","x":"Vérifier le système de drainage au bas de la pente","f":"S","q":"","o":[["printemps",[4,5,6],true],["automne",[10],true]]},{"id":"a8685894","x":"Vérifier la grille du système de drainage: corrosion excessive, instabilité, mise à niveau","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"38bf6a16","x":"Libérer de la neige les fosses de captation du réseau pluvial","f":"S","q":"Contrat","o":[["hiver",[1],true]]},{"id":"fad6eab8","x":"Faire nettoyer les regards et les fosses de captation du réseau pluvial","f":"AS","q":"Contrat","o":[["printemps",[4],true],["automne",[11],true]]},{"id":"a701fcaf","x":"Faire déneiger les accès","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true]]}] },
+  { e: "Stationnement intérieur", c: "Fondation - structure et stationnement intérieur", re: /stationnement intérieur – (dalle|membrane de surface)/i, t: [{"id":"075bc62d","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true]]},{"id":"13dfe5ee","x":"Nettoyage des espaces","f":"M","q":"Ménagers","o":[["automne",[10],true]]},{"id":"cfe7d211","x":"Vérifier l'état de la dalle pour toute fissuration, infiltration, détérioration, déformation","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"3abc9a4b","x":"Vérifier l'état du revêtement, membrane","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"33ddada8","x":"Vérifier l'état des colonnes pour toutes fissuration, éclats, armature apparente, traces de coulures de rouille","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"fef38ad0","x":"Vérifier les bouches de drains pour toute accumulation","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"1ae13c59","x":"Vérifier la grille du système de drainage: corrosion excessive, instabilité, mise à niveau","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"27899437","x":"Vérification des pentes de drainage et de leur efficacité","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7],true],["automne",[10],true]]},{"id":"7efdbc60","x":"Vérifier le plafond pour déceler toute fuite sur le réseau de plomberie. Vérifier les scellants coupe-feu","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"6ca08b1f","x":"Faire nettoyer les regards, les fosses de captation et les drains","f":"AS","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"03ff3187","x":"Faire laver/dégraisser le plancher","f":"AS","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Inspections stationnement étagés - Loi 122", c: "Fondation - structure et stationnement intérieur", re: /stationnements étagés/i, t: [{"id":"c080242f","x":"Pour les stationnements de 2 niveaux et plus, planifier l'inspection requise aux 5 ans (loi 122)","f":"A5","q":"Contrat","o":[["hiver",[2],true]]}] },
+  { e: "Toit-terrasse", c: "Fondation - structure et stationnement intérieur", re: /toit-terrasse/i, t: [{"id":"6ffae724","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"0dd626eb","x":"Vérifier les plafonds et les équipements qui y sont suspendus pour déceler toute fissuration, traces d'infiltration, efflorescence, moisissures, condensation","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Toiture principale - Plat", c: "Enveloppe du bâtiment", re: /toit plat/i, t: [{"id":"57125e0b","x":"Vérifier la présence de glace aux gouttières, drain de toiture","f":"S","q":"","o":[["hiver",[1,2,3],true]]},{"id":"cd6d9502","x":"Vérifier l'état des membranes, du recouvrement de gravier, des scellants et des systèmes de drainage","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"7e3ada28","x":"Vérifier la présence de grande accumulation d'eau suite aux pluies","f":"S","q":"","o":[["ete",[7],true]]},{"id":"a7caeb97","x":"Vérifier les pentes de drainage et de leur efficacité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"1f64ca71","x":"Vérifier l'état des solins et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"2bd78134","x":"Vérifier l'état des membranes, réparer ou remplacer les sections endommagés, combler les espaces en manque de gravier","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"d65321d3","x":"Faire enlever les débris et nettoyer les drain de toits","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Toiture principale - Pente", c: "Enveloppe du bâtiment", re: /toit en pente|gouttières/i, t: [{"id":"e4dfc4e2","x":"Vérifier la présence de glace aux gouttières, drain de toiture","f":"S","q":"","o":[["hiver",[1,2,3],true]]},{"id":"6459aa5a","x":"Vérifier l'état des bardeaux, des scellants et des systèmes de drainage","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"7cc63767","x":"Vérifier les pentes de drainage et de leur efficacité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"0f5d4887","x":"Vérifier l'état des solins et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"707448d3","x":"Vérifier l'état des bardeaux, réparer ou remplacer les bardeaux endommagés","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"84cfa7f2","x":"Vérifier l'état et le scellement des solins ainsi que les fixations corriger si nécessaire","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"2745923f","x":"Faire enlever les débris et nettoyer les gouttières de toits","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Toiture des saillies", c: "Enveloppe du bâtiment", re: /saillies/i, t: [{"id":"861f8002","x":"Vérifier la présence de glace aux gouttières, drain de toiture","f":"S","q":"","o":[["hiver",[1,2,3],true]]},{"id":"dda6ed38","x":"Vérifier l'état des recouvrements, des scellants et des systèmes de drainage","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"f6667793","x":"Vérifier les pentes de drainage et de leur efficacité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"85ae502f","x":"Vérifier l'état des bardeaux, réparer ou remplacer les bardeaux endommagés","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"2b003e14","x":"Vérifier l'état et le scellement des solins ainsi que les fixations corriger si nécessaire","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"733fd256","x":"Faire enlever les débris et nettoyer les système de drainage","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Toiture des marquises", c: "Enveloppe du bâtiment", re: /marquise/i, t: [{"id":"d705e4c9","x":"Vérifier la présence de glace aux gouttières, drain de toiture","f":"S","q":"","o":[["hiver",[1,2,3],true]]},{"id":"05d49288","x":"Vérifier l'état des recouvrements, des scellants et des systèmes de drainage","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"5cb49273","x":"Vérifier les pentes de drainage et de leur efficacité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"43ce7a1d","x":"Éléments d'acier peint, vérifier l'état des surfaces et l'apparition de corrosion","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"b5cbbfba","x":"Vérifier l'état des bardeaux, réparer ou remplacer les bardeaux endommagés","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"c431d637","x":"Vérifier l'état et le scellement des solins ainsi que les fixations corriger si nécessaire","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"59abe763","x":"Faire enlever les débris et nettoyer les système de drainage","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Toiture - Équipements", c: "Enveloppe du bâtiment", re: /cvac – communs – toiture|puits de lumière|solins, parapets|structure de service/i, t: [{"id":"625716bf","x":"Vérifier que les condenseurs soient bien installés","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"6f4a106e","x":"Vérifier que les antennes soient bien fixés","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"a2cf75c0","x":"Vérifier que les drains de toiture ou gouttières soient bien nettoyés","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"4f34ca32","x":"Voir à faire identifier tous les appareils sur la toiture","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"2202ef20","x":"Vérifier les structures en bois traitées","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"2ebb6cfa","x":"Vérifier les pare-vents","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"aeea0815","x":"Vérifier les trottoirs","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"39183bc0","x":"Vérifier les potagers","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Enveloppe du bâtiment - Béton préfabriqué", c: "Enveloppe du bâtiment", re: /béton préfabriqués/i, t: [{"id":"3afe13d5","x":"Vérifier l'état des panneaux. Relever toutes fissures, éclatement et trace d'efflorescence","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"bc236f48","x":"S'assurer du bon dégagement des drains de panneau et nettoyer délicatement si nécessaire","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"84605b3a","x":"Vérifier les joints de scellant au périmètre des éléments traversant les panneaux","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"22f95723","x":"Vérifier et remplacer les joints de scellant au périmètre des éléments traversant les panneaux","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"a765f4fc","x":"Vérifier les joints de contrôle et d'expension","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"6b4ba185","x":"Vérifier et corriger les joints de contrôle et d'expension","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]}] },
+  { e: "Enveloppe du bâtiment - Maçonnerie", c: "Enveloppe du bâtiment", re: /maçonnerie|parement – pierre|linteaux|scellants de rencontre/i, t: [{"id":"f5708d9c","x":"Vérifier l'état du mortier et de la maçonnerie. Relever toutes fissures, éclatement et trace d'efflorescence","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"1e8948d2","x":"S'assurer du bon dégagement des chantepleures et nettoyer délicatement si nécessaire","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"21354cc5","x":"Vérifier les joints de scellant au périmètre des éléments traversant la maçonnerie","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"0c49c12e","x":"Vérifier et remplacer les joints de scellant au périmètre des éléments traversant le revêtement","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"98ea77c2","x":"Vérifier les joints de contrôle et d'expension","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"94cb0298","x":"Vérifier et corriger les joints de contrôle et d'expension","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"38802bfc","x":"Vérifier l'état des linteaux et des solins de maçonnerie","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"c329e62e","x":"Vérifier l'état des solins métalliques et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Enveloppe du bâtiment - Parement de fibro-ciment", c: "Enveloppe du bâtiment", re: /fibrociment|panneaux composites|enduit acrylique|parement – stuc|agrégats/i, t: [{"id":"ea552b8d","x":"Vérifier l'état du revêtement. Relever les éclats, bris et bosselures","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"3d71b5ff","x":"Vérifier les joints de scellant entre le parement de fibro-ciment et les autres surfaces","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"9902af65","x":"Vérifier et remplacer les joints de scellant au périmètre des éléments traversant le revêtement","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"059f5876","x":"Vérifier l'état des solins et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Enveloppe du bâtiment - Parement métallique", c: "Enveloppe du bâtiment", re: /parement – métallique|soffites/i, t: [{"id":"e370b6dc","x":"Vérifier l'état du revêtement. Relever les éclats, bris et bosselures","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"55b9e891","x":"Vérifier et faire remplacer les joints de scellant entre le parement métallique et les autres surfaces","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"1cd3d8f6","x":"Vérifier et remplacer les joints de scellant au périmètre des éléments traversant le revêtement","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"3074bbb7","x":"Vérifier l'état des solins et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Enveloppe du bâtiment - Parement de bois", c: "Enveloppe du bâtiment", re: /fibre de bois|parement – vinyle/i, t: [{"id":"8ebaae1d","x":"Vérifier l'état du revêtement. Relever les éclats, bris et bosselures","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"e03c27f7","x":"Vérifier l'état des enduits de surface. Planifier la pose de teinture, peinture","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"8e64e9ce","x":"Vérifier et faire remplacer les joints de scellant entre le parement d'aluminium et les autres surfaces","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"9cf03c74","x":"Vérifier et remplacer les joints de scellant au périmètre des éléments traversant le revêtement","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"1d1d5c25","x":"Vérifier l'état des solins et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Bouches de ventilation", c: "Enveloppe du bâtiment", re: /ventilation – privatif/i, t: [{"id":"876e3a8a","x":"Rappeler aux copropriétaires de vérifier le branchement et l'efficacité des conduits de sécheuse","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"f7562be7","x":"Nettoyer les grilles de sortie","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"52d9d80a","x":"Nettoyer les conduits et les grilles de sortie","f":"S","q":"Contrat","o":[["printemps",[5],true],["ete",[8],true],["automne",[10],true]]}] },
+  { e: "Inspections des façades - Loi 122", c: "Enveloppe du bâtiment", re: /inspection des façades/i, t: [{"id":"039bbdfd","x":"Pour les immeubles de 5 étages et plus, planifier les inspections requises aux 5 ans (Loi 122)","f":"A5","q":"Contrat","o":[["hiver",[2],true]]}] },
+  { e: "Portes et fenêtres", c: "Portes extérieures et fenêtres", re: /^portes d'entrée|^portes de service – |portes-patio|porte simple|^fenêtres|scellants d'ouverture|vestibule|blocs de verre/i, t: [{"id":"fa5fbf82","x":"Nettoyage les surfaces, vitrages et huiler la quincaillerie","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"e393aca9","x":"Rappeler aux copropriétaires de vérifier le fonctionnement des portes-patios, portes-fenêtres et fenêtres et lubrifier/ajuster au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"bf15d40b","x":"Vérifier la présence de condensation et de buée à l'intérieur des verres thermos","f":"S","q":"","o":[["hiver",[1,2,3],true],["automne",[10],true]]},{"id":"0e9fdd92","x":"Vérifier la présence de traces d'infiltration d'eau à l'intérieur des vitrages et des contour de fenêtres et des portes","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"9cf0eeae","x":"Vérifier les allèges de fenêtre, les coupes-froids, scellants, nettoyage et lubrification des systèmes de fermeture des volets ouvrants","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"dbc0cc41","x":"Vérifier les seuils de porte, les coupes-froids, ferme-porte, scellants, nettoyage et lubrification des systèmes de fermeture des portes principales et de services","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"f8ca0e74","x":"Lubrifier les charnières de portes et resserrer les vis au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"a5c02213","x":"Ajuster les mécanismes d'ouverture, pognée, gache et barre panique","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"565ec25a","x":"Ajuster les charnières à ressort ou les cylindres des portes coupe-feu","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"9f162758","x":"Remplacer les joints de scellant au périmètre des portes et fenêtres","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]}] },
+  { e: "Portes de garage", c: "Portes extérieures et fenêtres", re: /porte de garage/i, t: [{"id":"dafffa0c","x":"Nettoyer les surfaces, les vitrages et huiler la quincaillerie","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"0e34a69e","x":"Vérifier les seuils, les coupes-froids et les scellants","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"38212e1a","x":"Vérifier le bon fonctionnement d'ouverture/fermeture des portes de stationnements","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"55d7a981","x":"Vérifier les panneaux, charnières et roues pour tout indices de bris, bosselures ou impacts - Usures et lubrification","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"eee2d46f","x":"Vérifier les resssorts, câbles de tension, fixations ainsi que les cablages électriques","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"75999ae7","x":"Vérifier la courroie d'entrainement","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"5dc43c97","x":"Vérifier le mécanisme d'ouverture manuel","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"ab7b1405","x":"Vérifier, nettoyer et lubrifier les éléments de la porte de garage et de son système d'ouverture","f":"S","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Mur rideau", c: "Portes extérieures et fenêtres", re: /mur-rideau/i, t: [{"id":"cdcd5591","x":"Nettoyage les surfaces et vitrages","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"64fdd6f6","x":"Vérifier la présence de condensation et de buée à l'intérieur des verres thermos","f":"S","q":"","o":[["hiver",[1,2,3],true],["automne",[10],true]]},{"id":"544fc403","x":"Remplacer les joints de scellant rigide au périmètre vitrage","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"9185b5ed","x":"Vérifier la présence de traces d'infiltration d'eau de l'intérieur des structures et des contour des vitrages","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Balcons", c: "Balcons escaliers et terrasses", re: /^balcons – /i, t: [{"id":"86756fd4","x":"Déneiger les balcons communs","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true]]},{"id":"8a1614ef","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"2e968c72","x":"Nettoyage des espaces","f":"M","q":"Ménagers","o":[["automne",[10,11,12],true]]},{"id":"9db7e777","x":"Rappel aux copropriétaires de déneiger leur balcon - si demandé par le syndicat","f":"M","q":"","o":[["hiver",[1,2,3],true]]},{"id":"fed99fdf","x":"Vérifier la stabilité et la fixation des mains courantes et garde-corps","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"6a924a19","x":"Vérifier la stabilité et la fixation des mains courantes et garde-corps. Corriger au besoin","f":"S","q":"","o":[["automne",[10],true]]},{"id":"97c19d09","x":"Balcon composite - vérifier l'état des surfaces, mains courantes, garde-corps et poteaux, et l'apparition de corrosion. Retouches au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"8e11d571","x":"Vérifier l'état des pontages de fibre de verre","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"ed815c41","x":"Vérifier les pentes et l'efficacité du drainage. Noter toute trace d'accumulation d'eau","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"7ad01070","x":"Vérifier les joints de scellant à la jonction des murs, retoucher si nécessaire","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"b0b47816","x":"Balcon de béton - Vérifier et documenter toute fissuration, effritement, éclatement, ancrages…","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"4e5340e1","x":"Balcon de béton - vérifier l'état des surfaces, Corriger avec un scellant ou un mortier","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"84d15249","x":"Balcon de béton - vérifier l'état des, mains courantes, garde-corps et poteaux, et l'apparition de corrosion. Retouches au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Terrasses urbaine - Toiture", c: "Balcons escaliers et terrasses", re: /terrasses urbaines/i, t: [{"id":"8613a49c","x":"Vérifier la stabilité et la fixation des mains courantes et garde-corps","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"c59010ee","x":"Mains courantes et garde-corps, vérifier l'état des surfaces et l'apparition de corrosion. Retouches au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"8245774b","x":"Pontage de bois, vérifier l'état des surfaces et réparations locales au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"200bdabe","x":"Pontage de bois, appliquer une protection sur les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"d48c902b","x":"Vérifier ou faire vérifier le plafond du niveau sous la terrasse","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"78ef89fa","x":"Vérifier les drains sous la terrasse et l'efficacité de l'évacuation vers les drains","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"88a70584","x":"Vérifier pour tout indice d'accumulation d'eau","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Vide sous toit", c: "Intérieur du bâtiment", re: /vides sous toit/i, t: [{"id":"acdf9ae4","x":"Vérifier le vide sous toit et documenter toutes traces d'infiltrations ou d'accumulation d'humidité","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Entrées et vestibules", c: "Intérieur du bâtiment", re: /vestibule/i, t: [{"id":"ef7773d4","x":"Nettoyer les espaces, surfaces, vitrages, sol et équipements","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"94579024","x":"Vérifier l'état des grilles grattes pieds","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[10],true]]},{"id":"fc524c62","x":"Vérifier l'état et le fonctionnement des systèmes de fermetures des portes de service. Mouvements, barrures, charnières","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Corridors et espaces communs", c: "Intérieur du bâtiment", re: /placoplâtre|revêtement de sol|tuiles acoustiques|lambris|escaliers intérieurs|surfaces vitrées intérieures|portes des unités|portes de service intérieures|rangements grillagés/i, t: [{"id":"acaf9146","x":"Nettoyer les espaces, surfaces, murs, planchers, plafonds, vitrages intérieures, équipements","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"5b28b4ef","x":"Vérifier l'état des planchers, murs et plafonds pour tout indice de soulèvement, détachement, perte d'adhérence, affaissement, infiltration","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"ed65ecdb","x":"Vérifier les drains de planchers pour tout indice de refoulement, débris, odeurs","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"dac97419","x":"Vérifier l'état et le fonctionnement des systèmes de fermetures des portes des unité/de service. Mouvements, barrures, charnières","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"bdb7d732","x":"Vérifier l'état des escaliers, stabilité, solidité, peintures, vernis","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"e82896d0","x":"Vérifier la stabilité et l'état des rampes et garde-corps des escaliers, peintures, vernis","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"07e914c7","x":"Vérifier l'état des équipements de cuisines communes: plomberie, robinetterie, cuisinière, ventilation/évacuation et clapet de sortie d'évacuation","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"915c9f6f","x":"Vérifier l'état des équipements de buanderie communes: plomberie, robinetterie, évacuation, grilles de sortie d'évacuation","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"a5479bf5","x":"Vérifier l'état des mobiliers fixes communs (salle de toilette, cuisine, salle commune): comptoirs, ajustements des charnières, glissière des tiroirs","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Chauffage localisé des espaces communs", c: "Intérieur du bâtiment", re: /plinthes électriques|aérothermes muraux/i, t: [{"id":"f7fcce29","x":"Vérifier le fonctionnement, stabilité, accumulation de poussière excessive","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true],["hiver",[1,2],true],["automne",[10,11,12],true]]},{"id":"6b2141e4","x":"Nettoyer les ailettes des plinthes électriques et aérothermes","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7],true],["automne",[10,11,12],true]]},{"id":"57a27c36","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9c1f726f","x":"Vérifier les chauffages des espaces communs","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true]]},{"id":"53a221f3","x":"Près des sorties, vérifier pour toute corrosion excessive","f":"M","q":"","o":[["hiver",[1,2],true],["automne",[10,11,12],true]]}] },
+  { e: "Salle commune", c: "Mobiliers et installations de confort", re: /^mobilier – espaces communs|^mobilier fixe/i, t: [{"id":"605b83a6","x":"Vérifier le mobilier intérieur: solidité, stabilité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"7f278c0c","x":"Vérifier le mobilier fixe, stabilité, solidité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9f6faa65","x":"Vérifier les équipements, fonctionnement, stabilité, solidité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"bc20a6c4","x":"Vérifier les équipements de buanderie, fonctionnement, stabilité, solidité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Salle de confort / Bibliothèque", c: "Mobiliers et installations de confort", re: /^mobilier – espaces communs|^mobilier fixe/i, t: [{"id":"40eee11f","x":"Vérifier le mobilier intérieur: solidité, stabilité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Bureau de l'administration", c: "Mobiliers et installations de confort", re: /^mobilier – espaces communs/i, t: [{"id":"923d0967","x":"Vérifier le mobilier intérieur: solidité, stabilité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Bureau de la sécurité", c: "Mobiliers et installations de confort", re: /surveillance/i, t: [{"id":"41c1ff7b","x":"Vérifier le mobilier intérieur: solidité, stabilité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Protection incendie", c: "Appareils et équipements spéciaux", re: /système d'incendie – (panneau central|détecteurs)/i, t: [{"id":"053b0ae1","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"83cf1563","x":"Planifier un exercice d'évacuation d'urgence - Incendie","f":"A","q":"","o":[["hiver",[2],true]]},{"id":"42a9e7fe","x":"Procéder à un exercice d'évacuation d'urgence - Incendie","f":"A","q":"","o":[["printemps",[5,6],true]]},{"id":"3c4ca8f5","x":"Planifier un plan de procédures d'urgence - Incendie","f":"A","q":"","o":[["hiver",[2],true]]},{"id":"1d102119","x":"Immeubles de 3 étages et plus: vérifier que des affiches d'évacuation soient placée près des ascenseurs","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Extincteurs portatifs", c: "Appareils et équipements spéciaux", re: /détecteurs d'incendie et extincteurs/i, t: [{"id":"0f9e09df","x":"Planifier l'inspection annuelle - NFPA 10","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"c2989888","x":"Vérifier les portes des rangement d'extincteurs - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"1f38734c","x":"Vérifier que les extincteurs sont pleins, en place, visibles et accessibles","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Détecteurs d'incendie", c: "Appareils et équipements spéciaux", re: /détecteurs d'incendie/i, t: [{"id":"ace6fb31","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"68f27f31","x":"Rappel au copropriétaire de vérifier le fonctionnement des détecteurs autonomes","f":"AS","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"20a9bed8","x":"Rappel au copropriétaire de vérifier l'année d'installation des détecteurs autonomes (10 ans)","f":"A","q":"","o":[["hiver",[1],true],["ete",[7],true]]}] },
+  { e: "Alarme d'incendie", c: "Appareils et équipements spéciaux", re: /panneau central|alarme incendie/i, t: [{"id":"7b034fdc","x":"Planifier l'inspection annuelle CAN/ULC-S536","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"95550042","x":"Vérifier que le panneau d'alarme d'incendie n'indique pas de code de défectuosité","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"aece5dfa","x":"Vérifier que le certificatde bon fonctionnement du syst. Alarme incendie soit à jour","f":"A","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"dc19ba3d","x":"Vérifier que le certificat de bon fonctionnement du système de protection d'incendie soit affiché","f":"A","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"111d2531","x":"Vérifier les systèmes du poste central d'alarme: selon CAN/ULC-S561","f":"A","q":"Contrat","o":[["hiver",[1],true]]}] },
+  { e: "Éclairages d'urgences", c: "Appareils et équipements spéciaux", re: /éclairage d'urgence/i, t: [{"id":"ff27f7bf","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"2a6ddded","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"00754918","x":"Vérifier que les témoins lumineux des éclairages d'urgences sont visibles","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"92bb36e9","x":"Vérifier les systèmes d'éclairage autonome d'urgence - par batterie","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"e66579f4","x":"Vérifier les systèmes d'éclairage autonome d'urgence - par génératrice","f":"A","q":"Contrat","o":[["hiver",[1],true]]}] },
+  { e: "Communication avec les unités", c: "Appareils et équipements spéciaux", re: /interphones/i, t: [{"id":"10a9adb8","x":"Nettoyer adéquatement le système dans les halls principaux","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"d22d16f6","x":"Vérifier le bon fonctionnement des interphones dans les unités","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"1aadf030","x":"Vérifier l'état général du panneau de contrôle principal: émission/réception de message audible, ouverture des portes, délai","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Communication dans les espaces communs", c: "Appareils et équipements spéciaux", re: /interphones/i, t: [{"id":"0f7689a1","x":"Vérifier le fonctionnement du téléphone d'urgence","f":"H","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"61c95233","x":"Vérifier le fonctionnement du système de haut-parleur par étage","f":"H","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"8cd53054","x":"Faire vérifier les systèmes","f":"A","q":"Contrat","o":[["hiver",[1],true]]}] },
+  { e: "Système de surveillance CCTV", c: "Appareils et équipements spéciaux", re: /surveillance/i, t: [{"id":"848f2528","x":"Vérifier que les cameras et écrans sont fonctionnelles et stables","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"ec6541b5","x":"Vérifier que les enregistrements sont disponibles","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Séparations coupe-feu", c: "Appareils et équipements spéciaux", re: /coupe-feu|obturation/i, t: [{"id":"46cb1f9c","x":"S'assurer que les portes séparations coupe-feu soient bien fermées et enclanchées et que leur ouverture compléte est possible","f":"H","q":"","o":[["hiver",[1],true]]},{"id":"1cda4599","x":"S'assurer que les séparations coupe-feu soient bien fermées et enclanchées et que leur ouverture compléte est possible","f":"H","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"b1e4d2fc","x":"S'assurer que les registres et les clapets coupe-feu sont en bon état: maillon-fusible, guides et roulements, position ouverte","f":"A","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Foyers et cheminées - Combustible solide", c: "Appareils et équipements spéciaux", re: /foyers/i, t: [{"id":"94088c93","x":"S'assurer auprès du services d'incendie de votre municipalité que les normes et réglementation en vigueur soient respecté - Depuis septembre 2017 plusieurs municipalités limitent l'utilisation des systèmes à combustible solide","f":"A","q":"","o":[["printemps",[5],true]]},{"id":"da9fda2d","x":"Vérifier l'état de la paroi extérieure, chapeau, stabilité, insertion, scellant et faire ramoner","f":"S","q":"","o":[["printemps",[5],true],["automne",[11],true]]}] },
+  { e: "Système de gicleur", c: "Appareils et équipements spéciaux", re: /gicleurs/i, t: [{"id":"0bcffbac","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["hiver",[1,2,3],true]]},{"id":"4b691816","x":"Les têtes de gicleur ne présentent pas de fuites ou de déformation","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"57d5e75e","x":"Les systèmes de pompes de gicleurs ne présentent pas de fuite ou corrosion importante","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"cad4684c","x":"Le local des pompes est sécurisé en tout temps","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a74e6bd2","x":"Le chauffage des locaux des pompes est fonctionnel","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a7d7ed7d","x":"Les raccords extérieurs de pompiers sont visibles et accessibles en tout temps","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"a34e6b6e","x":"L'alarme de basse température est fonctionnelle","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"0e94851f","x":"Vérification complète du système de gicleurs automatique - Selon NFPA 25","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"2b9b1f3c","x":"Vérification (5 ans) du système de gicleurs automatique - Selon NFPA 25","f":"A5","q":"Contrat","o":[["hiver",[1],true]]}] },
+  { e: "Système fermeture automatique des portes", c: "Appareils et équipements spéciaux", re: /ferme-portes/i, t: [{"id":"6f488377","x":"Vérifier le mécanisme de fermeture automatique","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"c2774f4e","x":"Vérifier le bon fonctionnement (aucun message d'erreurs)","f":"M","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Boites postales", c: "Appareils et équipements spéciaux", re: /casiers postaux/i, t: [{"id":"c214ad3b","x":"Nettoyer adéquatement, retirer toutes affiches ou publicité","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"e8f5eb74","x":"Vérifier les boites postales, fonctionnement, solidité, infraction, etc","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Chutes à déchets", c: "Appareils et équipements spéciaux", re: /chute à déchets – allocation/i, t: [{"id":"807639d3","x":"Nettoyer adéquatement et huiler la quincaillerie","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"e8b5e77e","x":"Vérifier l'état du conduit de chute et le système de fermeture des portes d'accès sur chaque étage","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"95044fac","x":"Vérifier l'état de la sortie du conduit et assurer la libre sortie, stabilité, propreté","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"51385518","x":"Faire nettoyer les chutes à déchets","f":"M","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"0606bdf2","x":"Vérifier l'état des conteneurs à déchets, roues, couvercles, stabilités, propreté","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"5b950eec","x":"Faire nettoyer/réparer les conteneurs à déchets","f":"M","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7,8,9],true],["automne",[10],true]]}] },
+  { e: "Compacteur à déchets", c: "Appareils et équipements spéciaux", re: /compacteur/i, t: [{"id":"406243ab","x":"Vérifier l'état général, stabilité, usure, fonctionnement, étanchéité des portes, aire de travail sécuritaire, propreté","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a7a993f1","x":"Vérifier le panneau électrique et le câblage, feux avertisseurs, fonctionnement du bouton d'urgence, niveau d'huile","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"c83148c3","x":"Faire vérifier et nettoyer le compâcteur à déchets","f":"M","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Ascenseur", c: "Appareils et équipements spéciaux", re: /ascenseur/i, t: [{"id":"8ce20b76","x":"Planifier l'inspection/maintenance annuelle","f":"A","q":"","o":[["hiver",[1],true]]},{"id":"e7245e8b","x":"Nettoyer adéquatement, retirer toutes affiches ou publicité","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"88b88002","x":"Vérifier que les essaies mensuels soit effectuées et inscrit au registre","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"22aff4ef","x":"Vérifier que les interventions, date, nom travail effectuée soient inscrit au registre","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"5aa4a0f2","x":"Vérifier que le registre des interventions et d'essaies annuels soient mis à jours par l'entrepreneur et présent dans la salle des ascenseurs - Selon (CSA B44-07) et (B44.2-07)","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"5a9f1dfb","x":"Vérifier que les attestations des essaies annuels des dispositifs de sécurité soit affiché ou au dossier","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"4e86a28c","x":"Faire effectuer la maintenance annuelle du système d'ascenseur - RBQ 14.1","f":"A","q":"","o":[["hiver",[1],true]]}] },
+  { e: "Apport d'air frais espaces communs", c: "Système de chauffage et ventilation", re: /échangeurs d'air|cvac – communs/i, t: [{"id":"9381255c","x":"Planifier le service d'entretien","f":"S","q":"","o":[["hiver",[1],true]]},{"id":"5e16d4e6","x":"Nettoyer adéquatement, vérifier les filtres et remplacer au besoin (3 mois)","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"1854a4bc","x":"Vérifier les ventilateurs, stabilité, bruits, courroies, alignement des poulies, poussières excessives","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"66ba255c","x":"Faire vérifier le ventilateur air neuf des espaces communs","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Climatisation localisée - espaces communs", c: "Système de chauffage et ventilation", re: /cvac – communs/i, t: [{"id":"a1e9a9d0","x":"Planifier le service d'entretien","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"b0a4d732","x":"Nettoyer adéquatement, vérifier les filtres et remplacer au besoin (minimum 3 mois ou selon manufacturier)","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"8f437c1c","x":"Nettoyer adéquatement, vérifier les filtres et remplacer au besoin (3 mois)","f":"M","q":"Ménagers","o":[["automne",[10,11,12],true]]},{"id":"7d4d6737","x":"Vérifier le fonctionnement, stabilité, bruits, filtres, poussières excessives","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"06d7ec8c","x":"Système CVAC des espaces communs","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Chauffage intégré grande surface - Communs", c: "Système de chauffage et ventilation", re: /chauffage à eau chaude/i, t: [{"id":"a4b038ac","x":"Planifier le service d'entretien","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"5fd92784","x":"Vérifier le fonctionnement, stabilité, câblage, branchement, filtres, corrosion","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true]]},{"id":"a5abdf4a","x":"Faire vérifier le système Chauffage intégré","f":"A","q":"","o":[["hiver",[1],true]]}] },
+  { e: "Ventilation salles techniques", c: "Système de chauffage et ventilation", re: /ventilation des salles de services/i, t: [{"id":"bb891249","x":"Nettoyer adéquatement, vérifier les filtres et remplacer au besoin (Minimum 3 mois ou selon manufacturier)","f":"M","q":"Ménagers","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"fc2f66d8","x":"Vérifier le fonctionnement, stabilité, bruits, filtres, poussières excessives","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"4023e354","x":"Faire vérifier les ventilateur des salles techniques","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Climatisation - salles techniques", c: "Système de chauffage et ventilation", re: /climatisation de zone/i, t: [{"id":"d0a9002e","x":"Planifier le service d'entretien","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"6dd81ba8","x":"Nettoyer adéquatement, vérifier les filtres et remplacer au besoin (Minimum 3 mois ou selon manufacturier)","f":"M","q":"Ménagers","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"c1320b0e","x":"Vérifier le fonctionnement, stabilité, bruits, filtres, poussières excessives","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"34331114","x":"Faire vérifier la climatisation des salles techniques","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Apport d'air frais - Stationnement intérieur", c: "Système de chauffage et ventilation", re: /ventilation du stationnement/i, t: [{"id":"6d8dbe09","x":"Planifier le service d'entretien","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"c0efe5d8","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"31171261","x":"Vérifier les ventilateurs et les volets persiennes motorisés: fonctionnement, stabilité, bruits, poussières excessives","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"51a38ca0","x":"Vérifier les boitiers: support, étanchéité, corrosion, peinture écaillée, stabilité","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"285e1f60","x":"Faire vérifier les ventilateurs air neuf et volets persiennes des stationnements","f":"S","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Chauffage - Stationnement intérieur", c: "Système de chauffage et ventilation", re: /aérothermes suspendus/i, t: [{"id":"30f771de","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"61f28234","x":"Vérifier le fonctionnement, stabilité, câblage, branchement, filtres, corrosion, bruits","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[10,11,12],true]]},{"id":"8d16a7d7","x":"Faire vérifier les aérothermes des stationnements","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Évacuation CO/NO2", c: "Système de chauffage et ventilation", re: /détection des gaz/i, t: [{"id":"972b7d6b","x":"Planifier l'inspection et calibration annuelle","f":"A","q":"","o":[["hiver",[1],true]]},{"id":"2c195803","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"0a92ceec","x":"Vérifier le fonctionnement, stabilité, bruits, contrôle de l'apport d'air frais et ouverture des volets motorisés","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"da2a20cc","x":"Faire effectuer la calibration des Sonde de détection CO\\NO2","f":"A","q":"Contrat","o":[["printemps",[4],true]]},{"id":"053283be","x":"Faire vérifier - Système d'évacuation CO\\NO2","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Système de désenfumage", c: "Système de chauffage et ventilation", re: /obturation/i, t: [{"id":"6009c8d9","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"76048633","x":"Vérifier le fonctionnement, stabilité, bruits, contrôle de l'apport d'air frais et les volets motorisés","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"f817f7e8","x":"Faire vérifier le système de désenfumage","f":"S","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Installations électriques intérieures", c: "Installation électriques/gaz naturel", re: /éclairage intérieurs/i, t: [{"id":"f4174b23","x":"Nettoyer adéquatement les espaces périphériques","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"749bd711","x":"Vérifier la stabilité des fixtures. Faire corriger au besoin","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"7c0290d8","x":"Vérifier le bon fonctionnement des luminaires intérieurs et des espaces communs. Corriger au besoin","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"b8a51616","x":"Vérifier le fonctionnement des prises intérieures","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"676722a3","x":"Vérifier le fonctionnement des prises des espaces communs","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Installations électriques extérieures", c: "Installation électriques/gaz naturel", re: /éclairage extérieurs|lampadaires|bornes de recharge/i, t: [{"id":"7de94fce","x":"Nettoyer adéquatement les espaces périphériques","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"b0f972b3","x":"Vérifier la stabilité des fixtures. Faire corriger au besoin","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"d76a2e98","x":"Vérifier le bon fonctionnement des luminaires extérieurs et des espaces communs. Corriger au besoin","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"939d6207","x":"Vérifier les prises extérieures - DDTF et/ou avec Disjoncteur différentiel","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Panneaux électriques principaux", c: "Installation électriques/gaz naturel", re: /panneaux de distribution|alimentation électrique principale|thermographique/i, t: [{"id":"2aabd314","x":"Nettoyer adéquatement les espaces périphériques","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"c16584c2","x":"Vérifier que les panneaux et les circuits soient identifiés","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"4835ad2e","x":"Vérifier que les espaces électriques soient libre de tout entreposage","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"46daf815","x":"Faire vérifier par un électricien que les espaces électriques soient libre de toute poussières excessives -","f":"M","q":"","o":[["hiver",[1],true]]},{"id":"5bc23a7a","x":"Vérifier que les espaces électriques soient libre de toute poussières excessives","f":"M","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"93f0b9f9","x":"Vérifier le bon fonctionnement du disjoncteur différentiel sur les prises extérieures","f":"AS","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"95774005","x":"Faire vérifier par un électricien avec capteur infrarouge l'entrée principale","f":"A","q":"Contrat","o":[["printemps",[4],true]]},{"id":"8cbb0fe1","x":"Pour toute situation qui présente un doute contacter Hydro-Québec au 1-800-790-2424","f":"C","q":"","o":[["hiver",[],true],["printemps",[],true],["ete",[],true],["automne",[],true]]}] },
+  { e: "Transformateurs de courant", c: "Installation électriques/gaz naturel", re: /alimentation électrique principale/i, t: [{"id":"8aa8b9e3","x":"Nettoyer adéquatement les espaces périphériques","f":"M","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true,"Ménagers"],["ete",[7,8,9],true,"Ménagers"],["automne",[10,11,12],true,"Ménagers"]]},{"id":"98761930","x":"Vérifier visuellement et auditivement","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"57b0ed93","x":"Vérifier que les espaces électriques soient libre de tout entreposage","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"a80a14f4","x":"Faire vérifier par un électricien que les espaces électriques soient libre de toute poussières excessives -","f":"M","q":"","o":[["printemps",[4],true]]}] },
+  { e: "Réseau - Gaz naturel", c: "Installation électriques/gaz naturel", re: /gaz naturel/i, t: [{"id":"7a8f416d","x":"Vérifier que les conduits intérieurs et extérieurs soient identifiés en jaune et idéalement avec la note ''GAZ NATUREL''","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"f8272f40","x":"Vérifier l'état des conduits et les valves intérieurs et extérieurs: de rouille excessive","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"8c43b29e","x":"Pour toute situation qui présente un doute contacter le fournisseur de gaz naturel - Montréal et les environs: Énergir au 1-800-361-8003","f":"C","q":"","o":[["hiver",[],true],["printemps",[],true],["ete",[],true],["automne",[],true]]}] },
+  { e: "Alimentation de secours - Génératrice", c: "Installation électriques/gaz naturel", re: /alimentation d'urgence/i, t: [{"id":"4dc98701","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["hiver",[1],true]]},{"id":"a2202bb0","x":"Nettoyer suite à demande du gestionnaire","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"aa1bdc75","x":"Vérifier que les essaies hebdomadaires sont effectués","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"7187d11e","x":"Vérifier que les essaies mensuels sont effectués","f":"H","q":"","o":[["automne",[10,11,12],true]]},{"id":"df7bb3f6","x":"Vérifier qu'ils n'y aie aucune fuite d'huile ou de carburant","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"209bdc91","x":"Vérifier les niveau de carburant, d'huile et de liquide de refroissement","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"acb91153","x":"Vérifier que les contact, câblages sont en bon état, bien fixés et solides","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"def101d5","x":"Vérifier l'état des courroies","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"fc7f9bde","x":"Faire vérifier le système d'alimentation de secours : selon CAN/CSA-C282","f":"A","q":"Contrat","o":[["printemps",[4],true]]},{"id":"0ef0ad80","x":"Faire vérifier (5ans) le système d'alimentation de secours : selon CAN/CSA-C282","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Alimentation en eau", c: "Alimentation et évacuation", re: /eau potable|antirefoulement/i, t: [{"id":"6ad25ae1","x":"Vérifier que les valve principales soient identifiés en bleu","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"78664e91","x":"Vérifier les conduits pour tout indice de coulure, bris, condensation, corrosion excessive","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"31b28cc6","x":"Vérifier les isolants de conduits pour les bris, déchirures, détachements","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"e3edf0e2","x":"Faire mettre à l'essai les valves d'arrêt graduellement, de l'entrée principale, pour s'assurer qu'elles fonctionnent et les empêcher de raidir. Demander l'assistance d'un plombier lorsque la valve présente un doute ou si elle n'a pas été actionné depuis plusieurs années","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"e9366ce5","x":"Planifier l'inspection annuelle du dispositif anti-retour (DAR)","f":"A","q":"Contrat","o":[["hiver",[1],true]]}] },
+  { e: "Chauffe-eau", c: "Alimentation et évacuation", re: /réservoirs? d'eau chaude/i, t: [{"id":"3a408e7e","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a3637c02","x":"Vérifier le chauffe-eau pour tout signe de corrosion excessive, fuite","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"35a4b615","x":"Vérifier le plancher, le bassin de rétention pour toute trace de fuite","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"5491b271","x":"Vérifier le fonctionnement du drain de plancher","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"0274f59e","x":"Vérifier que le contrôle de température ne soit pas inférieur à 60'Celcius","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"cb0934b6","x":"Vérifier le fonctionnement de soupape de sûreté","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"42f9998e","x":"Vérifier les isolants de conduits pour les bris, déchirures, détachements","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Pompe de surpression", c: "Alimentation et évacuation", re: /surpression/i, t: [{"id":"87344be1","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["hiver",[1],true]]},{"id":"71227447","x":"Nettoyer adéquatement les espaces","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a3185144","x":"Vérifier que l'interrupteur principal soit en mode ''Automatique''","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"96135f27","x":"Vérifier pour tout indice de fuite, corrosion excessive, instabilité","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a3280918","x":"Vérifier les supports, ancrage, stabilité, vibrations excessives","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"b291d370","x":"Vérifier de la soupape de sûreté et l'actionner manuellement","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"74b2bb8e","x":"Vérifier du réservoir d'expansion pour tout indice de corrosion de surface ou peinture écaillée","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"bed7cd61","x":"Faire vérifier le système de surpression d'alimentation","f":"A","q":"","o":[["hiver",[1],true]]}] },
+  { e: "Salles communes", c: "Alimentation et évacuation", re: /équipements de plomberie/i, t: [{"id":"157c5dea","x":"Nettoyer adéquatement les équipements et l'espace","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"ddf81a4a","x":"Vérifier la robinetterie, salle commune, SDB: fonctionnement, fuite, corrosion","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"bd308b46","x":"Vérifier la toilette: fonctionnement, stabilité, fuite, condensation excessive","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Robinetterie extérieure", c: "Alimentation et évacuation", re: /équipements de plomberie|eau potable/i, t: [{"id":"9477e931","x":"Vérifier les robinets extérieurs: fonctionnement, fuite, corrosion","f":"S","q":"","o":[["printemps",[5,6],true],["ete",[7,8,9],true]]},{"id":"427fdc2a","x":"Après le 15 mai et dès que le climat le permet, cesser l'hivernisation et mettre en fonction les appareils et robinetteries extérieures. Vérifier le fonctionnement et tout indice de fuite","f":"S","q":"","o":[["printemps",[5,6],true]]},{"id":"141283ff","x":"Avant le 15 septembre, fermer et hiverniser les appareils et robinetteries extérieures. Vérifier pour tout indice de fuite","f":"S","q":"","o":[["ete",[9],true]]},{"id":"0716edf8","x":"Vérifier le système d'irrigation extérieur, tête, répartiteur de zone","f":"AS","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"e108792c","x":"Vérification et ouverture du système d'irrigation extérieur","f":"S","q":"Contrat","o":[["printemps",[5],true]]},{"id":"aae1c4de","x":"Vérification, fermeture et hivernisation du système d'irrigation extérieur","f":"S","q":"Contrat","o":[["ete",[9],true]]},{"id":"9b91e2d2","x":"Pour toute situation de bris d'acqueduc contacter les bureaux de la ville de Montréal au 3-1-1","f":"C","q":"","o":[["hiver",[],true],["printemps",[],true],["ete",[],true],["automne",[],true]]}] },
+  { e: "Évacuation sanitaire", c: "Alimentation et évacuation", re: /évacuation sanitaire|évacuation pluviale et sanitaire/i, t: [{"id":"d10e8c03","x":"Vérifier que les conduits soient sans coulures, bien soutenue et avec une pente adéquate","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"6662a1ca","x":"Vérifier les couvercles, stabilité, bris, solidité","f":"S","q":"","o":[["hiver",[1,2,3],true]]},{"id":"13436e18","x":"Vérifier les grilles: corrosion excessive, stabilité, bris, solidité","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9c4ebfa9","x":"Planifier l'inspection du clapet anti-retour","f":"A","q":"Contrat","o":[["printemps",[5,6],true]]}] },
+  { e: "Bassin collecteur et pompes - Sanitaire", c: "Alimentation et évacuation", re: /pompes de puisard/i, t: [{"id":"6ac3537c","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["printemps",[5,6],true]]},{"id":"37b71c2d","x":"Vérifier le controleur, les capteurs, la lampe témoin, la sonnerie de trop plein","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"ad58b129","x":"Faire vérifier le dispositif anti-refoulement par un plombier - selon la norme CAN/CSA-B64.10.1 «Guide d’entretien et de mise à l’essai à pied d’oeuvre des dispositifs anti refoulement»","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Évacuation pluviale extérieure", c: "Alimentation et évacuation", re: /puisards et regards|clapets/i, t: [{"id":"8db59bc0","x":"Vérifier les grilles: corrosion excessive, stabilité, bris, solidité, débris","f":"S","q":"","o":[["hiver",[3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10],true]]}] },
+  { e: "Bassin collecteur et pompes - Pluvial intérieure", c: "Alimentation et évacuation", re: /pompes de puisard|clapets/i, t: [{"id":"2c827807","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["printemps",[4],true]]},{"id":"f51e49f9","x":"Vérifier le bassin et les caniveaux pour tout accumulation de débris, boue","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9cfcabe7","x":"Vérifier la garde d'eau des avaloirs de sol et ajouter de l'eau au besoin","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"c23bb852","x":"Vérifier le fonctionnement du système de pompage de la fosse de retenue","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f4b0c171","x":"Vérifier les branchements, les supports, les ancrages, du système de pompe","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f9f92f81","x":"Vérifier le controleur, les capteurs, la lampe témoin, la sonnerie de trop plein","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9cb4c2e9","x":"Vérifier les branchements, les supports, les ancrages","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"b8b0a6f2","x":"Faire vérifier système de pompes par un plombier -","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Piscine - Bassin (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(bassin)/i, t: [{"id":"bf493f85","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"bb2653c4","x":"Faire vérifier et ouvrir le valve d'eau - Faire hiverniser les valves d'eau","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"9492e19e","x":"Faire vérifier et mettre en fonction les circuits électriques - Faire mettre hors fonction les circuits électriques","f":"S","q":"ContraT","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"a2108265","x":"Faire vérifier pour tout débris et faire retirer","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"4263a984","x":"Planifier la vérification et l'entretien de la qualité de l'eau de baignade","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"cb7bfa99","x":"Vérifier et documenter les revêtement intérieur du bassin, béton, carreaux de céramique, fibre de verre, toile de vinyle, structure pour tout indice de bris, délamination, fissure, déchirement, détachement, perte de volume d'eau, etc","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"3744abe8","x":"Faire réparer les surfaces intérieures","f":"S","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"354900ca","x":"Faire vérifier que les équipements et installations soient sécuritaires et respectent les règlements municipaux et recommandations de l'INSPQ","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"3e5579d6","x":"Faire corriger selon les règlementations","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"23e73d61","x":"Vérifier que les équipements de sécurité sont visibles et accessibles en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"5fd2af87","x":"Vérifier que les affiches des règlements soient affichées et bien en vu en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"acecc1e7","x":"Prendre connaissance des recommandations concernant les règlementations à maintenir et faire respecter pour assurer la sécurité dans les espaces piscines (INSPQ)","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]}] },
+  { e: "Piscine - Enceinte, espace piétonnier et terrasse (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – (enceinte|contour)/i, t: [{"id":"36ba3084","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"cfe4014b","x":"Faire nettoyer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"8df6bae7","x":"Vérifier et documenter la surface des allées de béton : fissures, affaissement, éclatement","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"b76edfa0","x":"Faire réparer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"fe8686f8","x":"Vérifier et documenter les surfaces des pavés de béton: fissures, affaissement, instabilité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"b3e08792","x":"S'assurer que la pente des dalles est positive","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"e502bce2","x":"Faire réparer les surfaces et remettre de niveau au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"4c9791c6","x":"Vérifier que la clôture et les accès sont stables, solides et barrés en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"ae056640","x":"Vérifier pour toute trace de corrosion","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["printemps",[4],true],["ete",[7],true]]},{"id":"f062ceb0","x":"Gratter la corrosion et appliquer une peinture antirouille/zinc","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"21fa5b11","x":"Faire stabiliser et solidifier les structures","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true],["printemps",[4],true],["ete",[7],true]]},{"id":"ce4a7a7e","x":"Vérifier que les installations et supports d'équipements sont stables et bien fixés","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"0b3d31b2","x":"Gratter la corrosion et appliquer une peinture","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]}] },
+  { e: "Piscine - Pompes et filtreur (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(filtration)/i, t: [{"id":"422cd27c","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"98e8fd3a","x":"Vérifier à faire remplacer le sable aux 3-4 ans","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"6e400231","x":"Vérifier que les cablages électriques soit protégés en tout temps","f":"A","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"9da50f5a","x":"Vérifier l'indicateur de pression (manomètre) et s'assurer que la pression rencontre les indications du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"e0376279","x":"Vérifier que la position des vannes soient adéquate et selon les recommandations du manufacturier","f":"A","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"8aa22759","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"63d8a898","x":"Vérifier pour tout éléments ou débris qui pourraient nuite au bouches d'aspiration et de rejet","f":"S","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]}] },
+  { e: "Piscine - Système de dosage (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(filtration)/i, t: [{"id":"637c7043","x":"Planifier la calibration annuelle","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"480b9d4a","x":"Vérifier le Chlorinateur, doseur de pH, doseur de sel, les lampes témoins et que ceux-ci fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"dc13f8cd","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]}] },
+  { e: "Piscine - Système de chauffe eau T/P (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(chauffage)/i, t: [{"id":"07dadbee","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"a3befb15","x":"Faire vérifier la solidité des installations","f":"A","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"71211c9e","x":"Vérifier que les appareils fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"ff2562ab","x":"Vérifier que les cablage électrique et conduit des gaz soit protégés en tout temps, isolants, sécurité","f":"A","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"5dc90406","x":"Faire vérifier que les dégagements soient respectés (Min 24''au périmètre et min 48'' au dessus)","f":"A","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]}] },
+  { e: "Piscine - Système de traitement de l'air - Déshumidificateur mécanique (intérieure)", c: "Installations de piscine extérieur", re: /piscine intérieure – .*(humidité)/i, t: [{"id":"f8acb019","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true],["hiver",[1],true]]},{"id":"94ce0b10","x":"Vérifier que les appareils fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"dc4f3f87","x":"Vérifier le controleur, les capteurs, la lampe témoin, la sonnerie de trop plein","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"1b0be245","x":"Planifier l'inspection saisonnière","f":"A","q":"Contrat","o":[["ete",[7],true]]}] },
+  { e: "Piscine - Bassin (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(bassin)/i, t: [{"id":"726e8872","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"351976f2","x":"Faire vérifier et ouvrir le valve d'eau - Faire hiverniser les valves d'eau","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"0d8a4a0b","x":"Faire vérifier et mettre en fonction les circuits électriques - Faire mettre hors fonction les circuits électriques","f":"S","q":"ContraT","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"e8a1b169","x":"Faire vérifier pour tout débris et faire retirer","f":"S","q":"","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"55b89d1e","x":"Planifier la vérification et l'entretien de la qualité de l'eau de baignade","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"cd0b6f18","x":"Vérifier et documenter les revêtement intérieur du bassin, béton, carreaux de céramique, fibre de verre, toile de vinyle, structure pour tout indice de bris, délamination, fissure, déchirement, détachement, perte de volume d'eau, etc","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"07930389","x":"Faire réparer les surfaces intérieures","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f01a7afc","x":"Faire vérifier que les équipements et installations soient sécuritaires et respectent les règlements municipaux et recommandations de l'INSPQ","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"23388ad2","x":"Faire corriger selon les règlementations","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"de435578","x":"Vérifier que les équipements de sécurité sont visibles et accessibles en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"fcf614ac","x":"Vérifier que les affiches des règlements soient affichées et bien en vu en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"37d0a224","x":"Prendre connaissance des recommandations concernant les règlementations à maintenir et faire respecter pour assurer la sécurité dans les espaces piscines (INSPQ)","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]}] },
+  { e: "Piscine - Enceinte, espace piétonnier et terrasse (intérieure)", c: "Installations de piscine intérieure", re: /centre aquatique/i, t: [{"id":"9a6b3e80","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"b9695b08","x":"Faire nettoyer les surfaces","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"a5d045f7","x":"Vérifier et documenter la surface des allées de béton : fissures, affaissement, éclatement","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"2a736ed3","x":"Faire réparer les surfaces","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"2c8fff20","x":"Vérifier et documenter les surfaces des pavés de béton: fissures, affaissement, instabilité","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"8e096bdd","x":"S'assurer que la pente des dalles est positive","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"2545a761","x":"Faire réparer les surfaces et remettre de niveau au besoin","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"b5625e97","x":"Vérifier que la clôture et les accès sont stables, solides et barrés en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"46a52472","x":"Vérifier pour toute trace de corrosion","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true],["hiver",[1],true],["printemps",[4],true],["ete",[7],true]]},{"id":"20d0092d","x":"Gratter la corrosion et appliquer une peinture antirouille/zinc","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"f7eba770","x":"Faire stabiliser et solidifier les structures","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true],["hiver",[1],true],["ete",[7],true]]},{"id":"a83153af","x":"Vérifier que les installations et supports d'équipements sont stables et bien fixés","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9d2e44fb","x":"Gratter la corrosion et appliquer une peinture","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]}] },
+  { e: "Piscine - Pompes et filtreur (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(filtration)/i, t: [{"id":"25c0f1dd","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"fb213a88","x":"Vérifier à faire remplacer le sable aux 3-4 ans","f":"A","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"bf194df5","x":"Vérifier que les cablages électriques soit protégés en tout temps","f":"A","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"fc6e4e14","x":"Vérifier l'indicateur de pression (manomètre) et s'assurer que la pression rencontre les indications du manufacturier","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"43c913eb","x":"Vérifier que la position des vannes soient adéquate et selon les recommandations du manufacturier","f":"A","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"c2f6c367","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a00d776c","x":"Vérifier pour tout éléments ou débris qui pourraient nuite au bouches d'aspiration et de rejet","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Piscine - Système de dosage (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(filtration)/i, t: [{"id":"6572d9a3","x":"Planifier la calibration annuelle","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"89c9bfd1","x":"Planifier la calibration saisonnière","f":"A","q":"Contrat","o":[["ete",[7],true]]},{"id":"a9a48c37","x":"Vérifier le Chlorinateur, doseur de pH, doseur de sel, les lampes témoins et que ceux-ci fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"18d82548","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Piscine - Système de chauffe eau T/P (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(chauffage)/i, t: [{"id":"451b56eb","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"1dd95730","x":"Planifier l'inspection saisonnière","f":"A","q":"Contrat","o":[["ete",[7],true]]},{"id":"925e521a","x":"Faire vérifier la solidité des installations","f":"A","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"bf12de20","x":"Vérifier que les appareils fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["automne",[10,11,12],true]]},{"id":"55c12112","x":"Vérifier que les appareils fonctionnent selon les recommandations du manufacturier","f":"S","q":"","o":[["ete",[7,8,9],true]]},{"id":"eba9ee2e","x":"Vérifier que les cablage électrique et conduit des gaz soit protégés en tout temps, isolants, sécurité","f":"A","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f7fbd267","x":"Faire vérifier que les dégagements soient respectés (Min 24''au périmètre et min 48'' au dessus)","f":"A","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] }
+];
+
+const FREQUENCES_ENTRETIEN = {
+  H: "Chaque semaine",
+  M: "Chaque mois",
+  S: "Une fois dans la saison",
+  A: "Annuelle",
+  AS: "Annuelle, par un entrepreneur",
+  A5: "Aux 5 ans",
+  C: "Consigne en tout temps"
+};
+const SAISONS_ENTRETIEN = [
+  { cle: "hiver", libelle: "Hiver", mois: [1, 2, 3] },
+  { cle: "printemps", libelle: "Printemps", mois: [4, 5, 6] },
+  { cle: "ete", libelle: "Été", mois: [7, 8, 9] },
+  { cle: "automne", libelle: "Automne", mois: [10, 11, 12] }
+];
+const MOIS_ABREGES = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
+const NOMS_MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
+function libelleResponsable(q) {
+  if (q === "Ménagers") return "Entretien ménager";
+  if (q === "Contrat") return "Entrepreneur (contrat)";
+  return q ? sansNotesInternes(q) : "Syndicat / gestionnaire";
+}
+function libelleFrequence(tache) {
+  const total = new Set(tache.o.flatMap((o) => o[1])).size;
+  // Une inspection « annuelle » cochée à deux saisons se fait à chacune.
+  if (tache.f === "A" && tache.o.length > 1) return "Aux mois indiqués";
+  if (tache.f === "AS" && tache.o.length > 1) return "Aux mois indiqués, par un entrepreneur";
+  return FREQUENCES_ENTRETIEN[tache.f] ?? (total >= 12 ? "Chaque mois" : "Aux mois indiqués");
+}
+// « avril », « avril à novembre », « avril et octobre », « toute l'année »,
+// « printemps (mois à préciser) ». Les mois consécutifs se fusionnent d'une
+// saison à l'autre : une tâche mensuelle d'avril à novembre se lit d'un coup.
+function quandTache(tache) {
+  if (tache.f === "C") return "En tout temps";
+  const connus = [...new Set(tache.o.filter((o) => o[2]).flatMap((o) => o[1]))].sort((a, b) => a - b);
+  if (connus.length === 12) return "Toute l'année";
+  const plages = [];
+  for (const m of connus) {
+    const derniere = plages[plages.length - 1];
+    if (derniere && m === derniere[1] + 1) derniere[1] = m;
+    else plages.push([m, m]);
+  }
+  const seul = plages.length === 1 && tache.o.every((o) => o[2]);
+  const morceaux = plages.map(([a, b]) => a === b ? NOMS_MOIS[a - 1] : b === a + 1 ? (seul ? `${NOMS_MOIS[a - 1]} et ${NOMS_MOIS[b - 1]}` : `${NOMS_MOIS[a - 1]}-${NOMS_MOIS[b - 1]}`) : `${NOMS_MOIS[a - 1]} à ${NOMS_MOIS[b - 1]}`);
+  for (const [saison, , estConnu] of tache.o) {
+    if (estConnu) continue;
+    const s = SAISONS_ENTRETIEN.find((x) => x.cle === saison);
+    morceaux.push(`${(s?.libelle ?? saison).toLowerCase()} (mois à préciser)`);
+  }
+  if (morceaux.length <= 1) return morceaux[0] ?? "";
+  return `${morceaux.slice(0, -1).join(", ")} et ${morceaux[morceaux.length - 1]}`;
+}
+// Tâches ajoutées à la main : les mois choisis donnent les occurrences par saison.
+function occurrencesDepuisMois(mois) {
+  const valides = [...new Set((mois ?? []).map(Number).filter((m) => m >= 1 && m <= 12))];
+  return SAISONS_ENTRETIEN.map((s) => [s.cle, s.mois.filter((m) => valides.includes(m)), true]).filter((o) => o[1].length > 0);
+}
+function nettoyerPersoEntretien(brut) {
+  const src = objetJson(brut);
+  const retirees = Array.isArray(src.retirees) ? src.retirees.map(String).filter((x) => /^[a-z0-9_]{1,24}$/.test(x)).slice(0, 500) : [];
+  const ajoutees = (Array.isArray(src.ajoutees) ? src.ajoutees : []).slice(0, 50).map((t) => ({
+    id: /^p_[a-z0-9]{4,16}$/.test(String(t?.id)) ? String(t.id) : `p_${crypto.randomUUID().replace(/-/g, "").slice(0, 10)}`,
+    x: String(t?.x ?? "").trim().slice(0, 300),
+    f: FREQUENCES_ENTRETIEN[t?.f] ? t.f : "S",
+    q: ["Ménagers", "Contrat", ""].includes(t?.q) ? t.q : "",
+    mois: [...new Set((Array.isArray(t?.mois) ? t.mois : []).map(Number).filter((m) => m >= 1 && m <= 12))]
+  })).filter((t) => t.x && t.mois.length);
+  return { retirees, ajoutees };
+}
+// Tâches d'une composante : celles des éléments du carnet qui la visent, moins
+// celles que l'ingénieur a retirées, plus celles qu'il a ajoutées.
+function tachesPourComposante(component, { avecRetirees = false } = {}) {
+  const nom = String(component?.name ?? "");
+  const perso = nettoyerPersoEntretien(component?.taches_entretien);
+  const retirees = new Set(perso.retirees);
+  const taches = [];
+  for (const el of TACHES_ENTRETIEN) {
+    if (!el.re.test(nom)) continue;
+    for (const t of el.t) {
+      const retiree = retirees.has(t.id);
+      if (retiree && !avecRetirees) continue;
+      taches.push({ ...t, element: el.e, categorie: el.c, retiree });
+    }
+  }
+  for (const t of perso.ajoutees) {
+    taches.push({ id: t.id, x: t.x, f: t.f, q: t.q, o: occurrencesDepuisMois(t.mois), element: sansNotesInternes(nom), categorie: CATEGORIES[component?.cat]?.label ?? "", perso: true, retiree: false });
+  }
+  return taches;
+}
+function tacheAffichee(t) {
+  return {
+    id: t.id,
+    texte: t.x,
+    element: t.element,
+    frequence: libelleFrequence(t),
+    quand: quandTache(t),
+    responsable: libelleResponsable(t.q),
+    aPreciser: t.o.some((o) => !o[2]),
+    perso: !!t.perso,
+    retiree: !!t.retiree,
+    code: t.f,
+    mois: [...new Set(t.o.flatMap((o) => o[1]))].sort((a, b) => a - b)
+  };
+}
+// Tâches du dossier, regroupées par élément du carnet et sans doublon : deux
+// composantes du même élément (fenêtres en vinyle et portes-patio) partagent
+// ses tâches. Seules les composantes actives comptent.
+function carnetDuDossier(components) {
+  const parElement = new Map();
+  for (const comp of components) {
+    for (const t of tachesPourComposante(comp)) {
+      if (!parElement.has(t.element)) parElement.set(t.element, { element: t.element, categorie: t.categorie, taches: new Map() });
+      parElement.get(t.element).taches.set(t.id, t);
+    }
+  }
+  const ordreCat = [...new Set(TACHES_ENTRETIEN.map((e) => e.c))];
+  return [...parElement.values()]
+    .map((g) => ({ ...g, taches: [...g.taches.values()] }))
+    .sort((a, b) => {
+      const ia = ordreCat.indexOf(a.categorie), ib = ordreCat.indexOf(b.categorie);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
+}
+// ----------------------------------------------------------------------------
+// Tableur suivi d'entretien (.xlsx) — même présentation que le gabarit de la
+// firme : un onglet par saison, les mois où la tâche se fait grisés, puis les
+// colonnes de suivi à remplir par le syndicat. Un onglet « Calendrier » donne
+// la vue mois par mois. Écrit en SpreadsheetML directement : la version
+// communautaire de la bibliothèque tableur ne sait pas colorer une cellule.
+// ----------------------------------------------------------------------------
+function colonneXlsx(i) {
+  let s = "";
+  for (let n = i + 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + (n - 1) % 26) + s;
+  return s;
+}
+// Styles : 0 normal · 1 titre · 2 sous-titre · 3 en-tête jaune · 4 catégorie
+// · 5 élément · 6 texte encadré · 7 mois grisé · 8 mois vide · 9 en-tête gris
+// · 10 texte à préciser (italique)
+const STYLES_XLSX = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="5"><font><sz val="10"/><name val="Calibri"/></font><font><b/><sz val="14"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="10"/><name val="Calibri"/></font><font><i/><sz val="10"/><color rgb="FF6B6B6B"/><name val="Calibri"/></font></fonts>
+<fills count="6"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFBFBFBF"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFD9D9D9"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFF2F2F2"/><bgColor indexed="64"/></patternFill></fill></fills>
+<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"><color rgb="FFBFBFBF"/></left><right style="thin"><color rgb="FFBFBFBF"/></right><top style="thin"><color rgb="FFBFBFBF"/></top><bottom style="thin"><color rgb="FFBFBFBF"/></bottom><diagonal/></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="11">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+<xf numFmtId="0" fontId="3" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="3" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+<xf numFmtId="0" fontId="3" fillId="5" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="3" borderId="1" xfId="0" applyFill="1" applyBorder="1"/>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/>
+<xf numFmtId="0" fontId="3" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="4" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+</cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>`;
+// Une feuille : lignes de cellules { v, s } (ou null), largeurs, fusions.
+function feuilleXlsx({ lignes, largeurs, fusions = [], figer = null, paysage = true }) {
+  const rows = lignes.map((cellules, r) => {
+    const cs = (cellules ?? []).map((c, i) => {
+      if (c == null) return "";
+      const ref = `${colonneXlsx(i)}${r + 1}`;
+      const style = c.s ? ` s="${c.s}"` : "";
+      if (c.v == null || c.v === "") return `<c r="${ref}"${style}/>`;
+      return `<c r="${ref}"${style} t="inlineStr"><is><t xml:space="preserve">${echapperXml(String(c.v))}</t></is></c>`;
+    }).join("");
+    return `<row r="${r + 1}">${cs}</row>`;
+  }).join("");
+  const cols = largeurs.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("");
+  const volet = figer ? `<sheetViews><sheetView workbookViewId="0"><pane ySplit="${figer}" topLeftCell="A${figer + 1}" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>` : "";
+  const merges = fusions.length ? `<mergeCells count="${fusions.length}">${fusions.map((m) => `<mergeCell ref="${m}"/>`).join("")}</mergeCells>` : "";
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>${volet}<sheetFormatPr defaultRowHeight="15"/><cols>${cols}</cols><sheetData>${rows}</sheetData>${merges}<pageMargins left="0.4" right="0.4" top="0.5" bottom="0.5" header="0.3" footer="0.3"/><pageSetup orientation="${paysage ? "landscape" : "portrait"}" fitToWidth="1" fitToHeight="0"/></worksheet>`;
+}
+async function classeurXlsx(feuilles) {
+  const JSZip = import_jszip_min.default;
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${feuilles.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}</Types>`);
+  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`);
+  zip.file("xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${feuilles.map((f, i) => `<sheet name="${echapperXml(f.nom.slice(0, 31))}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets></workbook>`);
+  zip.file("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${feuilles.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join("")}<Relationship Id="rId${feuilles.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`);
+  zip.file("xl/styles.xml", STYLES_XLSX);
+  feuilles.forEach((f, i) => zip.file(`xl/worksheets/sheet${i + 1}.xml`, feuilleXlsx(f)));
+  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+async function tableurSuiviEntretien(ctx) {
+  const { dossier, components: components2, theme } = ctx;
+  const carnet = carnetDuDossier(components2);
+  const annee = new Date().getFullYear();
+  const titre = `${sansNotesInternes(dossier.name)} — ${dossier.dossier_no}`;
+  const entete = (sousTitre) => [
+    [{ v: theme?.nom || "", s: 2 }],
+    [{ v: titre, s: 1 }],
+    [{ v: "CARNET D'ENTRETIEN — IMMEUBLE ET INSTALLATIONS", s: 2 }],
+    [{ v: sousTitre, s: 2 }],
+    []
+  ];
+  const COLONNES_SUIVI = ["Vérifié par / date", "Action à prendre", "Photos", "OS", "Entrepreneur – contrat", "Coût", "Garantie"];
+  const feuilles = [];
+  for (const s of SAISONS_ENTRETIEN) {
+    const lignes = entete(`${s.libelle.toUpperCase()} ${annee} — ${s.mois.map((m) => NOMS_MOIS[m - 1]).join(", ")}`);
+    lignes.push([
+      { v: "Responsable", s: 3 }, { v: "Situation — demande d'étude", s: 3 }, { v: "Fréquence", s: 3 },
+      ...s.mois.map((m) => ({ v: MOIS_ABREGES[m - 1], s: 3 })),
+      ...COLONNES_SUIVI.map((c) => ({ v: c, s: 3 }))
+    ]);
+    let categorie = null;
+    for (const g of carnet) {
+      const saisonnieres = g.taches.filter((t) => t.o.some((o) => o[0] === s.cle));
+      if (!saisonnieres.length) continue;
+      if (g.categorie !== categorie) {
+        categorie = g.categorie;
+        lignes.push([{ v: "", s: 4 }, { v: String(categorie).toUpperCase(), s: 4 }, ...Array(3 + 1 + COLONNES_SUIVI.length).fill({ v: "", s: 4 })].slice(0, 13));
+      }
+      lignes.push([{ v: "", s: 5 }, { v: g.element, s: 5 }, ...Array(11).fill({ v: "", s: 5 })]);
+      for (const t of saisonnieres) {
+        const occ = t.o.find((o) => o[0] === s.cle);
+        const qui = occ[3] ?? t.q;
+        lignes.push([
+          { v: libelleResponsable(qui), s: 6 },
+          { v: occ[2] ? t.x : `${t.x} (mois à préciser)`, s: occ[2] ? 6 : 10 },
+          { v: libelleFrequence(t), s: 6 },
+          ...s.mois.map((m) => ({ v: "", s: occ[1].includes(m) ? 7 : 8 })),
+          ...COLONNES_SUIVI.map(() => ({ v: "", s: 8 }))
+        ]);
+      }
+    }
+    feuilles.push({ nom: `${s.libelle} ${annee}`, lignes, largeurs: [18, 58, 16, 6, 6, 6, 16, 22, 10, 8, 20, 10, 10], figer: 6 });
+  }
+  // Calendrier : chaque mois, ce qu'il y a à faire.
+  const cal = entete(`CALENDRIER ${annee} — tâches par mois`);
+  cal.push([{ v: "Mois", s: 3 }, { v: "Élément", s: 3 }, { v: "Tâche", s: 3 }, { v: "Fréquence", s: 3 }, { v: "Responsable", s: 3 }]);
+  for (let m = 1; m <= 12; m++) {
+    const duMois = carnet.flatMap((g) => g.taches.filter((t) => t.o.some((o) => o[1].includes(m))).map((t) => ({ g, t })));
+    if (!duMois.length) continue;
+    cal.push([{ v: NOMS_MOIS[m - 1].toUpperCase(), s: 4 }, { v: `${duMois.length} tâche${duMois.length > 1 ? "s" : ""}`, s: 4 }, { v: "", s: 4 }, { v: "", s: 4 }, { v: "", s: 4 }]);
+    for (const { g, t } of duMois) {
+      const occ = t.o.find((o) => o[1].includes(m));
+      cal.push([{ v: "", s: 8 }, { v: g.element, s: 6 }, { v: occ[2] ? t.x : `${t.x} (mois à préciser)`, s: occ[2] ? 6 : 10 }, { v: libelleFrequence(t), s: 6 }, { v: libelleResponsable(occ[3] ?? t.q), s: 6 }]);
+    }
+  }
+  feuilles.unshift({ nom: "Calendrier", lignes: cal, largeurs: [14, 34, 70, 18, 22], figer: 6 });
+  return classeurXlsx(feuilles);
+}
 const JARGON_STYLE_GUIDE = `Méthode et registre de la firme (Plan de gestion de l'actif — PGA) :
 
 ÉCHELLE D'ÉTAT (obligatoire, 4 niveaux + na) :
@@ -4218,7 +4595,8 @@ function blocsEtat(component, dossier, description) {
   const cote = coteRapport(component?.rating);
   const projet = phraseFinale(component?.projet_ca);
   const information = guide.information ? INFORMATIONS_REGLEMENTAIRES[guide.information]?.(dossier) : null;
-  return assembler([
+  // L'avis réglementaire forme son propre paragraphe : le rapport Word l'encadre.
+  return paragraphes([assembler([
     description || descriptionDeterministe(component),
     phraseLimite(component),
     guide.portee.join(" "),
@@ -4226,9 +4604,8 @@ function blocsEtat(component, dossier, description) {
     phraseAnnee(component),
     cote === "Bon" ? "Autre que l'entretien régulier, aucun suivi n'est prévu cette année." : null,
     LIMITE_RELEVE[component?.cat] ?? null,
-    projet ? `Selon les informations obtenues, le conseil d'administration planifie ${projet.charAt(0).toLowerCase()}${projet.slice(1)}` : null,
-    information
-  ]);
+    projet ? `Selon les informations obtenues, le conseil d'administration planifie ${projet.charAt(0).toLowerCase()}${projet.slice(1)}` : null
+  ]), information]);
 }
 function etatDeterministe(component, dossier) {
   return blocsEtat(component, dossier, null);
@@ -4572,7 +4949,8 @@ components.get("/:id", async (c) => {
   return c.json({
     ...component,
     photos: photos2.results,
-    guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats }
+    guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats },
+    entretien: tachesPourComposante(component, { avecRetirees: true }).map(tacheAffichee)
   });
 });
 components.patch("/:id", async (c) => {
@@ -4613,11 +4991,13 @@ components.patch("/:id", async (c) => {
     "limite_detail",
     "nature_risque",
     "source_annee",
-    "projet_ca"
+    "projet_ca",
+    "taches_entretien"
   ]) {
     if (key in body2) {
       fields.push(`${key} = ?${fields.length + 1}`);
-      values.push(body2[key]);
+      // Retraits et ajouts de tâches : validés avant d'être stockés.
+      values.push(key === "taches_entretien" ? JSON.stringify(nettoyerPersoEntretien(body2[key])) : body2[key]);
     }
   }
   if (fields.length === 0) return c.json({ error: "aucun champ à mettre à jour" }, 400);
@@ -4626,7 +5006,7 @@ components.patch("/:id", async (c) => {
     `UPDATE components SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
   ).bind(...values).run();
   const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
-  return c.json(component);
+  return c.json({ ...component, entretien: tachesPourComposante(component, { avecRetirees: true }).map(tacheAffichee) });
 });
 components.post("/:id/analyze", async (c) => {
   const component = await getOwnedComponent(c, c.req.param("id"));
@@ -23074,10 +23454,6 @@ _defineProperty(Packer, "compiler", new Compiler());
 const LOGO_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAJsAAAFXCAYAAAC1PDz3AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAAFxEAABcRAcom8z8AABGnSURBVHhe7d0NlFxlfcfxUVDRVmvheKi8ZHfuc0feDxHOoaVQ03J6WqVqPT277M69d3aJMSvoSQieI4g9pymoFWjzoqKIvAmtEBI8SqgBVAxGLEfCWygVA6XkpIQkm+zcl3nZ2Xl7+jx3nlk24dLJ7jz3vzOzv/85HzaHzN6XmS93585cdhK6Zt9w8vjAZnfwZadwzzG5Dz0hEIoZs+zZxvf4aN8x6uGe30FsvQmxARnEBmQQG5BBbEAGsQEZxAZkEBuQQWxABrEBGcQGZBAbkNEa28bBxFGFdPK8rGPc6qeNW3yLfXfWbHazmzbuFl9fLI2mIjcaupcIrualjV1eOvWgb5k/8tLmj2fhAc8yfuRmzFUJvnrJ0dlh0ylkTJ4TolYGMFfyyJjPmFMiuH9FbBArGZtoa8p3jPsQG8RqOjY7uRGxQawQG5BBbEAGsQEZxAZkEBuQQWxABrEBGcQGZBAbkEFsQAaxARkZW84xy75lbEJsEKtGbKzs2anNiA1ihdiADGIDMogNyCA2IIPYgEz3xpZJ6TMfy49dxHa0I3Ids9NlsTHuW0meu26IT25cy0ubhI1r2iC+//71PC+W52c+JJZthHKrB/nkPf8klr8u4ntmQy5/HS98PcP9pWdw3xbbH7lfGtliHy4/j0/efZ3Y/vUR2zRL4j6evPNaHiw9ve3t767YxM56w4vCB1DblKfC4ILR07if7hfL7+OT997A65N5dYM2p1LmpS238WDsnHD5kfulk4gtd/XFvO7uVxvQ/tQOvM6Dz8rtT0av8wh1Z2ziiKNt3iq2Yk7doM2Zr9iy+9QGtD+18T2ITcsgtpaD2HQNYms5iE3XILaWoz82cwtiQ2yRozO2vIjNt1M/RWyILXIQm65BbC0HsekaxNZyEJuuQWwtB7HpGsTWchCbrkFsLQex6RrE1nIQm65BbC0HsekaxNZyEJuuQWwtB7HpGsTWchCbrkFsLQex6RrE1nJ0xpZzWMWzzK2IDbFFjq7YpFyGVVyHbUNsiC1yEJuuQWwtB7HpGsTWchCbrkFsLQex6RrE1nIQm65BbC0HsekaxNZyEJuuQWwtB7HpGsTWchCbrkFsLQex6RrE1nIQm65BbC0HsekaxNZytMdmsd8gNsQWOTpjCzKsKmJ7ErEhtshBbLoGsbUcxKZrEFvLQWx1cS/UxT/aVS69RWxB456O+p7ZqIiY5yW2vXq2X6iNvyZiO3cBxiYesMlbrubVnU8Lz/Lq78TXudr5DK+9/DwviuX5o6eGv/ZeLr/4nS/wyvOP8+pLO6K/70iFy9/Bi3f+Iw8+c3a4/Mj90knGduVf8PL2n/GqWHfkds2G2Ifyk4/wYPliLdvfPbE1ieian1nQPnEHyuVRLp+CiC56e+Yoah1z0H2xQddCbEAGsQEZxAZkEBuQQWxAJsiYVd8yt+uLTX6conzdSpcRsbyo9UDXkbF5lrmj/djki67yFfgNNzZevdYx6u0kf/DE+Xm9CrTSH9u9N6hSNIyMbdNaxNYjEBuQQWxABrEBGcQGZBAbkEFsQAaxARnEBmQQG5BBbEAGsQEZFdsLiA1iFzhmzU2znYgNYofYgAxiAzKIDcggNiCD2IAMYgMyiA3IIDYgg9iADGIDMogNyCA2oFQLbOMVxAYUauJx3IXYgAJiAzKIDcggNiCD2IAMYgMyiA3IIDYgg9iADGIDMppju+frjVCqlfZNFnjpvjWIrXdoik2yDR6suIAXvmrzwrVD7btumOdWXqj1YwhhXmmMrUkehXRxpIh1QPexzZrnsL16YwOIEMjYbLYPsUHsEBuQQWxABrEBGcR2uEyK+yOn6DEqyI/EjGv5TTOX38EQ2zTGfSvJc19z+OTmm3npoe/z0pY72nAnLz38fV5YM8b9pWeGy5avQ+a+/Ak++cNviL+7K+J7ZumhO3nx1i/zYPnZYtli+ZH71TkQW5Ot3gHZcCOvlwqNd0HanUpZBHE7D8bO4X66LwyueNMqXnPH1Q3anFqVl3ds47nP/Qn3h/uj96uDILamZmz33sDrxZx6NNscGduW2w6N7ZsreS27T92gzZGxPfcYYus6iC12iK0JscUOsTUhttghtibEFj/brLu2MY7YEBuFugjORWyIjQJiCyE2CogthNgoILYQYqOA2EKIjQJiCyE2CogthNgoILYQYqOA2EKIjQJiCyE2CogthNgoILYQYqOA2EKIjULds40cYkNsJDyLlRAbYiOB2CTERgKxSYiNBGKTEBsJxCYhNhKITUJsJBCbhNhIIDYJsZFAbBJiI4HYJMRGArFJiI0EYpMQGwnEJiE2Eq7FaogNsZFBbIiNDGJDbGQQWzO2e67n9YLPeb0uHsxae8olXvrJrYfFtoLXJl4XpWhYfrXMy89uRWxdR8Tmp/t5Yd3lvPzrB3n56Ud5efvP5u6pn/PK07/gxe9exYNlZ4llJ0VsBs9dO8ynHtvEy89sjf6+2XjqUV7auF7E/OFw2yP3qwMhtibbaDxw8kjULnGklEezQ5ffiDry9nMiI+uuj8lEbEAGsQEZxAZkEBuQQWxABrEBGcTWK0ZP5cHnz+e5FRfoIV8wPvwzU9uE2HqB/DzTL/0NrwcTjbezNEwte4AHl53Lwxelo9Y5B4itF8jYrr6Y13W99yqmNr6HB5+Vb7chNpgJsQEZxAZkEBuQQWxABrEBGcQGZBAbkEFsQAaxARnEBmQQG5Dpgthch1URWy/ogtjwi2V6BWIDMogNyCA2IIPYgAxiAzKIDcggNiCD2IAMYgMyiA3IIDYgg9iATOfHVvcsI0BsvaALYvNt00VsvQCxARnEBmQQG5BBbEAGsQEZxAZkEBuQQWxAJpbYXkdsEEHGdtXHeG3fLl6fmuT1UrFt1T2vqM9LRWxwCMb90dN57gsX8eCqv+bBF/+qbbkrL+J+5pSIdc0JYus58jNNxVGu8VWDqHXMDWIDGoFt1jyb7UNsEDvEBmQQG5BBbEBGf2wj4jR56Rn6jJ4avZ64hNt/+pu3Y67C7U+9sXz5cYqXalz+paeJZc5YfgfTF5s8RbaSvLBmjFe2/5SXH3+gPb/ezMtP/DvPr72Me8OLxDq0noK/Wbj9Bs//y3I+tfU+sf4Ho7frSMntF4rfvpIHy84K7xu5jtw/DPCpR+4O9y3y+2ZDLv8H1/Ng+Yd1vegaK62xecN9fHLDjeqNDg1TnuKl+9dzf/BE3a/3vNmM7ZevnGuZSpmXHrpDvQLfFwZXvGkVr7kH1A3anFqVl5/f1vgA2uH+6P3qIPpju/cGdU9oGBnbprW0sYntrxdzagPaHBnbltsOje2bK3lN13uXMrbnHkNsWgax/f+D2BDb9CC2QyC2JsQWO8TWhNhih9iaEFv8wtiMPYgNsVGoift5F2JDbBQQWwixUUBsIcRGAbGFEBsFxBZCbBQQWwixUUBsIcRGAbGFEBsFxBZCbBQQWwixUUBsIcRGAbGFEBsFxBZCbLELRGyuZbyM2BBb7MLY0mwnYkNssUNsTYgtdoitCbHFDrE1IbbYIbYmxBY7xNaE2GKH2JoQW+wQWxNiix1ia0JssUNsTYgtdoitCbHFDrE1IbbYBRmz6tnsRcSG2GIXxmaZOxAbYosdYmtCbLFDbE0zY5vMqw1oc8LYbj80tm9dwWvufnWDNieM7ZcLOLa7v8Lr5VJ4dGhbMMFL91xPG5vYfnnkkcFFbtNsBFleeuDbIjb5q+NVbOs+z6t7/kfP8vMen3ryYZ67/LwFFptkiwV+ZjEPVv05D674SPtWLeHB8sViuUb0+nQLt/9sHqz4M7F+se6obZoNuf3yU4ibH7ohgg4+faZY/gWNv4v6ntmQy7hMhCY/yCPuz4nQQG9sIbHT2j7rUi0ncj1xOWzdbXmL7Z/5d22Zj/tn7mKIDSAaYgMyiA3IIDYgg9iADGIDMogNyAQZVs0OG88iNoidjM212JOIDWKH2IAMYgMyiA3IIDYgg9iADGIDMogNyCA2IIPYgAxiAzKIDcggNiATOKziWeavEBvELpdhFddh2xAbxA6xARnEBmQQG5BBbEAGsQGJnJB3WCVrG7+Yjq0oQssLgfhLaF/UHb+QzLgPioHNduXSxhUJvmTJ0UHG+DvPYvuE14XXoD2+4NpGaeadv1DIyDzHrIs/F7I22+nb5io+lnhPAhPP1AfMD4jYflMeVb+fbQFQR7Jq4LDAt5NPHbSMS1cnEm9XdwkmjqkPnPRuz2HrxH/RU/JpyeEPSq9RkVXEczPXz5iP+unkJ9RdgYlzeCLxtgkreZYI7YVePqrJwMLIbFYWJ5UT4uv92YxxobobMBSz1zn+9/yMcYt4IKq9eGY/HZnDSiKw8azVf+vEMDtD7T6GavjqxNv9NDvfs82Xypf21lGtEZh44m+bk/Lkx7OSNx4cOOlEtesY6jnwyePeK04K7pIPTK8c1VRk4Zmlbxkve2njS3X72PepXcbMx/DBxFETTt9HxYnBq1M98FwtjMw2azlxZhlY7DnPYmNPjSXeoXYXM59zcIX5Pt82NhRGxAPVxUc19XysIs6iPfHjcps7nBxQu4jphJHvwHgZc1A+lyl16VGt8R8IKxcyZtbLGJtzjnGR2j1MJ4072vd+3zF+PDmSmn4i3Q3ktqojWUn8uBwXT/7vyo+mFqvdwnTa8LFz3+HayU+L5zf7ZWxRD2qnmY5MnFl6Ntsrnmeunxzq61e7hOnU8axFf5i1jIfkj89OP6qp7auLrwXPMV71LGM1X3bSsWpXMJ08fPD0d+ac/pXiR9DBYgcf1VRktcBhOd8yXsha/St3DyTerXYD0w3jZ049ThwdtlY69KRAnRVX8xnmi+18wnOStnzhWW0+plvmpY+a7xJHimt8mwWddlSTRzKxbeXCiJl1bePhiSHjY2qzMd044/aiD4on1493ylGtEZj8M5vKWeygmzY2HHT6/1htLqZb59XRvmNyjvFV+US7kJnf2JqRCfLMcr84M755fCj5IbWpmG4eeQnR/iGTuTbbXpnHN9sbR7FQUfyo3C2+fm3/aN8fqc3E9MLICyMD21jr2aZ8S+eQACioyGo5m+XdYeN34sflF+UFAGrzML0ynCfeNmUlzxI/rnZQH9XeOLNM+a6V3O5ai5a9MJh4p9o0TK9NeGGkzb4jHvQa1SVEjfXIN8ZTrvj6czfNPqU2B9OrI1+fCtLGhZ5jvhj3hZHNJ/3ykuuCYx700skfZq3UR9SmYHp9DnzylPcGlnF7zknFdmHkdGSNS673e0PG7ROXGGeqTcAshAkvjEwbFwcO++84jmrqSb/8Wgwc43+9YWNNdtBYpFaPWUjzyqDxB246+YOi5gsjVWThG+PiDHenOPH4+99+6oTj1GoxC23CCyPt/kvEEWd3SdPbUmGw4SXXZuCljWcDO/k5+ZKKWiVmoY68MNKzjPt1XEIkn+uJZVQKGdN1reSvxI/mYZ5IHKVWhVnIIy+MPOgkl4nnanvnemGkDHT6kusRc8JLswcnL0n9pVoFBtOY3QMnHSueS22WL+DO9qgWRiZ4DpvybeOAa7F/y9vsHLVoDOaNkRdGZh1jpW+zidkc1ZqRiT+Hl1z76f6bvKGTmVosBvPm8TMnHCdOCh6pHuFRTd2mLp6XFVzHeMW12Vdyw8nj1eIwmOhpXBiZvCaXYX6rCyPVSyG1vMMCEdh/+k7ySo43xjFHOgeGTz7Bc4yt8qh2eFxN6l2EaiGT8sTZ6n/k02wEb4xjZjV8tO8YceZ4nQipGHVhZPON8cJIKpu12CPZIfPj6lsxmCMfeWGkN8BM1zKeqM04qr3xpJ9N5TPsQNYyNvoD7Hz1bRjM7IePffA9gZ38ZxFWeGHkjMhK4sxyn2+b3wuGUqepm2Mwcxt5CZE72LdYHLWeqS1NyV9ALJ/8F32bvSp/F9lrf8tOVjfFYNqb/YMf+H1x5LpJkL+eP+/Zxm9FZNfsxv8xjtE54W+MdNifitC2+47xX57TP7bn4/hV6pgYRr5bIEJzvCE2tHVJ4mj1rzEYDAaDwWAwmAU4icT/AZFH2OBbmEutAAAAAElFTkSuQmCC";
 const LOGO_WIDTH = 155;
 const LOGO_HEIGHT = 343;
-const ORANGE = "FF5E39";
-const DARK = "1A1A1A";
-const GREY = "6B6B6B";
-const FONT = "Barlow";
 const ETAT_LABELS$1 = ["Excellent", "Bon", "Moyen", "Mauvais", "Critique"];
 function base64ToUint8Array(base64) {
   const bin = atob(base64);
@@ -23087,40 +23463,6 @@ function base64ToUint8Array(base64) {
 }
 function money(n) {
   return n.toLocaleString("fr-CA", { style: "currency", currency: "CAD", maximumFractionDigits: 0 });
-}
-function heading(text) {
-  return new Paragraph({
-    heading: HeadingLevel.HEADING_1,
-    spacing: { before: 320, after: 160 },
-    children: [new TextRun({ text, bold: true, color: ORANGE, font: FONT, size: 24 })]
-  });
-}
-function body(text, opts = {}) {
-  return new Paragraph({
-    spacing: { after: 100 },
-    children: [
-      new TextRun({ text, font: FONT, bold: opts.bold, color: opts.color ?? DARK, size: opts.size ?? 20 })
-    ]
-  });
-}
-function cell(text, opts = {}) {
-  return new TableCell({
-    shading: opts.header ? { type: ShadingType.CLEAR, fill: DARK } : void 0,
-    margins: { top: 60, bottom: 60, left: 80, right: 80 },
-    children: [
-      new Paragraph({
-        children: [
-          new TextRun({
-            text,
-            font: FONT,
-            size: 16,
-            bold: opts.header,
-            color: opts.header ? "FFFFFF" : opts.color ?? DARK
-          })
-        ]
-      })
-    ]
-  });
 }
 // ============================================================================
 // LE RAPPORT .DOCX — plan de gestion de l'actif, ossature maison
@@ -23655,39 +23997,717 @@ function peutGererEntreprise(user, companyId) {
   if (user.role === "super_admin") return true;
   return user.company_id === companyId;
 }
-function titre2(text) {
-  return new Paragraph({
-    spacing: { before: 240, after: 100 },
-    children: [new TextRun({ text, bold: true, color: DARK, font: FONT, size: 22 })]
-  });
-}
-function titre3(text) {
-  return new Paragraph({
-    spacing: { before: 160, after: 60 },
-    children: [new TextRun({ text, bold: true, color: ORANGE, font: FONT, size: 19 })]
-  });
-}
-function paras(texte, opts = {}) {
-  if (!texte) return [];
-  return String(texte).split(/\n{2,}/).map((bloc) => bloc.trim()).filter(Boolean).flatMap((bloc) => bloc.split("\n").map((ligne) => body(ligne.trim(), opts)));
-}
-function puce(text) {
-  return body(`· ${text}`);
-}
-function tableauMaison(entetes, lignes) {
-  return new Table({
-    width: { size: 100, type: WidthType.PERCENTAGE },
-    rows: [
-      new TableRow({ children: entetes.map((h) => cell(h, { header: true })) }),
-      ...lignes.map((ligne) => new TableRow({ children: ligne.map((v) => cell(String(v))) }))
-    ]
-  });
-}
 function pourcent(taux) {
   return `${(taux * 100).toFixed(2).replace(".", ",").replace(/,00$/, "")}${NBSP}%`;
 }
-async function generateReportDocx(ctx) {
+// ============================================================================
+// IDENTITÉ DU RAPPORT — thème de la firme, fiche composante, composition Word
+// ----------------------------------------------------------------------------
+// Chaque firme hébergée publie ses rapports à son image : couleurs, polices,
+// coordonnées et logo viennent de sa fiche d'entreprise (companies.theme), et
+// non plus de constantes Condo Stratégis codées en dur. Une firme peut aussi
+// fournir son propre gabarit Word de mise en page (companies.mise_en_page) :
+// ses pages liminaires, ses champs {{…}} et son repère {{RAPPORT}}, où la
+// plateforme verse le rapport qu'elle a rédigé, dans les styles de la firme.
+// ============================================================================
+const THEME_DEFAUT = {
+  accent: "FF5E39",
+  encre: "0A0A0A",
+  gris: "6B6B6B",
+  filet: "E0E0E0",
+  fond: "F7F7F7",
+  vert: "1F8A4E",
+  vertPale: "E6F2EB",
+  police: "Inter Tight",
+  policeTitres: "Archivo",
+  policeMono: "JetBrains Mono",
+  adresse: "",
+  telephone: "",
+  courriel: "",
+  site: ""
+};
+// Coordonnées historiques de Condo Stratégis : reprises seulement pour cette
+// firme tant qu'elle ne les a pas saisies à sa fiche, pour que ses rapports ne
+// perdent pas leur pied de page le jour du déploiement.
+const COORDONNEES_STRATEGIS = {
+  adresse: "82, rue de Brésol, Montréal, Québec, H2Y 1V5",
+  telephone: "(514) 508-6987",
+  courriel: "info@condostrategis.ca"
+};
+const CHAMPS_THEME_COULEUR = ["accent", "encre", "gris"];
+const CHAMPS_THEME_POLICE = ["police", "policeTitres", "policeMono"];
+const CHAMPS_THEME_TEXTE = ["adresse", "telephone", "courriel", "site"];
+function estStrategis(nom) {
+  return /strat[ée]gis/i.test(String(nom ?? ""));
+}
+function nettoyerTheme(brut) {
+  const src = objetJson(brut);
+  const theme = {};
+  for (const k of CHAMPS_THEME_COULEUR) {
+    const v = String(src[k] ?? "").trim().replace(/^#/, "").toUpperCase();
+    if (/^[0-9A-F]{6}$/.test(v)) theme[k] = v;
+  }
+  for (const k of CHAMPS_THEME_POLICE) {
+    const v = String(src[k] ?? "").trim();
+    if (/^[\p{L}0-9 \-]{1,40}$/u.test(v)) theme[k] = v;
+  }
+  for (const k of CHAMPS_THEME_TEXTE) {
+    const v = String(src[k] ?? "").trim().slice(0, 160);
+    if (v) theme[k] = v;
+  }
+  return theme;
+}
+function themeDeFirme(company) {
+  const propre = nettoyerTheme(company?.theme);
+  const theme = { ...THEME_DEFAUT, ...propre, nom: String(company?.name ?? "").trim() };
+  if (estStrategis(theme.nom)) {
+    for (const [k, v] of Object.entries(COORDONNEES_STRATEGIS)) if (!propre[k]) theme[k] = v;
+  }
+  return theme;
+}
+function coordonneesFirme(theme) {
+  return [theme.nom, theme.adresse, theme.telephone, theme.courriel, theme.site].filter(Boolean).join(" — ");
+}
+// Dimensions d'une image PNG ou JPEG, lues dans son en-tête : ImageRun exige
+// une taille, et une photo de téléphone n'a jamais les proportions du cadre.
+function imageDocx(bytes) {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (b.length > 24 && b[0] === 137 && b[1] === 80 && b[2] === 78 && b[3] === 71) {
+    const vue = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    return { data: b, type: "png", largeur: vue.getUint32(16), hauteur: vue.getUint32(20) };
+  }
+  if (b.length > 4 && b[0] === 255 && b[1] === 216) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 255) { i++; continue; }
+      const marqueur = b[i + 1];
+      const longueur = (b[i + 2] << 8) + b[i + 3];
+      // SOF0 à SOF15, sauf DHT (C4), JPG (C8) et DAC (CC).
+      if (marqueur >= 192 && marqueur <= 207 && marqueur !== 196 && marqueur !== 200 && marqueur !== 204) {
+        return { data: b, type: "jpg", largeur: (b[i + 7] << 8) + b[i + 8], hauteur: (b[i + 5] << 8) + b[i + 6] };
+      }
+      i += 2 + longueur;
+    }
+  }
+  return null;
+}
+function tailleImage(image, largeurMax, hauteurMax) {
+  const ratio = image.largeur > 0 && image.hauteur > 0 ? image.hauteur / image.largeur : 0.75;
+  let largeur = largeurMax;
+  let hauteur = Math.round(largeur * ratio);
+  if (hauteur > hauteurMax) {
+    hauteur = hauteurMax;
+    largeur = Math.round(hauteur / ratio);
+  }
+  return { width: largeur, height: hauteur };
+}
+const SANS_BORDURE = { style: BorderStyle.NONE, size: 0, color: "FFFFFF" };
+// Outils de mise en forme, liés au thème d'un rapport. `modeStyles` : le rapport
+// sera versé dans le gabarit Word d'une firme — les titres portent alors les
+// styles Titre 1 à 3 et le texte courant hérite de ses polices, au lieu de
+// formats directs qui écraseraient sa mise en page.
+function outilsDocx(t, { modeStyles = false } = {}) {
+  const police = modeStyles ? void 0 : t.police;
+  const policeTitres = modeStyles ? void 0 : t.policeTitres;
+  const policeMono = modeStyles ? void 0 : t.policeMono;
+  const run = (text, o = {}) => new TextRun({
+    text,
+    font: o.font === void 0 ? police : o.font,
+    bold: o.bold,
+    italics: o.italics,
+    allCaps: o.allCaps,
+    characterSpacing: o.characterSpacing,
+    color: o.color === void 0 ? (modeStyles ? void 0 : t.encre) : o.color,
+    size: o.size === void 0 ? (modeStyles ? void 0 : 20) : o.size
+  });
+  const bordures = {
+    top: SANS_BORDURE,
+    left: SANS_BORDURE,
+    right: SANS_BORDURE,
+    insideVertical: SANS_BORDURE,
+    bottom: { style: BorderStyle.SINGLE, size: 4, color: t.filet },
+    insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: t.filet }
+  };
+  const sansBordures = { top: SANS_BORDURE, bottom: SANS_BORDURE, left: SANS_BORDURE, right: SANS_BORDURE, insideHorizontal: SANS_BORDURE, insideVertical: SANS_BORDURE };
+  function heading(text, o = {}) {
+    return new Paragraph({
+      heading: HeadingLevel.HEADING_1,
+      pageBreakBefore: !o.sansSaut,
+      keepNext: true,
+      spacing: { before: 120, after: 200 },
+      border: modeStyles ? void 0 : { bottom: { style: BorderStyle.SINGLE, size: 12, color: t.accent, space: 6 } },
+      children: [modeStyles ? new TextRun({ text }) : run(text, { font: policeTitres, bold: true, size: 32, allCaps: true })]
+    });
+  }
+  function titre2(text) {
+    return new Paragraph({
+      // Le bundle ne garde que HeadingLevel.HEADING_1 : identifiant de style direct.
+      heading: "Heading2",
+      keepNext: true,
+      spacing: { before: 280, after: 100 },
+      children: [modeStyles ? new TextRun({ text }) : run(text, { font: policeTitres, bold: true, size: 24 })]
+    });
+  }
+  function titre3(text) {
+    return new Paragraph({
+      heading: "Heading3",
+      keepNext: true,
+      spacing: { before: 160, after: 60 },
+      children: [modeStyles ? new TextRun({ text }) : run(text, { font: policeTitres, bold: true, color: t.accent, size: 20 })]
+    });
+  }
+  function body(text, o = {}) {
+    return new Paragraph({
+      spacing: { after: 100 },
+      children: [run(text, { bold: o.bold, color: o.color, size: o.size })]
+    });
+  }
+  function puce(text) {
+    return new Paragraph({
+      spacing: { after: 60 },
+      indent: { left: 360, hanging: 200 },
+      children: [run(`·\t${text}`)],
+      tabStops: [{ type: TabStopType.LEFT, position: 360 }]
+    });
+  }
+  // Avis réglementaire : filet de la couleur d'accent à gauche, sur fond blanc
+  // — le gabarit maison ne pose jamais de texte sur un fond teinté.
+  function encadre(text) {
+    return new Paragraph({
+      spacing: { before: 120, after: 160 },
+      indent: { left: 220 },
+      border: { left: { style: BorderStyle.SINGLE, size: 18, color: t.accent, space: 10 } },
+      children: [run(text, { size: 17 })]
+    });
+  }
+  function paras(texte, o = {}) {
+    if (!texte) return [];
+    return String(texte).split(/\n{2,}/).map((bloc) => bloc.trim()).filter(Boolean).flatMap((bloc) => bloc.split("\n").map((ligne) => {
+      const l = ligne.trim();
+      if (/^INFORMATION\s*:/.test(l)) return encadre(l);
+      if (/^[·•]\s*/.test(l)) return puce(l.replace(/^[·•]\s*/, ""));
+      return body(l, o);
+    }));
+  }
+  function cell(text, o = {}) {
+    return new TableCell({
+      shading: o.header ? { type: ShadingType.CLEAR, fill: t.fond, color: "auto" } : void 0,
+      margins: { top: 70, bottom: 70, left: 100, right: 100 },
+      children: [new Paragraph({
+        alignment: o.droite ? AlignmentType.RIGHT : void 0,
+        children: [o.header
+          ? run(text, { font: policeMono, size: 14, color: t.gris, allCaps: true, characterSpacing: 10 })
+          : run(text, { size: 17, color: o.color })]
+      })]
+    });
+  }
+  function tableauMaison(entetes, lignes, o = {}) {
+    const droite = new Set(o.colonnesDroite ?? []);
+    return new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      borders: bordures,
+      rows: [
+        new TableRow({ tableHeader: true, children: entetes.map((h, i) => cell(h, { header: true, droite: droite.has(i) })) }),
+        ...lignes.map((ligne) => new TableRow({ cantSplit: true, children: ligne.map((v, i) => cell(String(v), { droite: droite.has(i) })) }))
+      ]
+    });
+  }
+  function etiquette(text) {
+    return new Paragraph({
+      keepNext: true,
+      spacing: { before: 220, after: 70 },
+      children: [run(text, { font: policeMono, size: 16, bold: true, color: t.accent, allCaps: true, characterSpacing: 20 })]
+    });
+  }
+  // Bandeau de synthèse : ce qu'on doit lire d'un coup d'œil en feuilletant.
+  function bandeau(cases) {
+    const cellules = cases.map((c) => {
+      const teinte = c.teinte ?? null;
+      return new TableCell({
+        shading: teinte?.fond ? { type: ShadingType.CLEAR, fill: teinte.fond, color: "auto" } : void 0,
+        margins: { top: 80, bottom: 80, left: 110, right: 110 },
+        children: [
+          // keepNext : le bandeau ne reste jamais seul en bas de page.
+          new Paragraph({ keepNext: true, children: [run(c.libelle, { font: policeMono, size: 13, color: teinte?.libelle ?? t.gris, allCaps: true, characterSpacing: 10 })] }),
+          new Paragraph({ keepNext: true, spacing: { before: 30 }, children: [run(c.valeur, { bold: true, size: 18, color: teinte?.texte ?? t.encre })] })
+        ]
+      });
+    });
+    return new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      borders: {
+        top: { style: BorderStyle.SINGLE, size: 4, color: t.filet },
+        bottom: { style: BorderStyle.SINGLE, size: 4, color: t.filet },
+        left: SANS_BORDURE,
+        right: SANS_BORDURE,
+        insideHorizontal: SANS_BORDURE,
+        insideVertical: { style: BorderStyle.SINGLE, size: 4, color: t.filet }
+      },
+      rows: [new TableRow({ cantSplit: true, children: cellules })]
+    });
+  }
+  function teinteCote(cote) {
+    if (cote === "Bon") return { fond: t.vertPale, texte: t.vert, libelle: t.vert };
+    if (cote === "Passable") return { fond: null, texte: t.accent, libelle: t.accent };
+    if (cote === "Mauvais") return { fond: t.accent, texte: "FFFFFF", libelle: "FFFFFF" };
+    return null;
+  }
+  function photoBloc(photo, largeurMax, hauteurMax) {
+    return [
+      new Paragraph({
+        keepNext: true,
+        spacing: { after: 30 },
+        children: [new ImageRun({ data: photo.image.data, type: photo.image.type, transformation: tailleImage(photo.image, largeurMax, hauteurMax) })]
+      }),
+      new Paragraph({
+        spacing: { after: 120 },
+        children: [run(sansNotesInternes(photo.tag ?? "Photo"), { font: policeMono, size: 13, color: t.gris, allCaps: true, characterSpacing: 10 })]
+      })
+    ];
+  }
+  // Fiche composante — gabarit « classique éditorial » de la firme : surtitre
+  // catégorie · code, titre, filet court, bandeau de synthèse, puis les quatre
+  // sections. Les photos sont celles de l'ingénieur ; sans photo, le texte prend
+  // toute la largeur plutôt que de laisser un cadre vide dans un rapport livré.
+  function ficheDocx({ numero, nom, categorie, code, cote, ligne, component, fiche, photos, taches = [] }) {
+    const blocs = [];
+    blocs.push(new Paragraph({
+      keepNext: true,
+      spacing: { before: 420, after: 40 },
+      children: [run(`${categorie.toUpperCase()}${code ? ` · ${code}` : ""}`, { font: policeMono, size: 14, color: t.gris, characterSpacing: 20 })]
+    }));
+    blocs.push(new Paragraph({
+      heading: "Heading3",
+      keepNext: true,
+      spacing: { after: 40 },
+      children: [modeStyles ? new TextRun({ text: `${numero} ${nom}` }) : run(`${numero} ${nom}`, { font: policeTitres, bold: true, size: 30, allCaps: true })]
+    }));
+    // Filet court : la bordure d'un paragraphe fait toute sa largeur, un
+    // retrait à droite la ramène à environ 2,5 cm.
+    blocs.push(new Paragraph({
+      keepNext: true,
+      spacing: { after: 160 },
+      indent: { right: 8200 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 12, color: t.accent, space: 1 } },
+      children: []
+    }));
+    const delai = DELAIS_MAISON.find((d) => d.libelle === component?.delai_suggere);
+    blocs.push(bandeau([
+      { libelle: "Cote", valeur: cote ?? "Non cotée", teinte: teinteCote(cote) },
+      { libelle: "Origine", valeur: ligne.anneeInstall != null ? String(ligne.anneeInstall) : ligne.anneeReference != null ? `${ligne.anneeReference} (calcul)` : "—" },
+      { libelle: ligne.allocation ? "Cycle" : "Durée de vie", valeur: `${ligne.duree} ans` },
+      { libelle: ligne.allocation ? "Débutant en" : "Remplacement", valeur: ligne.annee != null ? String(ligne.annee) : "à confirmer" },
+      { libelle: "Délai", valeur: delai ? delai.libelle.replace(/\s*\(.*\)$/, "") : sansNotesInternes(component?.delai_suggere ?? "") || "—" }
+    ]));
+    for (const section of fiche.sections) {
+      blocs.push(etiquette(section.cle === "etat" ? "État de l'actif" : section.cle === "duree_vie" ? "Durée de vie et remplacement" : section.cle === "entretien" ? "Commentaires d'entretien" : "Attention spéciale"));
+      const texte = paras(section.texte);
+      if (section.cle === "etat" && photos.length > 0) {
+        const aCote = photos.slice(0, 2);
+        const dessous = photos.slice(2, 4);
+        blocs.push(new Table({
+          width: { size: 100, type: WidthType.PERCENTAGE },
+          borders: sansBordures,
+          rows: [new TableRow({
+            children: [
+              new TableCell({ width: { size: 62, type: WidthType.PERCENTAGE }, margins: { right: 200 }, children: texte.length ? texte : [new Paragraph({ children: [] })] }),
+              new TableCell({ width: { size: 38, type: WidthType.PERCENTAGE }, children: aCote.flatMap((p) => photoBloc(p, 215, 170)) })
+            ]
+          })]
+        }));
+        if (dessous.length) {
+          blocs.push(new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            borders: sansBordures,
+            rows: [new TableRow({
+              cantSplit: true,
+              children: [0, 1].map((i) => new TableCell({
+                width: { size: 50, type: WidthType.PERCENTAGE },
+                children: dessous[i] ? photoBloc(dessous[i], 300, 220) : [new Paragraph({ children: [] })]
+              }))
+            })]
+          }));
+        }
+      } else {
+        blocs.push(...texte);
+      }
+      // Tâches du carnet d'entretien de cette composante, sous les commentaires.
+      if (section.cle === "entretien" && taches.length) {
+        blocs.push(new Paragraph({ keepNext: true, spacing: { before: 120, after: 60 }, children: [run("Tâches planifiées au carnet d'entretien", { font: policeMono, size: 14, color: t.gris, allCaps: true, characterSpacing: 10 })] }));
+        blocs.push(tableauMaison(
+          ["Tâche", "Fréquence", "Quand", "Responsable"],
+          taches.map((x) => [x.texte, x.frequence, x.quand, x.responsable])
+        ));
+      }
+      if (section.cle === "duree_vie") {
+        blocs.push(tableauMaison(
+          ["Élément", "Type", ligne.allocation ? "Cycle" : "Durée de vie", ligne.allocation ? "Débutant en" : "Remplacement", ligne.libelleMontant],
+          [[
+            titreTableauMaison(component, ligne),
+            ligne.reglementaire ? ligne.reglementaire.libelle : ligne.allocation ? "Allocation" : "Remplacement",
+            `${ligne.duree} ans`,
+            ligne.annee != null ? String(ligne.annee) : "à confirmer",
+            montantMaison(ligne.cout) ?? `-${NBSP}$`
+          ]],
+          { colonnesDroite: [4] }
+        ));
+      }
+    }
+    return blocs;
+  }
+  return { run, heading, titre2, titre3, body, puce, encadre, paras, cell, tableauMaison, etiquette, ficheDocx, bordures };
+}
+// ----------------------------------------------------------------------------
+// Post-traitement du .docx produit : table des matières, sommaire exécutif,
+// et composition dans le gabarit Word de la firme.
+// ----------------------------------------------------------------------------
+const MARQUE_TDM = "§§TABLE_DES_MATIERES§§";
+const MARQUE_DEBUT_SOMMAIRE = "§§DEBUT_SOMMAIRE§§";
+const MARQUE_FIN_SOMMAIRE = "§§FIN_SOMMAIRE§§";
+const MARQUE_BLOC = (nom) => `§§BLOC_${nom}§§`;
+const BLOCS_GABARIT = ["rapport", "table_des_matieres", "sommaire_executif"];
+// docx produit toutes ses images avec <wp:docPr id="1"> ; Word exige des
+// identifiants uniques et « répare » sinon le document à l'ouverture.
+function renumeroterDessins(xml) {
+  let n = 0;
+  return xml.replace(/<wp:docPr id="\d+"/g, () => `<wp:docPr id="${++n}"`);
+}
+function echapperXml(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function champTableDesMatieres() {
+  return '<w:p><w:r><w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \\o "1-3" \\h \\z \\u </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t xml:space="preserve">Table des matières : si elle n\'apparaît pas, faites un clic droit ici puis « Mettre à jour les champs ».</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>';
+}
+// Bornes du paragraphe <w:p> qui contient la position `pos`.
+function paragrapheAutour(xml, pos) {
+  const a = xml.lastIndexOf("<w:p>", pos);
+  const b = xml.lastIndexOf("<w:p ", pos);
+  const debut = Math.max(a, b);
+  const fin = xml.indexOf("</w:p>", pos);
+  if (debut < 0 || fin < 0) return null;
+  return { debut, fin: fin + 6 };
+}
+function remplacerParagraphe(xml, marque, remplacement) {
+  const pos = xml.indexOf(marque);
+  if (pos < 0) return { xml, trouve: false };
+  const p = paragrapheAutour(xml, pos);
+  if (!p) return { xml, trouve: false };
+  return { xml: xml.slice(0, p.debut) + remplacement + xml.slice(p.fin), trouve: true };
+}
+// Champs {{cle}} d'un XML Word. Word coupe souvent un champ en plusieurs <w:t>
+// dès qu'on change la mise en forme ou que le correcteur passe dessus : on lit
+// donc le texte de tous les <w:t> bout à bout, on y repère les champs, puis on
+// reporte la valeur dans le premier morceau et on vide les suivants.
+const RE_WT = /<w:t(\s[^>]*)?>([\s\S]*?)<\/w:t>|<w:t(\s[^>]*)?\/>/g;
+function remplacerChampsXml(xml, valeurPour) {
+  const noeuds = [];
+  let m;
+  RE_WT.lastIndex = 0;
+  while ((m = RE_WT.exec(xml))) {
+    noeuds.push({ debut: m.index, fin: m.index + m[0].length, texte: decodeEntitesXml(m[2] ?? "") });
+  }
+  const trouves = [];
+  if (!noeuds.length) return { xml, trouves };
+  const bornes = [];
+  let complet = "";
+  for (const n of noeuds) {
+    bornes.push(complet.length);
+    complet += n.texte;
+  }
+  const indexNoeud = (pos) => {
+    for (let i = noeuds.length - 1; i >= 0; i--) {
+      if (bornes[i] <= pos && pos < bornes[i] + noeuds[i].texte.length) return i;
+    }
+    return -1;
+  };
+  const remplacements = [];
+  const re = /\{\{\s*([A-Za-zÀ-ÿ_][A-Za-zÀ-ÿ0-9_]*)\s*\}\}/g;
+  while ((m = re.exec(complet))) {
+    const cle = m[1].toLowerCase();
+    trouves.push(cle);
+    const valeur = valeurPour(cle);
+    if (valeur == null) continue;
+    remplacements.push({ debut: m.index, fin: m.index + m[0].length, texte: String(valeur) });
+  }
+  if (!remplacements.length) return { xml, trouves };
+  const textes = noeuds.map((n) => n.texte);
+  const touches = new Set();
+  for (const r of remplacements.reverse()) {
+    const iDeb = indexNoeud(r.debut);
+    const iFin = indexNoeud(r.fin - 1);
+    if (iDeb < 0 || iFin < 0) continue;
+    const offDeb = r.debut - bornes[iDeb];
+    const offFin = r.fin - bornes[iFin];
+    if (iDeb === iFin) {
+      textes[iDeb] = textes[iDeb].slice(0, offDeb) + r.texte + textes[iDeb].slice(offFin);
+    } else {
+      textes[iDeb] = textes[iDeb].slice(0, offDeb) + r.texte;
+      for (let k = iDeb + 1; k < iFin; k++) { textes[k] = ""; touches.add(k); }
+      textes[iFin] = textes[iFin].slice(offFin);
+      touches.add(iFin);
+    }
+    touches.add(iDeb);
+  }
+  let sortie = "";
+  let curseur = 0;
+  noeuds.forEach((n, i) => {
+    if (!touches.has(i)) return;
+    sortie += xml.slice(curseur, n.debut) + `<w:t xml:space="preserve">${echapperXml(textes[i])}</w:t>`;
+    curseur = n.fin;
+  });
+  sortie += xml.slice(curseur);
+  return { xml: sortie, trouves };
+}
+function texteVisibleXml(xml) {
+  const morceaux = [];
+  let m;
+  RE_WT.lastIndex = 0;
+  while ((m = RE_WT.exec(xml))) morceaux.push(decodeEntitesXml(m[2] ?? ""));
+  return morceaux.join("");
+}
+function ajouterMiseAJourDesChamps(settingsXml) {
+  if (!settingsXml || settingsXml.includes("w:updateFields")) return settingsXml;
+  return settingsXml.replace(/(<w:settings\b[^>]*>)/, '$1<w:updateFields w:val="true"/>');
+}
+// Contenu du <w:body> d'un document.xml, sans son sectPr final.
+function corpsDocument(xml) {
+  const debut = xml.indexOf("<w:body>");
+  const fin = xml.lastIndexOf("</w:body>");
+  let corps = xml.slice(debut + 8, fin);
+  const sect = corps.lastIndexOf("<w:sectPr");
+  if (sect >= 0 && corps.slice(sect).trim().endsWith("</w:sectPr>")) corps = corps.slice(0, sect);
+  return corps;
+}
+// Extrait le sommaire exécutif balisé du corps : [corps sans sommaire, sommaire].
+function extraireSommaire(corps) {
+  const i = corps.indexOf(MARQUE_DEBUT_SOMMAIRE);
+  const j = corps.indexOf(MARQUE_FIN_SOMMAIRE);
+  if (i < 0 || j < 0) return [corps, ""];
+  const pDeb = paragrapheAutour(corps, i);
+  const pFin = paragrapheAutour(corps, j);
+  if (!pDeb || !pFin) return [corps, ""];
+  return [corps.slice(0, pDeb.debut) + corps.slice(pFin.fin), corps.slice(pDeb.fin, pFin.debut)];
+}
+function sansMarquesSommaire(corps) {
+  let xml = corps;
+  for (const marque of [MARQUE_DEBUT_SOMMAIRE, MARQUE_FIN_SOMMAIRE]) xml = remplacerParagraphe(xml, marque, "").xml;
+  return xml;
+}
+// Rapport autonome : on remplace la marque de table des matières par le champ
+// Word et on demande à Word de mettre les champs à jour à l'ouverture.
+async function finaliserRapportDocx(bytes) {
+  const JSZip = import_jszip_min.default;
+  const zip = await JSZip.loadAsync(bytes);
+  let doc = await zip.file("word/document.xml").async("string");
+  doc = remplacerParagraphe(doc, MARQUE_TDM, champTableDesMatieres()).xml;
+  const corps = corpsDocument(doc);
+  const nouveau = sansMarquesSommaire(corps);
+  doc = renumeroterDessins(doc.replace(corps, () => nouveau));
+  zip.file("word/document.xml", doc);
+  const settings = zip.file("word/settings.xml");
+  if (settings) zip.file("word/settings.xml", ajouterMiseAJourDesChamps(await settings.async("string")));
+  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+// Styles de titre : on relie Heading1..3 du rapport aux styles de la firme par
+// leur nom interne (« heading 1 »), puisque l'identifiant est traduit dans un
+// Word en français (« Titre1 »). Un style absent est copié du rapport.
+function relierStyles(stylesFirme, stylesRapport, corps) {
+  const parNom = new Map();
+  const defs = new Map();
+  const re = /<w:style\b([^>]*)>([\s\S]*?)<\/w:style>/g;
+  let m;
+  while ((m = re.exec(stylesFirme))) {
+    const type = /w:type="([^"]+)"/.exec(m[1])?.[1];
+    const id = /w:styleId="([^"]+)"/.exec(m[1])?.[1];
+    const nom = /<w:name w:val="([^"]+)"/.exec(m[2])?.[1];
+    if (type === "paragraph" && id && nom) parNom.set(nom.toLowerCase(), id);
+  }
+  re.lastIndex = 0;
+  while ((m = re.exec(stylesRapport))) {
+    const id = /w:styleId="([^"]+)"/.exec(m[1])?.[1];
+    if (id) defs.set(id, m[0]);
+  }
+  let styles = stylesFirme;
+  let xml = corps;
+  for (const niveau of [1, 2, 3]) {
+    const idRapport = `Heading${niveau}`;
+    const idFirme = parNom.get(`heading ${niveau}`);
+    if (idFirme) {
+      if (idFirme !== idRapport) xml = xml.split(`<w:pStyle w:val="${idRapport}"/>`).join(`<w:pStyle w:val="${idFirme}"/>`);
+    } else if (defs.has(idRapport) && !styles.includes(`w:styleId="${idRapport}"`)) {
+      const def = defs.get(idRapport);
+      styles = styles.replace("</w:styles>", () => `${def}</w:styles>`);
+    }
+  }
+  return { styles, corps: xml };
+}
+// Verse le rapport produit par la plateforme dans le gabarit Word de la firme :
+// champs remplis, blocs {{RAPPORT}}, {{SOMMAIRE_EXECUTIF}} et
+// {{TABLE_DES_MATIERES}} placés, images et relations recopiées.
+async function composerAvecGabarit(rapportBytes, gabaritBytes, valeurs) {
+  const JSZip = import_jszip_min.default;
+  const [rapport, gabarit] = await Promise.all([JSZip.loadAsync(rapportBytes), JSZip.loadAsync(gabaritBytes)]);
+  const docRapport = await rapport.file("word/document.xml").async("string");
+  let [corps, sommaire] = extraireSommaire(corpsDocument(docRapport));
+  // Images du rapport : recopiées sous un nom et un identifiant propres, pour
+  // ne jamais entrer en collision avec celles de la firme.
+  const relsRapport = await rapport.file("word/_rels/document.xml.rels").async("string");
+  const cheminRels = "word/_rels/document.xml.rels";
+  let relsFirme = await gabarit.file(cheminRels).async("string");
+  const extensions = new Set();
+  let n = 0;
+  const remplacerIds = async (xml) => {
+    const ids = [...new Set([...xml.matchAll(/r:embed="([^"]+)"/g)].map((x) => x[1]))];
+    for (const id of ids) {
+      const rel = new RegExp(`<Relationship\\b[^>]*Id="${id}"[^>]*/>`).exec(relsRapport)?.[0];
+      const cible = rel && /Target="([^"]+)"/.exec(rel)?.[1];
+      const fichier = cible && rapport.file(`word/${cible.replace(/^\//, "").replace(/^word\//, "")}`);
+      if (!fichier) continue;
+      n += 1;
+      const ext = (cible.split(".").pop() || "png").toLowerCase();
+      extensions.add(ext);
+      const nom = `media/plateforme-${n}.${ext}`;
+      gabarit.file(`word/${nom}`, await fichier.async("uint8array"));
+      const nouvelId = `rIdPlateforme${n}`;
+      relsFirme = relsFirme.replace("</Relationships>", `<Relationship Id="${nouvelId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${nom}"/></Relationships>`);
+      xml = xml.split(`r:embed="${id}"`).join(`r:embed="${nouvelId}"`);
+    }
+    return xml;
+  };
+  corps = await remplacerIds(corps);
+  sommaire = await remplacerIds(sommaire);
+  gabarit.file(cheminRels, relsFirme);
+  const ct = gabarit.file("[Content_Types].xml");
+  if (ct) {
+    let types = await ct.async("string");
+    const mime = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif" };
+    for (const ext of extensions) {
+      if (!new RegExp(`Extension="${ext}"`, "i").test(types) && mime[ext]) {
+        types = types.replace("</Types>", `<Default Extension="${ext}" ContentType="${mime[ext]}"/></Types>`);
+      }
+    }
+    gabarit.file("[Content_Types].xml", types);
+  }
+  // Styles de titre de la firme.
+  const stylesFirmeFichier = gabarit.file("word/styles.xml");
+  const stylesRapportFichier = rapport.file("word/styles.xml");
+  if (stylesFirmeFichier && stylesRapportFichier) {
+    const relie = relierStyles(await stylesFirmeFichier.async("string"), await stylesRapportFichier.async("string"), corps + MARQUE_DEBUT_SOMMAIRE + sommaire);
+    gabarit.file("word/styles.xml", relie.styles);
+    [corps, sommaire] = relie.corps.split(MARQUE_DEBUT_SOMMAIRE);
+  }
+  // Champs, puis blocs.
+  const valeurPour = (cle) => BLOCS_GABARIT.includes(cle) ? MARQUE_BLOC(cle) : Object.prototype.hasOwnProperty.call(valeurs, cle) ? valeurs[cle] : null;
+  const cheminDoc = "word/document.xml";
+  let doc = remplacerChampsXml(await gabarit.file(cheminDoc).async("string"), valeurPour).xml;
+  let placeSommaire = remplacerParagraphe(doc, MARQUE_BLOC("sommaire_executif"), sommaire);
+  doc = placeSommaire.xml;
+  doc = remplacerParagraphe(doc, MARQUE_BLOC("table_des_matieres"), champTableDesMatieres()).xml;
+  // Sans {{SOMMAIRE_EXECUTIF}} dans le gabarit, le sommaire reste en tête du rapport.
+  const contenu = placeSommaire.trouve ? corps : sommaire + corps;
+  const place = remplacerParagraphe(doc, MARQUE_BLOC("rapport"), contenu);
+  if (place.trouve) {
+    doc = place.xml;
+  } else {
+    // Sans repère, le rapport suit les pages de la firme, sur une nouvelle page.
+    const saut = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
+    const corpsFirme = corpsDocument(doc);
+    const pos = doc.indexOf(corpsFirme) + corpsFirme.length;
+    doc = doc.slice(0, pos) + saut + contenu + doc.slice(pos);
+  }
+  // Préfixes d'espaces de noms employés par le rapport et absents du gabarit.
+  const racineRapport = /<w:document\b[^>]*>/.exec(docRapport)?.[0] ?? "";
+  const racineFirme = /<w:document\b[^>]*>/.exec(doc)?.[0] ?? "";
+  let racine = racineFirme;
+  for (const [, prefixe, uri] of racineRapport.matchAll(/xmlns:([A-Za-z0-9]+)="([^"]+)"/g)) {
+    if (!racine.includes(`xmlns:${prefixe}=`)) racine = racine.replace(/>$/, ` xmlns:${prefixe}="${uri}">`);
+  }
+  if (racine !== racineFirme) doc = doc.replace(racineFirme, () => racine);
+  gabarit.file(cheminDoc, renumeroterDessins(doc));
+  // Champs aussi dans les en-têtes et pieds de page de la firme.
+  for (const chemin of Object.keys(gabarit.files).filter((f) => /^word\/(header|footer)\d*\.xml$/.test(f))) {
+    const xml = await gabarit.file(chemin).async("string");
+    gabarit.file(chemin, remplacerChampsXml(xml, (cle) => Object.prototype.hasOwnProperty.call(valeurs, cle) ? valeurs[cle] : null).xml);
+  }
+  const settings = gabarit.file("word/settings.xml");
+  if (settings) gabarit.file("word/settings.xml", ajouterMiseAJourDesChamps(await settings.async("string")));
+  return gabarit.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+// Champs offerts aux gabarits de firme. Une clé inconnue reste visible telle
+// quelle dans le document produit, pour que la firme la repère.
+const CHAMPS_GABARIT = [
+  ["immeuble", "Nom du syndicat ou de l'immeuble"],
+  ["adresse", "Adresse de l'immeuble"],
+  ["ville", "Ville"],
+  ["adresse_complete", "Adresse et ville"],
+  ["dossier", "Numéro de dossier"],
+  ["unites", "Nombre d'unités"],
+  ["etages", "Nombre d'étages"],
+  ["annee_construction", "Année de construction"],
+  ["date_rapport", "Date du rapport (ex. 25 septembre 2026)"],
+  ["annee", "Année courante"],
+  ["signataire", "Nom du signataire"],
+  ["signataire_titre", "Titre du signataire (ex. ing.)"],
+  ["ordre", "Ordre professionnel (OIQ, OTPQ…)"],
+  ["no_membre", "Numéro de membre"],
+  ["firme", "Nom de la firme"],
+  ["firme_adresse", "Adresse de la firme"],
+  ["firme_telephone", "Téléphone de la firme"],
+  ["firme_courriel", "Courriel de la firme"],
+  ["firme_site", "Site Web de la firme"],
+  ["solde_fonds", "Solde actuel du fonds de prévoyance"],
+  ["cotisation_actuelle", "Cotisation annuelle actuelle"],
+  ["cotisation_recommandee", "Cotisation annuelle recommandée (an 1)"],
+  ["cotisation_mensuelle_unite", "Cotisation mensuelle moyenne par unité"]
+];
+const BLOCS_GABARIT_LIBELLES = [
+  ["rapport", "Où la plateforme insère le rapport (sinon, à la fin du document)"],
+  ["sommaire_executif", "Sommaire exécutif — scénario de financement sur 5 ans"],
+  ["table_des_matieres", "Table des matières Word, mise à jour à l'ouverture"]
+];
+function dateLongue(date) {
+  return date.toLocaleDateString("fr-CA", { day: "numeric", month: "long", year: "numeric" });
+}
+// Analyse d'un gabarit importé : champs reconnus, inconnus, repère présent,
+// et notes de rédaction internes laissées dans les pages liminaires — elles
+// seraient reprises telles quelles dans chaque rapport livré.
+async function analyserGabaritMiseEnPage(bytes) {
+  const JSZip = import_jszip_min.default;
+  const zip = await JSZip.loadAsync(bytes);
+  const doc = zip.file("word/document.xml");
+  if (!doc) throw new Error("ce fichier n'est pas un document Word (.docx)");
+  const xml = await doc.async("string");
+  const extras = [];
+  for (const chemin of Object.keys(zip.files).filter((f) => /^word\/(header|footer)\d*\.xml$/.test(f))) {
+    extras.push(await zip.file(chemin).async("string"));
+  }
+  const trouves = new Set();
+  for (const source of [xml, ...extras]) for (const cle of remplacerChampsXml(source, () => null).trouves) trouves.add(cle);
+  const connus = new Set([...CHAMPS_GABARIT.map(([k]) => k), ...BLOCS_GABARIT]);
+  const texte = texteVisibleXml(xml);
+  const phrases = texte.split(/(?<=[.!?;])\s+|\s{2,}/).map((s) => s.trim()).filter(Boolean);
+  const notes = phrases.filter((s) => NOTES_INTERNES.some((re) => re.test(s)) || /\?\?/.test(s)).slice(0, 12).map((s) => s.slice(0, 160));
+  return {
+    champs: [...trouves].filter((k) => connus.has(k) && !BLOCS_GABARIT.includes(k)),
+    blocs: [...trouves].filter((k) => BLOCS_GABARIT.includes(k)),
+    inconnus: [...trouves].filter((k) => !connus.has(k)),
+    repere: trouves.has("rapport"),
+    notes
+  };
+}
+async function generateReportDocx(ctx, opts = {}) {
   const { dossier, components: components2, projection } = ctx;
+  // Thème de la firme : couleurs, polices, coordonnées. Les outils de mise en
+  // forme sont liés à ce thème et masquent ici les helpers de module du même nom.
+  const theme = ctx.theme ?? themeDeFirme(null);
+  const pourGabarit = !!opts.pourGabarit;
+  const outils = outilsDocx(theme, { modeStyles: pourGabarit });
+  const { heading, titre2, titre3, body, puce, paras, tableauMaison } = outils;
+  const ORANGE = theme.accent;
+  const DARK = theme.encre;
+  const GREY = theme.gris;
+  const FONT = pourGabarit ? void 0 : theme.police;
+  const nomFirme = theme.nom || "La firme";
   // Gabarit de la firme propriétaire du dossier, ou le gabarit intégré si elle
   // n'en a pas importé. Résolu en amont (buildReportContext) : la génération ne
   // doit pas dépendre d'un accès à la base au milieu de la rédaction.
@@ -23700,56 +24720,47 @@ async function generateReportDocx(ctx) {
   const anneeCourante = maintenant.getFullYear();
   const today = maintenant.toLocaleDateString("fr-CA");
   const info = infoBatiment(dossier);
-  const nomSignataire = ctx.engineerName || "Condo Stratégis";
+  const nomSignataire = ctx.engineerName || nomFirme;
+  // Page de garde : logo et coordonnées de la firme, jamais ceux d'une autre.
+  const logo = ctx.logo ?? null;
   const cover = [
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 200 },
-      children: [
-        new ImageRun({
-          data: base64ToUint8Array(LOGO_BASE64),
-          transformation: { width: LOGO_WIDTH * 0.5, height: LOGO_HEIGHT * 0.5 },
-          type: "png"
-        })
-      ]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 60 },
-      children: [new TextRun({ text: "PLAN DE GESTION DE L'ACTIF", bold: true, color: ORANGE, font: FONT, size: 20 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 40 },
-      children: [new TextRun({ text: dossier.name.toUpperCase(), bold: true, color: DARK, font: FONT, size: 40 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 400 },
-      children: [
-        new TextRun({
-          text: `${dossier.address ?? ""}${dossier.city ? ", " + dossier.city : ""}`,
-          color: GREY,
-          font: FONT,
-          size: 20
-        })
-      ]
-    }),
-    body("Inclus à votre Plan de gestion de l'actif : Carnet d'entretien · Étude en fonds de prévoyance · Scénario de financement · Tableur suivi d'entretien", { color: GREY, size: 18 }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [new TextRun({ text: `Notre dossier : ${dossier.dossier_no}`, color: GREY, font: FONT, size: 18 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 40 },
-      children: [new TextRun({ text: `Préparé le ${today} · Rédigé par ${nomSignataire}`, color: GREY, font: FONT, size: 18 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
+    ...logo ? [new Paragraph({
+      alignment: AlignmentType.LEFT,
       spacing: { after: 600 },
-      children: [new TextRun({ text: "Condo Stratégis — 82, rue de Brésol, Montréal, Québec, H2Y 1V5 — (514) 508-6987 — info@condostrategis.ca", color: GREY, font: FONT, size: 16 })]
+      children: [new ImageRun({ data: logo.data, type: logo.type, transformation: tailleImage(logo, 170, 110) })]
+    })] : [],
+    new Paragraph({
+      spacing: { before: logo ? 0 : 1200, after: 120 },
+      children: [outils.run("PLAN DE GESTION DE L'ACTIF", { font: theme.policeMono, bold: true, color: ORANGE, size: 20, characterSpacing: 30 })]
+    }),
+    new Paragraph({
+      spacing: { after: 120 },
+      children: [outils.run(dossier.name, { font: theme.policeTitres, bold: true, size: 52, allCaps: true })]
+    }),
+    new Paragraph({
+      spacing: { after: 480 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 12, color: ORANGE, space: 12 } },
+      children: [outils.run(`${dossier.address ?? ""}${dossier.city ? ", " + dossier.city : ""}`, { color: GREY, size: 22 })]
+    }),
+    outils.tableauMaison(
+      ["Notre dossier", "Préparé le", "Rédigé par"],
+      [[dossier.dossier_no, dateLongue(maintenant), nomSignataire]]
+    ),
+    new Paragraph({ spacing: { before: 360, after: 80 }, children: [outils.run("Inclus à votre Plan de gestion de l'actif", { font: theme.policeMono, size: 15, color: GREY, allCaps: true, characterSpacing: 20 })] }),
+    ...["Carnet d'entretien", "Étude du fonds de prévoyance", "Scénario de financement", "Tableur suivi d'entretien"].map((t) => puce(t)),
+    new Paragraph({
+      spacing: { before: 720 },
+      children: [outils.run(coordonneesFirme(theme), { color: GREY, size: 16 })]
     })
+  ];
+  const tableDesMatieres = [
+    new Paragraph({
+      pageBreakBefore: true,
+      spacing: { after: 240 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 12, color: ORANGE, space: 6 } },
+      children: [outils.run("Table des matières", { font: theme.policeTitres, bold: true, size: 32, allCaps: true })]
+    }),
+    new Paragraph({ children: [new TextRun({ text: MARQUE_TDM })] })
   ];
   // ---- Lecture du moteur financier ---------------------------------------
   // Le moteur simule plusieurs scénarios de financement. La rédaction s'appuie
@@ -23771,7 +24782,7 @@ async function generateReportDocx(ctx) {
   const anneeConstruction = anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier.built_year);
   const sommaireMandat = [
     heading("1.0 Sommaire du mandat"),
-    body(`Condo Stratégis a été retenue par le conseil d'administration du ${dossier.name}${dossier.address ? `, ${dossier.address}` : ""}${dossier.city ? ` à ${dossier.city}` : ""}, Qc, pour effectuer une étude du Plan de gestion de l'actif.`),
+    body(`${nomFirme} a été retenue par le conseil d'administration du ${dossier.name}${dossier.address ? `, ${dossier.address}` : ""}${dossier.city ? ` à ${dossier.city}` : ""}, Qc, pour effectuer une étude du Plan de gestion de l'actif.`),
     body("Le mandat est soumis aux particularités décrites à la section Méthodologie (2.0) et Limitations légales (7.0) et présentées à l'offre de service."),
     titre2("1.1 Description de l'immeuble"),
     body(assembler([
@@ -23867,17 +24878,18 @@ async function generateReportDocx(ctx) {
       const fiche = parId.get(comp.id);
       if (!fiche) continue;
       numeroElement += 1;
-      observation.push(titre3(`4.${numeroCategorie}.${numeroElement} ${fiche.titre}`));
-      if (fiche.coteRapport) observation.push(body(`Cote au rapport : ${COTES_RAPPORT[fiche.coteRapport]}`, { bold: true }));
-      for (const section of fiche.sections) {
-        observation.push(body(section.titre, { bold: true }));
-        observation.push(...paras(section.texte));
-        if (section.tableau) {
-          observation.push(body(titreTableauMaison(comp, ligneDureeVie(comp, dossier)), { bold: true, size: 18 }));
-          observation.push(tableauMaison(section.tableau.entetes, section.tableau.lignes));
-          observation.push(body(""));
-        }
-      }
+      observation.push(...outils.ficheDocx({
+        numero: `4.${numeroCategorie}.${numeroElement}`,
+        nom: sansNotesInternes(comp.name ?? "Élément"),
+        categorie: CATEGORIES[cle].label,
+        code: sansNotesInternes(comp.uniformat_code ?? ""),
+        cote: fiche.coteRapport,
+        ligne: ligneDureeVie(comp, dossier),
+        component: comp,
+        fiche,
+        photos: ctx.photos?.get(comp.id) ?? [],
+        taches: tachesPourComposante(comp).map(tacheAffichee)
+      }));
     }
   }
   // ---- 5.0 Résultats et scénarios de financement --------------------------
@@ -24074,6 +25086,51 @@ async function generateReportDocx(ctx) {
       body("")
     ])
   ];
+  // ---- Sommaire exécutif — 5 ans -----------------------------------------
+  // Balisé pour qu'un gabarit de firme puisse le placer où il veut
+  // ({{SOMMAIRE_EXECUTIF}}) ; sinon il ouvre le rapport.
+  const travauxParAnnee = new Map();
+  const inclus = new Set(projection.includedComponentIds ?? []);
+  for (const comp of components2) {
+    if (!inclus.has(comp.id)) continue;
+    for (const ev of replacementEventsForComponent(comp, projection.params).events) {
+      if (ev.year > 5) continue;
+      if (!travauxParAnnee.has(ev.year)) travauxParAnnee.set(ev.year, []);
+      travauxParAnnee.get(ev.year).push(`${sansNotesInternes(comp.name)} — ${montantMaison(ev.cost) ?? `-${NBSP}$`}`);
+    }
+  }
+  const sommaireExecutif = [
+    new Paragraph({ children: [new TextRun({ text: MARQUE_DEBUT_SOMMAIRE })] }),
+    heading("Sommaire exécutif — 5 ans — Scénario de financement", { sansSaut: pourGabarit }),
+    body(`Le sommaire exécutif permet une appréciation succincte des ajustements aux cotisations du fonds de prévoyance et des projets de remplacement prévus au cours des cinq prochaines années${scenarioPrefere ? `, selon le scénario de financement de préférence (${scenarioPrefere.code})` : ""}.`),
+    ...scenarioPrefere ? [tableauMaison(
+      ["Année", "Augmentation", "Cotisation annuelle", "Travaux prévus"],
+      anneesScenario.slice(0, 5).map((y) => [
+        String(anneeCourante + y.year - 1),
+        `${y.pctAugmentation.toFixed(1).replace(".", ",")}${NBSP}%`,
+        montantMaison(y.cotisation) ?? `-${NBSP}$`,
+        (travauxParAnnee.get(y.year) ?? []).join(" · ") || "Aucun remplacement"
+      ]),
+      { colonnesDroite: [2] }
+    )] : [body("Aucun des scénarios simulés ne satisfait le double critère d'acceptation : le sommaire exécutif sera établi après la révision du calcul de financement.", { bold: true, color: ORANGE })],
+    body("Pour toute divergence avec le scénario de financement, ce dernier devra être considéré comme conforme à l'étude.", { color: GREY, size: 18 }),
+    new Paragraph({ children: [new TextRun({ text: MARQUE_FIN_SOMMAIRE })] })
+  ];
+  // Un seul flux paginé : chaque grande section s'ouvre sur une nouvelle page
+  // (saut avant les titres de niveau 1) et les fiches se suivent sans page
+  // blanche. Le pied de page porte la firme et la pagination continue.
+  const piedDePage = {
+    options: {
+      children: [new Paragraph({
+        border: { top: { style: BorderStyle.SINGLE, size: 4, color: THEME_DEFAUT.filet, space: 6 } },
+        tabStops: [{ type: TabStopType.RIGHT, position: 9360 }],
+        children: [
+          outils.run(`${nomFirme} — Plan de gestion de l'actif — ${dossier.dossier_no}`, { font: theme.policeMono, size: 14, color: GREY }),
+          new TextRun({ children: ["\t", PageNumber.CURRENT], font: theme.policeMono, size: 14, color: GREY })
+        ]
+      })]
+    }
+  };
   const doc = new File$1({
     styles: {
       default: {
@@ -24081,21 +25138,26 @@ async function generateReportDocx(ctx) {
       }
     },
     background: { color: "FFFFFF" },
-    sections: [
-      { children: cover },
-      { children: sommaireMandat },
-      { children: methodologie },
-      { children: commentLire },
-      { children: observation },
-      { children: resultats },
-      { children: conclusion },
-      { children: limitations },
-      { children: declaration },
-      { children: suivi },
-      { children: lexique },
-      { children: annexeA },
-      { children: annexeB }
-    ]
+    sections: [{
+      properties: { page: { margin: { top: 1080, right: 1080, bottom: 1080, left: 1080 } } },
+      footers: pourGabarit ? void 0 : { default: piedDePage },
+      children: [
+        ...pourGabarit ? [] : [...cover, ...tableDesMatieres],
+        ...sommaireExecutif,
+        ...sommaireMandat,
+        ...methodologie,
+        ...commentLire,
+        ...observation,
+        ...resultats,
+        ...conclusion,
+        ...limitations,
+        ...declaration,
+        ...suivi,
+        ...lexique,
+        ...annexeA,
+        ...annexeB
+      ]
+    }]
   });
   return Packer.toBuffer(doc);
 }
@@ -44650,6 +45712,78 @@ companies.delete("/:id/template", async (c) => {
   await c.env.DB.prepare("DELETE FROM company_templates WHERE company_id = ?1").bind(id).run();
   return c.json({ ok: true, retour: "gabarit intégré" });
 });
+// Identité du rapport : couleurs, polices et coordonnées de la firme.
+companies.get("/:id/theme", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT id, name, theme FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  return c.json({ theme: nettoyerTheme(company.theme), effectif: themeDeFirme(company), defauts: THEME_DEFAUT });
+});
+companies.patch("/:id/theme", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const theme = nettoyerTheme(await c.req.json());
+  await c.env.DB.prepare(
+    "UPDATE companies SET theme = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
+  ).bind(JSON.stringify(theme), id).run();
+  const company = await c.env.DB.prepare("SELECT id, name, theme FROM companies WHERE id = ?1").bind(id).first();
+  return c.json({ theme, effectif: themeDeFirme(company), defauts: THEME_DEFAUT });
+});
+// Gabarit Word de mise en page : pages liminaires, champs {{…}} et repère
+// {{RAPPORT}}. Distinct du gabarit de textes (/template), qui alimente les
+// sections rédigées ; celui-ci est repris tel quel autour du rapport.
+companies.get("/:id/mise-en-page", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT mise_en_page FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  const miseEnPage = objetJson(company.mise_en_page);
+  return c.json({
+    importe: !!miseEnPage.r2_key,
+    ...miseEnPage.r2_key ? { filename: miseEnPage.filename, imported_at: miseEnPage.imported_at, analyse: miseEnPage.analyse } : {},
+    champs: CHAMPS_GABARIT,
+    blocs: BLOCS_GABARIT_LIBELLES
+  });
+});
+companies.post("/:id/mise-en-page", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 20 * 1024 * 1024) return c.json({ error: "document trop volumineux (max 20 Mo)" }, 413);
+  let analyse;
+  try {
+    analyse = await analyserGabaritMiseEnPage(new Uint8Array(buffer));
+  } catch (e) {
+    return c.json({ error: `lecture du .docx impossible : ${e.message}` }, 400);
+  }
+  const r2Key = `company-layouts/${id}.docx`;
+  await c.env.PHOTOS.put(r2Key, buffer, { httpMetadata: { contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" } });
+  const miseEnPage = { r2_key: r2Key, filename: file.name || "gabarit.docx", imported_at: new Date().toISOString(), analyse };
+  await c.env.DB.prepare(
+    "UPDATE companies SET mise_en_page = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
+  ).bind(JSON.stringify(miseEnPage), id).run();
+  return c.json({ importe: true, filename: miseEnPage.filename, imported_at: miseEnPage.imported_at, analyse, champs: CHAMPS_GABARIT, blocs: BLOCS_GABARIT_LIBELLES });
+});
+companies.delete("/:id/mise-en-page", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT mise_en_page FROM companies WHERE id = ?1").bind(id).first();
+  const r2Key = objetJson(company?.mise_en_page).r2_key;
+  if (r2Key) await c.env.PHOTOS.delete(r2Key);
+  await c.env.DB.prepare(
+    "UPDATE companies SET mise_en_page = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1"
+  ).bind(id).run();
+  return c.json({ importe: false, champs: CHAMPS_GABARIT, blocs: BLOCS_GABARIT_LIBELLES });
+});
 companies.get("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
@@ -44853,9 +45987,61 @@ dossiers.post("/:id/components/import", async (c) => {
     stats: await dossierStats(c.env.DB, dossier.id)
   });
 });
-async function buildReportContext(c) {
+// Photos d'un rapport : au plus 4 par fiche, dans l'ordre des étiquettes du
+// terrain, sous un budget total — un Worker n'a que 128 Mo, et un rapport de
+// 150 fiches en photos de téléphone pleine résolution ne tiendrait pas.
+const PHOTOS_PAR_FICHE = 4;
+const PHOTO_MAX_OCTETS = 4 * 1024 * 1024;
+const PHOTOS_BUDGET_OCTETS = 40 * 1024 * 1024;
+async function photosDuRapport(env, components2) {
+  const parComposante = new Map();
+  if (!components2.length) return parComposante;
+  const ids = components2.map((comp) => comp.id);
+  const lignes = [];
+  for (let i = 0; i < ids.length; i += 90) {
+    const lot = ids.slice(i, i + 90);
+    const r = await env.DB.prepare(
+      `SELECT id, component_id, r2_key, tag, created_at FROM photos WHERE component_id IN (${lot.map((_, k) => `?${k + 1}`).join(", ")}) ORDER BY created_at ASC`
+    ).bind(...lot).all();
+    lignes.push(...r.results);
+  }
+  const rang = (tag) => {
+    const i = TAG_ORDER.indexOf(tag);
+    return i < 0 ? TAG_ORDER.length : i;
+  };
+  const choisies = [];
+  for (const id of ids) {
+    const siennes = lignes.filter((l) => l.component_id === id).sort((a, b) => rang(a.tag) - rang(b.tag)).slice(0, PHOTOS_PAR_FICHE);
+    choisies.push(...siennes);
+  }
+  let budget = PHOTOS_BUDGET_OCTETS;
+  const chargees = await enParallele(choisies, 6, async (ligne) => {
+    const obj = await env.PHOTOS.get(ligne.r2_key);
+    if (!obj || obj.size > PHOTO_MAX_OCTETS || obj.size > budget) return null;
+    budget -= obj.size;
+    const image = imageDocx(new Uint8Array(await obj.arrayBuffer()));
+    return image ? { ligne, image } : null;
+  });
+  for (const p of chargees) {
+    if (!p) continue;
+    if (!parComposante.has(p.ligne.component_id)) parComposante.set(p.ligne.component_id, []);
+    parComposante.get(p.ligne.component_id).push({ image: p.image, tag: p.ligne.tag });
+  }
+  return parComposante;
+}
+async function logoDeFirme(env, company) {
+  if (company?.logo_r2_key) {
+    const obj = await env.PHOTOS.get(company.logo_r2_key);
+    const image = obj ? imageDocx(new Uint8Array(await obj.arrayBuffer())) : null;
+    if (image) return image;
+  }
+  // Le logo intégré est celui de Condo Stratégis : jamais sur le rapport d'une autre firme.
+  return estStrategis(company?.name) ? imageDocx(base64ToUint8Array(LOGO_BASE64)) : null;
+}
+async function buildReportContext(c, opts = {}) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return null;
+  const company = dossier.company_id ? await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(dossier.company_id).first() : null;
   // Une composante désactivée n'existe pas dans l'immeuble : ni au rapport, ni au fonds.
   const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossier.id).all();
   const components2 = (await listComponentsForDossier(c.env.DB, dossier.id)).filter(estActive);
@@ -44871,10 +46057,61 @@ async function buildReportContext(c) {
     texteMaison: await texteMaisonPour(c.env.DB, dossier.company_id),
     banque: await banquePour(c.env.DB, dossier.company_id),
     textesValides: await textesValidesPour(c.env.DB, dossier.id),
-    engineerName: user?.name ?? "Condo Stratégis",
+    engineerName: user?.name ?? company?.name ?? "",
     signataire: user ?? null,
-    apiKey: c.env.ANTHROPIC_API_KEY ?? null
+    apiKey: c.env.ANTHROPIC_API_KEY ?? null,
+    company,
+    theme: themeDeFirme(company),
+    ...opts.word ? {
+      logo: await logoDeFirme(c.env, company),
+      photos: await photosDuRapport(c.env, components2)
+    } : {}
   };
+}
+// Valeurs des champs {{…}} d'un gabarit de firme.
+function valeursChamps(ctx) {
+  const { dossier, projection, theme, signataire } = ctx;
+  const info = infoBatiment(dossier);
+  const ordre = ordreDuSignataire(signataire);
+  const scenario = projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
+    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  const cotisation = scenario?.years?.[0]?.cotisation ?? null;
+  const unites = Number(dossier.units);
+  const valeur = (v) => v == null || v === "" ? "" : String(v);
+  return {
+    immeuble: valeur(dossier.name),
+    adresse: valeur(dossier.address),
+    ville: valeur(dossier.city),
+    adresse_complete: [dossier.address, dossier.city].filter(Boolean).join(", "),
+    dossier: valeur(dossier.dossier_no),
+    unites: valeur(dossier.units || ""),
+    etages: valeur(dossier.floors),
+    annee_construction: valeur(anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier.built_year)),
+    date_rapport: dateLongue(new Date()),
+    annee: String(new Date().getFullYear()),
+    signataire: valeur(signataire?.name ?? ctx.engineerName),
+    signataire_titre: valeur(signataire?.title),
+    ordre: valeur(signataire?.ordre_professionnel ?? ordre?.sigle),
+    no_membre: valeur(signataire?.no_membre),
+    firme: valeur(theme.nom),
+    firme_adresse: valeur(theme.adresse),
+    firme_telephone: valeur(theme.telephone),
+    firme_courriel: valeur(theme.courriel),
+    firme_site: valeur(theme.site),
+    solde_fonds: montantMaison(dossier.current_fund_balance) ?? "",
+    cotisation_actuelle: montantMaison(dossier.cotisation_annuelle) ?? "",
+    cotisation_recommandee: montantMaison(cotisation) ?? "",
+    cotisation_mensuelle_unite: cotisation != null && unites > 0 ? montantMaison(cotisation / 12 / unites) ?? "" : ""
+  };
+}
+// Le rapport Word livré : autonome aux couleurs de la firme, ou versé dans son
+// gabarit de mise en page quand elle en a importé un.
+async function produireRapportDocx(c, ctx) {
+  const miseEnPage = objetJson(ctx.company?.mise_en_page);
+  const gabarit = miseEnPage.r2_key ? await c.env.PHOTOS.get(miseEnPage.r2_key) : null;
+  if (!gabarit) return finaliserRapportDocx(await generateReportDocx(ctx));
+  const rapport = await generateReportDocx(ctx, { pourGabarit: true });
+  return composerAvecGabarit(rapport, new Uint8Array(await gabarit.arrayBuffer()), valeursChamps(ctx));
 }
 dossiers.get("/:id/projection", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
@@ -44888,13 +46125,26 @@ dossiers.get("/:id/projection", async (c) => {
   return c.json(projection);
 });
 dossiers.get("/:id/report.docx", async (c) => {
-  const ctx = await buildReportContext(c);
+  const ctx = await buildReportContext(c, { word: true });
   if (!ctx) return c.json({ error: "dossier introuvable" }, 404);
-  const bytes = await generateReportDocx(ctx);
+  const bytes = await produireRapportDocx(c, ctx);
   return new Response(new Blob([new Uint8Array(bytes)]), {
     headers: {
       "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "content-disposition": `attachment; filename="${ctx.dossier.dossier_no}-etude-fonds-prevoyance.docx"`
+    }
+  });
+});
+// Tableur suivi d'entretien du dossier : les tâches du carnet des composantes
+// actives, saison par saison, dans la présentation du gabarit de la firme.
+dossiers.get("/:id/suivi-entretien.xlsx", async (c) => {
+  const ctx = await buildReportContext(c);
+  if (!ctx) return c.json({ error: "dossier introuvable" }, 404);
+  const bytes = await tableurSuiviEntretien(ctx);
+  return new Response(new Blob([bytes]), {
+    headers: {
+      "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "content-disposition": `attachment; filename="${ctx.dossier.dossier_no}-suivi-entretien.xlsx"`
     }
   });
 });
@@ -45589,7 +46839,7 @@ app.use("/api/*", async (c, next) => {
   return next();
 });
 app.use("/api/*", async (c, next) => {
-  if (c.req.path.startsWith("/api/dossiers") || c.req.path.startsWith("/api/components")) {
+  if (c.req.path.startsWith("/api/dossiers") || c.req.path.startsWith("/api/components") || c.req.path.startsWith("/api/companies")) {
     await assurerColonnes(c.env.DB);
   }
   return next();

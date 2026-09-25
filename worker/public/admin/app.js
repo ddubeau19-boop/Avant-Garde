@@ -58,6 +58,14 @@ const state = {
   templateOpenCle: null,   // section dépliée dans l'éditeur
   templateEdits: {},       // clé -> texte brut en cours d'édition
   templateSaving: false,
+  theme: null,             // { theme, effectif, defauts } — identité du rapport
+  themeDraft: {},
+  themeSaving: false,
+  themeError: null,
+  themeNote: null,
+  miseEnPage: null,        // { importe, filename, analyse, champs, blocs }
+  miseEnPageUploading: false,
+  miseEnPageError: null,
   newEngTitle: '',
   newEngOrdre: '',
   newEngNoMembre: '',
@@ -342,11 +350,80 @@ async function loadCompanyDetail(id) {
     render();
     loadCompanyLogo(id, !!data.hasLogo);
     loadTemplate(id);
+    loadTheme(id);
+    loadMiseEnPage(id);
   } catch (e) {
     state.companyLoading = false;
     state.companyError = e.message || 'Impossible de charger cette entreprise.';
     render();
   }
+}
+
+// ---------------------------------------------------------------
+// Identité du rapport et gabarit Word de mise en page
+// ---------------------------------------------------------------
+async function loadTheme(id) {
+  try {
+    state.theme = await apiJson(`/api/companies/${id}/theme`);
+    state.themeDraft = Object.assign({}, state.theme.theme || {});
+    state.themeError = null;
+  } catch (e) {
+    state.themeError = e.message || "Impossible de charger l'identité du rapport.";
+  }
+  render();
+}
+
+async function saveTheme() {
+  if (state.themeSaving) return;
+  state.themeSaving = true;
+  state.themeError = null;
+  state.themeNote = null;
+  render();
+  try {
+    state.theme = await apiJson(`/api/companies/${state.companyId}/theme`, { method: 'PATCH', body: JSON.stringify(state.themeDraft) });
+    state.themeDraft = Object.assign({}, state.theme.theme || {});
+    state.themeNote = 'Identité enregistrée. Les prochains rapports Word la reprendront.';
+  } catch (e) {
+    state.themeError = e.message || "L'enregistrement a échoué.";
+  }
+  state.themeSaving = false;
+  render();
+}
+
+async function loadMiseEnPage(id) {
+  try {
+    state.miseEnPage = await apiJson(`/api/companies/${id}/mise-en-page`);
+    state.miseEnPageError = null;
+  } catch (e) {
+    state.miseEnPageError = e.message || 'Impossible de charger le gabarit de mise en page.';
+  }
+  render();
+}
+
+async function uploadMiseEnPage(file) {
+  if (!file || state.miseEnPageUploading) return;
+  state.miseEnPageUploading = true;
+  state.miseEnPageError = null;
+  render();
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    state.miseEnPage = await apiJson(`/api/companies/${state.companyId}/mise-en-page`, { method: 'POST', body: fd });
+  } catch (e) {
+    state.miseEnPageError = e.message || "L'import du gabarit a échoué.";
+  }
+  state.miseEnPageUploading = false;
+  render();
+}
+
+async function deleteMiseEnPage() {
+  if (!confirm("Retirer le gabarit de mise en page ? Les rapports reprendront la mise en page intégrée, aux couleurs de l'entreprise.")) return;
+  try {
+    state.miseEnPage = await apiJson(`/api/companies/${state.companyId}/mise-en-page`, { method: 'DELETE' });
+  } catch (e) {
+    state.miseEnPageError = e.message || "L'opération a échoué.";
+  }
+  render();
 }
 
 async function loadTemplate(id) {
@@ -793,7 +870,100 @@ function renderCompanyDetail() {
       </div>`).join('')}
     </div>
 
+    ${themeCardHtml()}
+    ${miseEnPageCardHtml()}
     ${templateCardHtml()}
+  </div>`;
+}
+
+// Identité du rapport : couleurs, polices et coordonnées reprises par le
+// rapport Word. Un champ vide garde la valeur par défaut.
+const THEME_CHAMPS = [
+  { k: 'accent', label: "Couleur d'accent", type: 'couleur', aide: 'Titres de section, filets, cote « Mauvais ».' },
+  { k: 'encre', label: 'Couleur du texte', type: 'couleur' },
+  { k: 'gris', label: 'Couleur secondaire', type: 'couleur', aide: 'Étiquettes, légendes, pied de page.' },
+  { k: 'police', label: 'Police du texte', type: 'texte' },
+  { k: 'policeTitres', label: 'Police des titres', type: 'texte' },
+  { k: 'policeMono', label: 'Police des étiquettes', type: 'texte' },
+  { k: 'adresse', label: 'Adresse', type: 'texte' },
+  { k: 'telephone', label: 'Téléphone', type: 'texte' },
+  { k: 'courriel', label: 'Courriel', type: 'texte' },
+  { k: 'site', label: 'Site Web', type: 'texte' },
+];
+
+function themeCardHtml() {
+  const t = state.theme;
+  const d = state.themeDraft || {};
+  const eff = (t && t.effectif) || {};
+  const val = (k) => d[k] != null && d[k] !== '' ? d[k] : '';
+  const couleur = (k) => '#' + String(val(k) || eff[k] || '000000').replace(/^#/, '');
+  return `
+  <div>
+    <div class="eng-section-head">
+      <span class="lbl">Identité du rapport</span>
+      <div class="rule"></div>
+    </div>
+    <div class="tpl-lead">Couleurs, polices et coordonnées du rapport Word de cette entreprise. Un champ laissé vide garde la valeur par défaut. Les polices doivent être installées sur les postes qui ouvrent le document; sinon Word les remplace.</div>
+    ${state.themeError ? `<div class="login-error" style="margin:10px 0">${escapeHtml(state.themeError)}</div>` : ''}
+    ${state.themeNote ? `<div class="temp-pass-warn" style="margin:10px 0"><i data-lucide="check"></i><span>${escapeHtml(state.themeNote)}</span></div>` : ''}
+    ${!t ? spinnerBlock('Chargement…') : `
+    <div class="theme-grid">
+      ${THEME_CHAMPS.map(c => `
+      <label class="theme-field">
+        <span class="field-label">${escapeHtml(c.label)}</span>
+        ${c.type === 'couleur' ? `
+        <span class="theme-color-row">
+          <input type="color" data-role="theme-color" data-key="${c.k}" value="${escapeHtml(couleur(c.k))}">
+          <input type="text" data-role="theme-field" data-key="${c.k}" value="${escapeHtml(val(c.k))}" placeholder="${escapeHtml((t.defauts || {})[c.k] || '')}" maxlength="7">
+        </span>` : `
+        <input type="text" data-role="theme-field" data-key="${c.k}" value="${escapeHtml(val(c.k))}" placeholder="${escapeHtml(eff[c.k] || (t.defauts || {})[c.k] || '')}">`}
+        ${c.aide ? `<span class="theme-help">${escapeHtml(c.aide)}</span>` : ''}
+      </label>`).join('')}
+    </div>
+    <div class="theme-apercu" style="--acc:${couleur('accent')};--enc:${couleur('encre')};--gri:${couleur('gris')}">
+      <div class="ta-eyebrow">Enveloppe du bâtiment · B20.10</div>
+      <div class="ta-title">4.3.12 Parement – Maçonnerie</div>
+      <div class="ta-rule"></div>
+      <div class="ta-label">État de l'actif</div>
+      <div class="ta-text">Aperçu des couleurs d'une fiche composante.</div>
+    </div>
+    <div class="tpl-actions">
+      <button class="btn-primary" data-action="theme-save" ${state.themeSaving ? 'disabled' : ''}>${state.themeSaving ? 'Enregistrement…' : "Enregistrer l'identité"}</button>
+    </div>`}
+  </div>`;
+}
+
+function miseEnPageCardHtml() {
+  const m = state.miseEnPage;
+  const a = (m && m.analyse) || null;
+  const champs = (m && m.champs) || [];
+  const blocs = (m && m.blocs) || [];
+  const puces = (liste) => liste.map(k => `<code class="champ-chip">{{${escapeHtml(k)}}}</code>`).join(' ');
+  return `
+  <div>
+    <div class="eng-section-head">
+      <span class="lbl">Gabarit Word de mise en page</span>
+      <div class="rule"></div>
+      <label class="btn-pill-sm">${state.miseEnPageUploading ? 'Analyse du document…' : 'Importer un .docx'}<input type="file" accept=".docx" data-role="mise-en-page-file" style="display:none" ${state.miseEnPageUploading ? 'disabled' : ''}></label>
+    </div>
+    <div class="tpl-lead">Les pages que l'entreprise place avant le rapport (page de garde, présentation de la firme, explications de la Loi 16…), avec son en-tête, son pied de page et ses styles. Écrivez les champs entre accolades là où les données du dossier doivent apparaître, et placez <code>{{RAPPORT}}</code> à l'endroit où le rapport de la plateforme commence.</div>
+    ${state.miseEnPageError ? `<div class="login-error" style="margin:10px 0">${escapeHtml(state.miseEnPageError)}</div>` : ''}
+    ${!m ? spinnerBlock('Chargement…') : `
+    ${m.importe ? `
+    <div class="tpl-lead" style="margin:10px 0">Importé depuis <code>${escapeHtml(m.filename || '')}</code> le ${fmtDate(m.imported_at)} · <button class="btn-row-action" data-action="mise-en-page-delete">Retirer ce gabarit</button></div>
+    ${a && !a.repere ? `<div class="temp-pass-warn" style="margin:8px 0"><i data-lucide="info"></i><span>Aucun repère <code>{{RAPPORT}}</code> : le rapport sera ajouté à la fin du document, sur une nouvelle page.</span></div>` : ''}
+    ${a && a.inconnus && a.inconnus.length ? `<div class="temp-pass-warn" style="margin:8px 0"><i data-lucide="alert-triangle"></i><span>Champs inconnus, laissés tels quels dans le rapport : ${puces(a.inconnus)}</span></div>` : ''}
+    ${a && a.notes && a.notes.length ? `<div class="temp-pass-warn" style="margin:8px 0"><i data-lucide="alert-triangle"></i><span>Notes de rédaction internes trouvées dans les pages liminaires — elles seraient reprises telles quelles dans chaque rapport livré :<br>${a.notes.map(n => `« ${escapeHtml(n)} »`).join('<br>')}</span></div>` : ''}
+    ${a ? `<div class="tpl-lead" style="margin:8px 0">Champs reconnus : ${a.champs && a.champs.length ? puces(a.champs) : 'aucun'}${a.blocs && a.blocs.length ? ` · Blocs : ${puces(a.blocs.map(b => b.toUpperCase()))}` : ''}</div>` : ''}` : `
+    <div class="tpl-lead" style="margin:10px 0">Aucun gabarit importé : les rapports utilisent la mise en page intégrée, aux couleurs de l'entreprise.</div>`}
+    <details class="champs-details">
+    <summary>Voir les champs disponibles (${champs.length + blocs.length})</summary>
+    <div class="dossiers-table" style="margin-top:12px">
+      <div class="dt-row champ-row dt-head"><div>Champ</div><div>Remplacé par</div></div>
+      ${blocs.map(([k, d]) => `<div class="dt-row champ-row"><div><code class="champ-chip">{{${escapeHtml(k.toUpperCase())}}}</code></div><div class="dt-sub">${escapeHtml(d)}</div></div>`).join('')}
+      ${champs.map(([k, d]) => `<div class="dt-row champ-row"><div><code class="champ-chip">{{${escapeHtml(k)}}}</code></div><div class="dt-sub">${escapeHtml(d)}</div></div>`).join('')}
+    </div>
+    </details>`}
   </div>`;
 }
 
@@ -909,6 +1079,14 @@ function initEvents() {
     // Pas de render() ici : re-dessiner le textarea à chaque frappe renverrait
     // le curseur à la fin.
     else if (t.matches('[data-role="template-text"]')) state.templateEdits[t.getAttribute('data-cle')] = t.value;
+    else if (t.matches('[data-role="theme-field"]')) state.themeDraft[t.getAttribute('data-key')] = t.value;
+    else if (t.matches('[data-role="theme-color"]')) {
+      // Le sélecteur de couleur met à jour le champ hexadécimal voisin.
+      const k = t.getAttribute('data-key');
+      state.themeDraft[k] = t.value.replace('#', '').toUpperCase();
+      const champ = t.parentElement && t.parentElement.querySelector('[data-role="theme-field"]');
+      if (champ) champ.value = state.themeDraft[k];
+    }
   });
 
   app.addEventListener('change', (e) => {
@@ -917,6 +1095,12 @@ function initEvents() {
       const f = t.files && t.files[0];
       t.value = '';
       if (f) uploadTemplate(f);
+      return;
+    }
+    if (t && t.matches && t.matches('[data-role="mise-en-page-file"]')) {
+      const f = t.files && t.files[0];
+      t.value = '';
+      if (f) uploadMiseEnPage(f);
       return;
     }
     if (t && t.matches && t.matches('[data-role="logo-file"]')) {
@@ -932,6 +1116,12 @@ function initEvents() {
     switch (action) {
       case 'logout':
         doLogout();
+        break;
+      case 'theme-save':
+        saveTheme();
+        break;
+      case 'mise-en-page-delete':
+        deleteMiseEnPage();
         break;
       case 'template-toggle': {
         const cle = btn.getAttribute('data-cle');

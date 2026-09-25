@@ -258,6 +258,21 @@ input, textarea { font-family: var(--font-body); }
 .reactiver i { width: 13px; height: 13px; }
 .btn-retirer { margin-top: 28px; color: var(--ink-600); }
 
+.tache-row { display: flex; gap: 10px; align-items: flex-start; border: 1px solid var(--ink-200); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: #fff; }
+.tache-row.retiree { border-style: dashed; }
+.tache-row.retiree .tache-texte { color: var(--ink-500); }
+.tache-mid { flex: 1; min-width: 0; }
+.tache-texte { font-size: 13.5px; color: var(--ink); line-height: 1.35; }
+.tache-sub { font-size: 11.5px; color: var(--ink-500); margin-top: 3px; line-height: 1.35; }
+.tache-perso { font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--orange); margin-left: 6px; }
+.tache-x { border: none; background: none; color: var(--ink-400); cursor: pointer; padding: 2px; flex: none; }
+.tache-x i { width: 16px; height: 16px; }
+.tache-retirees { margin: 6px 0 4px; }
+.tache-retirees summary { cursor: pointer; font-size: 12.5px; color: var(--ink-600); margin-bottom: 8px; }
+.tache-form { border: 1.5px solid var(--ink-200); border-radius: 12px; padding: 12px; margin-top: 8px; }
+.tache-actions { display: flex; gap: 8px; margin-top: 12px; }
+.tache-actions > button { flex: 1; padding: 12px; font-size: 14px; }
+
 .empty-state { padding: 40px 20px; text-align: center; color: var(--ink-500); font-size: 13px; }
 
 .bottom-bar {
