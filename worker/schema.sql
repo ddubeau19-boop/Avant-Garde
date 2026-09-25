@@ -81,6 +81,19 @@ CREATE TABLE carnet_suivi (
   UNIQUE (dossier_id, cle_tache, annee, mois)
 );
 
+-- Historique des modifications d'un dossier et de ses composantes : auteur,
+-- moment et, champ par champ, l'ancienne et la nouvelle valeur (JSON).
+CREATE TABLE journal (
+  id           TEXT PRIMARY KEY,
+  dossier_id   TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+  component_id TEXT,
+  user_id      TEXT,
+  action       TEXT NOT NULL,   -- creation | modification | ajout | photo | import | suivi | publication | depublication | revision
+  champs       TEXT,
+  moment       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX idx_journal_dossier ON journal(dossier_id, moment);
+
 CREATE TABLE dossiers (
   id                   TEXT PRIMARY KEY,
   dossier_no           TEXT NOT NULL UNIQUE,

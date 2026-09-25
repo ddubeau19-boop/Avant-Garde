@@ -796,6 +796,7 @@ async function deletePrix(id) {
 }
 
 async function openDossier(id) {
+  journal.ouvert = false; journal.entrees = null;
   revokeReviewPhotos();
   state.dossierId = id;
   state.screen = 'revision';
@@ -2316,6 +2317,69 @@ function batimentPanelHtml(d) {
   </div>`;
 }
 
+/* ---------- Historique des modifications ---------- */
+
+const journal = { ouvert: false, dossierId: null, entrees: null, chargement: false, erreur: null };
+const ACTIONS_JOURNAL = {
+  creation: 'a créé le dossier', modification: 'a modifié', ajout: 'a ajouté une composante', photo: 'a ajouté des photos',
+  import: 'a importé des composantes', suivi: 'a changé le suivi', publication: 'a publié le rapport',
+  depublication: 'a retiré la publication', revision: 'a commencé la révision',
+};
+
+async function chargerJournal(id) {
+  journal.dossierId = id; journal.chargement = true; journal.erreur = null; render();
+  try {
+    journal.entrees = await apiJson(`/api/dossiers/${id}/journal?limite=200`);
+  } catch (e) {
+    journal.erreur = e.message || "Impossible de charger l'historique.";
+  }
+  journal.chargement = false; render();
+}
+
+function momentJournal(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return d.toLocaleString('fr-CA', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function journalPanelHtml(d) {
+  const head = `
+    <button class="imm-head" data-action="toggle-journal" aria-expanded="${journal.ouvert ? 'true' : 'false'}">
+      <div class="imm-head-icon"><i data-lucide="history"></i></div>
+      <div style="flex:1">
+        <div class="imm-head-title">Historique des modifications</div>
+        <div class="imm-head-sub">Qui a changé quoi, et quand — au terrain comme au bureau</div>
+      </div>
+      <i data-lucide="${journal.ouvert ? 'chevron-up' : 'chevron-down'}" style="color:var(--ink-500)"></i>
+    </button>`;
+  if (!journal.ouvert) return `<div class="imm-panel">${head}</div>`;
+  let corps;
+  if (journal.chargement || journal.dossierId !== d.id) corps = spinnerBlock("Chargement de l'historique…");
+  else if (journal.erreur) corps = errorBanner(journal.erreur);
+  else if (!journal.entrees || !journal.entrees.length) corps = `<div class="empty-state">Aucune modification consignée pour l'instant.</div>`;
+  else corps = journal.entrees.map(e => {
+    const MONTANTS = ['current_fund_balance', 'cotisation_annuelle', 'replacement_cost'];
+    const valeur = (v, champ) => {
+      if (v == null || v === '') return '<span class="jn-vide">vide</span>';
+      if (MONTANTS.includes(champ) && !isNaN(Number(v))) return escapeHtml(fmt(Number(v)) + ' $');
+      if (champ === 'published_at' || champ === 'echeance') return escapeHtml(momentJournal(v.length === 10 ? v + 'T12:00:00' : v).replace(/,? \d+ h \d+$/, ''));
+      if (champ === 'useful_life_years') return escapeHtml(v + ' ans');
+      if (['done', 'confirmed', 'r_flag', 'actif'].includes(champ)) return v === '1' ? 'oui' : 'non';
+      return escapeHtml(v);
+    };
+    const champs = e.action === 'photo'
+      ? `<div class="jn-champ">${escapeHtml((e.champs[0] && e.champs[0].apres) || '1')} photo(s)</div>`
+      : e.champs.filter(ch => ch.champ !== 'photos').map(ch => ch.avant == null && ch.apres == null
+        ? `<div class="jn-champ"><b>${escapeHtml(ch.libelle)}</b> modifié</div>`
+        : `<div class="jn-champ"><b>${escapeHtml(ch.libelle)}</b> : ${valeur(ch.avant, ch.champ)} → ${valeur(ch.apres, ch.champ)}</div>`).join('');
+    return `<div class="jn-entree">
+      <div class="jn-tete"><span class="jn-qui">${escapeHtml(e.auteur || 'Système')}</span> ${ACTIONS_JOURNAL[e.action] || escapeHtml(e.action)}${e.composante ? ` <span class="jn-comp">${escapeHtml(e.composante.name)}</span>` : ''}<span class="jn-quand">${escapeHtml(momentJournal(e.moment))}</span></div>
+      ${champs}
+    </div>`;
+  }).join('');
+  return `<div class="imm-panel open">${head}<div class="imm-body jn-corps">${corps}</div></div>`;
+}
+
 function renderRevision() {
   if (state.revisionLoading) return `<div class="rev-shell">${spinnerBlock('Chargement du dossier…')}</div>`;
   if (state.revisionError) return `<div class="rev-shell"><div class="page-pad">${errorBanner(state.revisionError, 'retry-revision')}</div></div>`;
@@ -2374,6 +2438,7 @@ function renderRevision() {
       </button>
 
       ${batimentPanelHtml(d)}
+      ${journalPanelHtml(d)}
 
       <div class="comp-section-head">
         <span class="lbl">Composantes · ${docCount}/${total} documentées</span>
@@ -2863,6 +2928,10 @@ function initEvents() {
         render();
         break;
       }
+      case 'toggle-journal':
+        journal.ouvert = !journal.ouvert;
+        if (journal.ouvert && state.dossier) chargerJournal(state.dossier.id); else render();
+        break;
       case 'toggle-batiment':
         state.batimentOpen = !state.batimentOpen;
         render();

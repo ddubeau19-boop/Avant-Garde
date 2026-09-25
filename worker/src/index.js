@@ -2946,6 +2946,79 @@ async function getCurrentUser(c) {
   return user;
 }
 // ============================================================================
+// JOURNAL — historique des modifications d'un dossier et de ses composantes.
+// Chaque entrée garde l'auteur, le moment et, champ par champ, l'ancienne et
+// la nouvelle valeur. Les saisies d'une même personne sur une même fiche à
+// quelques minutes d'intervalle forment une seule entrée : le terrain
+// enregistre à chaque champ, le journal resterait sinon illisible.
+// ============================================================================
+const JOURNAL_REGROUPEMENT_MS = 10 * 60 * 1e3;
+const JOURNAL_VALEUR_MAX = 300;
+const LIBELLES_CHAMPS = {
+  name: "Nom", done: "Documentée", etat: "État", residual: "Vie résiduelle (%)", install_year: "Année d'installation",
+  qty: "Quantité", note: "Note", replacement_cost: "Coût de remplacement", useful_life_years: "Vie utile",
+  confirmed: "Confirmée au bureau", rating: "Cote", r_flag: "Remplacement (R)", observation: "Constats",
+  cause_possible: "Cause possible", delai_suggere: "Délai suggéré", consequences: "Conséquences",
+  uniformat_code: "Code Uniformat", position: "Position", emplacement: "Emplacement", variante: "Variante",
+  attributs: "Attributs", actif: "Dans la visite", etendue: "Étendue", etendue_qte: "Quantité touchée",
+  limite_observation: "Limite d'observation", limite_detail: "Détail de la limite", nature_risque: "Nature du risque",
+  source_annee: "Source de l'année", projet_ca: "Projet du CA", taches_entretien: "Tâches du carnet",
+  travaux_periode: "Travaux de la période", travaux_annee: "Année des travaux", cat: "Catégorie",
+  address: "Adresse", city: "Ville", units: "Unités", floors: "Étages", built_year: "Année de construction",
+  status: "Statut", current_fund_balance: "Solde du fonds", cotisation_annuelle: "Cotisation annuelle",
+  published_at: "Publication", batiment_info: "Fiche d'immeuble", assigne_a: "Responsable", echeance: "Échéance",
+  photos: "Photos", revision_de: "Révision de l'étude", revise_par: "Révisée par le dossier", composantes: "Composantes importées"
+};
+// Champs dont la valeur brute n'aide pas à la lecture : on note le changement seul.
+const CHAMPS_SANS_VALEUR = new Set(["taches_entretien", "attributs", "batiment_info"]);
+function valeurJournal(champ, v) {
+  if (v == null || v === "") return null;
+  if (CHAMPS_SANS_VALEUR.has(champ)) return null;
+  const t = String(v);
+  return t.length > JOURNAL_VALEUR_MAX ? `${t.slice(0, JOURNAL_VALEUR_MAX)}…` : t;
+}
+function differences(avant, apres, champs) {
+  const liste = [];
+  for (const champ of champs) {
+    const a = avant?.[champ] ?? null, b = apres?.[champ] ?? null;
+    if (String(a ?? "") === String(b ?? "")) continue;
+    liste.push({ champ, avant: valeurJournal(champ, a), apres: valeurJournal(champ, b) });
+  }
+  return liste;
+}
+// N'interrompt jamais la modification qu'il consigne.
+async function noterJournal(db, { dossierId, componentId = null, userId = null, action, champs = [] }) {
+  try {
+    if (["modification", "suivi"].includes(action) && !champs.length) return;
+    if (["modification", "photo"].includes(action)) {
+      const depuis = new Date(Date.now() - JOURNAL_REGROUPEMENT_MS).toISOString();
+      const dernier = await db.prepare(
+        `SELECT id, champs FROM journal WHERE dossier_id = ?1 AND COALESCE(component_id, '') = ?2 AND COALESCE(user_id, '') = ?3
+           AND action = ?4 AND moment >= ?5 ORDER BY moment DESC LIMIT 1`
+      ).bind(dossierId, componentId ?? "", userId ?? "", action, depuis).first();
+      if (dernier) {
+        const fusion = JSON.parse(dernier.champs || "[]");
+        for (const ch of champs) {
+          const deja = fusion.find((x) => x.champ === ch.champ);
+          if (!deja) fusion.push(ch);
+          else if (action === "photo") deja.apres = String(Number(deja.apres || 0) + Number(ch.apres || 0));
+          else deja.apres = ch.apres;
+        }
+        // Un champ revenu à sa valeur de départ n'a, au bout du compte, pas changé.
+        const utiles = action === "photo" ? fusion : fusion.filter((x) => String(x.avant ?? "") !== String(x.apres ?? "") || CHAMPS_SANS_VALEUR.has(x.champ));
+        if (!utiles.length) await db.prepare("DELETE FROM journal WHERE id = ?1").bind(dernier.id).run();
+        else await db.prepare("UPDATE journal SET champs = ?1, moment = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2")
+          .bind(JSON.stringify(utiles), dernier.id).run();
+        return;
+      }
+    }
+    await db.prepare("INSERT INTO journal (id, dossier_id, component_id, user_id, action, champs) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+      .bind(newId("jnl"), dossierId, componentId, userId, action, JSON.stringify(champs)).run();
+  } catch (e) {
+    console.error("journal non écrit", action, e?.message);
+  }
+}
+// ============================================================================
 // COMPTES AUTONOMES — invitations, mot de passe oublié, changement de mot de
 // passe. Les liens envoyés par courriel portent un jeton aléatoire dont seule
 // l'empreinte SHA-256 est gardée en base ; il sert une seule fois.
@@ -3677,7 +3750,17 @@ const TABLES_AJOUTEES = [
      fait_le    TEXT NOT NULL,
      fait_par   TEXT,
      note       TEXT,
-     UNIQUE (dossier_id, cle_tache, annee, mois))`
+     UNIQUE (dossier_id, cle_tache, annee, mois))`,
+  // Historique des modifications : qui a changé quoi, et quand.
+  `CREATE TABLE IF NOT EXISTS journal (
+     id           TEXT PRIMARY KEY,
+     dossier_id   TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+     component_id TEXT,
+     user_id      TEXT,
+     action       TEXT NOT NULL,
+     champs       TEXT,
+     moment       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
+  `CREATE INDEX IF NOT EXISTS idx_journal_dossier ON journal(dossier_id, moment)`
 ];
 let colonnesPretes = null;
 function assurerColonnes(db) {
@@ -5920,6 +6003,11 @@ components.patch("/:id", async (c) => {
     `UPDATE components SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
   ).bind(...values).run();
   const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
+  const auteur = await getCurrentUser(c);
+  await noterJournal(c.env.DB, {
+    dossierId: component.dossier_id, componentId: id, userId: auteur?.id, action: "modification",
+    champs: differences(owned, component, Object.keys(body2).filter((k) => k in LIBELLES_CHAMPS))
+  });
   return c.json({ ...component, entretien: tachesPourComposante(component, { avecRetirees: true, biblio: await bibliothequeDuDossier(c.env.DB, component.dossier_id) }).map(tacheAffichee) });
 });
 components.post("/:id/analyze", async (c) => {
@@ -5975,6 +6063,7 @@ components.post("/:id/photos", async (c) => {
   });
   await c.env.DB.prepare("INSERT INTO photos (id, component_id, r2_key, tag) VALUES (?1, ?2, ?3, ?4)").bind(id, componentId, r2Key, tag).run();
   const photo = await c.env.DB.prepare("SELECT * FROM photos WHERE id = ?1").bind(id).first();
+  await noterJournal(c.env.DB, { dossierId: component.dossier_id, componentId, userId: (await getCurrentUser(c))?.id, action: "photo", champs: [{ champ: "photos", avant: null, apres: "1" }] });
   return c.json(photo, 201);
 });
 components.post("/:id/structure-note", async (c) => {
@@ -47479,6 +47568,11 @@ dossiers.patch("/:id/suivi", async (c) => {
   await c.env.DB.prepare(`UPDATE dossiers SET ${sets.join(", ")} WHERE id = ?${vals.length}`).bind(...vals).run();
   const d = await c.env.DB.prepare("SELECT id, assigne_a, echeance FROM dossiers WHERE id = ?1").bind(dossier.id).first();
   const nom = d.assigne_a ? (await c.env.DB.prepare("SELECT name FROM users WHERE id = ?1").bind(d.assigne_a).first())?.name : null;
+  const nomAvant = dossier.assigne_a ? (await c.env.DB.prepare("SELECT name FROM users WHERE id = ?1").bind(dossier.assigne_a).first())?.name : null;
+  await noterJournal(c.env.DB, {
+    dossierId: dossier.id, userId: user.id, action: "suivi",
+    champs: differences({ assigne_a: nomAvant, echeance: dossier.echeance }, { assigne_a: nom, echeance: d.echeance }, ["assigne_a", "echeance"])
+  });
   return c.json({ ...d, assigne: d.assigne_a ? { id: d.assigne_a, name: nom } : null });
 });
 // Où en est le dossier dans le cycle des révisions : l'étude qu'il révise,
@@ -47534,6 +47628,8 @@ dossiers.post("/:id/revision", async (c) => {
     c.env.DB.prepare("INSERT OR IGNORE INTO carnet_regles (dossier_id, cle, user_id) SELECT ?1, cle, user_id FROM carnet_regles WHERE dossier_id = ?2").bind(id, source.id)
   ]);
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  await noterJournal(c.env.DB, { dossierId: id, userId: user.id, action: "creation", champs: [{ champ: "revision_de", avant: null, apres: String(source.dossier_no ?? "") }] });
+  await noterJournal(c.env.DB, { dossierId: source.id, userId: user.id, action: "revision", champs: [{ champ: "revise_par", avant: null, apres: dossierNo }] });
   return c.json({
     ...dossier,
     stats: await dossierStats(c.env.DB, id),
@@ -47585,6 +47681,7 @@ dossiers.post("/", async (c) => {
     })
   );
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  await noterJournal(c.env.DB, { dossierId: id, userId: user.id, action: "creation", champs: [] });
   return c.json({
     ...dossier,
     stats: await dossierStats(c.env.DB, id),
@@ -47617,6 +47714,34 @@ dossiers.get("/:id/components", async (c) => {
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
 });
+// Historique du dossier, du plus récent au plus ancien ; ?composante= pour
+// une seule fiche.
+dossiers.get("/:id/journal", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const composante = c.req.query("composante");
+  const limite = Math.min(Math.max(Number(c.req.query("limite")) || 100, 1), 500);
+  const rows = (await c.env.DB.prepare(
+    `SELECT j.*, u.name AS auteur, cmp.name AS composante FROM journal j
+       LEFT JOIN users u ON u.id = j.user_id
+       LEFT JOIN components cmp ON cmp.id = j.component_id
+       WHERE j.dossier_id = ?1 ${composante ? "AND j.component_id = ?3" : ""}
+       ORDER BY j.moment DESC LIMIT ?2`
+  ).bind(...composante ? [dossier.id, limite, composante] : [dossier.id, limite]).all()).results;
+  return c.json(rows.map((r) => ({
+    id: r.id,
+    moment: r.moment,
+    action: r.action,
+    auteur: r.auteur ?? null,
+    composante: r.component_id ? { id: r.component_id, name: r.composante ?? "Composante supprimée" } : null,
+    champs: JSON.parse(r.champs || "[]").map((x) => ({
+      ...x,
+      libelle: LIBELLES_CHAMPS[x.champ] ?? x.champ,
+      avant: x.champ === "rating" && x.avant ? RATING_LABELS[x.avant] ?? x.avant : x.avant,
+      apres: x.champ === "rating" && x.apres ? RATING_LABELS[x.apres] ?? x.apres : x.apres
+    }))
+  })));
+});
 // Catalogue de la firme pour l'ajout sur le terrain : sa bibliothèque, ou la
 // liste de Condo Stratégis quand elle n'en a pas importé.
 dossiers.get("/:id/catalogue", async (c) => {
@@ -47629,7 +47754,7 @@ dossiers.get("/:id/catalogue", async (c) => {
 // venir de l'appareil : une création faite hors connexion et rejouée deux fois
 // (réponse perdue en route) ne crée qu'une composante.
 dossiers.post("/:id/components", async (c) => {
-  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   const body2 = await c.req.json().catch(() => ({}));
   const name = String(body2.name ?? "").replace(/\s+/g, " ").trim();
@@ -47663,6 +47788,7 @@ dossiers.post("/:id/components", async (c) => {
      VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, 1)`
   ).bind(id, dossier.id, cat, name, qty, (depart?.m ?? -1) + 1, vu, code, attributs).run();
   const creee = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
+  await noterJournal(c.env.DB, { dossierId: dossier.id, componentId: id, userId: user?.id, action: "ajout", champs: [{ champ: "name", avant: null, apres: name }] });
   return c.json(await composanteComplete(c.env.DB, creee, biblio), 201);
 });
 // Toute la visite en un appel, pour la préparer hors connexion : chaque
@@ -47741,6 +47867,7 @@ dossiers.post("/:id/components/import", async (c) => {
       item.code ?? null
     ))
   );
+  await noterJournal(c.env.DB, { dossierId: dossier.id, userId: (await getCurrentUser(c))?.id, action: "import", champs: [{ champ: "composantes", avant: null, apres: String(items.length) }] });
   return c.json({
     ok: true,
     composantes_importees: items.length,
@@ -47963,7 +48090,7 @@ async function appliquerReglesModifiees(db, avant, apres, gabarit = GABARIT_STRA
 }
 dossiers.patch("/:id", async (c) => {
   const id = c.req.param("id");
-  const { dossier: owned } = await getOwnedDossier(c, id);
+  const { user: auteur, dossier: owned } = await getOwnedDossier(c, id);
   if (!owned) return c.json({ error: "dossier introuvable" }, 404);
   const body2 = await c.req.json();
   const fields = [];
@@ -47992,6 +48119,10 @@ dossiers.patch("/:id", async (c) => {
     `UPDATE dossiers SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
   ).bind(...values).run();
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  const changes = differences(owned, dossier, Object.keys(body2).filter((k) => k in LIBELLES_CHAMPS));
+  const publication = changes.filter((x) => x.champ === "published_at");
+  if (publication.length) await noterJournal(c.env.DB, { dossierId: id, userId: auteur?.id, action: dossier.published_at ? "publication" : "depublication", champs: publication });
+  await noterJournal(c.env.DB, { dossierId: id, userId: auteur?.id, action: "modification", champs: changes.filter((x) => x.champ !== "published_at") });
   // Les conditions viennent de la liste de la firme, complétée de celle de
   // Condo Stratégis pour les dossiers créés avant son import.
   const biblio = await bibliothequeDuDossier(c.env.DB, id);

@@ -698,3 +698,14 @@ details.ca-bloc summary { cursor: pointer; }
 .dt-resp { font-size: 13px; font-weight: 600; }
 .lien-mini { border: none; background: none; color: var(--ink-500); font-size: 11.5px; text-decoration: underline; cursor: pointer; padding: 0; }
 @media (max-width: 1100px) { .tuiles { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+
+/* Historique des modifications */
+.jn-corps { max-height: 460px; overflow-y: auto; padding: 4px 18px 14px; }
+.jn-entree { padding: 10px 0; border-top: 1px solid var(--line-soft); font-size: 13px; }
+.jn-entree:first-child { border-top: none; }
+.jn-tete { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; }
+.jn-qui { font-weight: 700; }
+.jn-comp { font-weight: 600; color: var(--accent-press); }
+.jn-quand { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--ink-500); }
+.jn-champ { color: var(--ink-600); margin-top: 3px; padding-left: 10px; border-left: 2px solid var(--ink-100); }
+.jn-vide { color: var(--ink-400, #999); font-style: italic; }
