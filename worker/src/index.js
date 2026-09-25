@@ -3353,10 +3353,10 @@ function evaluerRegles(dossier) {
 // dossier et l'inspecteur la réactive en un geste s'il la trouve sur place.
 // On demande au modèle les numéros à DÉSACTIVER plutôt qu'à garder : une
 // réponse tronquée ou vide laisse alors trop de composantes, jamais trop peu.
-async function filtrerGabarit(apiKey, profil) {
+async function filtrerGabarit(apiKey, profil, gabarit = GABARIT_STRATEGIS) {
   const toutActif = (erreur) => ({ inactifs: new Set(), source: "gabarit", erreur });
   if (!apiKey) return toutActif("aucune clé API configurée : aucune composante désactivée");
-  const liste = GABARIT_STRATEGIS
+  const liste = gabarit
     .map((item, i) => `${i + 1}. [${CATEGORIES[item.cat].label}] ${item.name}`)
     .join("\n");
   const prompt = `Tu es ingénieur en bâtiment spécialisé dans les études de fonds de prévoyance
@@ -3391,15 +3391,16 @@ Réponds UNIQUEMENT par les numéros séparés par des virgules, ou par le mot A
     const inactifs = new Set();
     for (const brut of suite.split(",")) {
       const n = Number(brut.trim());
-      if (Number.isInteger(n) && n >= 1 && n <= GABARIT_STRATEGIS.length) inactifs.add(n - 1);
+      if (Number.isInteger(n) && n >= 1 && n <= gabarit.length) inactifs.add(n - 1);
     }
     if (inactifs.size === 0 && !/aucune/i.test(texte)) {
       return toutActif(`réponse sans numéro exploitable | DÉBUT: « ${texte.slice(0, 200)} »`);
     }
     // Un filtre qui vide presque toute la liste est une réponse aberrante, pas
     // un immeuble : mieux vaut tout présenter que de faire disparaître l'inventaire.
-    if (GABARIT_STRATEGIS.length - inactifs.size < 20) {
-      return toutActif(`filtre ignoré : ${inactifs.size} composantes sur ${GABARIT_STRATEGIS.length} auraient été désactivées`);
+    // Le plancher suit la taille de la liste : une firme peut en avoir une courte.
+    if (gabarit.length - inactifs.size < Math.min(20, Math.ceil(gabarit.length / 2))) {
+      return toutActif(`filtre ignoré : ${inactifs.size} composantes sur ${gabarit.length} auraient été désactivées`);
     }
     return { inactifs, source: "gabarit-filtre-ia", erreur: null };
   } catch (e) {
@@ -3413,6 +3414,7 @@ Réponds UNIQUEMENT par les numéros séparés par des virgules, ou par le mot A
 const COLONNES_AJOUTEES = [
   ["companies", "theme", "TEXT"],
   ["companies", "mise_en_page", "TEXT"],
+  ["companies", "bibliotheque", "TEXT"],
   ["actif", "INTEGER NOT NULL DEFAULT 1"],
   ["etendue", "TEXT"],
   ["etendue_qte", "TEXT"],
@@ -3737,13 +3739,13 @@ const TACHES_ENTRETIEN = [
   { e: "Bassin collecteur et pompes - Sanitaire", c: "Alimentation et évacuation", re: /pompes de puisard/i, t: [{"id":"6ac3537c","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["printemps",[5,6],true]]},{"id":"37b71c2d","x":"Vérifier le controleur, les capteurs, la lampe témoin, la sonnerie de trop plein","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"ad58b129","x":"Faire vérifier le dispositif anti-refoulement par un plombier - selon la norme CAN/CSA-B64.10.1 «Guide d’entretien et de mise à l’essai à pied d’oeuvre des dispositifs anti refoulement»","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
   { e: "Évacuation pluviale extérieure", c: "Alimentation et évacuation", re: /puisards et regards|clapets/i, t: [{"id":"8db59bc0","x":"Vérifier les grilles: corrosion excessive, stabilité, bris, solidité, débris","f":"S","q":"","o":[["hiver",[3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10],true]]}] },
   { e: "Bassin collecteur et pompes - Pluvial intérieure", c: "Alimentation et évacuation", re: /pompes de puisard|clapets/i, t: [{"id":"2c827807","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["printemps",[4],true]]},{"id":"f51e49f9","x":"Vérifier le bassin et les caniveaux pour tout accumulation de débris, boue","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9cfcabe7","x":"Vérifier la garde d'eau des avaloirs de sol et ajouter de l'eau au besoin","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"c23bb852","x":"Vérifier le fonctionnement du système de pompage de la fosse de retenue","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f4b0c171","x":"Vérifier les branchements, les supports, les ancrages, du système de pompe","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f9f92f81","x":"Vérifier le controleur, les capteurs, la lampe témoin, la sonnerie de trop plein","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9cb4c2e9","x":"Vérifier les branchements, les supports, les ancrages","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"b8b0a6f2","x":"Faire vérifier système de pompes par un plombier -","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
-  { e: "Piscine - Bassin (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(bassin)/i, t: [{"id":"bf493f85","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"bb2653c4","x":"Faire vérifier et ouvrir le valve d'eau - Faire hiverniser les valves d'eau","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"9492e19e","x":"Faire vérifier et mettre en fonction les circuits électriques - Faire mettre hors fonction les circuits électriques","f":"S","q":"ContraT","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"a2108265","x":"Faire vérifier pour tout débris et faire retirer","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"4263a984","x":"Planifier la vérification et l'entretien de la qualité de l'eau de baignade","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"cb7bfa99","x":"Vérifier et documenter les revêtement intérieur du bassin, béton, carreaux de céramique, fibre de verre, toile de vinyle, structure pour tout indice de bris, délamination, fissure, déchirement, détachement, perte de volume d'eau, etc","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"3744abe8","x":"Faire réparer les surfaces intérieures","f":"S","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"354900ca","x":"Faire vérifier que les équipements et installations soient sécuritaires et respectent les règlements municipaux et recommandations de l'INSPQ","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"3e5579d6","x":"Faire corriger selon les règlementations","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"23e73d61","x":"Vérifier que les équipements de sécurité sont visibles et accessibles en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"5fd2af87","x":"Vérifier que les affiches des règlements soient affichées et bien en vu en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"acecc1e7","x":"Prendre connaissance des recommandations concernant les règlementations à maintenir et faire respecter pour assurer la sécurité dans les espaces piscines (INSPQ)","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]}] },
+  { e: "Piscine - Bassin (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(bassin)/i, t: [{"id":"bf493f85","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"bb2653c4","x":"Faire vérifier et ouvrir le valve d'eau - Faire hiverniser les valves d'eau","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"9492e19e","x":"Faire vérifier et mettre en fonction les circuits électriques - Faire mettre hors fonction les circuits électriques","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"a2108265","x":"Faire vérifier pour tout débris et faire retirer","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"4263a984","x":"Planifier la vérification et l'entretien de la qualité de l'eau de baignade","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"cb7bfa99","x":"Vérifier et documenter les revêtement intérieur du bassin, béton, carreaux de céramique, fibre de verre, toile de vinyle, structure pour tout indice de bris, délamination, fissure, déchirement, détachement, perte de volume d'eau, etc","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"3744abe8","x":"Faire réparer les surfaces intérieures","f":"S","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"354900ca","x":"Faire vérifier que les équipements et installations soient sécuritaires et respectent les règlements municipaux et recommandations de l'INSPQ","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"3e5579d6","x":"Faire corriger selon les règlementations","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"23e73d61","x":"Vérifier que les équipements de sécurité sont visibles et accessibles en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"5fd2af87","x":"Vérifier que les affiches des règlements soient affichées et bien en vu en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"acecc1e7","x":"Prendre connaissance des recommandations concernant les règlementations à maintenir et faire respecter pour assurer la sécurité dans les espaces piscines (INSPQ)","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]}] },
   { e: "Piscine - Enceinte, espace piétonnier et terrasse (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – (enceinte|contour)/i, t: [{"id":"36ba3084","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"cfe4014b","x":"Faire nettoyer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"8df6bae7","x":"Vérifier et documenter la surface des allées de béton : fissures, affaissement, éclatement","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"b76edfa0","x":"Faire réparer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"fe8686f8","x":"Vérifier et documenter les surfaces des pavés de béton: fissures, affaissement, instabilité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"b3e08792","x":"S'assurer que la pente des dalles est positive","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"e502bce2","x":"Faire réparer les surfaces et remettre de niveau au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"4c9791c6","x":"Vérifier que la clôture et les accès sont stables, solides et barrés en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"ae056640","x":"Vérifier pour toute trace de corrosion","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["printemps",[4],true],["ete",[7],true]]},{"id":"f062ceb0","x":"Gratter la corrosion et appliquer une peinture antirouille/zinc","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"21fa5b11","x":"Faire stabiliser et solidifier les structures","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true],["printemps",[4],true],["ete",[7],true]]},{"id":"ce4a7a7e","x":"Vérifier que les installations et supports d'équipements sont stables et bien fixés","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"0b3d31b2","x":"Gratter la corrosion et appliquer une peinture","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]}] },
   { e: "Piscine - Pompes et filtreur (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(filtration)/i, t: [{"id":"422cd27c","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"98e8fd3a","x":"Vérifier à faire remplacer le sable aux 3-4 ans","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"6e400231","x":"Vérifier que les cablages électriques soit protégés en tout temps","f":"A","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"9da50f5a","x":"Vérifier l'indicateur de pression (manomètre) et s'assurer que la pression rencontre les indications du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"e0376279","x":"Vérifier que la position des vannes soient adéquate et selon les recommandations du manufacturier","f":"A","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"8aa22759","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"63d8a898","x":"Vérifier pour tout éléments ou débris qui pourraient nuite au bouches d'aspiration et de rejet","f":"S","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]}] },
   { e: "Piscine - Système de dosage (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(filtration)/i, t: [{"id":"637c7043","x":"Planifier la calibration annuelle","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"480b9d4a","x":"Vérifier le Chlorinateur, doseur de pH, doseur de sel, les lampes témoins et que ceux-ci fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"dc13f8cd","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]}] },
   { e: "Piscine - Système de chauffe eau T/P (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(chauffage)/i, t: [{"id":"07dadbee","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"a3befb15","x":"Faire vérifier la solidité des installations","f":"A","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"71211c9e","x":"Vérifier que les appareils fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"ff2562ab","x":"Vérifier que les cablage électrique et conduit des gaz soit protégés en tout temps, isolants, sécurité","f":"A","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"5dc90406","x":"Faire vérifier que les dégagements soient respectés (Min 24''au périmètre et min 48'' au dessus)","f":"A","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]}] },
   { e: "Piscine - Système de traitement de l'air - Déshumidificateur mécanique (intérieure)", c: "Installations de piscine extérieur", re: /piscine intérieure – .*(humidité)/i, t: [{"id":"f8acb019","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true],["hiver",[1],true]]},{"id":"94ce0b10","x":"Vérifier que les appareils fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"dc4f3f87","x":"Vérifier le controleur, les capteurs, la lampe témoin, la sonnerie de trop plein","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"1b0be245","x":"Planifier l'inspection saisonnière","f":"A","q":"Contrat","o":[["ete",[7],true]]}] },
-  { e: "Piscine - Bassin (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(bassin)/i, t: [{"id":"726e8872","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"351976f2","x":"Faire vérifier et ouvrir le valve d'eau - Faire hiverniser les valves d'eau","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"0d8a4a0b","x":"Faire vérifier et mettre en fonction les circuits électriques - Faire mettre hors fonction les circuits électriques","f":"S","q":"ContraT","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"e8a1b169","x":"Faire vérifier pour tout débris et faire retirer","f":"S","q":"","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"55b89d1e","x":"Planifier la vérification et l'entretien de la qualité de l'eau de baignade","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"cd0b6f18","x":"Vérifier et documenter les revêtement intérieur du bassin, béton, carreaux de céramique, fibre de verre, toile de vinyle, structure pour tout indice de bris, délamination, fissure, déchirement, détachement, perte de volume d'eau, etc","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"07930389","x":"Faire réparer les surfaces intérieures","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f01a7afc","x":"Faire vérifier que les équipements et installations soient sécuritaires et respectent les règlements municipaux et recommandations de l'INSPQ","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"23388ad2","x":"Faire corriger selon les règlementations","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"de435578","x":"Vérifier que les équipements de sécurité sont visibles et accessibles en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"fcf614ac","x":"Vérifier que les affiches des règlements soient affichées et bien en vu en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"37d0a224","x":"Prendre connaissance des recommandations concernant les règlementations à maintenir et faire respecter pour assurer la sécurité dans les espaces piscines (INSPQ)","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]}] },
+  { e: "Piscine - Bassin (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(bassin)/i, t: [{"id":"726e8872","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"351976f2","x":"Faire vérifier et ouvrir le valve d'eau - Faire hiverniser les valves d'eau","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"0d8a4a0b","x":"Faire vérifier et mettre en fonction les circuits électriques - Faire mettre hors fonction les circuits électriques","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"e8a1b169","x":"Faire vérifier pour tout débris et faire retirer","f":"S","q":"","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"55b89d1e","x":"Planifier la vérification et l'entretien de la qualité de l'eau de baignade","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"cd0b6f18","x":"Vérifier et documenter les revêtement intérieur du bassin, béton, carreaux de céramique, fibre de verre, toile de vinyle, structure pour tout indice de bris, délamination, fissure, déchirement, détachement, perte de volume d'eau, etc","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"07930389","x":"Faire réparer les surfaces intérieures","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f01a7afc","x":"Faire vérifier que les équipements et installations soient sécuritaires et respectent les règlements municipaux et recommandations de l'INSPQ","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"23388ad2","x":"Faire corriger selon les règlementations","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"de435578","x":"Vérifier que les équipements de sécurité sont visibles et accessibles en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"fcf614ac","x":"Vérifier que les affiches des règlements soient affichées et bien en vu en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"37d0a224","x":"Prendre connaissance des recommandations concernant les règlementations à maintenir et faire respecter pour assurer la sécurité dans les espaces piscines (INSPQ)","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]}] },
   { e: "Piscine - Enceinte, espace piétonnier et terrasse (intérieure)", c: "Installations de piscine intérieure", re: /centre aquatique/i, t: [{"id":"9a6b3e80","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"b9695b08","x":"Faire nettoyer les surfaces","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"a5d045f7","x":"Vérifier et documenter la surface des allées de béton : fissures, affaissement, éclatement","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"2a736ed3","x":"Faire réparer les surfaces","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"2c8fff20","x":"Vérifier et documenter les surfaces des pavés de béton: fissures, affaissement, instabilité","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"8e096bdd","x":"S'assurer que la pente des dalles est positive","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"2545a761","x":"Faire réparer les surfaces et remettre de niveau au besoin","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"b5625e97","x":"Vérifier que la clôture et les accès sont stables, solides et barrés en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"46a52472","x":"Vérifier pour toute trace de corrosion","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true],["hiver",[1],true],["printemps",[4],true],["ete",[7],true]]},{"id":"20d0092d","x":"Gratter la corrosion et appliquer une peinture antirouille/zinc","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"f7eba770","x":"Faire stabiliser et solidifier les structures","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true],["hiver",[1],true],["ete",[7],true]]},{"id":"a83153af","x":"Vérifier que les installations et supports d'équipements sont stables et bien fixés","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9d2e44fb","x":"Gratter la corrosion et appliquer une peinture","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]}] },
   { e: "Piscine - Pompes et filtreur (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(filtration)/i, t: [{"id":"25c0f1dd","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"fb213a88","x":"Vérifier à faire remplacer le sable aux 3-4 ans","f":"A","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"bf194df5","x":"Vérifier que les cablages électriques soit protégés en tout temps","f":"A","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"fc6e4e14","x":"Vérifier l'indicateur de pression (manomètre) et s'assurer que la pression rencontre les indications du manufacturier","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"43c913eb","x":"Vérifier que la position des vannes soient adéquate et selon les recommandations du manufacturier","f":"A","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"c2f6c367","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a00d776c","x":"Vérifier pour tout éléments ou débris qui pourraient nuite au bouches d'aspiration et de rejet","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
   { e: "Piscine - Système de dosage (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(filtration)/i, t: [{"id":"6572d9a3","x":"Planifier la calibration annuelle","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"89c9bfd1","x":"Planifier la calibration saisonnière","f":"A","q":"Contrat","o":[["ete",[7],true]]},{"id":"a9a48c37","x":"Vérifier le Chlorinateur, doseur de pH, doseur de sel, les lampes témoins et que ceux-ci fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"18d82548","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
@@ -3820,18 +3822,30 @@ function nettoyerPersoEntretien(brut) {
   return { retirees, ajoutees };
 }
 // Tâches d'une composante : celles des éléments du carnet qui la visent, moins
-// celles que l'ingénieur a retirées, plus celles qu'il a ajoutées.
-function tachesPourComposante(component, { avecRetirees = false } = {}) {
+// celles que l'ingénieur a retirées, plus celles qu'il a ajoutées. Quand la
+// firme a importé ses tâches, une composante de sa liste prend les siennes ;
+// une composante qui n'y figure pas (dossier créé avant l'import) garde celles
+// de la bibliothèque Condo Stratégis.
+function tachesPourComposante(component, { avecRetirees = false, biblio = null } = {}) {
   const nom = String(component?.name ?? "");
   const perso = nettoyerPersoEntretien(component?.taches_entretien);
   const retirees = new Set(perso.retirees);
   const taches = [];
-  for (const el of TACHES_ENTRETIEN) {
-    if (!el.re.test(nom)) continue;
-    for (const t of el.t) {
-      const retiree = retirees.has(t.id);
-      if (retiree && !avecRetirees) continue;
-      taches.push({ ...t, element: el.e, categorie: el.c, retiree });
+  const garder = (t, element, categorie) => {
+    const retiree = retirees.has(t.id);
+    if (retiree && !avecRetirees) return;
+    const { comps, ...tache } = t;
+    taches.push({ ...tache, element, categorie, retiree });
+  };
+  const cle = cleTexte(nom);
+  if (biblio?.taches && biblio.noms.has(cle)) {
+    for (const el of biblio.taches) {
+      for (const t of el.t) if (t.comps.includes(cle)) garder(t, el.e, el.c);
+    }
+  } else {
+    for (const el of TACHES_ENTRETIEN) {
+      if (!el.re.test(nom)) continue;
+      for (const t of el.t) garder(t, el.e, el.c);
     }
   }
   for (const t of perso.ajoutees) {
@@ -3857,21 +3871,468 @@ function tacheAffichee(t) {
 // Tâches du dossier, regroupées par élément du carnet et sans doublon : deux
 // composantes du même élément (fenêtres en vinyle et portes-patio) partagent
 // ses tâches. Seules les composantes actives comptent.
-function carnetDuDossier(components) {
+function carnetDuDossier(components, biblio = null) {
   const parElement = new Map();
   for (const comp of components) {
-    for (const t of tachesPourComposante(comp)) {
+    for (const t of tachesPourComposante(comp, { biblio })) {
       if (!parElement.has(t.element)) parElement.set(t.element, { element: t.element, categorie: t.categorie, taches: new Map() });
       parElement.get(t.element).taches.set(t.id, t);
     }
   }
-  const ordreCat = [...new Set(TACHES_ENTRETIEN.map((e) => e.c))];
+  const ordreCat = [...new Set([...TACHES_ENTRETIEN, ...biblio?.taches ?? []].map((e) => e.c))];
   return [...parElement.values()]
     .map((g) => ({ ...g, taches: [...g.taches.values()] }))
     .sort((a, b) => {
       const ia = ordreCat.indexOf(a.categorie), ib = ordreCat.indexOf(b.categorie);
       return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
     });
+}
+// ============================================================================
+// BIBLIOTHÈQUE DE LA FIRME — liste de composantes et tâches du carnet
+// ----------------------------------------------------------------------------
+// Par défaut, une nouvelle visite part de la liste Condo Stratégis
+// (GABARIT_STRATEGIS) et chaque composante reçoit les tâches du carnet qui la
+// visent (TACHES_ENTRETIEN). Une firme peut importer sa propre liste, avec ou
+// sans ses tâches, depuis un classeur au format de l'export : onglets
+// « Composantes » et « Tâches ». Elle est stockée dans companies.bibliotheque
+// et devient la liste de départ de ses nouvelles visites ; les dossiers
+// existants gardent leurs composantes.
+// ============================================================================
+const LIBELLES_REGLES = {
+  etages5: "5 étages et plus (Loi 122)",
+  stationnement_int: "Stationnement intérieur",
+  ascenseur: "Ascenseur",
+  gicleurs: "Gicleurs",
+  generatrice: "Génératrice",
+  piscine_interieure: "Piscine intérieure",
+  piscine_exterieure: "Piscine extérieure"
+};
+const LIMITES_BIBLIOTHEQUE = { composantes: 400, taches: 3000, octets: 900 * 1024 };
+// Clé de comparaison : sans accents, sans casse, tirets et espaces uniformisés.
+function cleTexte(s) {
+  return String(s ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase()
+    .replace(/[‐-―−]/g, "-").replace(/[’']/g, "'").replace(/\s+/g, " ").trim();
+}
+function bibliothequeDeFirme(company) {
+  const b = objetJson(company?.bibliotheque);
+  if (!Array.isArray(b.composantes) || !b.composantes.length) return null;
+  return {
+    ...b,
+    taches: Array.isArray(b.taches) && b.taches.length ? b.taches : null,
+    noms: new Set(b.composantes.map((item) => cleTexte(item.name)))
+  };
+}
+async function bibliothequeDuDossier(db, dossierId) {
+  const row = await db.prepare(
+    "SELECT co.bibliotheque FROM dossiers d JOIN companies co ON co.id = d.company_id WHERE d.id = ?1"
+  ).bind(dossierId).first();
+  return bibliothequeDeFirme(row);
+}
+function listeDeDepart(biblio) {
+  return biblio?.composantes ?? GABARIT_STRATEGIS;
+}
+// Vue de la bibliothèque pour l'admin : chaque composante avec ses tâches.
+function vueBibliotheque(biblio) {
+  const liste = listeDeDepart(biblio);
+  const ids = new Set();
+  let sansTache = 0;
+  const composantes = liste.map((item) => {
+    const taches = tachesPourComposante({ name: item.name, cat: item.cat }, { biblio }).map((t) => {
+      ids.add(t.id);
+      const a = tacheAffichee(t);
+      return { texte: a.texte, element: a.element, frequence: a.frequence, quand: a.quand, responsable: a.responsable };
+    });
+    if (!taches.length) sansTache += 1;
+    return {
+      cat: item.cat,
+      name: item.name,
+      code: item.code ?? "",
+      type: item.type ?? "",
+      unite: item.unite ?? "",
+      vu: item.vu ?? null,
+      condition: item.regle ? LIBELLES_REGLES[item.regle] ?? item.regle : "",
+      taches
+    };
+  });
+  return {
+    source: biblio ? "firme" : "defaut",
+    filename: biblio?.filename ?? null,
+    imported_at: biblio?.imported_at ?? null,
+    tachesPropres: !!biblio?.taches,
+    avertissements: biblio?.avertissements ?? [],
+    categories: Object.entries(CATEGORIES).sort((a, b) => a[1].ordre - b[1].ordre).map(([cle, cat]) => ({ cle, label: cat.label })),
+    composantes,
+    stats: { composantes: composantes.length, taches: ids.size, sansTache }
+  };
+}
+// ----------------------------------------------------------------------------
+// Lecture d'un classeur .xlsx : texte des cellules, feuille par feuille. La
+// bibliothèque tableur embarquée n'a gardé que l'écriture ; celle-ci suffit
+// à lire des valeurs, sans formules ni mise en forme.
+// ----------------------------------------------------------------------------
+function attributXml(balise, nom) {
+  const m = balise.match(new RegExp(`\\s${nom}="([^"]*)"`));
+  return m ? decodeEntitesXml(m[1]) : null;
+}
+function texteXmlRuns(xml) {
+  return [...xml.replace(/<rPh\b[\s\S]*?<\/rPh>/g, "").replace(/<t\b[^>]*\/>/g, "").matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)]
+    .map((m) => decodeEntitesXml(m[1])).join("");
+}
+function indexColonne(ref) {
+  const lettres = String(ref ?? "").match(/^[A-Z]+/)?.[0];
+  if (!lettres) return null;
+  let n = 0;
+  for (const ch of lettres) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n - 1;
+}
+function lignesFeuilleXlsx(xml, partages) {
+  const lignes = [];
+  for (const r of xml.matchAll(/<row\b([^>]*?)(?:\/>|>([\s\S]*?)<\/row>)/g)) {
+    const numero = Number(attributXml(r[1], "r")) || lignes.length + 1;
+    if (numero > 20000) break;
+    const cellules = [];
+    for (const cm of (r[2] ?? "").matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+      const col = indexColonne(attributXml(cm[1], "r")) ?? cellules.length;
+      if (col > 60) continue;
+      const type = attributXml(cm[1], "t");
+      const interieur = cm[2] ?? "";
+      const v = interieur.match(/<v>([\s\S]*?)<\/v>/)?.[1];
+      let valeur = "";
+      if (type === "s") valeur = partages[Number(v)] ?? "";
+      else if (type === "inlineStr") valeur = texteXmlRuns(interieur);
+      else if (type === "b") valeur = v === "1" ? "VRAI" : "FAUX";
+      else if (v != null) valeur = decodeEntitesXml(v);
+      cellules[col] = valeur.trim();
+    }
+    lignes[numero - 1] = Array.from(cellules, (x) => x ?? "");
+  }
+  return Array.from(lignes, (x) => x ?? []);
+}
+async function lireClasseurXlsx(bytes) {
+  const JSZip = import_jszip_min.default;
+  let zip;
+  try {
+    zip = await JSZip.loadAsync(bytes);
+  } catch {
+    throw new Error("ce fichier n'est pas un classeur Excel (.xlsx)");
+  }
+  const lire = async (chemin) => zip.file(chemin)?.async("string") ?? null;
+  const classeur = await lire("xl/workbook.xml");
+  if (!classeur) throw new Error("ce fichier n'est pas un classeur Excel (.xlsx)");
+  const cibles = new Map();
+  for (const m of ((await lire("xl/_rels/workbook.xml.rels")) ?? "").matchAll(/<Relationship\b[^>]*>/g)) {
+    const id = attributXml(m[0], "Id"), cible = attributXml(m[0], "Target");
+    if (id && cible) cibles.set(id, cible.startsWith("/") ? cible.slice(1) : `xl/${cible.replace(/^\.\//, "")}`);
+  }
+  const partages = [];
+  for (const m of ((await lire("xl/sharedStrings.xml")) ?? "").matchAll(/<si\b[^>]*?(?:\/>|>([\s\S]*?)<\/si>)/g)) {
+    partages.push(texteXmlRuns(m[1] ?? ""));
+  }
+  const feuilles = [];
+  for (const m of classeur.matchAll(/<sheet\b[^>]*>/g)) {
+    const chemin = cibles.get(attributXml(m[0], "r:id"));
+    const xml = chemin ? await lire(chemin) : null;
+    if (xml) feuilles.push({ nom: attributXml(m[0], "name") ?? "", lignes: lignesFeuilleXlsx(xml, partages) });
+  }
+  return feuilles;
+}
+// ----------------------------------------------------------------------------
+// Import : validation ligne par ligne. Une seule erreur bloque tout l'import,
+// pour ne jamais remplacer la liste d'une firme par une liste à moitié lue.
+// ----------------------------------------------------------------------------
+const COLONNES_BIBLIOTHEQUE = {
+  composantes: {
+    categorie: ["categorie"],
+    nom: ["composante", "nom de la composante", "nom"],
+    code: ["code uniformat", "uniformat", "code"],
+    type: ["type"],
+    unite: ["unite"],
+    vu: ["duree de vie", "vie utile", "dvu"],
+    regle: ["condition", "regle"]
+  },
+  taches: {
+    composante: ["composante"],
+    element: ["element du carnet", "element", "groupe"],
+    tache: ["tache", "description"],
+    frequence: ["frequence", "rythme"],
+    mois: ["mois"],
+    responsable: ["responsable", "qui"]
+  }
+};
+function reperesColonnes(lignes, colonnes, requises) {
+  for (let r = 0; r < Math.min(lignes.length, 10); r++) {
+    const reperes = {};
+    (lignes[r] ?? []).forEach((v, i) => {
+      const k = cleTexte(v);
+      if (!k) return;
+      for (const [champ, alias] of Object.entries(colonnes)) {
+        if (reperes[champ] == null && alias.some((a) => k === a || k.startsWith(`${a} `) || k.startsWith(`${a}(`))) {
+          reperes[champ] = i;
+          break;
+        }
+      }
+    });
+    if (requises.every((c) => reperes[c] != null)) return { ligneEntete: r, reperes };
+  }
+  return null;
+}
+function categorieDepuis(v) {
+  const k = cleTexte(v);
+  if (!k) return null;
+  for (const [cle, cat] of Object.entries(CATEGORIES)) if (k === cle || k === cleTexte(cat.label)) return cle;
+  // Un libellé abrégé (« Enveloppe », « Plomberie ») suffit s'il ne désigne qu'une catégorie.
+  const candidats = Object.entries(CATEGORIES).filter(([cle, cat]) => cleTexte(cat.label).includes(k) || k.includes(cle));
+  return candidats.length === 1 ? candidats[0][0] : null;
+}
+function frequenceDepuis(v) {
+  const code = String(v ?? "").trim().toUpperCase().replace(/\s+/g, "");
+  if (FREQUENCES_ENTRETIEN[code]) return code;
+  const k = cleTexte(v);
+  if (!k) return null;
+  if (/tout temps|consigne/.test(k)) return "C";
+  if (/5 ans|cinq ans/.test(k)) return "A5";
+  if (/annuel/.test(k)) return /entrepr|contrat/.test(k) ? "AS" : "A";
+  if (/hebdo|semaine/.test(k)) return "H";
+  if (/saison/.test(k)) return "S";
+  if (/mensuel|chaque mois/.test(k)) return "M";
+  return null;
+}
+const MOIS_MOTS = [
+  [/\bjanv(?:ier)?\b/g, 1], [/\bfevr?(?:ier)?\b/g, 2], [/\bmars\b/g, 3], [/\bavr(?:il)?\b/g, 4],
+  [/\bmai\b/g, 5], [/\bjuin\b/g, 6], [/\bjuil(?:let)?\b/g, 7], [/\baout\b/g, 8],
+  [/\bsept(?:embre)?\b/g, 9], [/\boct(?:obre)?\b/g, 10], [/\bnov(?:embre)?\b/g, 11], [/\bdec(?:embre)?\b/g, 12]
+];
+// « avril, octobre », « 4, 10 », « avril à juin », « 11-3 », « printemps »,
+// « toute l'année ». Rend null si un morceau n'est pas un mois.
+function moisDepuis(v) {
+  let k = cleTexte(v).replace(/\./g, " ");
+  if (!k) return [];
+  if (/toute l'annee|tous les mois|12 mois/.test(k)) return [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  for (const s of SAISONS_ENTRETIEN) k = k.replace(new RegExp(`\\b${cleTexte(s.libelle)}\\b`, "g"), ` ${s.mois[0]}-${s.mois[s.mois.length - 1]} `);
+  for (const [re, n] of MOIS_MOTS) k = k.replace(re, ` ${n} `);
+  k = k.replace(/\b(?:a|au|jusqu'a)\b/g, "-").replace(/\bet\b/g, ",");
+  if (/[^\d\s,;\/\-]/.test(k)) return null;
+  const jetons = k.match(/\d+|-/g) ?? [];
+  const mois = new Set();
+  for (let i = 0; i < jetons.length; i++) {
+    const n = Number(jetons[i]);
+    if (!Number.isInteger(n)) continue;
+    if (n < 1 || n > 12) return null;
+    if (jetons[i + 1] === "-" && /^\d+$/.test(jetons[i + 2] ?? "")) {
+      const fin = Number(jetons[i + 2]);
+      if (fin < 1 || fin > 12) return null;
+      // « novembre à mars » passe par décembre.
+      for (let m = n, garde = 0; garde < 12; m = m % 12 + 1, garde++) {
+        mois.add(m);
+        if (m === fin) break;
+      }
+      i += 2;
+    } else mois.add(n);
+  }
+  return [...mois].sort((a, b) => a - b);
+}
+function responsableDepuis(v) {
+  const k = cleTexte(v);
+  if (!k || /syndicat|gestionnaire|administrat/.test(k)) return "";
+  if (/menag|concierge/.test(k)) return "Ménagers";
+  if (/contrat|entrepreneur/.test(k)) return "Contrat";
+  return String(v).trim().slice(0, 40);
+}
+async function idTacheBibliotheque(element, texte, frequence) {
+  const donnees = new TextEncoder().encode(`${cleTexte(element)}|${cleTexte(texte)}|${frequence}`);
+  const empreinte = new Uint8Array(await crypto.subtle.digest("SHA-1", donnees));
+  return `f_${[...empreinte.slice(0, 5)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+async function analyserBibliotheque(bytes, filename) {
+  const feuilles = await lireClasseurXlsx(bytes);
+  const erreurs = [];
+  const avertissements = [];
+  const erreur = (feuille, ligne, message) => {
+    if (erreurs.length < 60) erreurs.push({ feuille, ligne, message });
+  };
+  const trouver = (motNom, colonnes, requises, exclue) => {
+    const candidates = [
+      ...feuilles.filter((f) => cleTexte(f.nom).includes(motNom)),
+      ...feuilles
+    ].filter((f) => f !== exclue);
+    for (const f of candidates) {
+      const r = reperesColonnes(f.lignes, colonnes, requises);
+      if (r) return { feuille: f, ...r };
+    }
+    return null;
+  };
+  const fc = trouver("composante", COLONNES_BIBLIOTHEQUE.composantes, ["categorie", "nom"]);
+  if (!fc) {
+    return { erreurs: [{ feuille: "", ligne: null, message: "Onglet des composantes introuvable : il faut au moins les colonnes « Catégorie » et « Composante ». Partez du fichier téléchargé avec « Télécharger la liste »." }], avertissements };
+  }
+  // --- Composantes ----------------------------------------------------------
+  const composantes = [];
+  const parCle = new Map();
+  const col = (ligne, champ, reperes) => (reperes[champ] != null ? String(ligne[reperes[champ]] ?? "").trim() : "");
+  for (let r = fc.ligneEntete + 1; r < fc.feuille.lignes.length; r++) {
+    const ligne = fc.feuille.lignes[r] ?? [];
+    const x = (champ) => col(ligne, champ, fc.reperes);
+    const nom = x("nom");
+    if (!nom && !x("categorie")) continue;
+    const n = r + 1;
+    const nomFeuille = fc.feuille.nom;
+    if (!nom) { erreur(nomFeuille, n, "nom de composante manquant"); continue; }
+    if (nom.length > 150) { erreur(nomFeuille, n, "nom de composante trop long (150 caractères au plus)"); continue; }
+    const cle = cleTexte(nom);
+    if (parCle.has(cle)) { erreur(nomFeuille, n, `« ${nom} » figure déjà à la ligne ${parCle.get(cle).ligne}`); continue; }
+    const cat = categorieDepuis(x("categorie"));
+    if (!cat) { erreur(nomFeuille, n, `catégorie « ${x("categorie")} » inconnue`); continue; }
+    let vu = null;
+    if (x("vu")) {
+      vu = Number(x("vu").replace(",", ".").replace(/\s*ans?$/i, ""));
+      if (!Number.isFinite(vu) || vu < 1 || vu > 200) { erreur(nomFeuille, n, `durée de vie « ${x("vu")} » invalide (nombre d'années entre 1 et 200)`); continue; }
+      vu = Math.round(vu);
+    } else avertissements.push(`${nomFeuille}, ligne ${n} : « ${nom} » n'a pas de durée de vie.`);
+    const typeBrut = cleTexte(x("type"));
+    const type = !typeBrut ? (/allocation/i.test(nom) ? "allocation" : "remplacement")
+      : typeBrut.startsWith("alloc") ? "allocation" : typeBrut.startsWith("rempl") ? "remplacement" : null;
+    if (!type) { erreur(nomFeuille, n, `type « ${x("type")} » inconnu (remplacement ou allocation)`); continue; }
+    let regle;
+    if (x("regle")) {
+      const k = cleTexte(x("regle"));
+      regle = Object.keys(LIBELLES_REGLES).find((cleRegle) => k === cleTexte(cleRegle) || k === cleTexte(LIBELLES_REGLES[cleRegle]));
+      if (!regle) { erreur(nomFeuille, n, `condition « ${x("regle")} » inconnue`); continue; }
+    }
+    const item = { cat, name: nom, vu, code: x("code").slice(0, 30), type, unite: x("unite").slice(0, 20), ...regle ? { regle } : {} };
+    parCle.set(cle, { item, ligne: n });
+    composantes.push(item);
+  }
+  if (!composantes.length && !erreurs.length) erreur(fc.feuille.nom, null, "aucune composante dans l'onglet");
+  if (composantes.length > LIMITES_BIBLIOTHEQUE.composantes) erreur(fc.feuille.nom, null, `${composantes.length} composantes : ${LIMITES_BIBLIOTHEQUE.composantes} au plus`);
+  // --- Tâches (facultatives) --------------------------------------------------
+  let taches = null;
+  const ft = trouver("tache", COLONNES_BIBLIOTHEQUE.taches, ["composante", "tache", "frequence"], fc.feuille);
+  if (!ft) {
+    avertissements.push("Aucun onglet de tâches : les composantes dont le nom correspond à la liste Condo Stratégis reçoivent ses tâches du carnet.");
+  } else {
+    const elements = new Map();
+    let total = 0;
+    for (let r = ft.ligneEntete + 1; r < ft.feuille.lignes.length; r++) {
+      const ligne = ft.feuille.lignes[r] ?? [];
+      const x = (champ) => col(ligne, champ, ft.reperes);
+      if (!x("composante") && !x("tache")) continue;
+      const n = r + 1;
+      const nomFeuille = ft.feuille.nom;
+      const comp = parCle.get(cleTexte(x("composante")));
+      if (!comp) { erreur(nomFeuille, n, `composante « ${x("composante")} » absente de l'onglet des composantes`); continue; }
+      const texte = x("tache");
+      if (!texte) { erreur(nomFeuille, n, "texte de la tâche manquant"); continue; }
+      if (texte.length > 300) { erreur(nomFeuille, n, "tâche trop longue (300 caractères au plus)"); continue; }
+      const f = frequenceDepuis(x("frequence"));
+      if (!f) { erreur(nomFeuille, n, `fréquence « ${x("frequence")} » inconnue (H, M, S, A, AS, A5 ou C)`); continue; }
+      const mois = moisDepuis(x("mois"));
+      if (mois === null) { erreur(nomFeuille, n, `mois « ${x("mois")} » illisibles (ex. : « avril, octobre » ou « 4, 10 »)`); continue; }
+      if (!mois.length && f !== "C") { erreur(nomFeuille, n, "aucun mois : indiquez quand la tâche se fait (seule une consigne C peut s'en passer)"); continue; }
+      const element = (x("element") || comp.item.name).slice(0, 150);
+      const cleElement = cleTexte(element);
+      if (!elements.has(cleElement)) elements.set(cleElement, { e: element, c: CATEGORIES[comp.item.cat].label, t: new Map() });
+      const groupe = elements.get(cleElement);
+      const id = await idTacheBibliotheque(element, texte, f);
+      const cleComp = cleTexte(comp.item.name);
+      // La même tâche d'un même élément, rattachée à plusieurs composantes, n'en fait qu'une.
+      if (groupe.t.has(id)) {
+        const t = groupe.t.get(id);
+        if (!t.comps.includes(cleComp)) t.comps.push(cleComp);
+        continue;
+      }
+      const o = f === "C" ? SAISONS_ENTRETIEN.map((s) => [s.cle, [], true]) : occurrencesDepuisMois(mois);
+      groupe.t.set(id, { id, x: texte, f, q: responsableDepuis(x("responsable")), o, comps: [cleComp] });
+      total += 1;
+    }
+    if (total > LIMITES_BIBLIOTHEQUE.taches) erreur(ft.feuille.nom, null, `${total} tâches : ${LIMITES_BIBLIOTHEQUE.taches} au plus`);
+    taches = [...elements.values()].map((g) => ({ e: g.e, c: g.c, t: [...g.t.values()] }));
+    if (!total) {
+      taches = null;
+      avertissements.push("L'onglet des tâches est vide : les composantes dont le nom correspond à la liste Condo Stratégis reçoivent ses tâches du carnet.");
+    } else {
+      const avecTache = new Set(taches.flatMap((g) => g.t.flatMap((t) => t.comps)));
+      const sans = composantes.filter((item) => !avecTache.has(cleTexte(item.name)));
+      if (sans.length) avertissements.push(`${sans.length} composante${sans.length > 1 ? "s n'ont" : " n'a"} aucune tâche : ${sans.slice(0, 8).map((item) => item.name).join(", ")}${sans.length > 8 ? "…" : ""}`);
+    }
+  }
+  const bibliotheque = {
+    v: 1,
+    filename: String(filename || "bibliotheque.xlsx").slice(0, 150),
+    imported_at: new Date().toISOString(),
+    avertissements: avertissements.slice(0, 30),
+    composantes,
+    taches
+  };
+  if (!erreurs.length && JSON.stringify(bibliotheque).length > LIMITES_BIBLIOTHEQUE.octets) {
+    erreur("", null, "bibliothèque trop volumineuse : raccourcissez les textes ou réduisez le nombre de tâches");
+  }
+  return { erreurs, avertissements: bibliotheque.avertissements, bibliotheque };
+}
+// ----------------------------------------------------------------------------
+// Export : la bibliothèque en vigueur, au format que l'import relit. Une firme
+// part de ce fichier, le corrige et le réimporte.
+// ----------------------------------------------------------------------------
+// [4, 5, 6, 10] → « avril à juin, octobre » : relisible par moisDepuis.
+function moisEnTexte(mois) {
+  if (mois.length === 12) return "toute l'année";
+  const plages = [];
+  for (const m of mois) {
+    const derniere = plages[plages.length - 1];
+    if (derniere && m === derniere[1] + 1) derniere[1] = m;
+    else plages.push([m, m]);
+  }
+  return plages.map(([a, b]) => b - a >= 2 ? `${NOMS_MOIS[a - 1]} à ${NOMS_MOIS[b - 1]}` : a === b ? NOMS_MOIS[a - 1] : `${NOMS_MOIS[a - 1]}, ${NOMS_MOIS[b - 1]}`).join(", ");
+}
+async function classeurBibliotheque(biblio, nomFirme) {
+  const liste = listeDeDepart(biblio);
+  const T = (v) => ({ v, s: 6 });
+  const E = (v) => ({ v, s: 9 });
+  const lisezMoi = [
+    [{ v: `Bibliothèque de composantes — ${nomFirme}`, s: 1 }],
+    [{ v: biblio ? `Liste importée de « ${biblio.filename} » le ${String(biblio.imported_at).slice(0, 10)}.` : "Liste Condo Stratégis, utilisée par défaut.", s: 2 }],
+    [],
+    [{ v: "Comment l'utiliser", s: 2 }],
+    [T("1. Corrigez ou complétez les onglets « Composantes » et « Tâches ». Gardez la ligne d'en-tête et le nom des colonnes.")],
+    [T("2. Importez le fichier depuis l'administration, page Bibliothèque. Une erreur bloque tout l'import et la liste en vigueur reste en place.")],
+    [T("3. La liste importée sert de départ à toutes les nouvelles visites de la firme. Les dossiers existants gardent leurs composantes.")],
+    [T("L'onglet « Tâches » est facultatif. Sans lui, une composante dont le nom correspond à la liste Condo Stratégis reçoit ses tâches du carnet.")],
+    [],
+    [{ v: "Onglet « Composantes »", s: 2 }],
+    [E("Colonne"), E("Contenu")],
+    [T("Catégorie"), T(`Obligatoire. Une de : ${Object.values(CATEGORIES).sort((a, b) => a.ordre - b.ordre).map((c) => c.label).join(" · ")}`)],
+    [T("Composante"), T("Obligatoire. Nom unique dans la liste.")],
+    [T("Code Uniformat"), T("Facultatif. Ex. : B20.10")],
+    [T("Type"), T("remplacement ou allocation. Vide : allocation si le nom contient « Allocation », sinon remplacement.")],
+    [T("Unité"), T("Facultatif. Ex. : m², ml, u, global")],
+    [T("Durée de vie (ans)"), T("Nombre d'années, de 1 à 200.")],
+    [T("Condition"), T(`Facultatif. La composante s'active ou se désactive selon la fiche d'immeuble : ${Object.values(LIBELLES_REGLES).join(" · ")}`)],
+    [],
+    [{ v: "Onglet « Tâches »", s: 2 }],
+    [E("Colonne"), E("Contenu")],
+    [T("Composante"), T("Obligatoire. Nom exact d'une composante de l'onglet « Composantes ». Une tâche partagée se répète sur une ligne par composante.")],
+    [T("Élément du carnet"), T("Facultatif. Regroupe les tâches dans le tableur de suivi (ex. : « Toiture »). Vide : le nom de la composante.")],
+    [T("Tâche"), T("Obligatoire. Le texte de la tâche.")],
+    [T("Fréquence"), T(Object.entries(FREQUENCES_ENTRETIEN).map(([k, v]) => `${k} = ${v}`).join(" · "))],
+    [T("Mois"), T("Les mois où la tâche se fait : « avril, octobre », « 4, 10 », « avril à juin », « printemps », « toute l'année ». Vide seulement pour une consigne C.")],
+    [T("Responsable"), T("Ménagers (entretien ménager), Contrat (entrepreneur) ou Syndicat. Vide : syndicat / gestionnaire.")]
+  ];
+  const lignesComposantes = [
+    ["Catégorie", "Composante", "Code Uniformat", "Type", "Unité", "Durée de vie (ans)", "Condition"].map(E),
+    ...liste.map((item) => [CATEGORIES[item.cat]?.label ?? item.cat, item.name, item.code ?? "", item.type ?? "", item.unite ?? "", item.vu ?? "", item.regle ? LIBELLES_REGLES[item.regle] ?? "" : ""].map(T))
+  ];
+  const lignesTaches = [["Composante", "Élément du carnet", "Tâche", "Fréquence", "Mois", "Responsable"].map(E)];
+  for (const item of liste) {
+    for (const t of tachesPourComposante({ name: item.name, cat: item.cat }, { biblio })) {
+      const mois = [...new Set(t.o.flatMap((o) => o[1]))].sort((a, b) => a - b);
+      const qui = t.q === "Ménagers" || t.q === "Contrat" ? t.q : t.q ? t.q : "Syndicat";
+      lignesTaches.push([item.name, t.element, t.x, t.f, moisEnTexte(mois), qui].map(T));
+    }
+  }
+  return classeurXlsx([
+    { nom: "Lisez-moi", lignes: lisezMoi, largeurs: [26, 120], paysage: true },
+    { nom: "Composantes", lignes: lignesComposantes, largeurs: [34, 58, 16, 16, 10, 18, 28], figer: 1 },
+    { nom: "Tâches", lignes: lignesTaches, largeurs: [48, 34, 70, 11, 30, 14], figer: 1 }
+  ]);
 }
 // ----------------------------------------------------------------------------
 // Tableur suivi d'entretien (.xlsx) — même présentation que le gabarit de la
@@ -3944,7 +4405,7 @@ async function classeurXlsx(feuilles) {
 }
 async function tableurSuiviEntretien(ctx) {
   const { dossier, components: components2, theme } = ctx;
-  const carnet = carnetDuDossier(components2);
+  const carnet = carnetDuDossier(components2, ctx.biblio);
   const annee = new Date().getFullYear();
   const titre = `${sansNotesInternes(dossier.name)} — ${dossier.dossier_no}`;
   const entete = (sousTitre) => [
@@ -4950,7 +5411,7 @@ components.get("/:id", async (c) => {
     ...component,
     photos: photos2.results,
     guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats },
-    entretien: tachesPourComposante(component, { avecRetirees: true }).map(tacheAffichee)
+    entretien: tachesPourComposante(component, { avecRetirees: true, biblio: await bibliothequeDuDossier(c.env.DB, component.dossier_id) }).map(tacheAffichee)
   });
 });
 components.patch("/:id", async (c) => {
@@ -5006,7 +5467,7 @@ components.patch("/:id", async (c) => {
     `UPDATE components SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
   ).bind(...values).run();
   const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
-  return c.json({ ...component, entretien: tachesPourComposante(component, { avecRetirees: true }).map(tacheAffichee) });
+  return c.json({ ...component, entretien: tachesPourComposante(component, { avecRetirees: true, biblio: await bibliothequeDuDossier(c.env.DB, component.dossier_id) }).map(tacheAffichee) });
 });
 components.post("/:id/analyze", async (c) => {
   const component = await getOwnedComponent(c, c.req.param("id"));
@@ -24888,7 +25349,7 @@ async function generateReportDocx(ctx, opts = {}) {
         component: comp,
         fiche,
         photos: ctx.photos?.get(comp.id) ?? [],
-        taches: tachesPourComposante(comp).map(tacheAffichee)
+        taches: tachesPourComposante(comp, { biblio: ctx.biblio }).map(tacheAffichee)
       }));
     }
   }
@@ -45784,6 +46245,63 @@ companies.delete("/:id/mise-en-page", async (c) => {
   ).bind(id).run();
   return c.json({ importe: false, champs: CHAMPS_GABARIT, blocs: BLOCS_GABARIT_LIBELLES });
 });
+// Bibliothèque de composantes : la liste de départ des visites de la firme et
+// les tâches du carnet rattachées, importées d'un classeur ou, à défaut,
+// celles de Condo Stratégis.
+companies.get("/:id/bibliotheque", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT bibliotheque FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  return c.json(vueBibliotheque(bibliothequeDeFirme(company)));
+});
+companies.get("/:id/bibliotheque.xlsx", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT name, slug, bibliotheque FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  const bytes = await classeurBibliotheque(bibliothequeDeFirme(company), company.name ?? "");
+  return new Response(new Blob([bytes]), {
+    headers: {
+      "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "content-disposition": `attachment; filename="bibliotheque-${company.slug || "composantes"}.xlsx"`
+    }
+  });
+});
+companies.post("/:id/bibliotheque", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 5 * 1024 * 1024) return c.json({ error: "classeur trop volumineux (max 5 Mo)" }, 413);
+  let analyse;
+  try {
+    analyse = await analyserBibliotheque(new Uint8Array(buffer), file.name);
+  } catch (e) {
+    return c.json({ error: `lecture du classeur impossible : ${e.message}` }, 400);
+  }
+  if (analyse.erreurs.length) {
+    return c.json({ error: "Import refusé : corrigez les lignes signalées, puis réimportez le fichier.", erreurs: analyse.erreurs, avertissements: analyse.avertissements }, 422);
+  }
+  await c.env.DB.prepare(
+    "UPDATE companies SET bibliotheque = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
+  ).bind(JSON.stringify(analyse.bibliotheque), id).run();
+  return c.json(vueBibliotheque(bibliothequeDeFirme({ bibliotheque: analyse.bibliotheque })));
+});
+companies.delete("/:id/bibliotheque", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  await c.env.DB.prepare(
+    "UPDATE companies SET bibliotheque = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1"
+  ).bind(id).run();
+  return c.json(vueBibliotheque(null));
+});
 companies.get("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
@@ -45885,17 +46403,20 @@ dossiers.post("/", async (c) => {
     user.company_id
   ).run();
   const regles = evaluerRegles({ floors: body2.floors ?? null, batiment_info: null });
+  // La liste de la firme, si elle en a importé une ; sinon celle de Condo Stratégis.
+  const firme = user.company_id ? await c.env.DB.prepare("SELECT bibliotheque FROM companies WHERE id = ?1").bind(user.company_id).first() : null;
+  const gabarit = listeDeDepart(bibliothequeDeFirme(firme));
   const filtre = await filtrerGabarit(c.env.ANTHROPIC_API_KEY, {
     units: body2.units ?? 0,
     floors: body2.floors ?? null,
     builtYear: body2.built_year ?? null
-  });
+  }, gabarit);
   // ai_suggested reste à 0 : la liste vient du gabarit, l'IA n'a fait que la filtrer.
   const stmt = c.env.DB.prepare(
     `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code, attributs, actif) VALUES (?1, ?2, ?3, ?4, '—', 0, ?5, ?6, ?7, ?8, ?9)`
   );
   await c.env.DB.batch(
-    GABARIT_STRATEGIS.map((item, i) => {
+    gabarit.map((item, i) => {
       // Une règle certaine l'emporte sur le jugement de l'IA.
       const certain = item.regle ? regles[item.regle] : void 0;
       const actif = certain !== void 0 ? certain : !filtre.inactifs.has(i);
@@ -45912,7 +46433,7 @@ dossiers.post("/", async (c) => {
     inventaire: {
       source: filtre.source,
       erreur: filtre.erreur,
-      total: GABARIT_STRATEGIS.length,
+      total: gabarit.length,
       desactivees: filtre.inactifs.size
     }
   }, 201);
@@ -46061,6 +46582,7 @@ async function buildReportContext(c, opts = {}) {
     signataire: user ?? null,
     apiKey: c.env.ANTHROPIC_API_KEY ?? null,
     company,
+    biblio: bibliothequeDeFirme(company),
     theme: themeDeFirme(company),
     ...opts.word ? {
       logo: await logoDeFirme(c.env, company),
@@ -46164,13 +46686,13 @@ dossiers.get("/:id/report.xlsx", async (c) => {
 // extérieure : non » désactive toute la piscine extérieure. Seules les règles
 // dont la réponse vient de changer sont appliquées, pour ne pas défaire à chaque
 // enregistrement une réactivation faite à la main par l'inspecteur.
-async function appliquerReglesModifiees(db, avant, apres) {
+async function appliquerReglesModifiees(db, avant, apres, gabarit = GABARIT_STRATEGIS) {
   const anciennes = evaluerRegles(avant);
   const nouvelles = evaluerRegles(apres);
   const requetes = [];
   for (const [cle, valeur] of Object.entries(nouvelles)) {
     if (valeur === void 0 || valeur === anciennes[cle]) continue;
-    const noms = GABARIT_STRATEGIS.filter((item) => item.regle === cle).map((item) => item.name);
+    const noms = gabarit.filter((item) => item.regle === cle).map((item) => item.name);
     if (!noms.length) continue;
     requetes.push(
       db.prepare(
@@ -46214,7 +46736,11 @@ dossiers.patch("/:id", async (c) => {
     `UPDATE dossiers SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
   ).bind(...values).run();
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
-  const composantesMisesAJour = await appliquerReglesModifiees(c.env.DB, owned, dossier);
+  // Les conditions viennent de la liste de la firme, complétée de celle de
+  // Condo Stratégis pour les dossiers créés avant son import.
+  const biblio = await bibliothequeDuDossier(c.env.DB, id);
+  const gabarit = biblio ? [...biblio.composantes, ...GABARIT_STRATEGIS.filter((item) => !biblio.noms.has(cleTexte(item.name)))] : GABARIT_STRATEGIS;
+  const composantesMisesAJour = await appliquerReglesModifiees(c.env.DB, owned, dossier, gabarit);
   return c.json({ ...dossier, stats: await dossierStats(c.env.DB, id), composantes_mises_a_jour: composantesMisesAJour });
 });
 const photos = new Hono();

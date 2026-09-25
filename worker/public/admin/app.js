@@ -11,7 +11,7 @@ const TOKEN_KEY = 'cs_admin_token';
 // ---------------------------------------------------------------
 const state = {
   booting: true,
-  screen: 'login', // login | forbidden | companies | company
+  screen: 'login', // login | forbidden | companies | company | bibliotheque
 
   token: null,
   user: null,
@@ -66,6 +66,15 @@ const state = {
   miseEnPage: null,        // { importe, filename, analyse, champs, blocs }
   miseEnPageUploading: false,
   miseEnPageError: null,
+  biblio: null,            // { source, filename, composantes:[…], stats, … } — bibliothèque de composantes
+  biblioError: null,
+  biblioNote: null,
+  biblioErreurs: [],       // lignes refusées au dernier import
+  biblioUploading: false,
+  biblioDownloading: false,
+  biblioCat: '',           // filtre de catégorie
+  biblioRecherche: '',
+  biblioOuvertes: {},      // nom de composante -> tâches dépliées
   newEngTitle: '',
   newEngOrdre: '',
   newEngNoMembre: '',
@@ -336,6 +345,13 @@ async function openCompany(id) {
   state.newEngError = null;
   state.tempPasswordInfo = null;
   state.logoError = null;
+  state.biblio = null;
+  state.biblioError = null;
+  state.biblioNote = null;
+  state.biblioErreurs = [];
+  state.biblioCat = '';
+  state.biblioRecherche = '';
+  state.biblioOuvertes = {};
   await loadCompanyDetail(id);
 }
 
@@ -352,6 +368,7 @@ async function loadCompanyDetail(id) {
     loadTemplate(id);
     loadTheme(id);
     loadMiseEnPage(id);
+    loadBibliotheque(id);
   } catch (e) {
     state.companyLoading = false;
     state.companyError = e.message || 'Impossible de charger cette entreprise.';
@@ -424,6 +441,128 @@ async function deleteMiseEnPage() {
     state.miseEnPageError = e.message || "L'opération a échoué.";
   }
   render();
+}
+
+// ---------------------------------------------------------------
+// Bibliothèque de composantes : liste de départ des visites et tâches du carnet
+// ---------------------------------------------------------------
+async function loadBibliotheque(id) {
+  try {
+    state.biblio = await apiJson(`/api/companies/${id}/bibliotheque`);
+    state.biblioError = null;
+  } catch (e) {
+    state.biblioError = e.message || 'Impossible de charger la bibliothèque.';
+  }
+  render();
+}
+
+function openBibliotheque() {
+  state.screen = 'bibliotheque';
+  state.biblioNote = null;
+  state.biblioErreurs = [];
+  state.biblioError = null;
+  render();
+  window.scrollTo(0, 0);
+  if (!state.biblio) loadBibliotheque(state.companyId);
+}
+
+function backToCompany() {
+  state.screen = 'company';
+  render();
+  window.scrollTo(0, 0);
+}
+
+async function uploadBibliotheque(file) {
+  if (!file || state.biblioUploading) return;
+  state.biblioUploading = true;
+  state.biblioError = null;
+  state.biblioNote = null;
+  state.biblioErreurs = [];
+  render();
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await apiRaw(`/api/companies/${state.companyId}/bibliotheque`, { method: 'POST', body: fd });
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (res.ok) {
+      state.biblio = data;
+      state.biblioOuvertes = {};
+      state.biblioNote = `Liste importée : ${data.stats.composantes} composantes et ${data.stats.taches} tâches. Elle sert de départ aux nouvelles visites de l'entreprise.`;
+    } else {
+      state.biblioError = (data && data.error) || `Erreur ${res.status}`;
+      state.biblioErreurs = (data && data.erreurs) || [];
+    }
+  } catch (e) {
+    state.biblioError = e.message || "L'import a échoué.";
+  }
+  state.biblioUploading = false;
+  render();
+}
+
+async function resetBibliotheque() {
+  if (!confirm("Revenir à la liste Condo Stratégis ? La liste importée par l'entreprise sera retirée. Les dossiers existants ne changent pas.")) return;
+  try {
+    state.biblio = await apiJson(`/api/companies/${state.companyId}/bibliotheque`, { method: 'DELETE' });
+    state.biblioOuvertes = {};
+    state.biblioErreurs = [];
+    state.biblioError = null;
+    state.biblioNote = 'Les nouvelles visites repartent de la liste Condo Stratégis.';
+  } catch (e) {
+    state.biblioError = e.message || "L'opération a échoué.";
+  }
+  render();
+}
+
+async function downloadBibliotheque() {
+  if (state.biblioDownloading) return;
+  state.biblioDownloading = true;
+  render();
+  try {
+    const res = await apiRaw(`/api/companies/${state.companyId}/bibliotheque.xlsx`);
+    if (!res.ok) throw new Error(`Erreur ${res.status}`);
+    const blob = await res.blob();
+    const nom = ((res.headers.get('content-disposition') || '').match(/filename="([^"]+)"/) || [])[1] || 'bibliotheque.xlsx';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = nom;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  } catch (e) {
+    state.biblioError = e.message || 'Le téléchargement a échoué.';
+  }
+  state.biblioDownloading = false;
+  render();
+}
+
+// Recherche sans accents ni casse, dans le nom, le code et le texte des tâches.
+function cleRecherche(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+function composanteVisible(c) {
+  if (state.biblioCat && c.cat !== state.biblioCat) return false;
+  const q = cleRecherche(state.biblioRecherche).trim();
+  if (!q) return true;
+  const texte = cleRecherche([c.name, c.code, c.condition].concat(c.taches.map(t => t.texte + ' ' + t.element)).join(' '));
+  return q.split(/\s+/).every(mot => texte.includes(mot));
+}
+// Filtre appliqué au DOM pendant la frappe : un render() ferait perdre le
+// curseur du champ de recherche.
+function filtrerBibliothequeDom() {
+  const b = state.biblio;
+  if (!b) return;
+  document.querySelectorAll('[data-bib-idx]').forEach(el => {
+    el.hidden = !composanteVisible(b.composantes[Number(el.getAttribute('data-bib-idx'))]);
+  });
+  document.querySelectorAll('[data-bib-cat]').forEach(g => {
+    g.hidden = !g.querySelector('[data-bib-idx]:not([hidden])');
+  });
+  const n = b.composantes.filter(composanteVisible).length;
+  const compte = document.querySelector('[data-role="biblio-compte"]');
+  if (compte) compte.textContent = n === b.composantes.length ? `${n} composantes` : `${n} sur ${b.composantes.length} composantes`;
 }
 
 async function loadTemplate(id) {
@@ -739,6 +878,7 @@ function renderShell() {
   let main = '';
   if (state.screen === 'companies') main = renderCompanies();
   else if (state.screen === 'company') main = renderCompanyDetail();
+  else if (state.screen === 'bibliotheque') main = renderBibliotheque();
   return `<div class="app-shell">${topbarHtml()}${main}</div>`;
 }
 
@@ -870,9 +1010,128 @@ function renderCompanyDetail() {
       </div>`).join('')}
     </div>
 
+    ${bibliothequeCardHtml()}
     ${themeCardHtml()}
     ${miseEnPageCardHtml()}
     ${templateCardHtml()}
+  </div>`;
+}
+
+function sourceBibliothequeHtml(b) {
+  return b.source === 'firme'
+    ? `<span class="status-badge" style="background:#E8F5E9;color:#1B5E20">Liste de l'entreprise</span> <span class="bib-source">importée de <code>${escapeHtml(b.filename || '')}</code> le ${fmtDate(b.imported_at)}${b.tachesPropres ? '' : ' · tâches du carnet Condo Stratégis'}</span>`
+    : `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">Liste Condo Stratégis</span> <span class="bib-source">utilisée par défaut</span>`;
+}
+
+function bibliothequeCardHtml() {
+  const b = state.biblio;
+  return `
+  <div>
+    <div class="eng-section-head">
+      <span class="lbl">Bibliothèque de composantes</span>
+      <div class="rule"></div>
+      <button class="btn-pill-sm" data-action="biblio-open"><i data-lucide="library" style="width:14px;height:14px"></i>Ouvrir la bibliothèque</button>
+    </div>
+    <div class="tpl-lead">La liste de composantes qui sert de départ à chaque nouvelle visite, avec les tâches du carnet d'entretien rattachées à chacune. L'entreprise peut importer sa propre liste.</div>
+    ${state.biblioError && state.screen === 'company' ? `<div class="login-error" style="margin:10px 0">${escapeHtml(state.biblioError)}</div>` : ''}
+    ${!b ? spinnerBlock('Chargement…') : `
+    <div class="bib-resume">${sourceBibliothequeHtml(b)}<span class="bib-chiffres">${b.stats.composantes} composantes · ${b.stats.taches} tâches</span></div>`}
+  </div>`;
+}
+
+function renderBibliotheque() {
+  const c = state.company;
+  const b = state.biblio;
+  const cats = (b && b.categories) || [];
+  const visibles = b ? b.composantes.filter(composanteVisible).length : 0;
+  return `
+  <div class="page-pad">
+    <button class="back-link" data-action="biblio-back"><i data-lucide="chevron-left"></i>${escapeHtml((c && c.name) || 'Entreprise')}</button>
+    <div class="page-head-row">
+      <div>
+        <div class="eyebrow-orange">${escapeHtml((c && c.name) || '')}</div>
+        <h1 class="page-title">Bibliothèque</h1>
+        <p class="page-lead">Les composantes créées à chaque nouvelle visite et les tâches du carnet d'entretien rattachées à chacune. L'IA désactive ensuite celles qui ne conviennent pas à l'immeuble, et l'inspecteur peut les réactiver.</p>
+      </div>
+      <div class="bib-actions">
+        <button class="btn-secondary" data-action="biblio-download" ${state.biblioDownloading || !b ? 'disabled' : ''}><i data-lucide="${state.biblioDownloading ? 'loader-2' : 'download'}"></i>${state.biblioDownloading ? 'Préparation…' : 'Télécharger la liste (.xlsx)'}</button>
+        <label class="btn-primary ${state.biblioUploading ? 'is-disabled' : ''}"><i data-lucide="${state.biblioUploading ? 'loader-2' : 'upload'}"></i>${state.biblioUploading ? 'Vérification…' : 'Importer une liste (.xlsx)'}<input type="file" accept=".xlsx" data-role="biblio-file" style="display:none" ${state.biblioUploading ? 'disabled' : ''}></label>
+      </div>
+    </div>
+
+    <div class="bib-aide">
+      <i data-lucide="info"></i>
+      <div>Pour importer la liste de l'entreprise : téléchargez la liste actuelle, modifiez les onglets <strong>Composantes</strong> et <strong>Tâches</strong> dans Excel (l'onglet <strong>Lisez-moi</strong> explique chaque colonne), puis importez le fichier. L'onglet Tâches est facultatif. La nouvelle liste s'applique aux nouvelles visites; les dossiers existants ne changent pas.</div>
+    </div>
+
+    ${state.biblioError ? `<div class="login-error" style="margin:14px 0">${escapeHtml(state.biblioError)}</div>` : ''}
+    ${state.biblioErreurs.length ? `
+    <div class="bib-erreurs">
+      <div class="bib-erreurs-titre">${state.biblioErreurs.length} ligne${state.biblioErreurs.length > 1 ? 's' : ''} à corriger — rien n'a été importé, la liste en vigueur reste en place</div>
+      <ul>${state.biblioErreurs.map(e => `<li><span class="mono-cell">${escapeHtml(e.feuille || 'Classeur')}${e.ligne ? `, ligne ${e.ligne}` : ''}</span> — ${escapeHtml(e.message)}</li>`).join('')}</ul>
+    </div>` : ''}
+    ${state.biblioNote ? `<div class="temp-pass-warn" style="margin:14px 0"><i data-lucide="check"></i><span>${escapeHtml(state.biblioNote)}</span></div>` : ''}
+
+    ${!b ? spinnerBlock('Chargement de la bibliothèque…') : `
+    <div class="bib-resume" style="margin:18px 0 6px">
+      ${sourceBibliothequeHtml(b)}
+      ${b.source === 'firme' ? `<button class="btn-row-action" data-action="biblio-reset">Revenir à la liste Condo Stratégis</button>` : ''}
+    </div>
+    ${b.avertissements && b.avertissements.length ? `<div class="temp-pass-warn" style="margin:10px 0"><i data-lucide="alert-triangle"></i><span>${b.avertissements.map(escapeHtml).join('<br>')}</span></div>` : ''}
+
+    <div class="bib-stats">
+      <div><strong>${b.stats.composantes}</strong><span>composantes</span></div>
+      <div><strong>${b.stats.taches}</strong><span>tâches du carnet</span></div>
+      <div><strong>${b.stats.sansTache}</strong><span>composante${b.stats.sansTache > 1 ? 's' : ''} sans tâche</span></div>
+    </div>
+
+    <div class="bib-toolbar">
+      <div class="field-box" style="flex:1;margin:0"><i data-lucide="search"></i><input type="search" data-role="biblio-search" placeholder="Rechercher une composante ou une tâche…" value="${escapeHtml(state.biblioRecherche)}"></div>
+      <select class="bib-select" data-role="biblio-cat">
+        <option value="">Toutes les catégories</option>
+        ${cats.map(k => `<option value="${k.cle}" ${state.biblioCat === k.cle ? 'selected' : ''}>${escapeHtml(k.label)}</option>`).join('')}
+      </select>
+      <span class="bib-compte" data-role="biblio-compte">${visibles === b.composantes.length ? `${visibles} composantes` : `${visibles} sur ${b.composantes.length} composantes`}</span>
+    </div>
+
+    ${cats.map(k => {
+      const items = b.composantes.map((comp, i) => [comp, i]).filter(([comp]) => comp.cat === k.cle);
+      if (!items.length) return '';
+      const cachee = !items.some(([comp]) => composanteVisible(comp));
+      return `
+      <div class="bib-groupe" data-bib-cat="${k.cle}" ${cachee ? 'hidden' : ''}>
+        <div class="eng-section-head"><span class="lbl">${escapeHtml(k.label)}</span><div class="rule"></div><span class="bib-n">${items.length}</span></div>
+        <div class="dossiers-table">
+          ${items.map(([comp, i]) => {
+            const ouvert = !!state.biblioOuvertes[comp.name];
+            const infos = [comp.code, comp.type, comp.unite, comp.vu ? `${comp.vu} ans` : 'durée de vie non indiquée'].filter(Boolean).map(escapeHtml).join(' · ');
+            return `
+            <div class="bib-comp" data-bib-idx="${i}" ${composanteVisible(comp) ? '' : 'hidden'}>
+              <div class="dt-row bib-row">
+                <div>
+                  <div class="dt-name">${escapeHtml(comp.name)}</div>
+                  <div class="dt-sub">${infos}</div>
+                </div>
+                <div>${comp.condition ? `<span class="status-badge" title="S'active ou se désactive selon la fiche d'immeuble" style="background:var(--orange-wash);color:var(--ink-800)">Si : ${escapeHtml(comp.condition)}</span>` : ''}</div>
+                <div><button class="btn-row-action" data-action="biblio-toggle" data-idx="${i}" ${comp.taches.length ? '' : 'disabled'}>${comp.taches.length ? `${comp.taches.length} tâche${comp.taches.length > 1 ? 's' : ''}` : 'Aucune tâche'}<i data-lucide="${ouvert ? 'chevron-up' : 'chevron-down'}" style="width:13px;height:13px;vertical-align:-2px;margin-left:4px"></i></button></div>
+              </div>
+              ${ouvert ? `
+              <div class="bib-taches">
+                <div class="bib-tache bib-tache-head"><div>Tâche</div><div>Rythme</div><div>Quand</div><div>Responsable</div></div>
+                ${comp.taches.map(t => `
+                <div class="bib-tache">
+                  <div>${escapeHtml(t.texte)}${t.element && t.element !== comp.name ? `<div class="dt-sub">${escapeHtml(t.element)}</div>` : ''}</div>
+                  <div>${escapeHtml(t.frequence)}</div>
+                  <div>${escapeHtml(t.quand)}</div>
+                  <div>${escapeHtml(t.responsable)}</div>
+                </div>`).join('')}
+              </div>` : ''}
+            </div>`;
+          }).join('')}
+        </div>
+      </div>`;
+    }).join('')}
+    ${visibles === 0 ? `<div class="empty-state">Aucune composante ne correspond à la recherche.</div>` : ''}`}
   </div>`;
 }
 
@@ -1076,6 +1335,7 @@ function initEvents() {
     else if (t.matches('[data-role="new-eng-title"]')) state.newEngTitle = t.value;
     else if (t.matches('[data-role="new-eng-ordre"]')) state.newEngOrdre = t.value;
     else if (t.matches('[data-role="new-eng-no-membre"]')) state.newEngNoMembre = t.value;
+    else if (t.matches('[data-role="biblio-search"]')) { state.biblioRecherche = t.value; filtrerBibliothequeDom(); }
     // Pas de render() ici : re-dessiner le textarea à chaque frappe renverrait
     // le curseur à la fin.
     else if (t.matches('[data-role="template-text"]')) state.templateEdits[t.getAttribute('data-cle')] = t.value;
@@ -1095,6 +1355,17 @@ function initEvents() {
       const f = t.files && t.files[0];
       t.value = '';
       if (f) uploadTemplate(f);
+      return;
+    }
+    if (t && t.matches && t.matches('[data-role="biblio-file"]')) {
+      const f = t.files && t.files[0];
+      t.value = '';
+      if (f) uploadBibliotheque(f);
+      return;
+    }
+    if (t && t.matches && t.matches('[data-role="biblio-cat"]')) {
+      state.biblioCat = t.value;
+      render();
       return;
     }
     if (t && t.matches && t.matches('[data-role="mise-en-page-file"]')) {
@@ -1123,6 +1394,26 @@ function initEvents() {
       case 'mise-en-page-delete':
         deleteMiseEnPage();
         break;
+      case 'biblio-open':
+        openBibliotheque();
+        break;
+      case 'biblio-back':
+        backToCompany();
+        break;
+      case 'biblio-download':
+        downloadBibliotheque();
+        break;
+      case 'biblio-reset':
+        resetBibliotheque();
+        break;
+      case 'biblio-toggle': {
+        const comp = state.biblio && state.biblio.composantes[Number(btn.getAttribute('data-idx'))];
+        if (comp) {
+          state.biblioOuvertes[comp.name] = !state.biblioOuvertes[comp.name];
+          render();
+        }
+        break;
+      }
       case 'template-toggle': {
         const cle = btn.getAttribute('data-cle');
         state.templateOpenCle = state.templateOpenCle === cle ? null : cle;

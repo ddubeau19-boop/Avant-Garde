@@ -234,3 +234,38 @@ code { font-family: var(--font-mono); }
 .champ-row { grid-template-columns: minmax(180px, 240px) 1fr; }
 .champs-details { margin-top: 12px; }
 .champs-details summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-700); }
+
+/* ---------- bibliothèque de composantes ---------- */
+[hidden] { display: none !important; }
+.bib-resume { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; color: var(--ink-600); }
+.bib-source code { font-size: 12px; }
+.bib-chiffres { margin-left: auto; font-family: var(--font-mono); font-size: 12px; color: var(--ink-500); }
+.bib-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.bib-actions label.is-disabled { opacity: .55; pointer-events: none; }
+.bib-aide { display: flex; gap: 10px; align-items: flex-start; background: var(--ink-050); border-radius: 12px; padding: 14px 16px; font-size: 13px; line-height: 1.55; color: var(--ink-700); }
+.bib-aide i { width: 16px; height: 16px; flex-shrink: 0; margin-top: 2px; color: var(--ink-500); }
+.bib-erreurs { border: 1.5px solid var(--orange); background: #fff; border-radius: 12px; padding: 14px 18px; margin: 14px 0; font-size: 13px; }
+.bib-erreurs-titre { font-weight: 700; margin-bottom: 8px; }
+.bib-erreurs ul { margin: 0; padding-left: 18px; line-height: 1.7; }
+.bib-erreurs .mono-cell { font-size: 12px; }
+.bib-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 18px 0; }
+.bib-stats div { border: 1px solid var(--ink-200); border-radius: 12px; padding: 12px 16px; display: flex; align-items: baseline; gap: 8px; }
+.bib-stats strong { font-family: var(--font-display); font-weight: 800; font-size: 22px; }
+.bib-stats span { font-size: 12.5px; color: var(--ink-500); }
+.bib-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; position: sticky; top: 0; z-index: 2; background: var(--paper); padding: 10px 0; }
+.bib-toolbar .field-box input { width: 100%; }
+.bib-select { border: 1.5px solid var(--ink-200); border-radius: 999px; padding: 9px 14px; font: inherit; font-size: 13px; background: #fff; max-width: 100%; }
+.bib-compte { font-family: var(--font-mono); font-size: 12px; color: var(--ink-500); white-space: nowrap; }
+.bib-n { font-family: var(--font-mono); font-size: 11px; color: var(--ink-400); }
+.bib-row { grid-template-columns: 1fr auto auto; }
+.bib-row .btn-row-action:disabled { opacity: .5; cursor: default; }
+.bib-taches { background: var(--ink-050); border-top: 1px solid var(--line-soft); padding: 6px 22px 12px; }
+.bib-tache { display: grid; grid-template-columns: 2.6fr 1.2fr 1.3fr 1.2fr; gap: 14px; padding: 8px 0; font-size: 13px; line-height: 1.45; border-top: 1px solid var(--ink-100); }
+.bib-tache:first-child { border-top: none; }
+.bib-tache-head { font-family: var(--font-mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-500); }
+@media (max-width: 720px) {
+  .bib-stats { grid-template-columns: 1fr; }
+  .bib-tache { grid-template-columns: 1fr; gap: 2px; }
+  .bib-tache-head { display: none; }
+  .bib-row { grid-template-columns: 1fr; }
+}
