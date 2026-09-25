@@ -2885,6 +2885,12 @@ async function createSessionToken(userId, secret) {
   return `${payload}.${sig}`;
 }
 async function verifySessionToken(token, secret) {
+  return (await lireJetonSession(token, secret))?.userId ?? null;
+}
+// Le jeton porte son échéance ; sa date d'émission s'en déduit. Elle sert à
+// fermer d'un coup toutes les sessions d'un compte (mot de passe changé,
+// compte désactivé) : celles émises avant users.sessions_apres sont refusées.
+async function lireJetonSession(token, secret) {
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   const [userId, expiresAt, sig] = parts;
@@ -2892,7 +2898,7 @@ async function verifySessionToken(token, secret) {
   const expected = await hmac(secret, payload);
   if (expected !== sig) return null;
   if (Date.now() > Number(expiresAt)) return null;
-  return userId;
+  return { userId, emisLe: Number(expiresAt) - SESSION_TTL_MS };
 }
 const auth = new Hono();
 async function companyBrief(db, companyId) {
@@ -2909,10 +2915,17 @@ auth.post("/login", async (c) => {
   const email = body2.email?.trim().toLowerCase();
   const password = body2.password;
   if (!email || !password) return c.json({ error: "courriel et mot de passe requis" }, 400);
+  if (await tentativesRecentes(c.env.DB, `connexion:${email}`, 15) >= 8) {
+    return c.json({ error: "Trop de tentatives de connexion. Réessayez dans 15 minutes, ou utilisez « Mot de passe oublié »." }, 429);
+  }
   const user = await c.env.DB.prepare("SELECT * FROM users WHERE email = ?1").bind(email).first();
-  if (!user) return c.json({ error: "identifiants invalides" }, 401);
-  const ok = await verifyPassword(password, user.password_hash, user.password_salt);
-  if (!ok) return c.json({ error: "identifiants invalides" }, 401);
+  const ok = user ? await verifyPassword(password, user.password_hash, user.password_salt) : false;
+  if (!ok) {
+    await noterTentative(c.env.DB, `connexion:${email}`);
+    return c.json({ error: "identifiants invalides" }, 401);
+  }
+  if (user.actif === 0) return c.json({ error: "Ce compte a été désactivé par l'administrateur de votre firme." }, 403);
+  await c.env.DB.prepare("DELETE FROM tentatives_connexion WHERE cle = ?1").bind(`connexion:${email}`).run();
   const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
   return c.json({ token, user: await publicUser(c.env.DB, user) });
 });
@@ -2925,11 +2938,200 @@ async function getCurrentUser(c) {
   const authHeader = c.req.header("Authorization");
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
   if (!token) return null;
-  const userId = await verifySessionToken(token, c.env.SESSION_SECRET);
-  if (!userId) return null;
-  const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(userId).first();
-  return user ?? null;
+  const session = await lireJetonSession(token, c.env.SESSION_SECRET);
+  if (!session) return null;
+  const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(session.userId).first();
+  if (!user || user.actif === 0) return null;
+  if (user.sessions_apres && session.emisLe < Number(user.sessions_apres)) return null;
+  return user;
 }
+// ============================================================================
+// COMPTES AUTONOMES — invitations, mot de passe oublié, changement de mot de
+// passe. Les liens envoyés par courriel portent un jeton aléatoire dont seule
+// l'empreinte SHA-256 est gardée en base ; il sert une seule fois.
+// ============================================================================
+const DUREE_JETON = { invitation: 7 * 24 * 3600e3, reinitialisation: 3600e3 };
+const LONGUEUR_MIN_MOT_DE_PASSE = 10;
+async function empreinteJeton(jeton) {
+  const octets = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(jeton)));
+  return [...octets].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function creerJetonCompte(db, userId, type) {
+  const jeton = toBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+  // Un nouveau lien remplace les précédents du même type.
+  await db.prepare("DELETE FROM jetons_compte WHERE user_id = ?1 AND type = ?2").bind(userId, type).run();
+  await db.prepare("INSERT INTO jetons_compte (id, user_id, type, expire_le) VALUES (?1, ?2, ?3, ?4)")
+    .bind(await empreinteJeton(jeton), userId, type, Date.now() + DUREE_JETON[type]).run();
+  return jeton;
+}
+async function lireJetonCompte(db, jeton) {
+  if (!jeton || !/^[A-Za-z0-9_-]{30,60}$/.test(jeton)) return null;
+  const row = await db.prepare(
+    `SELECT j.*, u.email, u.name, u.company_id, u.actif, u.title, u.ordre_professionnel, u.no_membre
+       FROM jetons_compte j JOIN users u ON u.id = j.user_id WHERE j.id = ?1`
+  ).bind(await empreinteJeton(jeton)).first();
+  if (!row || row.utilise_le || Date.now() > Number(row.expire_le) || row.actif === 0) return null;
+  return row;
+}
+async function tentativesRecentes(db, cle, minutes) {
+  const row = await db.prepare("SELECT COUNT(*) AS n FROM tentatives_connexion WHERE cle = ?1 AND moment > ?2")
+    .bind(cle, Date.now() - minutes * 60e3).first();
+  return row?.n ?? 0;
+}
+async function noterTentative(db, cle) {
+  await db.prepare("INSERT INTO tentatives_connexion (cle, moment) VALUES (?1, ?2)").bind(cle, Date.now()).run();
+  // Ménage des vieilles entrées, au passage.
+  await db.prepare("DELETE FROM tentatives_connexion WHERE moment < ?1").bind(Date.now() - 24 * 3600e3).run();
+}
+function motDePasseRefuse(motDePasse) {
+  if (typeof motDePasse !== "string" || motDePasse.length < LONGUEUR_MIN_MOT_DE_PASSE) {
+    return `Le mot de passe doit compter au moins ${LONGUEUR_MIN_MOT_DE_PASSE} caractères.`;
+  }
+  if (motDePasse.length > 200) return "Mot de passe trop long.";
+  return null;
+}
+// Nouveau mot de passe : toutes les sessions ouvertes du compte se ferment.
+async function definirMotDePasse(db, userId, motDePasse) {
+  const { hash, salt } = await hashPassword(motDePasse);
+  await db.prepare(
+    "UPDATE users SET password_hash = ?1, password_salt = ?2, invitation_en_attente = 0, sessions_apres = ?3 WHERE id = ?4"
+  ).bind(hash, salt, Date.now(), userId).run();
+}
+// ---- Courriels ---------------------------------------------------------------
+function expediteur(env) {
+  return { email: env.COURRIEL_EXPEDITEUR || "no-reply@stratege.io", name: "Condo Stratégis" };
+}
+function courrielHtml({ titre, paragraphes, bouton, pied }) {
+  const p = (t) => `<p style="margin:0 0 14px;font-size:15px;line-height:1.55;color:#2E2E2E">${t}</p>`;
+  return `<!DOCTYPE html><html lang="fr"><body style="margin:0;background:#F7F7F7;font-family:Helvetica,Arial,sans-serif">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F7F7F7;padding:32px 12px"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#FFFFFF;border-radius:14px;padding:32px 28px">
+<tr><td>
+<div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#FF5E39;font-weight:700;margin-bottom:10px">Condo Stratégis</div>
+<h1 style="margin:0 0 18px;font-size:22px;line-height:1.25;color:#0A0A0A">${echapperXml(titre)}</h1>
+${paragraphes.map(p).join("")}
+${bouton ? `<p style="margin:24px 0"><a href="${echapperXml(bouton.url)}" style="display:inline-block;background:#FF5E39;color:#FFFFFF;text-decoration:none;font-weight:700;font-size:15px;padding:13px 24px;border-radius:999px">${echapperXml(bouton.texte)}</a></p>
+<p style="margin:0 0 14px;font-size:12px;line-height:1.5;color:#6B6B6B">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br><span style="word-break:break-all">${echapperXml(bouton.url)}</span></p>` : ""}
+${pied ? `<p style="margin:22px 0 0;font-size:12px;line-height:1.5;color:#969696">${pied}</p>` : ""}
+</td></tr></table></td></tr></table></body></html>`;
+}
+async function envoyerCourriel(env, { to, subject, titre, paragraphes, bouton, pied, replyTo }) {
+  if (!env.EMAIL) throw new Error("l'envoi de courriels n'est pas configuré sur ce serveur");
+  const texte = [titre, "", ...paragraphes.map((t) => t.replace(/<[^>]+>/g, "")), ...bouton ? ["", `${bouton.texte} : ${bouton.url}`] : [], ...pied ? ["", pied.replace(/<[^>]+>/g, "")] : []].join("\n");
+  await env.EMAIL.send({
+    to,
+    from: expediteur(env),
+    subject,
+    html: courrielHtml({ titre, paragraphes: paragraphes.map(echapperXml), bouton, pied: pied ? echapperXml(pied) : "" }),
+    text: texte,
+    ...replyTo ? { replyTo } : {}
+  });
+}
+// Les liens des courriels pointent toujours en https, sauf en développement local.
+function origineDe(c) {
+  const url = new URL(c.req.url);
+  if (url.hostname === "localhost" || url.hostname === "127.0.0.1") return url.origin;
+  return `https://${url.host}`;
+}
+async function envoyerInvitation(c, user, jeton, invitePar) {
+  const firme = await companyBrief(c.env.DB, user.company_id);
+  const nomFirme = firme?.name ?? "votre firme";
+  await envoyerCourriel(c.env, {
+    to: user.email,
+    subject: `${nomFirme} vous invite sur Condo Stratégis`,
+    titre: `Bienvenue, ${user.name}`,
+    paragraphes: [
+      `${invitePar?.name ?? "Votre administrateur"} vous a créé un compte sur la plateforme Condo Stratégis pour ${nomFirme} : visites terrain, études de fonds de prévoyance et carnets d'entretien.`,
+      "Choisissez votre mot de passe pour activer votre compte. Le lien est valable 7 jours."
+    ],
+    bouton: { texte: "Activer mon compte", url: `${origineDe(c)}/compte/?jeton=${jeton}` },
+    pied: "Vous n'attendiez pas cette invitation ? Ignorez ce courriel : aucun compte ne sera activé.",
+    replyTo: invitePar?.email ? { email: invitePar.email, name: invitePar.name ?? undefined } : void 0
+  });
+}
+async function envoyerReinitialisation(c, user, jeton) {
+  await envoyerCourriel(c.env, {
+    to: user.email,
+    subject: "Réinitialiser votre mot de passe — Condo Stratégis",
+    titre: "Nouveau mot de passe",
+    paragraphes: [
+      `Bonjour ${user.name}, une demande de réinitialisation du mot de passe a été faite pour votre compte.`,
+      "Le lien ci-dessous est valable une heure et ne sert qu'une fois."
+    ],
+    bouton: { texte: "Choisir un nouveau mot de passe", url: `${origineDe(c)}/compte/?jeton=${jeton}` },
+    pied: "Vous n'avez rien demandé ? Ignorez ce courriel : votre mot de passe actuel reste valide."
+  });
+}
+// ---- Routes publiques --------------------------------------------------------
+// La réponse est la même que le compte existe ou non : on ne révèle pas qui
+// a un compte.
+auth.post("/oubli", async (c) => {
+  const body2 = await c.req.json().catch(() => ({}));
+  const email = String(body2.email ?? "").trim().toLowerCase();
+  const reponse = { ok: true, message: "Si un compte existe pour cette adresse, un courriel vient d'être envoyé." };
+  if (!email || !email.includes("@")) return c.json({ error: "adresse courriel requise" }, 400);
+  if (await tentativesRecentes(c.env.DB, `oubli:${email}`, 60) >= 3) return c.json(reponse);
+  await noterTentative(c.env.DB, `oubli:${email}`);
+  const user = await c.env.DB.prepare("SELECT * FROM users WHERE email = ?1").bind(email).first();
+  if (!user || user.actif === 0) return c.json(reponse);
+  try {
+    if (user.invitation_en_attente) await envoyerInvitation(c, user, await creerJetonCompte(c.env.DB, user.id, "invitation"), null);
+    else await envoyerReinitialisation(c, user, await creerJetonCompte(c.env.DB, user.id, "reinitialisation"));
+  } catch (e) {
+    console.error("courriel de réinitialisation non envoyé", e?.code, e?.message);
+  }
+  return c.json(reponse);
+});
+auth.get("/jeton/:jeton", async (c) => {
+  const j = await lireJetonCompte(c.env.DB, c.req.param("jeton"));
+  if (!j) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Demandez-en un nouveau." }, 404);
+  const firme = await companyBrief(c.env.DB, j.company_id);
+  return c.json({
+    type: j.type,
+    email: j.email,
+    name: j.name,
+    firme: firme?.name ?? null,
+    signature: { title: j.title, ordre_professionnel: j.ordre_professionnel, no_membre: j.no_membre },
+    longueur_min: LONGUEUR_MIN_MOT_DE_PASSE
+  });
+});
+auth.post("/jeton/:jeton", async (c) => {
+  const j = await lireJetonCompte(c.env.DB, c.req.param("jeton"));
+  if (!j) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Demandez-en un nouveau." }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const refus = motDePasseRefuse(body2.password);
+  if (refus) return c.json({ error: refus }, 400);
+  await c.env.DB.prepare("UPDATE jetons_compte SET utilise_le = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1").bind(j.id).run();
+  await definirMotDePasse(c.env.DB, j.user_id, body2.password);
+  // À l'activation, l'ingénieur complète son bloc de signature.
+  if (j.type === "invitation") {
+    const champ = (v, max) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null);
+    await c.env.DB.prepare("UPDATE users SET title = COALESCE(?1, title), ordre_professionnel = COALESCE(?2, ordre_professionnel), no_membre = COALESCE(?3, no_membre) WHERE id = ?4")
+      .bind(champ(body2.title, 60), champ(body2.ordre_professionnel, 10)?.toUpperCase() ?? null, champ(body2.no_membre, 30), j.user_id).run();
+  }
+  const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(j.user_id).first();
+  const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
+  return c.json({ token, user: await publicUser(c.env.DB, user) });
+});
+// Changer son mot de passe (connecté) : les autres sessions se ferment, la
+// session courante reçoit un nouveau jeton.
+auth.post("/mot-de-passe", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "non authentifié" }, 401);
+  const body2 = await c.req.json().catch(() => ({}));
+  if (await tentativesRecentes(c.env.DB, `changement:${user.id}`, 15) >= 5) {
+    return c.json({ error: "Trop de tentatives. Réessayez dans 15 minutes." }, 429);
+  }
+  if (!await verifyPassword(String(body2.actuel ?? ""), user.password_hash, user.password_salt)) {
+    await noterTentative(c.env.DB, `changement:${user.id}`);
+    return c.json({ error: "Le mot de passe actuel est incorrect." }, 400);
+  }
+  const refus = motDePasseRefuse(body2.nouveau);
+  if (refus) return c.json({ error: refus }, 400);
+  await definirMotDePasse(c.env.DB, user.id, body2.nouveau);
+  const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
+  return c.json({ token, user: await publicUser(c.env.DB, user) });
+});
 function requireSuperAdmin(c, user) {
   if (!user || user.role !== "super_admin") {
     return c.json({ error: "accès réservé aux administrateurs" }, 403);
@@ -3415,6 +3617,9 @@ const COLONNES_AJOUTEES = [
   ["companies", "theme", "TEXT"],
   ["companies", "mise_en_page", "TEXT"],
   ["companies", "bibliotheque", "TEXT"],
+  ["users", "actif", "INTEGER NOT NULL DEFAULT 1"],
+  ["users", "invitation_en_attente", "INTEGER NOT NULL DEFAULT 0"],
+  ["users", "sessions_apres", "INTEGER"],
   ["actif", "INTEGER NOT NULL DEFAULT 1"],
   ["etendue", "TEXT"],
   ["etendue_qte", "TEXT"],
@@ -3425,10 +3630,23 @@ const COLONNES_AJOUTEES = [
   ["projet_ca", "TEXT"],
   ["taches_entretien", "TEXT"]
 ];
+// Tables ajoutées après la mise en production, créées au premier appel.
+const TABLES_AJOUTEES = [
+  `CREATE TABLE IF NOT EXISTS jetons_compte (
+     id         TEXT PRIMARY KEY,
+     user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     type       TEXT NOT NULL,
+     expire_le  INTEGER NOT NULL,
+     utilise_le TEXT,
+     cree_le    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
+  `CREATE TABLE IF NOT EXISTS tentatives_connexion (cle TEXT NOT NULL, moment INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS idx_tentatives_cle ON tentatives_connexion(cle, moment)`
+];
 let colonnesPretes = null;
 function assurerColonnes(db) {
   if (!colonnesPretes) {
     colonnesPretes = (async () => {
+      for (const sql of TABLES_AJOUTEES) await db.prepare(sql).run();
       // Entrées [colonne, type] : table components ; [table, colonne, type] sinon.
       const parTable = new Map();
       for (const entree of COLONNES_AJOUTEES) {
@@ -46396,6 +46614,97 @@ companies.patch("/:id/engineers/:userId", async (c) => {
   ).bind(cible.id).first();
   return c.json(u);
 });
+// ---- Équipe de la firme : son administrateur invite, désactive et nomme --
+function membreEquipe(u) {
+  return {
+    id: u.id, name: u.name, email: u.email, role: u.role, title: u.title,
+    ordre_professionnel: u.ordre_professionnel, no_membre: u.no_membre, created_at: u.created_at,
+    actif: u.actif !== 0, invitation_en_attente: !!u.invitation_en_attente
+  };
+}
+companies.get("/:id/equipe", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const rows = await c.env.DB.prepare("SELECT * FROM users WHERE company_id = ?1 ORDER BY created_at ASC").bind(id).all();
+  return c.json({ membres: rows.results.map(membreEquipe), moi: user.id, courriel: !!c.env.EMAIL });
+});
+companies.post("/:id/equipe", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const email = String(body2.email ?? "").trim().toLowerCase();
+  const name = String(body2.name ?? "").trim().slice(0, 120);
+  const role = body2.role === "admin" ? "admin" : "engineer";
+  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return c.json({ error: "nom et courriel valide requis" }, 400);
+  const existant = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(email).first();
+  if (existant) return c.json({ error: "un compte existe déjà avec ce courriel" }, 409);
+  // Mot de passe aléatoire jamais communiqué : l'ingénieur choisit le sien par le lien.
+  const { hash, salt } = await hashPassword(toBase64Url(crypto.getRandomValues(new Uint8Array(24))));
+  const nouveauId = newId("usr");
+  await c.env.DB.prepare(
+    `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role, invitation_en_attente)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)`
+  ).bind(nouveauId, email, name, hash, salt, id, role).run();
+  const membre = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(nouveauId).first();
+  return c.json(await inviter(c, membre, user), 201);
+});
+// Envoie l'invitation ; si le courriel ne part pas, le lien revient à
+// l'administrateur pour qu'il le transmette lui-même.
+async function inviter(c, membre, invitePar) {
+  const jeton = await creerJetonCompte(c.env.DB, membre.id, "invitation");
+  try {
+    await envoyerInvitation(c, membre, jeton, invitePar);
+    return { membre: membreEquipe(membre), envoye: true };
+  } catch (e) {
+    console.error("invitation non envoyée", e?.code, e?.message);
+    return { membre: membreEquipe(membre), envoye: false, lien: `${origineDe(c)}/compte/?jeton=${jeton}`, erreur: e?.message ?? "envoi impossible" };
+  }
+}
+async function membreDeLaFirme(c) {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return { refus: c.notFound() };
+  if (!peutAdministrerFirme(user, id)) return { refus: c.json({ error: "réservé aux administrateurs de la firme" }, 403) };
+  const membre = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1 AND company_id = ?2").bind(c.req.param("userId"), id).first();
+  if (!membre) return { refus: c.json({ error: "compte introuvable dans cette firme" }, 404) };
+  return { user, membre };
+}
+companies.post("/:id/equipe/:userId/invitation", async (c) => {
+  const { refus, user, membre } = await membreDeLaFirme(c);
+  if (refus) return refus;
+  if (!membre.invitation_en_attente) return c.json({ error: "ce compte est déjà activé" }, 400);
+  if (membre.actif === 0) return c.json({ error: "réactivez d'abord ce compte" }, 400);
+  return c.json(await inviter(c, membre, user));
+});
+companies.patch("/:id/equipe/:userId", async (c) => {
+  const { refus, user, membre } = await membreDeLaFirme(c);
+  if (refus) return refus;
+  if (membre.role === "super_admin") return c.json({ error: "le compte du super admin ne se modifie pas ici" }, 400);
+  // Un administrateur ne se retire pas lui-même : la firme resterait sans personne pour la gérer.
+  if (membre.id === user.id) return c.json({ error: "vous ne pouvez pas modifier votre propre accès" }, 400);
+  const body2 = await c.req.json().catch(() => ({}));
+  const champs = [];
+  const valeurs = [];
+  if ("actif" in body2) {
+    champs.push(`actif = ?${champs.length + 1}`);
+    valeurs.push(body2.actif ? 1 : 0);
+    // Désactivé : ses sessions ouvertes se ferment tout de suite.
+    if (!body2.actif) { champs.push(`sessions_apres = ?${champs.length + 1}`); valeurs.push(Date.now()); }
+  }
+  if ("role" in body2) {
+    if (!ROLES_UTILISATEUR.includes(body2.role)) return c.json({ error: "rôle invalide (engineer ou admin)" }, 400);
+    champs.push(`role = ?${champs.length + 1}`);
+    valeurs.push(body2.role);
+  }
+  if (!champs.length) return c.json({ error: "rien à modifier" }, 400);
+  await c.env.DB.prepare(`UPDATE users SET ${champs.join(", ")} WHERE id = ?${champs.length + 1}`).bind(...valeurs, membre.id).run();
+  const maj = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(membre.id).first();
+  return c.json(membreEquipe(maj));
+});
 const dossiers = new Hono();
 async function dossierStats(db, dossierId) {
   const row = await db.prepare(
@@ -47439,7 +47748,7 @@ app.use("/api/*", async (c, next) => {
   return next();
 });
 app.use("/api/*", async (c, next) => {
-  if (c.req.path.startsWith("/api/dossiers") || c.req.path.startsWith("/api/components") || c.req.path.startsWith("/api/companies")) {
+  if (["/api/dossiers", "/api/components", "/api/companies", "/api/auth"].some((p) => c.req.path.startsWith(p))) {
     await assurerColonnes(c.env.DB);
   }
   return next();

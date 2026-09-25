@@ -1588,6 +1588,7 @@ function loginHtml() {
         <button class="btn-primary" type="submit" ${state.loginLoading || !state.online ? 'disabled' : ''}>
           ${state.loginLoading ? `<i data-lucide="loader-2" class="spin" style="width:17px;height:17px"></i>Connexion…` : `<i data-lucide="log-in" style="width:17px;height:17px"></i>Se connecter`}
         </button>
+        <a href="/compte/?retour=/terrain/" style="display:block;text-align:center;margin-top:14px;font-size:12.5px;color:var(--ink-500)">Mot de passe oublié ?</a>
       </form>
     </div>
   </div>`;
@@ -1606,7 +1607,10 @@ function dossiersHtml() {
   return `<div class="picker-screen">
     <div class="top-row" style="margin-bottom:20px">
       <div class="brand"><img src="${state.companyLogoUrl || '../assets/logo-mark.png'}" alt=""><span>${esc((state.user && state.user.company && state.user.company.name) || 'Condo Stratégis')}</span></div>
-      <button data-action="logout" style="border:none;background:none;color:var(--ink-500);font-size:12px;cursor:pointer">Déconnexion</button>
+      <div style="display:flex;gap:14px;align-items:center">
+        <a href="/compte/?changer=1&retour=/terrain/" style="color:var(--ink-500);font-size:12px;text-decoration:none">Mot de passe</a>
+        <button data-action="logout" style="border:none;background:none;color:var(--ink-500);font-size:12px;cursor:pointer">Déconnexion</button>
+      </div>
     </div>
     <div class="eyebrow">Étude de fonds de prévoyance</div>
     <h1 class="page-title">Choisir un<br>dossier</h1>

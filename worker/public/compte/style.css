@@ -1,0 +1,21 @@
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--ink-050); font-family: var(--font-body, 'Inter Tight', system-ui, sans-serif); color: var(--ink); padding: 24px 16px; }
+.carte { width: 100%; max-width: 440px; background: #fff; border-radius: 18px; padding: 32px 28px; box-shadow: 0 10px 30px rgba(0,0,0,.06); }
+.marque { display: flex; align-items: center; gap: 10px; margin-bottom: 26px; font-family: var(--font-display, 'Archivo', sans-serif); font-weight: 800; font-size: 14px; text-transform: uppercase; letter-spacing: .02em; }
+.marque img { width: 26px; height: 26px; }
+.marque .e { color: var(--orange); }
+h1 { font-family: var(--font-display, 'Archivo', sans-serif); font-weight: 900; font-size: 26px; letter-spacing: -.02em; text-transform: uppercase; margin: 0 0 8px; line-height: 1.1; }
+.lead { color: var(--ink-500); font-size: 14px; line-height: 1.55; margin: 0 0 22px; }
+label { display: block; font-size: 12.5px; font-weight: 600; color: var(--ink-700); margin: 14px 0 6px; }
+input { width: 100%; border: 1.5px solid var(--ink-200); border-radius: 12px; padding: 12px 14px; font: inherit; font-size: 15px; background: #fff; }
+input:focus { outline: none; border-color: var(--ink); }
+.rangee { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.aide { font-size: 12px; color: var(--ink-500); margin-top: 6px; line-height: 1.45; }
+.section { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--ink-100); font-size: 13px; color: var(--ink-600); }
+button, .bouton { display: inline-flex; align-items: center; justify-content: center; width: 100%; margin-top: 22px; border: none; border-radius: 999px; background: var(--orange); color: #fff; font: inherit; font-weight: 700; font-size: 15px; padding: 14px 20px; cursor: pointer; text-decoration: none; }
+.bouton.secondaire { background: #fff; color: var(--ink); border: 1.5px solid var(--ink-200); margin-top: 10px; }
+button:disabled { opacity: .55; cursor: default; }
+.erreur { background: var(--orange-wash); color: var(--ink-800); border-radius: 10px; padding: 11px 14px; font-size: 13.5px; line-height: 1.5; margin: 14px 0 0; }
+.ok { background: var(--green-wash); color: var(--green); border-radius: 10px; padding: 11px 14px; font-size: 13.5px; line-height: 1.5; margin: 14px 0 0; }
+.discret { color: var(--ink-500); font-size: 13px; text-align: center; }
+.lien { display: block; text-align: center; margin-top: 18px; color: var(--ink-500); font-size: 13px; }

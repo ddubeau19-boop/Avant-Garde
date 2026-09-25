@@ -647,3 +647,15 @@ button { font-family: inherit; }
 .prix-pieces > div { display: flex; gap: 12px; font-size: 11px; color: var(--ink-600); }
 .prix-pieces > div > span:first-child { flex: 1; }
 .prix-pieces .mono { font-family: var(--font-mono); }
+
+/* ---------- équipe de la firme ---------- */
+.eq-lead { color: var(--ink-500); font-size: 14px; line-height: 1.55; margin: 0 0 20px; max-width: 620px; }
+.eq-form { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; border: 1.5px dashed var(--ink-300); border-radius: 14px; padding: 14px 16px; background: #fff; }
+.eq-form input, .eq-form select { border: 1.5px solid var(--ink-200); border-radius: 999px; padding: 10px 14px; font: inherit; font-size: 13.5px; background: #fff; flex: 1; min-width: 180px; }
+.eq-form select { flex: 0 0 auto; min-width: 0; }
+.eq-row { grid-template-columns: 2.2fr 1fr 1fr 2fr; }
+.eq-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.eq-actions .btn-row-action:disabled { opacity: .5; cursor: default; }
+.eq-lien { width: 100%; margin-top: 8px; border: 1.5px solid var(--ink-200); border-radius: 8px; padding: 8px 10px; font-family: var(--font-mono); font-size: 12px; background: #fff; }
+a.btn-logout { display: inline-flex; }
+@media (max-width: 760px) { .eq-row { grid-template-columns: 1fr; gap: 6px; } .eq-actions { justify-content: flex-start; } }
