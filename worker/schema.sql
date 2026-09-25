@@ -14,7 +14,8 @@ CREATE TABLE companies (
   created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   theme        TEXT,   -- JSON : couleurs, polices et coordonnées du rapport de la firme
-  mise_en_page TEXT    -- JSON : gabarit Word de mise en page importé (clé R2, analyse)
+  mise_en_page TEXT,   -- JSON : gabarit Word de mise en page importé (clé R2, analyse)
+  bibliotheque TEXT    -- JSON : liste de composantes et tâches du carnet importées par la firme
 );
 
 CREATE TABLE users (
@@ -25,7 +26,7 @@ CREATE TABLE users (
   password_salt TEXT NOT NULL,
   created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   company_id    TEXT REFERENCES companies(id),
-  role          TEXT NOT NULL DEFAULT 'engineer',  -- 'engineer' | 'super_admin'
+  role          TEXT NOT NULL DEFAULT 'engineer',  -- 'engineer' | 'admin' (administrateur de la firme) | 'super_admin'
   -- Bloc de signature, repris tel quel à la section 8.0 Déclaration du rapport.
   title               TEXT,  -- ex. « ing., M.Sc.A. », « T.P. »
   ordre_professionnel TEXT,  -- ex. « OIQ », « OTPQ », « OAQ »

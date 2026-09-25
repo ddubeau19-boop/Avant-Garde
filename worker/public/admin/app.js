@@ -4,6 +4,8 @@
 // companies ("entreprises") and their engineer accounts.
 // ============================================================
 
+import { creerBibliotheque } from '../shared/bibliotheque.js';
+
 const TOKEN_KEY = 'cs_admin_token';
 
 // ---------------------------------------------------------------
@@ -11,7 +13,7 @@ const TOKEN_KEY = 'cs_admin_token';
 // ---------------------------------------------------------------
 const state = {
   booting: true,
-  screen: 'login', // login | forbidden | companies | company
+  screen: 'login', // login | forbidden | companies | company | bibliotheque
 
   token: null,
   user: null,
@@ -66,6 +68,7 @@ const state = {
   miseEnPage: null,        // { importe, filename, analyse, champs, blocs }
   miseEnPageUploading: false,
   miseEnPageError: null,
+  roleSaving: null,        // id du compte dont le rôle change
   newEngTitle: '',
   newEngOrdre: '',
   newEngNoMembre: '',
@@ -336,6 +339,7 @@ async function openCompany(id) {
   state.newEngError = null;
   state.tempPasswordInfo = null;
   state.logoError = null;
+  bib.reset();
   await loadCompanyDetail(id);
 }
 
@@ -352,6 +356,7 @@ async function loadCompanyDetail(id) {
     loadTemplate(id);
     loadTheme(id);
     loadMiseEnPage(id);
+    bib.charger();
   } catch (e) {
     state.companyLoading = false;
     state.companyError = e.message || 'Impossible de charger cette entreprise.';
@@ -423,6 +428,52 @@ async function deleteMiseEnPage() {
   } catch (e) {
     state.miseEnPageError = e.message || "L'opération a échoué.";
   }
+  render();
+}
+
+// ---------------------------------------------------------------
+// Bibliothèque de composantes (page partagée avec la console bureau)
+// ---------------------------------------------------------------
+const bib = creerBibliotheque({
+  apiJson: (path, opts) => apiJson(path, opts),
+  apiRaw: (path, opts) => apiRaw(path, opts),
+  render: () => render(),
+  escapeHtml: (x) => escapeHtml(x),
+  fmtDate: (x) => fmtDate(x),
+  spinnerBlock: (x) => spinnerBlock(x),
+  companyId: () => state.companyId,
+});
+
+function openBibliotheque() {
+  state.screen = 'bibliotheque';
+  bib.s.note = null;
+  bib.s.erreurs = [];
+  bib.s.error = null;
+  render();
+  window.scrollTo(0, 0);
+  if (!bib.s.biblio) bib.charger();
+}
+
+function backToCompany() {
+  state.screen = 'company';
+  render();
+  window.scrollTo(0, 0);
+}
+
+// Rôle d'un compte : ingénieur ou administrateur de la firme.
+async function setEngineerRole(userId, role) {
+  if (state.roleSaving) return;
+  state.roleSaving = userId;
+  render();
+  try {
+    const u = await apiJson(`/api/companies/${state.companyId}/engineers/${userId}`, { method: 'PATCH', body: JSON.stringify({ role }) });
+    const liste = (state.company && state.company.engineers) || [];
+    const idx = liste.findIndex(e => e.id === userId);
+    if (idx >= 0) liste[idx] = Object.assign({}, liste[idx], u);
+  } catch (e) {
+    alert(e.message || 'Le changement de rôle a échoué.');
+  }
+  state.roleSaving = null;
   render();
 }
 
@@ -739,6 +790,7 @@ function renderShell() {
   let main = '';
   if (state.screen === 'companies') main = renderCompanies();
   else if (state.screen === 'company') main = renderCompanyDetail();
+  else if (state.screen === 'bibliotheque') main = renderBibliotheque();
   return `<div class="app-shell">${topbarHtml()}${main}</div>`;
 }
 
@@ -862,7 +914,11 @@ function renderCompanyDetail() {
       <div class="dt-row eng-row">
         <div class="dt-name">${escapeHtml(e.name || '—')}</div>
         <div class="mono-cell">${escapeHtml(e.email || '—')}</div>
-        <div><span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">${e.role === 'super_admin' ? 'Admin' : 'Ingénieur'}</span></div>
+        <div class="role-cell">${e.role === 'super_admin'
+          ? `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">Super admin</span>`
+          : e.role === 'admin'
+            ? `<span class="status-badge" style="background:var(--orange-wash);color:var(--ink-800)">Admin de la firme</span><button class="role-toggle" data-action="engineer-role" data-id="${e.id}" data-role-cible="engineer" ${state.roleSaving ? 'disabled' : ''}>${state.roleSaving === e.id ? '…' : 'Retirer'}</button>`
+            : `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">Ingénieur</span><button class="role-toggle" data-action="engineer-role" data-id="${e.id}" data-role-cible="admin" ${state.roleSaving ? 'disabled' : ''} title="Un administrateur de la firme peut importer sa bibliothèque de composantes depuis la console bureau.">${state.roleSaving === e.id ? '…' : 'Nommer admin'}</button>`}</div>
         <div>${e.ordre_professionnel && e.no_membre
           ? `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">${escapeHtml(e.ordre_professionnel)} ${escapeHtml(e.no_membre)}</span>`
           : `<span class="status-badge" title="La section 8.0 du rapport sortira avec « à compléter avant signature »." style="background:#FFF1EC;color:#B03A1A">Bloc incomplet</span>`}</div>
@@ -870,10 +926,32 @@ function renderCompanyDetail() {
       </div>`).join('')}
     </div>
 
+    ${bibliothequeCardHtml()}
     ${themeCardHtml()}
     ${miseEnPageCardHtml()}
     ${templateCardHtml()}
   </div>`;
+}
+
+function bibliothequeCardHtml() {
+  return `
+  <div>
+    <div class="eng-section-head">
+      <span class="lbl">Bibliothèque de composantes</span>
+      <div class="rule"></div>
+      <button class="btn-pill-sm" data-action="biblio-open"><i data-lucide="library" style="width:14px;height:14px"></i>Ouvrir la bibliothèque</button>
+    </div>
+    <div class="tpl-lead">La liste de composantes qui sert de départ à chaque nouvelle visite, avec les tâches du carnet d'entretien rattachées à chacune. Un administrateur de la firme peut aussi importer sa liste depuis la console bureau.</div>
+    ${bib.resumeHtml()}
+  </div>`;
+}
+
+function renderBibliotheque() {
+  const c = state.company;
+  return bib.html({
+    retour: `<button class="back-link" data-action="biblio-back"><i data-lucide="chevron-left"></i>${escapeHtml((c && c.name) || 'Entreprise')}</button>`,
+    eyebrow: (c && c.name) || '',
+  });
 }
 
 // Identité du rapport : couleurs, polices et coordonnées reprises par le
@@ -1076,6 +1154,7 @@ function initEvents() {
     else if (t.matches('[data-role="new-eng-title"]')) state.newEngTitle = t.value;
     else if (t.matches('[data-role="new-eng-ordre"]')) state.newEngOrdre = t.value;
     else if (t.matches('[data-role="new-eng-no-membre"]')) state.newEngNoMembre = t.value;
+    else if (bib.input(t)) return;
     // Pas de render() ici : re-dessiner le textarea à chaque frappe renverrait
     // le curseur à la fin.
     else if (t.matches('[data-role="template-text"]')) state.templateEdits[t.getAttribute('data-cle')] = t.value;
@@ -1097,6 +1176,7 @@ function initEvents() {
       if (f) uploadTemplate(f);
       return;
     }
+    if (t && t.matches && bib.change(t)) return;
     if (t && t.matches && t.matches('[data-role="mise-en-page-file"]')) {
       const f = t.files && t.files[0];
       t.value = '';
@@ -1113,6 +1193,7 @@ function initEvents() {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
     const action = btn.getAttribute('data-action');
+    if (bib.click(action, btn)) return;
     switch (action) {
       case 'logout':
         doLogout();
@@ -1122,6 +1203,15 @@ function initEvents() {
         break;
       case 'mise-en-page-delete':
         deleteMiseEnPage();
+        break;
+      case 'biblio-open':
+        openBibliotheque();
+        break;
+      case 'biblio-back':
+        backToCompany();
+        break;
+      case 'engineer-role':
+        setEngineerRole(btn.getAttribute('data-id'), btn.getAttribute('data-role-cible'));
         break;
       case 'template-toggle': {
         const cle = btn.getAttribute('data-cle');

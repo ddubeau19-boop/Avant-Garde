@@ -166,7 +166,7 @@ code { font-family: var(--font-mono); }
   font-size: 13px; color: var(--ink-500); background: var(--ink-100);
 }
 
-.eng-row { grid-template-columns: 1.4fr 1.5fr .7fr 1fr .9fr; }
+.eng-row { grid-template-columns: 1.4fr 1.5fr 1.3fr 1fr .9fr; }
 
 /* ---------- company detail ---------- */
 .co-detail-head { display: flex; align-items: center; gap: 24px; margin-bottom: 26px; flex-wrap: wrap; }
@@ -234,3 +234,8 @@ code { font-family: var(--font-mono); }
 .champ-row { grid-template-columns: minmax(180px, 240px) 1fr; }
 .champs-details { margin-top: 12px; }
 .champs-details summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-700); }
+
+/* ---------- rôle d'un compte de la firme ---------- */
+.role-cell { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.role-toggle { border: none; background: none; padding: 2px 4px; font: inherit; font-size: 12px; color: var(--ink-500); text-decoration: underline; cursor: pointer; }
+.role-toggle:disabled { opacity: .5; cursor: default; }

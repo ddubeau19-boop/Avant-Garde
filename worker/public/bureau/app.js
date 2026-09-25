@@ -3,6 +3,8 @@
 // Vanilla-JS SPA, no build step. Talks to the real `vigies` API.
 // ============================================================
 
+import { creerBibliotheque } from '../shared/bibliotheque.js';
+
 const TOKEN_KEY = 'cs_bureau_token';
 
 /* ---------- Taxonomie maison : les catégories de la feuille « Relevé », plus les piscines ---------- */
@@ -319,6 +321,7 @@ function authHeaders(extra) {
 function handleUnauthorized() {
   state.token = null;
   state.user = null;
+  bib.reset();
   try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
   state.screen = 'login';
   state.loginError = 'Votre session a expiré. Veuillez vous reconnecter.';
@@ -503,6 +506,7 @@ function doLogout() {
   if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
   state.token = null;
   state.user = null;
+  bib.reset();
   try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
   state.screen = 'login';
   state.dossiers = [];
@@ -1198,6 +1202,7 @@ function railHtml() {
   const items = [
     { key: 'dossiers', label: 'Dossiers', icon: 'folder', action: 'go-dossiers', active: dossiersActive },
     { key: 'prix', label: 'Banque de prix', icon: 'receipt', action: 'go-prix', active: state.screen === 'prix' },
+    { key: 'bibliotheque', label: 'Bibliothèque', icon: 'library', action: 'go-bibliotheque', active: state.screen === 'bibliotheque' },
     { key: 'clients', label: 'Clients', icon: 'users', disabled: true },
     { key: 'carnet', label: "Carnet d'entretien", icon: 'calendar-clock', disabled: true },
     { key: 'modeles', label: 'Modèles', icon: 'file-stack', disabled: true },
@@ -1230,8 +1235,24 @@ function renderShell() {
   else if (state.screen === 'revision') main = renderRevision();
   else if (state.screen === 'publier') main = renderPublier();
   else if (state.screen === 'reviewIA') main = renderReviewIA();
+  else if (state.screen === 'bibliotheque') main = `<div class="page-pad cscr" style="padding:0">${bib.html({ eyebrow: (state.user && state.user.company && state.user.company.name) || '' })}</div>`;
   return `<div class="shell">${railHtml()}<div class="main">${main}</div></div>`;
 }
+
+// Bibliothèque de composantes de la firme : tous la consultent, un
+// administrateur de la firme y importe sa liste (page partagée avec l'admin).
+const bib = creerBibliotheque({
+  apiJson: (path, opts) => apiJson(path, opts),
+  apiRaw: (path, opts) => apiRaw(path, opts),
+  render: () => render(),
+  escapeHtml: (x) => escapeHtml(x),
+  fmtDate: (iso) => {
+    const d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleDateString('fr-CA', { day: 'numeric', month: 'short', year: 'numeric' });
+  },
+  spinnerBlock: (x) => spinnerBlock(x),
+  companyId: () => state.user && state.user.company && state.user.company.id,
+});
 
 function renderDossiers() {
   if (state.dossiersLoading && state.dossiers.length === 0) {
@@ -2258,6 +2279,7 @@ function initEvents() {
     if (!t || !t.matches) return;
     if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
+    else if (bib.input(t)) return;
     else if (t.matches('[data-role="prix-field"]')) {
       const champ = t.getAttribute('data-field');
       state.prixForm[champ] = t.type === 'checkbox' ? t.checked : t.value;
@@ -2268,6 +2290,7 @@ function initEvents() {
 
   app.addEventListener('change', (e) => {
     const t = e.target;
+    if (t && t.matches && bib.change(t)) return;
     if (t && t.matches && t.matches('[data-role="composantes-import-file"]')) {
       const f = t.files && t.files[0];
       t.value = '';
@@ -2279,7 +2302,17 @@ function initEvents() {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
     const action = btn.getAttribute('data-action');
+    if (bib.click(action, btn)) return;
     switch (action) {
+      case 'go-bibliotheque':
+        leaveReviewIA();
+        state.screen = 'bibliotheque';
+        bib.s.note = null;
+        bib.s.erreurs = [];
+        bib.s.error = null;
+        render();
+        bib.charger();
+        break;
       case 'go-dossiers':
         leaveReviewIA();
         state.screen = 'dossiers';
