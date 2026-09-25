@@ -26,7 +26,7 @@ CREATE TABLE users (
   password_salt TEXT NOT NULL,
   created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   company_id    TEXT REFERENCES companies(id),
-  role          TEXT NOT NULL DEFAULT 'engineer',  -- 'engineer' | 'super_admin'
+  role          TEXT NOT NULL DEFAULT 'engineer',  -- 'engineer' | 'admin' (administrateur de la firme) | 'super_admin'
   -- Bloc de signature, repris tel quel à la section 8.0 Déclaration du rapport.
   title               TEXT,  -- ex. « ing., M.Sc.A. », « T.P. »
   ordre_professionnel TEXT,  -- ex. « OIQ », « OTPQ », « OAQ »

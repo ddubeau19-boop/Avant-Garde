@@ -24458,6 +24458,15 @@ function peutGererEntreprise(user, companyId) {
   if (user.role === "super_admin") return true;
   return user.company_id === companyId;
 }
+// Modifier les réglages de la firme (bibliothèque, gabarits, identité) :
+// le super admin, ou un administrateur de cette firme. Les ingénieurs les
+// consultent sans pouvoir les changer.
+const ROLES_UTILISATEUR = ["engineer", "admin"];
+function peutAdministrerFirme(user, companyId) {
+  if (!user) return false;
+  if (user.role === "super_admin") return true;
+  return user.role === "admin" && user.company_id === companyId;
+}
 function pourcent(taux) {
   return `${(taux * 100).toFixed(2).replace(".", ",").replace(/,00$/, "")}${NBSP}%`;
 }
@@ -46098,6 +46107,7 @@ companies.post("/:id/template", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const company = await c.env.DB.prepare("SELECT id FROM companies WHERE id = ?1").bind(id).first();
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
   const form = await c.req.formData();
@@ -46156,6 +46166,7 @@ companies.patch("/:id/template", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const body2 = await c.req.json();
   const sections = nettoyerSections(body2.sections);
   await c.env.DB.prepare(
@@ -46170,6 +46181,7 @@ companies.delete("/:id/template", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   await c.env.DB.prepare("DELETE FROM company_templates WHERE company_id = ?1").bind(id).run();
   return c.json({ ok: true, retour: "gabarit intégré" });
 });
@@ -46186,6 +46198,7 @@ companies.patch("/:id/theme", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const theme = nettoyerTheme(await c.req.json());
   await c.env.DB.prepare(
     "UPDATE companies SET theme = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
@@ -46214,6 +46227,7 @@ companies.post("/:id/mise-en-page", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const form = await c.req.formData();
   const file = form.get("file");
   if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
@@ -46237,6 +46251,7 @@ companies.delete("/:id/mise-en-page", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const company = await c.env.DB.prepare("SELECT mise_en_page FROM companies WHERE id = ?1").bind(id).first();
   const r2Key = objetJson(company?.mise_en_page).r2_key;
   if (r2Key) await c.env.PHOTOS.delete(r2Key);
@@ -46254,7 +46269,7 @@ companies.get("/:id/bibliotheque", async (c) => {
   if (!peutGererEntreprise(user, id)) return c.notFound();
   const company = await c.env.DB.prepare("SELECT bibliotheque FROM companies WHERE id = ?1").bind(id).first();
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
-  return c.json(vueBibliotheque(bibliothequeDeFirme(company)));
+  return c.json({ ...vueBibliotheque(bibliothequeDeFirme(company)), peutModifier: peutAdministrerFirme(user, id) });
 });
 companies.get("/:id/bibliotheque.xlsx", async (c) => {
   const user = await getCurrentUser(c);
@@ -46274,6 +46289,7 @@ companies.post("/:id/bibliotheque", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const form = await c.req.formData();
   const file = form.get("file");
   if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
@@ -46291,16 +46307,17 @@ companies.post("/:id/bibliotheque", async (c) => {
   await c.env.DB.prepare(
     "UPDATE companies SET bibliotheque = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
   ).bind(JSON.stringify(analyse.bibliotheque), id).run();
-  return c.json(vueBibliotheque(bibliothequeDeFirme({ bibliotheque: analyse.bibliotheque })));
+  return c.json({ ...vueBibliotheque(bibliothequeDeFirme({ bibliotheque: analyse.bibliotheque })), peutModifier: true });
 });
 companies.delete("/:id/bibliotheque", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   await c.env.DB.prepare(
     "UPDATE companies SET bibliotheque = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1"
   ).bind(id).run();
-  return c.json(vueBibliotheque(null));
+  return c.json({ ...vueBibliotheque(null), peutModifier: true });
 });
 companies.get("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
@@ -46349,6 +46366,23 @@ companies.post("/:id/engineers", async (c) => {
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'engineer', ?7, ?8, ?9)`
   ).bind(id, email, name, hash, salt, companyId, title, ordreProfessionnel, noMembre).run();
   return c.json({ user: { id, email, name, role: "engineer", title, ordre_professionnel: ordreProfessionnel, no_membre: noMembre }, tempPassword }, 201);
+});
+// Rôle d'un compte de la firme : ingénieur ou administrateur de la firme.
+// Seul le super admin l'attribue.
+companies.patch("/:id/engineers/:userId", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const body2 = await c.req.json();
+  if (!ROLES_UTILISATEUR.includes(body2.role)) return c.json({ error: "rôle invalide (engineer ou admin)" }, 400);
+  const cible = await c.env.DB.prepare("SELECT id, role FROM users WHERE id = ?1 AND company_id = ?2").bind(c.req.param("userId"), c.req.param("id")).first();
+  if (!cible) return c.json({ error: "compte introuvable dans cette entreprise" }, 404);
+  if (cible.role === "super_admin") return c.json({ error: "le rôle du super admin ne se change pas ici" }, 400);
+  await c.env.DB.prepare("UPDATE users SET role = ?1 WHERE id = ?2").bind(body2.role, cible.id).run();
+  const u = await c.env.DB.prepare(
+    "SELECT id, name, email, role, title, ordre_professionnel, no_membre, created_at FROM users WHERE id = ?1"
+  ).bind(cible.id).first();
+  return c.json(u);
 });
 const dossiers = new Hono();
 async function dossierStats(db, dossierId) {
