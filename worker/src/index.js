@@ -3001,7 +3001,7 @@ async function definirMotDePasse(db, userId, motDePasse) {
 function expediteur(env) {
   return { email: env.COURRIEL_EXPEDITEUR || "no-reply@stratege.io", name: "Condo Stratégis" };
 }
-function courrielHtml({ titre, paragraphes, bouton, pied }) {
+function courrielHtml({ titre, paragraphes, liste, bouton, pied }) {
   const p = (t) => `<p style="margin:0 0 14px;font-size:15px;line-height:1.55;color:#2E2E2E">${t}</p>`;
   return `<!DOCTYPE html><html lang="fr"><body style="margin:0;background:#F7F7F7;font-family:Helvetica,Arial,sans-serif">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F7F7F7;padding:32px 12px"><tr><td align="center">
@@ -3010,19 +3010,20 @@ function courrielHtml({ titre, paragraphes, bouton, pied }) {
 <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#FF5E39;font-weight:700;margin-bottom:10px">Condo Stratégis</div>
 <h1 style="margin:0 0 18px;font-size:22px;line-height:1.25;color:#0A0A0A">${echapperXml(titre)}</h1>
 ${paragraphes.map(p).join("")}
+${liste && liste.length ? `<ul style="margin:0 0 14px;padding-left:20px;font-size:14px;line-height:1.6;color:#2E2E2E">${liste.map((l) => `<li style="margin-bottom:6px">${l}</li>`).join("")}</ul>` : ""}
 ${bouton ? `<p style="margin:24px 0"><a href="${echapperXml(bouton.url)}" style="display:inline-block;background:#FF5E39;color:#FFFFFF;text-decoration:none;font-weight:700;font-size:15px;padding:13px 24px;border-radius:999px">${echapperXml(bouton.texte)}</a></p>
 <p style="margin:0 0 14px;font-size:12px;line-height:1.5;color:#6B6B6B">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br><span style="word-break:break-all">${echapperXml(bouton.url)}</span></p>` : ""}
 ${pied ? `<p style="margin:22px 0 0;font-size:12px;line-height:1.5;color:#969696">${pied}</p>` : ""}
 </td></tr></table></td></tr></table></body></html>`;
 }
-async function envoyerCourriel(env, { to, subject, titre, paragraphes, bouton, pied, replyTo }) {
+async function envoyerCourriel(env, { to, subject, titre, paragraphes, liste, bouton, pied, replyTo }) {
   if (!env.EMAIL) throw new Error("l'envoi de courriels n'est pas configuré sur ce serveur");
-  const texte = [titre, "", ...paragraphes.map((t) => t.replace(/<[^>]+>/g, "")), ...bouton ? ["", `${bouton.texte} : ${bouton.url}`] : [], ...pied ? ["", pied.replace(/<[^>]+>/g, "")] : []].join("\n");
+  const texte = [titre, "", ...paragraphes.map((t) => t.replace(/<[^>]+>/g, "")), ...(liste ?? []).map((l) => `- ${l}`), ...bouton ? ["", `${bouton.texte} : ${bouton.url}`] : [], ...pied ? ["", pied.replace(/<[^>]+>/g, "")] : []].join("\n");
   await env.EMAIL.send({
     to,
     from: expediteur(env),
     subject,
-    html: courrielHtml({ titre, paragraphes: paragraphes.map(echapperXml), bouton, pied: pied ? echapperXml(pied) : "" }),
+    html: courrielHtml({ titre, paragraphes: paragraphes.map(echapperXml), liste: (liste ?? []).map(echapperXml), bouton, pied: pied ? echapperXml(pied) : "" }),
     text: texte,
     ...replyTo ? { replyTo } : {}
   });
@@ -3034,6 +3035,7 @@ function origineDe(c) {
   return `https://${url.host}`;
 }
 async function envoyerInvitation(c, user, jeton, invitePar) {
+  if (user.role === "portail") return envoyerInvitationPortail(c.env, origineDe(c), user, jeton, null, invitePar);
   const firme = await companyBrief(c.env.DB, user.company_id);
   const nomFirme = firme?.name ?? "votre firme";
   await envoyerCourriel(c.env, {
@@ -3086,8 +3088,10 @@ auth.get("/jeton/:jeton", async (c) => {
   const j = await lireJetonCompte(c.env.DB, c.req.param("jeton"));
   if (!j) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Demandez-en un nouveau." }, 404);
   const firme = await companyBrief(c.env.DB, j.company_id);
+  const role = (await c.env.DB.prepare("SELECT role FROM users WHERE id = ?1").bind(j.user_id).first())?.role;
   return c.json({
     type: j.type,
+    portail: role === "portail",
     email: j.email,
     name: j.name,
     firme: firme?.name ?? null,
@@ -3628,7 +3632,13 @@ const COLONNES_AJOUTEES = [
   ["nature_risque", "TEXT"],
   ["source_annee", "TEXT"],
   ["projet_ca", "TEXT"],
-  ["taches_entretien", "TEXT"]
+  ["taches_entretien", "TEXT"],
+  // Révision aux cinq ans : lien vers l'étude et la composante précédentes,
+  // et suivi des travaux que l'étude précédente prévoyait dans la période.
+  ["dossiers", "revision_de", "TEXT"],
+  ["origine_id", "TEXT"],
+  ["travaux_periode", "TEXT"],
+  ["travaux_annee", "INTEGER"]
 ];
 // Tables ajoutées après la mise en production, créées au premier appel.
 const TABLES_AJOUTEES = [
@@ -3640,7 +3650,29 @@ const TABLES_AJOUTEES = [
      utilise_le TEXT,
      cree_le    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
   `CREATE TABLE IF NOT EXISTS tentatives_connexion (cle TEXT NOT NULL, moment INTEGER NOT NULL)`,
-  `CREATE INDEX IF NOT EXISTS idx_tentatives_cle ON tentatives_connexion(cle, moment)`
+  `CREATE INDEX IF NOT EXISTS idx_tentatives_cle ON tentatives_connexion(cle, moment)`,
+  // Portail du syndicat : qui a accès à quel immeuble, qui fait quelle tâche, ce qui a été fait.
+  `CREATE TABLE IF NOT EXISTS portail_acces (
+     user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+     fonction   TEXT,
+     cree_le    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+     PRIMARY KEY (user_id, dossier_id))`,
+  `CREATE TABLE IF NOT EXISTS carnet_regles (
+     dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+     cle        TEXT NOT NULL,
+     user_id    TEXT,
+     PRIMARY KEY (dossier_id, cle))`,
+  `CREATE TABLE IF NOT EXISTS carnet_suivi (
+     id         TEXT PRIMARY KEY,
+     dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+     cle_tache  TEXT NOT NULL,
+     annee      INTEGER NOT NULL,
+     mois       INTEGER NOT NULL,
+     fait_le    TEXT NOT NULL,
+     fait_par   TEXT,
+     note       TEXT,
+     UNIQUE (dossier_id, cle_tache, annee, mois))`
 ];
 let colonnesPretes = null;
 function assurerColonnes(db) {
@@ -3856,6 +3888,162 @@ const INFORMATIONS_REGLEMENTAIRES = {
   },
   rbq_clapets: () => "INFORMATION : La Régie du bâtiment du Québec (RBQ) rappelle aux propriétaires que dans un réseau de plomberie, il est obligatoire de bien protéger les appareils sanitaires contre le refoulement potentiel des égouts. En effet, les refoulements des eaux d'égout et des eaux de pluie sont à l'origine de bien des dommages à l'intérieur des bâtiments. Ces refoulements constituent d'ailleurs une des causes de réclamation les plus fréquentes auprès des compagnies d'assurance habitation."
 };
+// ============================================================================
+// RÉVISION AUX CINQ ANS (Loi 16)
+// ----------------------------------------------------------------------------
+// Une révision part de l'étude précédente du même immeuble : composantes,
+// années, durées de vie, coûts indexés à l'année courante, fiche d'immeuble et
+// tâches du carnet ajustées. Chaque composante garde le lien vers celle de
+// l'étude précédente (origine_id) : l'inspecteur voit ce qui avait été
+// observé, dit si les travaux prévus dans la période ont été faits, et le
+// rapport présente l'évolution.
+// ============================================================================
+const CHAMPS_REPRIS_REVISION = [
+  "cat", "name", "qty", "sort_order", "install_year", "residual", "useful_life_years", "uniformat_code",
+  "position", "emplacement", "variante", "attributs", "actif", "source_annee", "projet_ca", "taches_entretien"
+];
+const TRAVAUX_PERIODE = { fait: "Réalisés", reporte: "Reportés", abandonne: "Abandonnés" };
+function anneeEtude(dossier) {
+  const d = new Date(dossier?.published_at || dossier?.created_at || Date.now());
+  return Number.isNaN(d.getTime()) ? (/* @__PURE__ */ new Date()).getFullYear() : d.getFullYear();
+}
+function remplacementPrevu(comp) {
+  return comp?.install_year && comp?.useful_life_years ? Number(comp.install_year) + Number(comp.useful_life_years) : null;
+}
+function facteurIndexation(anneeDepart, anneeArrivee) {
+  return Math.pow(1 + RESERVE_FUND_PARAMS.inflationRate, Math.max(0, anneeArrivee - anneeDepart));
+}
+// Ce que l'étude précédente disait d'une composante.
+function resumePrecedent(prev, photos, annee) {
+  const prevu = remplacementPrevu(prev);
+  const actif = prev.actif !== 0;
+  return {
+    id: prev.id,
+    annee,
+    actif,
+    rating: prev.rating ?? null,
+    r_flag: prev.r_flag ?? 0,
+    observation: prev.observation ?? null,
+    cause_possible: prev.cause_possible ?? null,
+    delai_suggere: prev.delai_suggere ?? null,
+    install_year: prev.install_year ?? null,
+    useful_life_years: prev.useful_life_years ?? null,
+    replacement_cost: prev.replacement_cost ?? null,
+    remplacement_prevu: prevu,
+    // Un remplacement que l'étude précédente plaçait avant aujourd'hui, ou une
+    // cote « remplacement requis » : l'inspecteur dit s'il a été fait.
+    travaux_a_verifier: actif && ((prevu != null && prevu <= (/* @__PURE__ */ new Date()).getFullYear()) || prev.rating === 4),
+    photos: photos.map((p) => ({ id: p.id, tag: p.tag }))
+  };
+}
+async function precedentsPour(db, composantes) {
+  const ids = [...new Set(composantes.map((c) => c.origine_id).filter(Boolean))];
+  const resultat = new Map();
+  for (let i = 0; i < ids.length; i += 80) {
+    const lot = ids.slice(i, i + 80);
+    const marques = lot.map((_, k) => `?${k + 1}`).join(", ");
+    const rows = await db.prepare(
+      `SELECT cmp.*, d.published_at AS dossier_publie, d.created_at AS dossier_cree
+         FROM components cmp JOIN dossiers d ON d.id = cmp.dossier_id WHERE cmp.id IN (${marques})`
+    ).bind(...lot).all();
+    const photos2 = await db.prepare(`SELECT id, component_id, tag FROM photos WHERE component_id IN (${marques}) ORDER BY created_at ASC`).bind(...lot).all();
+    for (const r of rows.results) {
+      const annee = anneeEtude({ published_at: r.dossier_publie, created_at: r.dossier_cree });
+      resultat.set(r.id, resumePrecedent(r, photos2.results.filter((p) => p.component_id === r.id), annee));
+    }
+  }
+  return resultat;
+}
+async function avecPrecedents(db, composantes, { complet = true } = {}) {
+  const precedents = await precedentsPour(db, composantes);
+  if (!precedents.size) return composantes;
+  return composantes.map((c) => {
+    const p = c.origine_id ? precedents.get(c.origine_id) : null;
+    if (!p) return c;
+    return { ...c, precedent: complet ? p : { annee: p.annee, rating: p.rating, travaux_a_verifier: p.travaux_a_verifier } };
+  });
+}
+// Section « Évolution depuis l'étude précédente » du rapport.
+function sectionEvolution(ctx, outils, anneeCourante) {
+  const r = ctx.revision;
+  if (!r) return [];
+  const { titre2, body, puce, tableauMaison } = outils;
+  const nom = (c) => sansNotesInternes(c.name ?? "");
+  const facteur = facteurIndexation(r.annee, anneeCourante);
+  const toutes = ctx.composantesToutes ?? ctx.components;
+  const actives = toutes.filter(estActive);
+  const prevParId = new Map(r.composantes.map((c) => [c.id, c]));
+  const out = [
+    titre2("1.7 Évolution depuis l'étude précédente"),
+    body(`La présente étude révise l'étude ${String(r.dossier.dossier_no ?? "").trim()} réalisée en ${r.annee}, conformément à l'obligation de mise à jour au moins tous les cinq ans. Pour la comparaison, les coûts de l'étude précédente sont indexés de ${pourcent(facteur - 1)}, soit l'inflation des coûts de la construction de ${r.annee} à ${anneeCourante}.`)
+  ];
+  // Fonds de prévoyance
+  if (r.dossier.current_fund_balance != null || ctx.dossier.current_fund_balance != null) {
+    out.push(tableauMaison(["", `Étude ${r.annee}`, `Étude ${anneeCourante}`], [
+      ["Solde du fonds de prévoyance", montantMaison(r.dossier.current_fund_balance) ?? "—", montantMaison(ctx.dossier.current_fund_balance) ?? "—"],
+      ["Cotisation annuelle", montantMaison(r.dossier.cotisation_annuelle) ?? "—", montantMaison(ctx.dossier.cotisation_annuelle) ?? "—"]
+    ]));
+  }
+  // Travaux prévus dans la période
+  const parStatut = (statut) => actives.filter((c) => c.travaux_periode === statut);
+  const faits = parStatut("fait"), reportes = parStatut("reporte"), abandonnes = parStatut("abandonne");
+  if (faits.length || reportes.length || abandonnes.length) {
+    out.push(titre2("Travaux prévus à l'étude précédente"));
+    const ligne = (c) => {
+      const prevu = remplacementPrevu(prevParId.get(c.origine_id) ?? {});
+      if (c.travaux_periode === "fait") return `${nom(c)}${c.travaux_annee ? ` — réalisé en ${c.travaux_annee}` : ""}`;
+      return `${nom(c)}${prevu ? ` — prévu en ${prevu}` : ""}`;
+    };
+    for (const [liste, titre] of [[faits, "Réalisés"], [reportes, "Reportés"], [abandonnes, "Abandonnés"]]) {
+      if (!liste.length) continue;
+      out.push(body(`${titre} :`));
+      liste.forEach((c) => out.push(puce(ligne(c))));
+    }
+  }
+  // État des composantes
+  const comparees = actives.map((c) => [c, prevParId.get(c.origine_id)]).filter(([c, p]) => p && p.rating && c.rating);
+  const degradees = comparees.filter(([c, p]) => c.rating > p.rating);
+  const ameliorees = comparees.filter(([c, p]) => c.rating < p.rating);
+  if (comparees.length) {
+    out.push(titre2("État des composantes"));
+    const stables = comparees.length - degradees.length - ameliorees.length;
+    const compte = (n, un, plusieurs) => (n === 0 ? `aucune ${un.replace(/^(se |s')/, "ne $1").replace(/^est/, "n'est")}` : `${n} ${n > 1 ? plusieurs : un}`);
+    out.push(body(`Sur ${comparees.length} composante${comparees.length > 1 ? "s" : ""} cotée${comparees.length > 1 ? "s" : ""} aux deux études, ${compte(degradees.length, "s'est dégradée", "se sont dégradées")}, ${compte(ameliorees.length, "s'est améliorée", "se sont améliorées")} et ${compte(stables, "est restée au même niveau", "sont restées au même niveau")}.`));
+    if (degradees.length) {
+      out.push(tableauMaison(["Composante", `Cote ${r.annee}`, `Cote ${anneeCourante}`],
+        degradees.sort((a, b) => (b[0].rating - b[1].rating) - (a[0].rating - a[1].rating)).slice(0, 15)
+          .map(([c, p]) => [nom(c), RATING_LABELS[p.rating] ?? String(p.rating), RATING_LABELS[c.rating] ?? String(c.rating)])));
+    }
+  }
+  // Coûts de remplacement
+  const avecCouts = actives.map((c) => [c, prevParId.get(c.origine_id)]).filter(([c, p]) => p && p.replacement_cost > 0 && c.replacement_cost > 0);
+  if (avecCouts.length) {
+    const totalAvant = avecCouts.reduce((t, [, p]) => t + p.replacement_cost * facteur, 0);
+    const totalApres = avecCouts.reduce((t, [c]) => t + Number(c.replacement_cost), 0);
+    out.push(titre2("Coûts de remplacement"));
+    out.push(body(`Pour les composantes présentes aux deux études, les coûts de remplacement totalisent ${montantMaison(totalApres)}, contre ${montantMaison(totalAvant)} à l'étude précédente une fois indexée, un écart de ${pourcent((totalApres - totalAvant) / totalAvant)}.`));
+    const ecarts = avecCouts.map(([c, p]) => ({ c, avant: p.replacement_cost * facteur, apres: Number(c.replacement_cost) }))
+      .map((e) => ({ ...e, ecart: (e.apres - e.avant) / e.avant }))
+      .filter((e) => Math.abs(e.ecart) >= 0.15)
+      .sort((a, b) => Math.abs(b.apres - b.avant) - Math.abs(a.apres - a.avant))
+      .slice(0, 12);
+    if (ecarts.length) {
+      out.push(body("Principaux écarts (15 % et plus) :"));
+      out.push(tableauMaison(["Composante", `${r.annee}, indexé`, `${anneeCourante}`, "Écart"],
+        ecarts.map((e) => [nom(e.c), montantMaison(e.avant), montantMaison(e.apres), `${e.ecart > 0 ? "+" : ""}${pourcent(e.ecart)}`])));
+    }
+  }
+  // Composantes ajoutées ou retirées
+  const originesActives = new Set(actives.map((c) => c.origine_id).filter(Boolean));
+  const ajoutees = actives.filter((c) => !c.origine_id || prevParId.get(c.origine_id)?.actif === 0);
+  const retirees = r.composantes.filter((p) => p.actif !== 0 && !originesActives.has(p.id));
+  if (ajoutees.length || retirees.length) {
+    out.push(titre2("Composantes ajoutées ou retirées"));
+    if (ajoutees.length) { out.push(body("Ajoutées à la présente étude :")); ajoutees.forEach((c) => out.push(puce(nom(c)))); }
+    if (retirees.length) { out.push(body("Retirées depuis l'étude précédente :")); retirees.forEach((c) => out.push(puce(nom(c)))); }
+  }
+  return out;
+}
 // ============================================================================
 // CARNET D'ENTRETIEN — tâches par composante
 // ----------------------------------------------------------------------------
@@ -5608,7 +5796,7 @@ async function listComponentsForDossier(db, dossierId) {
        GROUP BY component_id`
   ).bind(dossierId).all();
   const counts = new Map(photoCounts.results.map((r) => [r.component_id, r.n]));
-  return rows.results.map((row) => ({ ...row, photos: counts.get(row.id) ?? 0 }));
+  return avecPrecedents(db, rows.results.map((row) => ({ ...row, photos: counts.get(row.id) ?? 0 })), { complet: false });
 }
 async function getOwnedComponent(c, id) {
   const user = await getCurrentUser(c);
@@ -5629,7 +5817,8 @@ components.get("/:id", async (c) => {
     ...component,
     photos: photos2.results,
     guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats },
-    entretien: tachesPourComposante(component, { avecRetirees: true, biblio: await bibliothequeDuDossier(c.env.DB, component.dossier_id) }).map(tacheAffichee)
+    entretien: tachesPourComposante(component, { avecRetirees: true, biblio: await bibliothequeDuDossier(c.env.DB, component.dossier_id) }).map(tacheAffichee),
+    precedent: component.origine_id ? (await precedentsPour(c.env.DB, [component])).get(component.origine_id) ?? null : null
   });
 });
 components.patch("/:id", async (c) => {
@@ -5671,12 +5860,17 @@ components.patch("/:id", async (c) => {
     "nature_risque",
     "source_annee",
     "projet_ca",
-    "taches_entretien"
+    "taches_entretien",
+    "travaux_periode",
+    "travaux_annee"
   ]) {
     if (key in body2) {
       fields.push(`${key} = ?${fields.length + 1}`);
       // Retraits et ajouts de tâches : validés avant d'être stockés.
-      values.push(key === "taches_entretien" ? JSON.stringify(nettoyerPersoEntretien(body2[key])) : body2[key]);
+      values.push(key === "taches_entretien" ? JSON.stringify(nettoyerPersoEntretien(body2[key]))
+        : key === "travaux_periode" ? (TRAVAUX_PERIODE[body2[key]] ? body2[key] : null)
+        : key === "travaux_annee" ? (Number.isInteger(Number(body2[key])) && Number(body2[key]) > 1900 && Number(body2[key]) <= 2200 ? Number(body2[key]) : null)
+        : body2[key]);
     }
   }
   if (fields.length === 0) return c.json({ error: "aucun champ à mettre à jour" }, 400);
@@ -25503,7 +25697,8 @@ async function generateReportDocx(ctx, opts = {}) {
     body(`Cotisation annuelle : ${montantMaison(dossier.cotisation_annuelle) ?? "non disponible"}`),
     titre2("1.6 Visite"),
     body(`Inspecteur : ${nomSignataire}`),
-    body(`Préparé le : ${today}`)
+    body(`Préparé le : ${today}`),
+    ...sectionEvolution(ctx, outils, anneeCourante)
   ];
   // ---- 2.0 Méthodologie ---------------------------------------------------
   const methodologie = [
@@ -46705,6 +46900,399 @@ companies.patch("/:id/equipe/:userId", async (c) => {
   const maj = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(membre.id).first();
   return c.json(membreEquipe(maj));
 });
+// ============================================================================
+// PORTAIL DU SYNDICAT — carnet d'entretien en ligne, gratuit
+// ----------------------------------------------------------------------------
+// La firme ouvre le portail d'un immeuble à des membres du syndicat
+// (gestionnaire, administrateurs, concierge…) et répartit les tâches du
+// carnet : par défaut selon le responsable prévu (syndicat, entretien
+// ménager, entrepreneur), puis tâche par tâche. Les membres voient les
+// tâches du mois, les cochent, et reçoivent un rappel le 1er du mois.
+// Un compte du portail (role « portail ») n'appartient à aucune firme et
+// n'atteint que /api/portail.
+// ============================================================================
+const MOIS_NOMS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
+const cleTacheCarnet = (element, id) => `${element}::${id}`;
+async function tachesCarnetDossier(db, dossierId) {
+  const comps = (await db.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossierId).all()).results;
+  const carnet = carnetDuDossier(comps, await bibliothequeDuDossier(db, dossierId));
+  const liste = [];
+  for (const g of carnet) {
+    for (const t of g.taches) {
+      const a = tacheAffichee(t);
+      liste.push({
+        cle: cleTacheCarnet(g.element, t.id), element: sansNotesInternes(g.element), categorie: g.categorie,
+        texte: a.texte, frequence: a.frequence, quand: a.quand, responsable: a.responsable,
+        q: t.q || "", mois: a.mois, consigne: t.f === "C"
+      });
+    }
+  }
+  return liste;
+}
+async function reglesCarnet(db, dossierId) {
+  const rows = (await db.prepare("SELECT cle, user_id FROM carnet_regles WHERE dossier_id = ?1").bind(dossierId).all()).results;
+  const regles = { defauts: {}, taches: {} };
+  for (const r of rows) {
+    if (r.cle.startsWith("q:")) regles.defauts[r.cle.slice(2)] = r.user_id || null;
+    else if (r.cle.startsWith("t:")) regles.taches[r.cle.slice(2)] = r.user_id || "";
+  }
+  return regles;
+}
+// Une règle propre à la tâche l'emporte (même « personne ») ; sinon, le
+// défaut de son type de responsable.
+function responsableEffectif(tache, regles) {
+  if (Object.prototype.hasOwnProperty.call(regles.taches, tache.cle)) return { user_id: regles.taches[tache.cle] || null, source: "tache" };
+  const defaut = regles.defauts[tache.q];
+  return defaut ? { user_id: defaut, source: "defaut" } : { user_id: null, source: null };
+}
+async function membresPortail(db, dossierId) {
+  return (await db.prepare(
+    `SELECT u.id, u.name, u.email, u.actif, u.invitation_en_attente, a.fonction, a.cree_le
+       FROM portail_acces a JOIN users u ON u.id = a.user_id WHERE a.dossier_id = ?1 ORDER BY a.cree_le ASC`
+  ).bind(dossierId).all()).results.map((m) => ({ ...m, actif: m.actif !== 0, invitation_en_attente: !!m.invitation_en_attente }));
+}
+async function envoyerInvitationPortail(env, origine, user, jeton, dossier, invitePar) {
+  const lien = jeton ? `${origine}/compte/?jeton=${jeton}` : `${origine}/portail/`;
+  await envoyerCourriel(env, {
+    to: user.email,
+    subject: dossier ? `Carnet d'entretien en ligne — ${dossier.name}` : "Votre carnet d'entretien en ligne",
+    titre: `Bonjour ${user.name}`,
+    paragraphes: [
+      `${invitePar?.name ?? "Votre firme d'ingénierie"} vous donne accès au carnet d'entretien${dossier ? ` de ${dossier.name}` : " de votre immeuble"} : les tâches de chaque mois, qui s'en occupe, ce qui a été fait, et l'état des composantes de l'immeuble.`,
+      jeton ? "Choisissez votre mot de passe pour activer votre accès. Le lien est valable 7 jours." : "Connectez-vous avec votre compte habituel.",
+      "Le service est gratuit pour le syndicat."
+    ],
+    bouton: { texte: jeton ? "Activer mon accès" : "Ouvrir le carnet", url: lien },
+    pied: "Vous n'attendiez pas ce courriel ? Ignorez-le : aucun accès ne sera activé sans vous.",
+    replyTo: invitePar?.email ? { email: invitePar.email, name: invitePar.name ?? undefined } : void 0
+  });
+}
+// Les tâches d'un mois pour un immeuble, avec qui les fait et ce qui est fait.
+async function moisDuCarnet(db, dossierId, annee, mois) {
+  const [taches, regles, membres, suivis] = await Promise.all([
+    tachesCarnetDossier(db, dossierId),
+    reglesCarnet(db, dossierId),
+    membresPortail(db, dossierId),
+    db.prepare(
+      `SELECT s.*, u.name AS fait_par_nom FROM carnet_suivi s LEFT JOIN users u ON u.id = s.fait_par
+         WHERE s.dossier_id = ?1 AND s.annee = ?2 AND s.mois = ?3`
+    ).bind(dossierId, annee, mois).all()
+  ]);
+  const noms = new Map(membres.map((m) => [m.id, m.name]));
+  const faits = new Map(suivis.results.map((r) => [r.cle_tache, r]));
+  const enrichir = (t) => {
+    const r = responsableEffectif(t, regles);
+    const fait = faits.get(t.cle);
+    return {
+      ...t,
+      responsable_id: r.user_id && noms.has(r.user_id) ? r.user_id : null,
+      responsable_nom: r.user_id ? noms.get(r.user_id) ?? null : null,
+      fait: fait ? { fait_le: fait.fait_le, par: fait.fait_par_nom ?? null, note: fait.note ?? "" } : null
+    };
+  };
+  return {
+    taches: taches.filter((t) => !t.consigne && t.mois.includes(mois)).map(enrichir),
+    consignes: taches.filter((t) => t.consigne).map(enrichir),
+    membres
+  };
+}
+// Rappels du mois pour un immeuble : un courriel par membre, avec ses tâches
+// du mois et celles du mois précédent restées à faire.
+async function envoyerRappelsDossier(env, origine, dossier, annee, mois) {
+  const courant = await moisDuCarnet(env.DB, dossier.id, annee, mois);
+  const precedentMois = mois === 1 ? 12 : mois - 1;
+  const precedentAnnee = mois === 1 ? annee - 1 : annee;
+  const precedent = await moisDuCarnet(env.DB, dossier.id, precedentAnnee, precedentMois);
+  let envoyes = 0;
+  for (const m of courant.membres) {
+    if (!m.actif || m.invitation_en_attente) continue;
+    const miennes = courant.taches.filter((t) => t.responsable_id === m.id);
+    const enRetard = precedent.taches.filter((t) => t.responsable_id === m.id && !t.fait);
+    if (!miennes.length && !enRetard.length) continue;
+    const ligne = (t) => `${t.texte} — ${t.element}${t.frequence ? ` (${t.frequence.toLowerCase()})` : ""}`;
+    await envoyerCourriel(env, {
+      to: m.email,
+      subject: `Carnet d'entretien — ${MOIS_NOMS[mois - 1]} ${annee} — ${dossier.name}`,
+      titre: `Vos tâches de ${MOIS_NOMS[mois - 1]}`,
+      paragraphes: [`Bonjour ${m.name}, voici les tâches d'entretien qui vous sont confiées ce mois-ci pour ${dossier.name}.`],
+      liste: [
+        ...miennes.slice(0, 40).map(ligne),
+        ...miennes.length > 40 ? [`… et ${miennes.length - 40} autres tâches ce mois-ci, dans le carnet en ligne`] : [],
+        ...enRetard.slice(0, 20).map((t) => `Restée à faire en ${MOIS_NOMS[precedentMois - 1]} : ${ligne(t)}`),
+        ...enRetard.length > 20 ? [`… et ${enRetard.length - 20} autres tâches restées à faire`] : []
+      ],
+      bouton: { texte: "Ouvrir le carnet", url: `${origine}/portail/?immeuble=${dossier.id}` },
+      pied: "Cochez chaque tâche une fois faite : l'historique d'entretien de l'immeuble se construit tout seul."
+    });
+    envoyes += 1;
+  }
+  return { envoyes, sans_responsable: courant.taches.filter((t) => !t.responsable_id).length };
+}
+async function rappelsMensuels(env) {
+  await assurerColonnes(env.DB);
+  const origine = env.URL_PLATEFORME || "https://pga.stratege.io";
+  const maintenant = new Date();
+  const annee = maintenant.getUTCFullYear(), mois = maintenant.getUTCMonth() + 1;
+  // Un immeuble révisé envoie ses rappels depuis la révision, pas depuis l'ancienne étude.
+  const rows = (await env.DB.prepare(
+    `SELECT DISTINCT d.* FROM portail_acces a JOIN dossiers d ON d.id = a.dossier_id
+       WHERE NOT EXISTS (SELECT 1 FROM dossiers r WHERE r.revision_de = d.id)`
+  ).all()).results;
+  for (const dossier of rows) {
+    try {
+      const r = await envoyerRappelsDossier(env, origine, dossier, annee, mois);
+      console.log("rappels du carnet", dossier.id, r);
+    } catch (e) {
+      console.error("rappels du carnet en échec", dossier.id, e?.code, e?.message);
+    }
+  }
+}
+// ---- Côté firme : membres et répartition, depuis la console bureau -------------
+async function dossierPortail(c, { ecriture = false } = {}) {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return { refus: c.json({ error: "dossier introuvable" }, 404) };
+  if (ecriture && !peutAdministrerFirme(user, dossier.company_id)) return { refus: c.json({ error: "réservé aux administrateurs de la firme" }, 403) };
+  return { user, dossier };
+}
+function nettoyerFonction(v) {
+  return String(v ?? "").trim().slice(0, 60) || null;
+}
+const dossiersPortail = new Hono();
+dossiersPortail.get("/:id/portail", async (c) => {
+  const { refus, user, dossier } = await dossierPortail(c);
+  if (refus) return refus;
+  const [membres, regles, taches, historique] = await Promise.all([
+    membresPortail(c.env.DB, dossier.id),
+    reglesCarnet(c.env.DB, dossier.id),
+    tachesCarnetDossier(c.env.DB, dossier.id),
+    c.env.DB.prepare(
+      `SELECT s.cle_tache, s.annee, s.mois, s.fait_le, s.note, u.name AS par FROM carnet_suivi s LEFT JOIN users u ON u.id = s.fait_par
+         WHERE s.dossier_id = ?1 ORDER BY s.fait_le DESC LIMIT 30`
+    ).bind(dossier.id).all()
+  ]);
+  return c.json({
+    membres,
+    regles,
+    types: [...new Set(taches.map((t) => t.q))].map((q) => ({ q, libelle: libelleResponsable(q), n: taches.filter((t) => t.q === q).length })),
+    taches: taches.map((t) => ({ ...t, ...responsableEffectif(t, regles) })),
+    historique: historique.results,
+    peutModifier: peutAdministrerFirme(user, dossier.company_id),
+    courriel: !!c.env.EMAIL
+  });
+});
+dossiersPortail.post("/:id/portail/membres", async (c) => {
+  const { refus, user, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const body2 = await c.req.json().catch(() => ({}));
+  const email = String(body2.email ?? "").trim().toLowerCase();
+  const name = String(body2.name ?? "").trim().slice(0, 120);
+  const fonction = nettoyerFonction(body2.fonction);
+  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return c.json({ error: "nom et courriel valide requis" }, 400);
+  let membre = await c.env.DB.prepare("SELECT * FROM users WHERE email = ?1").bind(email).first();
+  if (membre && membre.role !== "portail") return c.json({ error: "cette adresse appartient à un compte de firme : utilisez une autre adresse pour le portail" }, 409);
+  let jeton = null;
+  if (!membre) {
+    const { hash, salt } = await hashPassword(toBase64Url(crypto.getRandomValues(new Uint8Array(24))));
+    const id = newId("usr");
+    await c.env.DB.prepare(
+      `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role, invitation_en_attente) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'portail', 1)`
+    ).bind(id, email, name, hash, salt).run();
+    membre = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(id).first();
+  }
+  if (membre.invitation_en_attente) jeton = await creerJetonCompte(c.env.DB, membre.id, "invitation");
+  await c.env.DB.prepare("INSERT INTO portail_acces (user_id, dossier_id, fonction) VALUES (?1, ?2, ?3) ON CONFLICT (user_id, dossier_id) DO UPDATE SET fonction = excluded.fonction")
+    .bind(membre.id, dossier.id, fonction).run();
+  try {
+    await envoyerInvitationPortail(c.env, origineDe(c), membre, jeton, dossier, user);
+    return c.json({ membres: await membresPortail(c.env.DB, dossier.id), envoye: true }, 201);
+  } catch (e) {
+    console.error("invitation au portail non envoyée", e?.code, e?.message);
+    return c.json({ membres: await membresPortail(c.env.DB, dossier.id), envoye: false, erreur: e?.message ?? "envoi impossible", lien: jeton ? `${origineDe(c)}/compte/?jeton=${jeton}` : `${origineDe(c)}/portail/` }, 201);
+  }
+});
+dossiersPortail.patch("/:id/portail/membres/:userId", async (c) => {
+  const { refus, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const body2 = await c.req.json().catch(() => ({}));
+  await c.env.DB.prepare("UPDATE portail_acces SET fonction = ?1 WHERE user_id = ?2 AND dossier_id = ?3").bind(nettoyerFonction(body2.fonction), c.req.param("userId"), dossier.id).run();
+  return c.json({ membres: await membresPortail(c.env.DB, dossier.id) });
+});
+dossiersPortail.post("/:id/portail/membres/:userId/invitation", async (c) => {
+  const { refus, user, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const membre = await c.env.DB.prepare("SELECT u.* FROM users u JOIN portail_acces a ON a.user_id = u.id WHERE u.id = ?1 AND a.dossier_id = ?2").bind(c.req.param("userId"), dossier.id).first();
+  if (!membre) return c.json({ error: "membre introuvable" }, 404);
+  const jeton = membre.invitation_en_attente ? await creerJetonCompte(c.env.DB, membre.id, "invitation") : null;
+  try {
+    await envoyerInvitationPortail(c.env, origineDe(c), membre, jeton, dossier, user);
+    return c.json({ envoye: true });
+  } catch (e) {
+    return c.json({ envoye: false, erreur: e?.message ?? "envoi impossible", lien: jeton ? `${origineDe(c)}/compte/?jeton=${jeton}` : `${origineDe(c)}/portail/` });
+  }
+});
+// Retirer l'accès : ses tâches redeviennent sans responsable.
+dossiersPortail.delete("/:id/portail/membres/:userId", async (c) => {
+  const { refus, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const uid = c.req.param("userId");
+  await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM portail_acces WHERE user_id = ?1 AND dossier_id = ?2").bind(uid, dossier.id),
+    c.env.DB.prepare("DELETE FROM carnet_regles WHERE user_id = ?1 AND dossier_id = ?2").bind(uid, dossier.id)
+  ]);
+  return c.json({ membres: await membresPortail(c.env.DB, dossier.id) });
+});
+// Répartition : les défauts par type de responsable et les exceptions par
+// tâche, remplacés d'un bloc.
+dossiersPortail.put("/:id/portail/regles", async (c) => {
+  const { refus, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const body2 = await c.req.json().catch(() => ({}));
+  const ids = new Set((await membresPortail(c.env.DB, dossier.id)).map((m) => m.id));
+  const valide = (v) => (v === "" || v == null ? "" : ids.has(String(v)) ? String(v) : null);
+  const requetes = [c.env.DB.prepare("DELETE FROM carnet_regles WHERE dossier_id = ?1").bind(dossier.id)];
+  const inserer = (cle, uid) => requetes.push(c.env.DB.prepare("INSERT INTO carnet_regles (dossier_id, cle, user_id) VALUES (?1, ?2, ?3)").bind(dossier.id, cle, uid || null));
+  for (const [q, uid] of Object.entries(body2.defauts ?? {})) {
+    const v = valide(uid);
+    if (v === null) return c.json({ error: "membre inconnu dans la répartition" }, 400);
+    if (v) inserer(`q:${String(q).slice(0, 60)}`, v);
+  }
+  for (const [cle, uid] of Object.entries(body2.taches ?? {}).slice(0, 2000)) {
+    const v = valide(uid);
+    if (v === null) return c.json({ error: "membre inconnu dans la répartition" }, 400);
+    inserer(`t:${String(cle).slice(0, 300)}`, v);
+  }
+  for (let i = 0; i < requetes.length; i += 80) await c.env.DB.batch(requetes.slice(i, i + 80));
+  return c.json({ regles: await reglesCarnet(c.env.DB, dossier.id) });
+});
+dossiersPortail.post("/:id/portail/rappels", async (c) => {
+  const { refus, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const maintenant = new Date();
+  try {
+    return c.json(await envoyerRappelsDossier(c.env, origineDe(c), dossier, maintenant.getFullYear(), maintenant.getMonth() + 1));
+  } catch (e) {
+    return c.json({ error: `envoi impossible : ${e?.message ?? e}` }, 502);
+  }
+});
+// ---- Côté syndicat : /api/portail ----------------------------------------------
+const portail = new Hono();
+// Un membre voit les immeubles où il a accès ; un compte de firme voit ceux
+// de sa firme (aperçu du portail depuis le bureau).
+async function immeublePortail(c) {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  if (!user || !dossier) return { refus: c.json({ error: "immeuble introuvable" }, 404) };
+  if (user.role === "portail") {
+    const acces = await c.env.DB.prepare("SELECT fonction FROM portail_acces WHERE user_id = ?1 AND dossier_id = ?2").bind(user.id, id).first();
+    if (!acces) return { refus: c.json({ error: "immeuble introuvable" }, 404) };
+    return { user, dossier, fonction: acces.fonction };
+  }
+  if (!peutGererEntreprise(user, dossier.company_id)) return { refus: c.json({ error: "immeuble introuvable" }, 404) };
+  return { user, dossier, fonction: "Aperçu de la firme", apercu: true };
+}
+portail.get("/immeubles", async (c) => {
+  const user = await getCurrentUser(c);
+  const rows = user.role === "portail"
+    ? (await c.env.DB.prepare(
+        `SELECT d.id, d.name, d.address, d.city, d.company_id, a.fonction FROM portail_acces a JOIN dossiers d ON d.id = a.dossier_id
+           WHERE a.user_id = ?1 AND NOT EXISTS (SELECT 1 FROM dossiers r JOIN portail_acces a2 ON a2.dossier_id = r.id AND a2.user_id = ?1 WHERE r.revision_de = d.id)
+           ORDER BY d.name`
+      ).bind(user.id).all()).results
+    : [];
+  const firmes = new Map();
+  for (const r of rows) if (!firmes.has(r.company_id)) firmes.set(r.company_id, await companyBrief(c.env.DB, r.company_id));
+  return c.json(rows.map((r) => ({ id: r.id, name: r.name, address: r.address, city: r.city, fonction: r.fonction, firme: firmes.get(r.company_id) })));
+});
+portail.get("/immeubles/:id", async (c) => {
+  const { refus, user, dossier, fonction, apercu } = await immeublePortail(c);
+  if (refus) return refus;
+  const maintenant = new Date();
+  const annee = Number(c.req.query("annee")) || maintenant.getFullYear();
+  const mois = Math.min(12, Math.max(1, Number(c.req.query("mois")) || maintenant.getMonth() + 1));
+  const { taches, consignes, membres } = await moisDuCarnet(c.env.DB, dossier.id, annee, mois);
+  const company = await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(dossier.company_id).first();
+  const theme = themeDeFirme(company);
+  return c.json({
+    immeuble: { id: dossier.id, name: dossier.name, address: dossier.address, city: dossier.city, dossier_no: dossier.dossier_no, rapport: !!dossier.published_at },
+    firme: { id: company?.id, name: company?.name, hasLogo: !!company?.logo_r2_key, accent: theme.accent, telephone: theme.telephone, courriel: theme.courriel },
+    moi: { id: user.id, name: user.name, fonction, apercu: !!apercu },
+    membres: membres.filter((m) => m.actif).map((m) => ({ id: m.id, name: m.name, fonction: m.fonction })),
+    periode: { annee, mois, libelle: `${MOIS_NOMS[mois - 1]} ${annee}` },
+    taches,
+    consignes
+  });
+});
+portail.post("/immeubles/:id/suivi", async (c) => {
+  const { refus, user, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  const body2 = await c.req.json().catch(() => ({}));
+  const annee = Number(body2.annee), mois = Number(body2.mois);
+  const cle = String(body2.cle ?? "");
+  if (!Number.isInteger(annee) || annee < 2000 || annee > 2200 || !Number.isInteger(mois) || mois < 1 || mois > 12 || !cle) return c.json({ error: "tâche, année et mois requis" }, 400);
+  if (!(await tachesCarnetDossier(c.env.DB, dossier.id)).some((t) => t.cle === cle)) return c.json({ error: "tâche inconnue pour cet immeuble" }, 404);
+  const note = String(body2.note ?? "").trim().slice(0, 500) || null;
+  await c.env.DB.prepare(
+    `INSERT INTO carnet_suivi (id, dossier_id, cle_tache, annee, mois, fait_le, fait_par, note)
+     VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?6, ?7)
+     ON CONFLICT (dossier_id, cle_tache, annee, mois) DO UPDATE SET note = excluded.note, fait_par = excluded.fait_par`
+  ).bind(newId("svi"), dossier.id, cle, annee, mois, user.id, note).run();
+  return c.json({ ok: true });
+});
+portail.delete("/immeubles/:id/suivi", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  await c.env.DB.prepare("DELETE FROM carnet_suivi WHERE dossier_id = ?1 AND cle_tache = ?2 AND annee = ?3 AND mois = ?4")
+    .bind(dossier.id, String(c.req.query("cle") ?? ""), Number(c.req.query("annee")), Number(c.req.query("mois"))).run();
+  return c.json({ ok: true });
+});
+portail.get("/immeubles/:id/historique", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  const taches = new Map((await tachesCarnetDossier(c.env.DB, dossier.id)).map((t) => [t.cle, t]));
+  const rows = (await c.env.DB.prepare(
+    `SELECT s.*, u.name AS par FROM carnet_suivi s LEFT JOIN users u ON u.id = s.fait_par WHERE s.dossier_id = ?1 ORDER BY s.fait_le DESC LIMIT 300`
+  ).bind(dossier.id).all()).results;
+  return c.json(rows.map((r) => ({
+    texte: taches.get(r.cle_tache)?.texte ?? "Tâche retirée du carnet", element: taches.get(r.cle_tache)?.element ?? "",
+    periode: `${MOIS_NOMS[r.mois - 1]} ${r.annee}`, fait_le: r.fait_le, par: r.par, note: r.note
+  })));
+});
+portail.get("/immeubles/:id/composantes", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  const rows = (await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1 ORDER BY sort_order ASC").bind(dossier.id).all()).results;
+  return c.json(rows.map((r) => {
+    const prevu = remplacementPrevu(r);
+    return { name: sansNotesInternes(r.name), categorie: CATEGORIES[r.cat]?.label ?? "", cote: r.rating ? RATING_LABELS[r.rating] : null, rating: r.rating, remplacement: prevu, annee: r.install_year };
+  }));
+});
+portail.get("/immeubles/:id/logo", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  const company = await c.env.DB.prepare("SELECT logo_r2_key FROM companies WHERE id = ?1").bind(dossier.company_id).first();
+  const obj = company?.logo_r2_key ? await c.env.PHOTOS.get(company.logo_r2_key) : null;
+  if (!obj) return c.notFound();
+  return new Response(obj.body, { headers: { "content-type": obj.httpMetadata?.contentType ?? "image/png", "cache-control": "private, max-age=3600" } });
+});
+async function contexteRapportPortail(c, dossier, opts = {}) {
+  const signataire = dossier.created_by ? await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(dossier.created_by).first() : null;
+  return buildReportContext(c, { ...opts, dossier, signataire });
+}
+portail.get("/immeubles/:id/suivi-entretien.xlsx", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  const bytes = await tableurSuiviEntretien(await contexteRapportPortail(c, dossier));
+  return new Response(new Blob([bytes]), { headers: { "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "content-disposition": `attachment; filename="${dossier.dossier_no}-suivi-entretien.xlsx"` } });
+});
+// Le rapport seulement une fois publié par la firme.
+portail.get("/immeubles/:id/rapport.docx", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  if (!dossier.published_at) return c.json({ error: "le rapport n'est pas encore publié par la firme" }, 404);
+  const bytes = await produireRapportDocx(c, await contexteRapportPortail(c, dossier, { word: true }));
+  return new Response(new Blob([new Uint8Array(bytes)]), { headers: { "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "content-disposition": `attachment; filename="${dossier.dossier_no}-etude-fonds-prevoyance.docx"` } });
+});
 const dossiers = new Hono();
 async function dossierStats(db, dossierId) {
   const row = await db.prepare(
@@ -46733,7 +47321,66 @@ dossiers.get("/", async (c) => {
   const withStats = await Promise.all(
     rows.results.map(async (d) => ({ ...d, stats: await dossierStats(c.env.DB, d.id) }))
   );
-  return c.json(withStats);
+  return c.json(withStats.map((d) => ({ ...d, ...infoRevision(d, rows.results) })));
+});
+// Où en est le dossier dans le cycle des révisions : l'étude qu'il révise,
+// celle qui le révise, et si sa révision aux cinq ans est due.
+function infoRevision(d, tous) {
+  const annee = anneeEtude(d);
+  const source = d.revision_de ? tous.find((x) => x.id === d.revision_de) : null;
+  const suivante = tous.find((x) => x.revision_de === d.id) ?? null;
+  const echeance = annee + 5;
+  return {
+    annee_etude: annee,
+    revision_source: source ? { id: source.id, dossier_no: source.dossier_no, annee: anneeEtude(source) } : null,
+    revise_par: suivante ? { id: suivante.id, dossier_no: suivante.dossier_no } : null,
+    revision_echeance: echeance,
+    // Due dans l'année qui vient, ou dépassée, et pas encore commencée.
+    revision_due: !suivante && !!d.published_at && echeance <= (/* @__PURE__ */ new Date()).getFullYear() + 1
+  };
+}
+dossiers.post("/:id/revision", async (c) => {
+  const { user, dossier: source } = await getOwnedDossier(c, c.req.param("id"));
+  if (!source) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const dossierNo = String(body2.dossier_no ?? "").trim().slice(0, 40);
+  if (!dossierNo) return c.json({ error: "numéro du nouveau dossier requis" }, 400);
+  if (await c.env.DB.prepare("SELECT id FROM dossiers WHERE dossier_no = ?1").bind(dossierNo).first()) {
+    return c.json({ error: `le numéro de dossier ${dossierNo} est déjà utilisé` }, 409);
+  }
+  const deja = await c.env.DB.prepare("SELECT id, dossier_no FROM dossiers WHERE revision_de = ?1").bind(source.id).first();
+  if (deja) return c.json({ error: `cette étude a déjà une révision : dossier ${deja.dossier_no}`, id: deja.id }, 409);
+  const anneeSource = anneeEtude(source);
+  const annee = (/* @__PURE__ */ new Date()).getFullYear();
+  const facteur = facteurIndexation(anneeSource, annee);
+  const id = newId("dos");
+  await c.env.DB.prepare(
+    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id, batiment_info, revision_de)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`
+  ).bind(id, dossierNo, source.name, source.address, source.city, source.units ?? 0, source.floors, source.built_year, user.id, source.company_id, source.batiment_info, source.id).run();
+  const anciennes = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 ORDER BY sort_order ASC, created_at ASC").bind(source.id).all();
+  const nouveauxIds = new Map(anciennes.results.map((comp) => [comp.id, newId("cmp")]));
+  const colonnes = ["id", "dossier_id", ...CHAMPS_REPRIS_REVISION, "replacement_cost", "parent_id", "origine_id"];
+  const sql = `INSERT INTO components (${colonnes.join(", ")}) VALUES (${colonnes.map((_, i) => `?${i + 1}`).join(", ")})`;
+  const requetes = anciennes.results.map((comp) => c.env.DB.prepare(sql).bind(
+    nouveauxIds.get(comp.id), id,
+    ...CHAMPS_REPRIS_REVISION.map((champ) => comp[champ] ?? (champ === "actif" ? 1 : champ === "sort_order" ? 0 : null)),
+    comp.replacement_cost != null ? Math.round(comp.replacement_cost * facteur) : null,
+    comp.parent_id ? nouveauxIds.get(comp.parent_id) ?? null : null,
+    comp.id
+  ));
+  for (let i = 0; i < requetes.length; i += 50) await c.env.DB.batch(requetes.slice(i, i + 50));
+  // Le portail du syndicat suit l'immeuble : mêmes membres, même répartition.
+  await c.env.DB.batch([
+    c.env.DB.prepare("INSERT OR IGNORE INTO portail_acces (user_id, dossier_id, fonction) SELECT user_id, ?1, fonction FROM portail_acces WHERE dossier_id = ?2").bind(id, source.id),
+    c.env.DB.prepare("INSERT OR IGNORE INTO carnet_regles (dossier_id, cle, user_id) SELECT ?1, cle, user_id FROM carnet_regles WHERE dossier_id = ?2").bind(id, source.id)
+  ]);
+  const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  return c.json({
+    ...dossier,
+    stats: await dossierStats(c.env.DB, id),
+    revision: { source: { id: source.id, dossier_no: source.dossier_no, annee: anneeSource }, composantes: anciennes.results.length, indexation: facteur - 1 }
+  }, 201);
 });
 dossiers.post("/", async (c) => {
   const user = await getCurrentUser(c);
@@ -46803,7 +47450,9 @@ async function getOwnedDossier(c, id) {
 dossiers.get("/:id", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
-  return c.json({ ...dossier, stats: await dossierStats(c.env.DB, dossier.id) });
+  const lies = await c.env.DB.prepare("SELECT id, dossier_no, published_at, created_at, revision_de FROM dossiers WHERE id = ?1 OR revision_de = ?2")
+    .bind(dossier.revision_de ?? "", dossier.id).all();
+  return c.json({ ...dossier, stats: await dossierStats(c.env.DB, dossier.id), ...infoRevision(dossier, lies.results.concat([dossier])) });
 });
 dossiers.get("/:id/components", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
@@ -46827,13 +47476,15 @@ dossiers.get("/:id/hors-ligne", async (c) => {
     parComposante.get(p.component_id).push(p);
   }
   const biblio = await bibliothequeDuDossier(c.env.DB, dossier.id);
+  const precedents = await precedentsPour(c.env.DB, rows.results);
   const composantes = rows.results.map((component) => {
     const guide = guidePour(component);
     return {
       ...component,
       photos: parComposante.get(component.id) ?? [],
       guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats },
-      entretien: tachesPourComposante(component, { avecRetirees: true, biblio }).map(tacheAffichee)
+      entretien: tachesPourComposante(component, { avecRetirees: true, biblio }).map(tacheAffichee),
+      precedent: component.origine_id ? precedents.get(component.origine_id) ?? null : null
     };
   });
   return c.json({ dossier, composantes, genere_le: new Date().toISOString() });
@@ -46943,12 +47594,22 @@ async function logoDeFirme(env, company) {
   return estStrategis(company?.name) ? imageDocx(base64ToUint8Array(LOGO_BASE64)) : null;
 }
 async function buildReportContext(c, opts = {}) {
-  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  // Le portail fournit le dossier et son signataire ; ailleurs, le dossier
+  // vient de l'URL et doit appartenir à la firme de l'utilisateur.
+  const { user, dossier } = opts.dossier ? { user: opts.signataire ?? null, dossier: opts.dossier } : await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return null;
   const company = dossier.company_id ? await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(dossier.company_id).first() : null;
   // Une composante désactivée n'existe pas dans l'immeuble : ni au rapport, ni au fonds.
   const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossier.id).all();
-  const components2 = (await listComponentsForDossier(c.env.DB, dossier.id)).filter(estActive);
+  const composantesToutes = await listComponentsForDossier(c.env.DB, dossier.id);
+  const components2 = composantesToutes.filter(estActive);
+  // Étude révisée : son dossier et ses composantes, pour la section Évolution.
+  const source = dossier.revision_de ? await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1 AND company_id = ?2").bind(dossier.revision_de, dossier.company_id).first() : null;
+  const revision = source ? {
+    dossier: source,
+    annee: anneeEtude(source),
+    composantes: (await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(source.id).all()).results
+  } : null;
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
@@ -46965,6 +47626,8 @@ async function buildReportContext(c, opts = {}) {
     signataire: user ?? null,
     apiKey: c.env.ANTHROPIC_API_KEY ?? null,
     company,
+    composantesToutes,
+    revision,
     biblio: bibliothequeDeFirme(company),
     theme: themeDeFirme(company),
     ...opts.word ? {
@@ -47745,10 +48408,13 @@ app.use("/api/*", async (c, next) => {
   if (PUBLIC_PREFIXES.some((p) => c.req.path === p || c.req.path.startsWith(p + "/"))) return next();
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
+  // Un membre du portail d'un syndicat n'atteint que le portail : jamais les
+  // dossiers, composantes ou réglages d'une firme.
+  if (user.role === "portail" && !c.req.path.startsWith("/api/portail")) return c.json({ error: "accès réservé au portail du syndicat" }, 403);
   return next();
 });
 app.use("/api/*", async (c, next) => {
-  if (["/api/dossiers", "/api/components", "/api/companies", "/api/auth"].some((p) => c.req.path.startsWith(p))) {
+  if (["/api/dossiers", "/api/components", "/api/companies", "/api/auth", "/api/portail"].some((p) => c.req.path.startsWith(p))) {
     await assurerColonnes(c.env.DB);
   }
   return next();
@@ -47756,12 +48422,19 @@ app.use("/api/*", async (c, next) => {
 app.route("/api/auth", auth);
 app.route("/api/companies", companies);
 app.route("/api/dossiers", dossiers);
+app.route("/api/dossiers", dossiersPortail);
 app.route("/api/components", components);
 app.route("/api/photos", photos);
 app.route("/api/prix", prix);
+app.route("/api/portail", portail);
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 const index = {
-  fetch: app.fetch
+  fetch: app.fetch,
+  // Le 1er de chaque mois : les tâches du carnet partent par courriel aux
+  // membres des portails.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(rappelsMensuels(env));
+  }
 };
 export {
   index as default

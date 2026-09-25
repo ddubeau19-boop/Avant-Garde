@@ -597,7 +597,8 @@ async function preparerHorsLigne(id) {
     maj({ dossierId: id, etat: 'fiches' });
     const lot = await apiJson(`/api/dossiers/${id}/hors-ligne`, null, { timeout: 60000 });
     await HL.ecrireLot(lot.composantes.map(c => [`component:${c.id}`, c]));
-    const photos = lot.composantes.flatMap(c => c.photos || []);
+    // Les photos de l'étude précédente aussi, pour comparer sur place.
+    const photos = lot.composantes.flatMap(c => (c.photos || []).concat(c.precedent ? c.precedent.photos || [] : []));
     const presentes = await HL.photosPresentes();
     const manquantes = photos.filter(p => !presentes.has(p.id));
     let faites = photos.length - manquantes.length;
@@ -811,7 +812,7 @@ async function openFiche(id) {
     state.facetsOpen = !!(comp.position || comp.emplacement || comp.variante);
     state.ficheLoading = false;
     render();
-    loadPhotoBlobs(comp.photos || []);
+    loadPhotoBlobs((comp.photos || []).concat(comp.precedent ? comp.precedent.photos || [] : []));
   } catch (e) {
     state.ficheLoading = false;
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
@@ -1371,6 +1372,7 @@ function rowVals(c) {
     sub, statusLabel, statusColor, statusBg, thumbBg, thumbColor, thumbIcon: info.icon,
     rflag: !!c.r_flag,
     aiTag: !!(c.ai_suggested && !c.done),
+    travauxTag: !!(c.precedent && c.precedent.travaux_a_verifier && !c.travaux_periode),
   };
 }
 
@@ -1599,6 +1601,7 @@ function dossiersHtml() {
     const pct = d.stats ? d.stats.pct : 0;
     return `<div class="picker-card" data-action="select-dossier" data-id="${esc(d.id)}">
       <h3>${esc(d.name)}</h3>
+      ${d.revision_source ? `<div class="addr" style="color:var(--orange)">Révision de l'étude ${esc(d.revision_source.dossier_no)} (${esc(d.revision_source.annee)})</div>` : ''}
       <div class="addr">${esc(d.address || '')}${d.city ? ' · ' + esc(d.city) : ''}</div>
       <div class="picker-bar"><div style="width:${pct}%"></div></div>
       <div class="picker-pct">${pct}% complété · ${d.stats ? d.stats.done : 0}/${d.stats ? d.stats.total : 0}</div>
@@ -1864,6 +1867,7 @@ function rowHtml(r) {
       ${r.facets ? `<div class="facets">${esc(r.facets)}</div>` : ''}
       <div class="sub">${esc(r.sub)}</div>
       ${r.aiTag ? `<div class="ai-tag">Suggéré IA</div>` : ''}
+      ${r.travauxTag ? `<div class="ai-tag">Travaux à vérifier</div>` : ''}
     </div>
     <div class="comp-end">
       <span class="status-pill" style="background:${r.statusBg};color:${r.statusColor}">${esc(r.statusLabel)}</span>
@@ -2035,6 +2039,85 @@ function attributsHtml(c) {
     </div>`;
 }
 
+// Révision aux cinq ans : ce que l'étude précédente disait de la composante,
+// et le suivi des travaux qu'elle prévoyait dans la période.
+function precedentHtml(c) {
+  const p = c.precedent;
+  if (!p) return '';
+  if (!p.actif) {
+    return `<div class="precedent-card"><div class="pc-hdr"><i data-lucide="history"></i>Étude précédente · ${esc(p.annee)}</div><div class="pc-texte">Composante absente de l'immeuble à l'étude précédente.</div></div>`;
+  }
+  const r = ratingInfo(p.rating);
+  const vignettes = (p.photos || []).map(ph => {
+    const url = state.photoBlobUrls[ph.id];
+    if (!url && state.photoIndispo[ph.id]) return `<div class="pc-photo indispo"><i data-lucide="image-off"></i></div>`;
+    return `<div class="pc-photo">${url ? `<img src="${url}" alt="">` : `<i data-lucide="loader-2"></i>`}</div>`;
+  }).join('');
+  let travaux = '';
+  if (p.travaux_a_verifier) {
+    const motif = p.remplacement_prevu
+      ? `L'étude ${esc(p.annee)} prévoyait le remplacement en ${esc(p.remplacement_prevu)}.`
+      : `L'étude ${esc(p.annee)} cotait cette composante « remplacement requis ».`;
+    const choix = [['fait', 'Réalisé'], ['reporte', 'Reporté'], ['abandonne', 'Abandonné']]
+      .map(([v, l]) => `<button class="quick-chip ${c.travaux_periode === v ? 'on' : ''}" data-action="set-travaux" data-val="${v}">${l}</button>`).join('');
+    travaux = `
+      <div class="pc-travaux">
+        <div class="pc-texte"><b>${motif}</b> Ces travaux ont-ils été faits ?</div>
+        <div class="quick-chips">${choix}</div>
+        ${c.travaux_periode === 'fait' ? `
+        <label class="pc-annee">Année des travaux
+          <input id="travauxAnnee" data-role="travaux-annee" inputmode="numeric" maxlength="4" value="${esc(c.travaux_annee || '')}" placeholder="AAAA">
+        </label>
+        <div class="pc-aide">L'année de construction ou de réparation de la fiche prend cette valeur.</div>` : ''}
+      </div>`;
+  }
+  return `
+  <div class="precedent-card">
+    <div class="pc-hdr"><i data-lucide="history"></i>Étude précédente · ${esc(p.annee)}</div>
+    <div class="pc-cote">${r ? `<span class="status-pill" style="background:${r.bg};color:${r.color}">${esc(r.label)}</span>` : '<span class="pc-texte">Non cotée</span>'}${p.r_flag ? '<span class="r-pill">R</span>' : ''}${p.delai_suggere ? `<span class="pc-texte">${esc(p.delai_suggere)}</span>` : ''}</div>
+    ${p.observation ? `<div class="pc-obs">${esc(p.observation)}</div>` : ''}
+    ${vignettes ? `<div class="pc-photos">${vignettes}</div>` : ''}
+    ${travaux}
+  </div>`;
+}
+
+// Réalisé : l'année des travaux devient l'année de construction ou de
+// réparation. Autre choix : on revient à celle de l'étude précédente.
+function onTravauxClick(val) {
+  const c = state.activeComponent;
+  if (!c || !c.precedent) return;
+  const suivant = c.travaux_periode === val ? null : val;
+  const patch = { travaux_periode: suivant };
+  if (suivant === 'fait') {
+    const annee = c.travaux_annee || (c.precedent.remplacement_prevu && c.precedent.remplacement_prevu <= new Date().getFullYear() ? c.precedent.remplacement_prevu : new Date().getFullYear());
+    patch.travaux_annee = annee;
+    patch.install_year = annee;
+  } else if (c.travaux_periode === 'fait') {
+    patch.travaux_annee = null;
+    patch.install_year = c.precedent.install_year;
+  }
+  applyComponentPatch(c.id, patch);
+  render();
+  setSaveStatus('ficheStatus', 'Enregistrement…');
+  patchComponent(c.id, patch)
+    .then((r) => setSaveStatus('ficheStatus', r && r.enAttente ? "Gardé sur l'appareil" : 'Enregistré'))
+    .catch(() => setSaveStatus('ficheStatus', ''));
+}
+function onTravauxAnneeBlur(e) {
+  const c = state.activeComponent;
+  if (!c) return;
+  const v = e.target.value.trim();
+  if (!/^\d{4}$/.test(v)) { if (v) showToast('Indiquez une année sur 4 chiffres.'); return; }
+  const annee = parseInt(v, 10);
+  if (annee === c.travaux_annee) return;
+  const patch = { travaux_annee: annee, install_year: annee };
+  applyComponentPatch(c.id, patch);
+  patchComponent(c.id, patch)
+    .then((r) => setSaveStatus('ficheStatus', r && r.enAttente ? "Gardé sur l'appareil" : 'Enregistré'))
+    .catch(() => setSaveStatus('ficheStatus', ''));
+  render();
+}
+
 function ficheHtml() {
   if (state.ficheLoading || !state.activeComponent) return `<div class="scr-fiche">${loadingHtml()}</div>`;
   const c = state.activeComponent;
@@ -2083,6 +2166,7 @@ function ficheHtml() {
       <h2 class="fiche-title">${esc(c.name)}</h2>
     </div>
     <div class="fiche-body">
+      ${precedentHtml(c)}
       <div class="section-lbl">Photos (${photos.length})</div>
       <div class="photo-strip scr">
         <button class="photo-add ${state.uploadingPhoto ? 'uploading' : ''}" data-action="add-photo">
@@ -2322,6 +2406,7 @@ function onRootClick(e) {
     case 'set-rating': onRatingClick(t.dataset.rating); break;
     case 'toggle-rflag': onRflagClick(); break;
     case 'set-facet': onFacetClick(t.dataset.field, t.dataset.val); break;
+    case 'set-travaux': onTravauxClick(t.dataset.val); break;
     case 'toggle-facets': state.facetsOpen = !state.facetsOpen; render(); break;
     case 'add-constat': ajouterConstat(t.dataset.val); break;
     case 'tache-retirer': retirerTache(t.dataset.id); break;
@@ -2390,6 +2475,7 @@ function onRootFocusout(e) {
   const t = e.target;
   if (!t || !t.matches) return;
   if (t.matches('[data-role="year-input"]')) { onYearBlur(e); return; }
+  if (t.matches('[data-role="travaux-annee"]')) { onTravauxAnneeBlur(e); return; }
   if (t.matches('[data-role="comp-number"]')) { onNumberBlur(t.dataset.field, e); return; }
   if (t.matches('[data-role="comp-text"]') || t.matches('[data-role="comp-textarea"]')) {
     const v = t.value.trim();

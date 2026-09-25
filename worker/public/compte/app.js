@@ -6,10 +6,10 @@
 //   ?changer=1 changer son mot de passe, connecté (&retour=/bureau/)
 //   (rien)     demander un lien « mot de passe oublié »
 // ============================================================
-const CLES_SESSION = ['cs_bureau_token', 'cs_terrain_token', 'cs_admin_token'];
+const CLES_SESSION = ['cs_bureau_token', 'cs_terrain_token', 'cs_admin_token', 'cs_portail_token'];
 const app = document.getElementById('app');
 const params = new URLSearchParams(location.search);
-const retour = /^\/(bureau|terrain|admin)\/$/.test(params.get('retour') || '') ? params.get('retour') : null;
+let retour = /^\/(bureau|terrain|admin|portail)\/$/.test(params.get('retour') || '') ? params.get('retour') : null;
 
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const lire = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
@@ -53,8 +53,9 @@ function afficherErreur(message) {
 }
 
 function termine(titre, texte) {
+  const libelle = retour === '/terrain/' ? "Ouvrir l'application terrain" : retour === '/portail/' ? "Ouvrir le carnet d'entretien" : 'Ouvrir la console bureau';
   page(titre, texte, `
-    <a class="bouton" href="${retour || '/bureau/'}">${retour === '/terrain/' ? "Ouvrir l'application terrain" : 'Ouvrir la console bureau'}</a>
+    <a class="bouton" href="${retour || '/bureau/'}">${libelle}</a>
     ${retour ? '' : `<a class="bouton secondaire" href="/terrain/">Ouvrir l'application terrain</a>`}`);
 }
 
@@ -72,11 +73,13 @@ async function viaJeton(jeton) {
   page(
     invitation ? `Bienvenue, ${esc(info.name)}` : 'Nouveau mot de passe',
     invitation
-      ? `Activez votre compte ${esc(info.email)}${info.firme ? ` pour <strong>${esc(info.firme)}</strong>` : ''} en choisissant votre mot de passe.`
+      ? (info.portail
+        ? `Activez votre accès au carnet d'entretien de votre immeuble (${esc(info.email)}) en choisissant votre mot de passe.`
+        : `Activez votre compte ${esc(info.email)}${info.firme ? ` pour <strong>${esc(info.firme)}</strong>` : ''} en choisissant votre mot de passe.`)
       : `Choisissez un nouveau mot de passe pour ${esc(info.email)}. Vos autres sessions ouvertes seront fermées.`,
     `<form id="f" novalidate>
       ${champsMotDePasse(info.longueur_min)}
-      ${invitation ? `
+      ${invitation && !info.portail ? `
       <div class="section">Bloc de signature, repris à la déclaration du rapport. Vous pourrez le compléter plus tard.</div>
       <label for="titre">Titre</label>
       <input id="titre" type="text" placeholder="ex. ing., M.Sc.A." value="${esc(sig.title || '')}">
@@ -94,7 +97,7 @@ async function viaJeton(jeton) {
     bouton.disabled = true;
     try {
       const corps = { password: document.getElementById('mdp').value };
-      if (invitation) {
+      if (invitation && !info.portail) {
         corps.title = document.getElementById('titre').value;
         corps.ordre_professionnel = document.getElementById('ordre').value;
         corps.no_membre = document.getElementById('membre').value;
@@ -102,9 +105,15 @@ async function viaJeton(jeton) {
       const data = await api(`/api/auth/jeton/${encodeURIComponent(jeton)}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(corps),
       });
-      // Connecté d'emblée dans la console bureau et l'application terrain.
-      ecrire('cs_bureau_token', data.token);
-      ecrire('cs_terrain_token', data.token);
+      // Connecté d'emblée : au portail pour un membre d'un syndicat, sinon
+      // dans la console bureau et l'application terrain.
+      if (info.portail) {
+        ecrire('cs_portail_token', data.token);
+        retour = '/portail/';
+      } else {
+        ecrire('cs_bureau_token', data.token);
+        ecrire('cs_terrain_token', data.token);
+      }
       history.replaceState(null, '', location.pathname);
       termine(invitation ? 'Compte activé' : 'Mot de passe changé', invitation ? 'Votre compte est prêt. Vous êtes connecté.' : 'Votre nouveau mot de passe est enregistré. Vous êtes connecté.');
     } catch (err) {

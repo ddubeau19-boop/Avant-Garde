@@ -26,7 +26,7 @@ CREATE TABLE users (
   password_salt TEXT NOT NULL,
   created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   company_id    TEXT REFERENCES companies(id),
-  role          TEXT NOT NULL DEFAULT 'engineer',  -- 'engineer' | 'admin' (administrateur de la firme) | 'super_admin'
+  role          TEXT NOT NULL DEFAULT 'engineer',  -- 'engineer' | 'admin' (administrateur de la firme) | 'super_admin' | 'portail' (membre d'un syndicat)
   -- Bloc de signature, repris tel quel à la section 8.0 Déclaration du rapport.
   title               TEXT,  -- ex. « ing., M.Sc.A. », « T.P. »
   ordre_professionnel TEXT,  -- ex. « OIQ », « OTPQ », « OAQ »
@@ -51,6 +51,36 @@ CREATE TABLE jetons_compte (
 CREATE TABLE tentatives_connexion (cle TEXT NOT NULL, moment INTEGER NOT NULL);
 CREATE INDEX idx_tentatives_cle ON tentatives_connexion(cle, moment);
 
+-- Portail du syndicat (gratuit) : les membres d'un immeuble (comptes users de
+-- rôle « portail », sans firme), la répartition des tâches du carnet et
+-- l'historique de ce qui a été fait.
+CREATE TABLE portail_acces (
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+  fonction   TEXT,              -- ex. « Gestionnaire », « Président du CA »
+  cree_le    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (user_id, dossier_id)
+);
+-- cle « q:<responsable> » : défaut pour un type de responsable ;
+-- cle « t:<élément>::<tâche> » : exception pour une tâche (user_id NULL = personne).
+CREATE TABLE carnet_regles (
+  dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+  cle        TEXT NOT NULL,
+  user_id    TEXT,
+  PRIMARY KEY (dossier_id, cle)
+);
+CREATE TABLE carnet_suivi (
+  id         TEXT PRIMARY KEY,
+  dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+  cle_tache  TEXT NOT NULL,
+  annee      INTEGER NOT NULL,
+  mois       INTEGER NOT NULL,
+  fait_le    TEXT NOT NULL,
+  fait_par   TEXT,
+  note       TEXT,
+  UNIQUE (dossier_id, cle_tache, annee, mois)
+);
+
 CREATE TABLE dossiers (
   id                   TEXT PRIMARY KEY,
   dossier_no           TEXT NOT NULL UNIQUE,
@@ -68,7 +98,8 @@ CREATE TABLE dossiers (
   cotisation_annuelle  REAL,
   published_at         TEXT,
   company_id           TEXT REFERENCES companies(id),
-  batiment_info        TEXT   -- JSON : fiche d'immeuble saisie en terrain
+  batiment_info        TEXT,  -- JSON : fiche d'immeuble saisie en terrain
+  revision_de          TEXT   -- étude précédente du même immeuble (révision aux cinq ans)
 );
 
 CREATE TABLE components (
@@ -112,7 +143,11 @@ CREATE TABLE components (
   nature_risque      TEXT,   -- securite | infiltration | degradation | conformite | esthetique
   source_annee       TEXT,   -- plaque | carnet | administration | estimee
   projet_ca          TEXT,   -- travaux planifiés par le conseil d'administration
-  taches_entretien   TEXT    -- JSON : tâches du carnet retirées ou ajoutées par l'ingénieur
+  taches_entretien   TEXT,   -- JSON : tâches du carnet retirées ou ajoutées par l'ingénieur
+  -- Révision aux cinq ans
+  origine_id         TEXT,    -- composante de l'étude précédente
+  travaux_periode    TEXT,    -- fait | reporte | abandonne : travaux prévus à l'étude précédente
+  travaux_annee      INTEGER  -- année des travaux réalisés
 );
 
 CREATE TABLE photos (

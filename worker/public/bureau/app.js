@@ -1206,7 +1206,7 @@ function railHtml() {
     { key: 'bibliotheque', label: 'Bibliothèque', icon: 'library', action: 'go-bibliotheque', active: state.screen === 'bibliotheque' },
     ...(estAdminFirme() ? [{ key: 'equipe', label: 'Équipe', icon: 'users-round', action: 'go-equipe', active: state.screen === 'equipe' }] : []),
     { key: 'clients', label: 'Clients', icon: 'users', disabled: true },
-    { key: 'carnet', label: "Carnet d'entretien", icon: 'calendar-clock', disabled: true },
+    { key: 'carnet', label: "Carnet d'entretien", icon: 'calendar-clock', action: 'go-carnet', active: state.screen === 'carnet' },
     { key: 'modeles', label: 'Modèles', icon: 'file-stack', disabled: true },
   ];
   const initials = initialsOf(state.user && state.user.name);
@@ -1239,6 +1239,7 @@ function renderShell() {
   else if (state.screen === 'publier') main = renderPublier();
   else if (state.screen === 'reviewIA') main = renderReviewIA();
   else if (state.screen === 'equipe') main = renderEquipe();
+  else if (state.screen === 'carnet') main = renderCarnet();
   else if (state.screen === 'bibliotheque') main = `<div class="page-pad cscr" style="padding:0">${bib.html({ eyebrow: (state.user && state.user.company && state.user.company.name) || '' })}</div>`;
   return `<div class="shell">${railHtml()}<div class="main">${main}</div></div>`;
 }
@@ -1383,6 +1384,174 @@ function renderEquipe() {
   </div>`;
 }
 
+// Révision aux cinq ans : un nouveau dossier qui part de cette étude
+// (composantes, années, coûts indexés, fiche d'immeuble, carnet).
+async function nouvelleRevision(id) {
+  const d = state.dossiers.find(x => x.id === id);
+  if (!d) return;
+  const suggestion = `${String(new Date().getFullYear()).slice(2)}-`;
+  const no = prompt(`Révision de l'étude ${d.dossier_no} — ${d.name}\n\nLe nouveau dossier reprend les composantes, les années, les durées de vie, les coûts (indexés à ${new Date().getFullYear()}), la fiche d'immeuble et le carnet d'entretien. L'inspecteur verra sur le terrain ce qui avait été observé.\n\nNuméro du nouveau dossier :`, suggestion);
+  if (!no || !no.trim() || no.trim() === suggestion) return;
+  try {
+    const r = await apiJson(`/api/dossiers/${id}/revision`, { method: 'POST', body: JSON.stringify({ dossier_no: no.trim() }) });
+    await loadDossiers();
+    alert(`Dossier ${r.dossier_no} créé : ${r.revision.composantes} composantes reprises, coûts indexés de ${(r.revision.indexation * 100).toFixed(1).replace('.', ',')} %. La visite peut commencer dans l'application terrain.`);
+  } catch (e) {
+    alert(e.message || 'La création de la révision a échoué.');
+  }
+}
+
+// ---------------------------------------------------------------
+// Carnet d'entretien : portail du syndicat (gratuit). La firme choisit
+// qui y a accès pour chaque immeuble et qui fait quelle tâche.
+// ---------------------------------------------------------------
+const carnet = { dossierId: null, data: null, error: null, note: null, lien: null, form: { name: '', email: '', fonction: '' }, edits: null, dirty: false, saving: false, busy: null };
+const FONCTIONS_SUGGEREES = ['Gestionnaire', 'Président du CA', 'Administrateur', 'Trésorier', 'Secrétaire', 'Concierge'];
+
+async function ouvrirCarnet(id) {
+  if (!state.dossiers.length) await loadDossiers();
+  carnet.dossierId = id || carnet.dossierId || (state.dossiers[0] && state.dossiers[0].id) || null;
+  carnet.data = null; carnet.error = null; carnet.note = null; carnet.lien = null; carnet.dirty = false;
+  render();
+  if (!carnet.dossierId) return;
+  try {
+    carnet.data = await apiJson(`/api/dossiers/${carnet.dossierId}/portail`);
+    carnet.edits = { defauts: Object.assign({}, carnet.data.regles.defauts), taches: Object.assign({}, carnet.data.regles.taches) };
+  } catch (e) {
+    carnet.error = e.message || 'Impossible de charger le carnet.';
+  }
+  render();
+}
+
+function resultatInvitationCarnet(r, nom) {
+  if (r.envoye) { carnet.note = `Invitation envoyée à ${nom}.`; carnet.lien = null; }
+  else { carnet.note = `Le courriel n'a pas pu partir (${r.erreur}). Transmettez ce lien à ${nom} :`; carnet.lien = r.lien; }
+}
+
+async function inviterAuPortail() {
+  const f = carnet.form;
+  if (!f.name.trim() || !f.email.trim()) { carnet.error = 'Le nom et le courriel sont requis.'; render(); return; }
+  carnet.busy = 'inviter'; carnet.error = null; carnet.note = null; carnet.lien = null; render();
+  try {
+    const r = await apiJson(`/api/dossiers/${carnet.dossierId}/portail/membres`, { method: 'POST', body: JSON.stringify({ name: f.name.trim(), email: f.email.trim(), fonction: f.fonction.trim() }) });
+    resultatInvitationCarnet(r, f.name.trim());
+    carnet.data.membres = r.membres;
+    carnet.form = { name: '', email: '', fonction: '' };
+  } catch (e) { carnet.error = e.message; }
+  carnet.busy = null; render();
+}
+
+async function actionMembrePortail(uid, action) {
+  const m = carnet.data.membres.find(x => x.id === uid);
+  if (!m) return;
+  const base = `/api/dossiers/${carnet.dossierId}/portail/membres/${uid}`;
+  carnet.error = null; carnet.note = null; carnet.lien = null;
+  try {
+    if (action === 'retirer') {
+      if (!confirm(`Retirer l'accès de ${m.name} au carnet de cet immeuble ? Ses tâches deviendront sans responsable.`)) return;
+      carnet.data.membres = (await apiJson(base, { method: 'DELETE' })).membres;
+      await ouvrirCarnet(carnet.dossierId);
+      return;
+    }
+    if (action === 'renvoyer') resultatInvitationCarnet(await apiJson(`${base}/invitation`, { method: 'POST' }), m.name);
+  } catch (e) { carnet.error = e.message; }
+  render();
+}
+
+async function enregistrerRepartition() {
+  carnet.saving = true; carnet.error = null; render();
+  try {
+    await apiJson(`/api/dossiers/${carnet.dossierId}/portail/regles`, { method: 'PUT', body: JSON.stringify(carnet.edits) });
+    carnet.saving = false;
+    await ouvrirCarnet(carnet.dossierId);
+    carnet.note = 'Répartition enregistrée.';
+  } catch (e) { carnet.error = e.message; carnet.saving = false; }
+  render();
+}
+
+async function envoyerRappels() {
+  if (!confirm("Envoyer maintenant à chaque membre ses tâches de ce mois ? Les rappels partent aussi automatiquement le 1er de chaque mois.")) return;
+  carnet.busy = 'rappels'; carnet.error = null; carnet.note = null; render();
+  try {
+    const r = await apiJson(`/api/dossiers/${carnet.dossierId}/portail/rappels`, { method: 'POST' });
+    carnet.note = `${r.envoyes} rappel${r.envoyes > 1 ? 's' : ''} envoyé${r.envoyes > 1 ? 's' : ''}.${r.sans_responsable ? ` ${r.sans_responsable} tâche${r.sans_responsable > 1 ? 's' : ''} de ce mois n'${r.sans_responsable > 1 ? 'ont' : 'a'} pas de responsable.` : ''}`;
+  } catch (e) { carnet.error = e.message; }
+  carnet.busy = null; render();
+}
+
+// Aperçu : le portail s'ouvre avec la session du bureau (même origine).
+function apercuPortail() {
+  try { localStorage.setItem('cs_portail_token', state.token); } catch (e) {}
+  window.open(`/portail/?immeuble=${carnet.dossierId}`, '_blank');
+}
+
+function renderCarnet() {
+  const d = carnet.data;
+  const opts = state.dossiers.map(x => `<option value="${x.id}" ${x.id === carnet.dossierId ? 'selected' : ''}>${escapeHtml(x.dossier_no || '')} — ${escapeHtml(x.name || '')}</option>`).join('');
+  const modif = !!(d && d.peutModifier);
+  const nomMembre = (id) => { const m = d && d.membres.find(x => x.id === id); return m ? m.name : null; };
+  const selectMembre = (attrs, valeur, premiere) => `<select ${attrs} ${modif ? '' : 'disabled'}>${premiere}${(d ? d.membres : []).map(m => `<option value="${m.id}" ${valeur === m.id ? 'selected' : ''}>${escapeHtml(m.name)}${m.fonction ? ` (${escapeHtml(m.fonction)})` : ''}</option>`).join('')}</select>`;
+  let repartition = '';
+  if (d && carnet.edits) {
+    const groupes = new Map();
+    d.taches.filter(t => !t.consigne).forEach(t => { if (!groupes.has(t.element)) groupes.set(t.element, []); groupes.get(t.element).push(t); });
+    repartition = `
+      <div class="ca-bloc">
+        <div class="ca-titre">Par défaut, selon le responsable prévu au carnet</div>
+        ${d.types.map(ty => `<div class="ca-ligne"><div>${escapeHtml(ty.libelle)}<div class="dt-sub">${ty.n} tâche${ty.n > 1 ? 's' : ''}</div></div>
+          ${selectMembre(`data-role="carnet-defaut" data-q="${escapeHtml(ty.q)}"`, carnet.edits.defauts[ty.q] || '', '<option value="">Personne</option>')}</div>`).join('')}
+      </div>
+      <details class="ca-bloc" ${carnet.dirty ? 'open' : ''}>
+        <summary class="ca-titre">Tâche par tâche (${d.taches.filter(t => !t.consigne).length})</summary>
+        ${[...groupes.entries()].map(([el, ts]) => `<div class="ca-groupe">${escapeHtml(el)}</div>${ts.map(t => {
+          const propre = Object.prototype.hasOwnProperty.call(carnet.edits.taches, t.cle);
+          const val = propre ? (carnet.edits.taches[t.cle] || '__personne') : '';
+          const defaut = nomMembre(carnet.edits.defauts[t.q]);
+          return `<div class="ca-ligne"><div>${escapeHtml(t.texte)}<div class="dt-sub">${escapeHtml(t.quand)} · ${escapeHtml(t.responsable)}</div></div>
+            <select data-role="carnet-tache" data-cle="${escapeHtml(t.cle)}" ${modif ? '' : 'disabled'}>
+              <option value="" ${val === '' ? 'selected' : ''}>Par défaut${defaut ? ` (${escapeHtml(defaut)})` : ' (personne)'}</option>
+              ${d.membres.map(m => `<option value="${m.id}" ${val === m.id ? 'selected' : ''}>${escapeHtml(m.name)}</option>`).join('')}
+              <option value="__personne" ${val === '__personne' ? 'selected' : ''}>Personne</option>
+            </select></div>`;
+        }).join('')}`).join('')}
+      </details>
+      ${modif ? `<div class="ca-actions"><button class="btn-primary" data-action="carnet-enregistrer" ${carnet.saving || !carnet.dirty ? 'disabled' : ''}>${carnet.saving ? 'Enregistrement…' : carnet.dirty ? 'Enregistrer la répartition' : 'Répartition enregistrée'}</button></div>` : ''}`;
+  }
+  return `
+  <div class="page-pad cscr">
+    <div class="eyebrow-orange">Portail du syndicat · gratuit</div>
+    <h1 class="page-title">Carnet d'entretien</h1>
+    <p class="eq-lead">Donnez au syndicat un accès en ligne à son carnet : les tâches de chaque mois, qui s'en occupe, ce qui a été fait. Chaque membre reçoit ses tâches par courriel le 1er du mois.</p>
+    <div class="ca-choix"><select data-role="carnet-dossier">${opts || '<option>Aucun dossier</option>'}</select>
+      ${d ? `<button class="btn-secondary" data-action="carnet-apercu"><i data-lucide="eye"></i>Voir le portail</button>` : ''}
+      ${d && modif ? `<button class="btn-secondary" data-action="carnet-rappels" ${carnet.busy === 'rappels' || !d.membres.length ? 'disabled' : ''}><i data-lucide="send"></i>${carnet.busy === 'rappels' ? 'Envoi…' : 'Envoyer les rappels du mois'}</button>` : ''}
+    </div>
+    ${carnet.error ? errorBanner(carnet.error) : ''}
+    ${carnet.note ? `<div class="temp-pass-warn" style="margin:12px 0"><i data-lucide="${carnet.lien ? 'alert-triangle' : 'check'}"></i><span>${escapeHtml(carnet.note)}${carnet.lien ? `<br><input class="eq-lien" readonly value="${escapeHtml(carnet.lien)}" onclick="this.select()">` : ''}</span></div>` : ''}
+    ${!carnet.dossierId ? '' : !d ? (carnet.error ? '' : spinnerBlock('Chargement du carnet…')) : `
+    <div class="ca-section">Membres du syndicat</div>
+    ${modif ? `<form class="eq-form" id="carnet-form">
+      <input type="text" data-role="carnet-name" placeholder="Nom complet" value="${escapeHtml(carnet.form.name)}">
+      <input type="email" data-role="carnet-email" placeholder="Courriel" value="${escapeHtml(carnet.form.email)}">
+      <input type="text" data-role="carnet-fonction" list="fonctions-portail" placeholder="Fonction (gestionnaire, président du CA…)" value="${escapeHtml(carnet.form.fonction)}">
+      <datalist id="fonctions-portail">${FONCTIONS_SUGGEREES.map(f => `<option value="${f}">`).join('')}</datalist>
+      <button type="submit" class="btn-primary" ${carnet.busy === 'inviter' ? 'disabled' : ''}>${carnet.busy === 'inviter' ? 'Envoi…' : 'Inviter'}</button>
+    </form>` : `<div class="temp-pass-warn"><i data-lucide="info"></i><span>Seul un administrateur de la firme invite les membres et répartit les tâches.</span></div>`}
+    <div class="dossiers-table" style="margin-top:14px">
+      ${d.membres.length ? d.membres.map(m => `<div class="dt-row eq-row">
+        <div><div class="dt-name">${escapeHtml(m.name)}</div><div class="dt-sub">${escapeHtml(m.email)}</div></div>
+        <div>${escapeHtml(m.fonction || '—')}</div>
+        <div>${m.invitation_en_attente ? `<span class="status-badge" style="background:var(--orange-wash);color:var(--ink-800)">Invitation envoyée</span>` : `<span class="status-badge" style="background:var(--green-wash);color:var(--green)">Actif</span>`}</div>
+        <div class="eq-actions">${modif ? `${m.invitation_en_attente ? `<button class="btn-row-action" data-action="carnet-membre" data-op="renvoyer" data-id="${m.id}">Renvoyer</button>` : ''}<button class="btn-row-action" data-action="carnet-membre" data-op="retirer" data-id="${m.id}">Retirer</button>` : ''}</div>
+      </div>`).join('') : `<div class="empty-state">Aucun membre : invitez le gestionnaire ou un administrateur du syndicat.</div>`}
+    </div>
+    <div class="ca-section">Qui fait quoi</div>
+    ${d.membres.length ? repartition : `<div class="temp-pass-warn"><i data-lucide="info"></i><span>Invitez d'abord des membres pour leur confier des tâches.</span></div>`}
+    ${d.historique.length ? `<div class="ca-section">Derniers entretiens cochés</div>
+    <div class="dossiers-table">${d.historique.map(h => { const t = d.taches.find(x => x.cle === h.cle_tache); return `<div class="dt-row ca-hist"><div>${escapeHtml(t ? t.texte : 'Tâche')}<div class="dt-sub">${escapeHtml(t ? t.element : '')}</div></div><div class="dt-sub">${escapeHtml(h.par || '')} · ${new Date(h.fait_le).toLocaleDateString('fr-CA')}${h.note ? ` · ${escapeHtml(h.note)}` : ''}</div></div>`; }).join('')}</div>` : ''}`}
+  </div>`;
+}
+
 function renderDossiers() {
   if (state.dossiersLoading && state.dossiers.length === 0) {
     return `<div class="page-pad">${spinnerBlock('Chargement des dossiers…')}</div>`;
@@ -1411,13 +1580,17 @@ function renderDossiers() {
       <div class="dt-row dt-head"><div>Syndicat</div><div>Dossier</div><div>Documentées</div><div>Statut</div><div></div></div>
       ${filtered.length === 0 ? `<div class="empty-state">Aucun dossier dans cette catégorie.</div>` : filtered.map(d => `
       <div class="dt-row">
-        <div><div class="dt-name">${escapeHtml(d.name || '—')}</div><div class="dt-sub">${escapeHtml(d.address || '')}${d.address && d.units ? ' · ' : ''}${d.units ? d.units + ' unités' : ''}</div></div>
+        <div><div class="dt-name">${escapeHtml(d.name || '—')}</div><div class="dt-sub">${escapeHtml(d.address || '')}${d.address && d.units ? ' · ' : ''}${d.units ? d.units + ' unités' : ''}</div>${d.revision_source ? `<div class="dt-sub" style="color:var(--accent-press)">Révision de l'étude ${escapeHtml(d.revision_source.dossier_no)} (${d.revision_source.annee})</div>` : ''}</div>
         <div class="dt-no">${escapeHtml(d.dossier_no || '—')}</div>
         <div class="dt-doc">
           <div class="prog-track"><div class="prog-fill" style="background:${d._barColor};width:${d._pct}%"></div></div>
           <span class="dt-doc-label">${d.stats ? d.stats.done + '/' + d.stats.total : '—'}</span>
         </div>
-        <div><span class="status-badge" style="background:${d._statusBg};color:${d._statusColor}">${d._statusLabel}</span></div>
+        <div>
+          <span class="status-badge" style="background:${d._statusBg};color:${d._statusColor}">${d._statusLabel}</span>
+          ${d.revision_due ? `<span class="status-badge" style="background:var(--orange-wash);color:var(--accent-press);margin-top:4px" title="Loi 16 : mise à jour au moins tous les cinq ans">Révision due · ${d.revision_echeance}</span>` : ''}
+          ${d.revise_par ? `<div class="dt-sub">Révisée : ${escapeHtml(d.revise_par.dossier_no)}</div>` : (d.published_at || d._pct === 100) ? `<button class="lien-revision" data-action="nouvelle-revision" data-id="${d.id}">Nouvelle révision →</button>` : ''}
+        </div>
         <div><button class="btn-row-action ${d._reviewReady ? 'primary' : ''}" data-action="open-dossier" data-id="${d.id}">${d._reviewReady ? 'Réviser' : 'Ouvrir'}</button></div>
       </div>`).join('')}
     </div>
@@ -2397,6 +2570,9 @@ function initEvents() {
     } else if (e.target && e.target.id === 'prix-form') {
       e.preventDefault();
       submitPrix();
+    } else if (e.target && e.target.id === 'carnet-form') {
+      e.preventDefault();
+      inviterAuPortail();
     } else if (e.target && e.target.id === 'equipe-form') {
       e.preventDefault();
       inviterMembre();
@@ -2413,6 +2589,9 @@ function initEvents() {
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
     else if (bib.input(t)) return;
     else if (t.matches('[data-role="equipe-name"]')) equipe.form.name = t.value;
+    else if (t.matches('[data-role="carnet-name"]')) carnet.form.name = t.value;
+    else if (t.matches('[data-role="carnet-email"]')) carnet.form.email = t.value;
+    else if (t.matches('[data-role="carnet-fonction"]')) carnet.form.fonction = t.value;
     else if (t.matches('[data-role="equipe-email"]')) equipe.form.email = t.value;
     else if (t.matches('[data-role="prix-field"]')) {
       const champ = t.getAttribute('data-field');
@@ -2426,6 +2605,17 @@ function initEvents() {
     const t = e.target;
     if (t && t.matches && bib.change(t)) return;
     if (t && t.matches && t.matches('[data-role="equipe-role"]')) { equipe.form.role = t.value; return; }
+    if (t && t.matches && t.matches('[data-role="carnet-dossier"]')) { ouvrirCarnet(t.value); return; }
+    if (t && t.matches && t.matches('[data-role="carnet-defaut"]')) {
+      if (t.value) carnet.edits.defauts[t.getAttribute('data-q')] = t.value; else delete carnet.edits.defauts[t.getAttribute('data-q')];
+      carnet.dirty = true; render(); return;
+    }
+    if (t && t.matches && t.matches('[data-role="carnet-tache"]')) {
+      const cle = t.getAttribute('data-cle');
+      if (t.value === '') delete carnet.edits.taches[cle];
+      else carnet.edits.taches[cle] = t.value === '__personne' ? '' : t.value;
+      carnet.dirty = true; render(); return;
+    }
     if (t && t.matches && t.matches('[data-role="composantes-import-file"]')) {
       const f = t.files && t.files[0];
       t.value = '';
@@ -2439,6 +2629,18 @@ function initEvents() {
     const action = btn.getAttribute('data-action');
     if (bib.click(action, btn)) return;
     switch (action) {
+      case 'go-carnet':
+        leaveReviewIA();
+        state.screen = 'carnet';
+        ouvrirCarnet(state.dossierId);
+        break;
+      case 'carnet-apercu': apercuPortail(); break;
+      case 'carnet-rappels': envoyerRappels(); break;
+      case 'carnet-enregistrer': enregistrerRepartition(); break;
+      case 'carnet-membre': actionMembrePortail(btn.getAttribute('data-id'), btn.getAttribute('data-op')); break;
+      case 'nouvelle-revision':
+        nouvelleRevision(btn.getAttribute('data-id'));
+        break;
       case 'go-equipe':
         leaveReviewIA();
         state.screen = 'equipe';
