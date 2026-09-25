@@ -1091,10 +1091,10 @@ function accueilHtml() {
       <i data-lucide="chevron-right" class="go"></i>
     </button>
     <div class="ai-banner">
-      <div class="icon"><i data-lucide="sparkles"></i></div>
+      <div class="icon"><i data-lucide="clipboard-list"></i></div>
       <div>
-        <div class="title">Checklist générée par l'IA</div>
-        <div class="body">${st.total} composante${st.total > 1 ? 's' : ''} identifiée${st.total > 1 ? 's' : ''} pour ce dossier. Ajustez sur le terrain au fil de la visite.</div>
+        <div class="title">Liste du gabarit Condo Stratégis</div>
+        <div class="body">${st.total} composante${st.total > 1 ? 's' : ''} pour ce dossier. Retirez sur le terrain celles qui ne s'appliquent pas à l'immeuble.</div>
       </div>
     </div>
     <button class="btn-cta" data-action="go-liste"><i data-lucide="play"></i>Reprendre la visite</button>
