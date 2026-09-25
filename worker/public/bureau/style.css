@@ -661,3 +661,17 @@ a.btn-logout { display: inline-flex; }
 @media (max-width: 760px) { .eq-row { grid-template-columns: 1fr; gap: 6px; } .eq-actions { justify-content: flex-start; } }
 
 .lien-revision { display: block; border: none; background: none; padding: 4px 0 0; font: inherit; font-size: 12px; font-weight: 600; color: var(--accent-press); cursor: pointer; }
+
+/* ---------- carnet d'entretien : portail du syndicat ---------- */
+.ca-choix { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+.ca-choix select { border: 1.5px solid var(--ink-200); border-radius: 999px; padding: 10px 14px; font: inherit; font-size: 13.5px; background: #fff; min-width: 260px; max-width: 100%; }
+.ca-section { font-family: var(--font-mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-600); margin: 30px 0 12px; }
+.ca-bloc { border: 1px solid var(--ink-200); border-radius: 14px; background: #fff; padding: 6px 18px 10px; margin-bottom: 12px; }
+.ca-titre { font-weight: 700; font-size: 13.5px; padding: 10px 0; cursor: default; }
+details.ca-bloc summary { cursor: pointer; }
+.ca-ligne { display: grid; grid-template-columns: 1fr 260px; gap: 14px; align-items: center; padding: 9px 0; border-top: 1px solid var(--ink-100); font-size: 13.5px; }
+.ca-ligne select { border: 1.5px solid var(--ink-200); border-radius: 10px; padding: 8px 10px; font: inherit; font-size: 13px; background: #fff; width: 100%; }
+.ca-groupe { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-500); margin: 14px 0 2px; }
+.ca-actions { margin: 6px 0 10px; }
+.ca-hist { grid-template-columns: 1.4fr 1fr; }
+@media (max-width: 760px) { .ca-ligne { grid-template-columns: 1fr; } }

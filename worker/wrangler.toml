@@ -30,6 +30,9 @@ CRM_COMPANY_ID = "com_980c47a26e91493593a8"
 # Adresse d'expédition des courriels (invitations, mots de passe). Tout
 # alias du domaine intégré à Email Service convient, sans boîte à créer.
 COURRIEL_EXPEDITEUR = "no-reply@stratege.io"
+# Adresse publique de la plateforme, pour les liens des rappels mensuels
+# (envoyés sans requête entrante, donc sans adresse à reprendre).
+URL_PLATEFORME = "https://pga.stratege.io"
 
 # Cloudflare Email Service : envoi des invitations et des liens de
 # réinitialisation. Le domaine stratege.io y est intégré (Email Sending).
@@ -43,6 +46,11 @@ bucket_name = "stratege-fp-photos"
 [[routes]]
 pattern = "pga.stratege.io"
 custom_domain = true
+
+# Rappels du carnet d'entretien aux membres des portails : le 1er de chaque
+# mois, 11 h UTC (7 h à Montréal l'été, 6 h l'hiver).
+[triggers]
+crons = ["0 11 1 * *"]
 
 [observability]
 enabled = true

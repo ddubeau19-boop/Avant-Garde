@@ -26,7 +26,7 @@ CREATE TABLE users (
   password_salt TEXT NOT NULL,
   created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   company_id    TEXT REFERENCES companies(id),
-  role          TEXT NOT NULL DEFAULT 'engineer',  -- 'engineer' | 'admin' (administrateur de la firme) | 'super_admin'
+  role          TEXT NOT NULL DEFAULT 'engineer',  -- 'engineer' | 'admin' (administrateur de la firme) | 'super_admin' | 'portail' (membre d'un syndicat)
   -- Bloc de signature, repris tel quel à la section 8.0 Déclaration du rapport.
   title               TEXT,  -- ex. « ing., M.Sc.A. », « T.P. »
   ordre_professionnel TEXT,  -- ex. « OIQ », « OTPQ », « OAQ »
@@ -50,6 +50,36 @@ CREATE TABLE jetons_compte (
 -- Tentatives de connexion et demandes de réinitialisation, pour les limiter.
 CREATE TABLE tentatives_connexion (cle TEXT NOT NULL, moment INTEGER NOT NULL);
 CREATE INDEX idx_tentatives_cle ON tentatives_connexion(cle, moment);
+
+-- Portail du syndicat (gratuit) : les membres d'un immeuble (comptes users de
+-- rôle « portail », sans firme), la répartition des tâches du carnet et
+-- l'historique de ce qui a été fait.
+CREATE TABLE portail_acces (
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+  fonction   TEXT,              -- ex. « Gestionnaire », « Président du CA »
+  cree_le    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (user_id, dossier_id)
+);
+-- cle « q:<responsable> » : défaut pour un type de responsable ;
+-- cle « t:<élément>::<tâche> » : exception pour une tâche (user_id NULL = personne).
+CREATE TABLE carnet_regles (
+  dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+  cle        TEXT NOT NULL,
+  user_id    TEXT,
+  PRIMARY KEY (dossier_id, cle)
+);
+CREATE TABLE carnet_suivi (
+  id         TEXT PRIMARY KEY,
+  dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+  cle_tache  TEXT NOT NULL,
+  annee      INTEGER NOT NULL,
+  mois       INTEGER NOT NULL,
+  fait_le    TEXT NOT NULL,
+  fait_par   TEXT,
+  note       TEXT,
+  UNIQUE (dossier_id, cle_tache, annee, mois)
+);
 
 CREATE TABLE dossiers (
   id                   TEXT PRIMARY KEY,
