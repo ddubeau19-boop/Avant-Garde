@@ -65,6 +65,13 @@ jobs:
           echo "$tables tables créées."
           [ "$tables" -ge 5 ]
 
+      # Le worker tourne en local sur une base créée à partir de schema.sql :
+      # moteur financier calculé à la main, étanchéité des firmes et des
+      # rôles, comptes, rapport, révision, portail. Aucun accès à la
+      # production. Un test qui échoue bloque le déploiement (needs).
+      - name: Tests automatisés
+        run: node worker/tests/run.mjs
+
   # Filet visible tant que la protection de branche n'est pas activée côté GitHub :
   # une poussée directe sur le tronc laisse une trace rouge au lieu de passer
   # inaperçue. Ne bloque rien par lui-même — seules les règles de branche le font.
