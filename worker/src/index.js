@@ -3073,145 +3073,219 @@ function extractJson(text) {
 }
 // Liste de départ de toute nouvelle visite : l'onglet SOMM30 du gabarit de
 // calculs Condo Stratégis (« 4.11 CALCULS - 26-001 PGA (2026) », avril 2026),
-// dans son ordre et avec ses durées de vie, noms corrigés. Les éléments de
-// piscine et de sauna, rangés en plomberie dans le gabarit, ont leur propre
-// catégorie, séparée entre piscine extérieure et intérieure.
-// Le gabarit ne porte pas de code Uniformat ; les lignes vides « nd » sont omises.
+// noms corrigés, complété des éléments que le gabarit de rapport (« 2.12.2
+// RAPPORT - 26-000 PGA ») traite sans que le gabarit de calculs les porte
+// (drain français, pierre, fibrociment, rangements grillagés…) et de ceux qui
+// manquaient aux deux (chaudière, bornes de recharge, inspections annuelles,
+// honoraires de révision de la Loi 16…).
+//   code   — code Uniformat II maison, repris du gabarit de rapport quand il y
+//            figure, sinon déduit de la même nomenclature.
+//   type   — remplacement ou allocation, explicite plutôt que deviné du nom.
+//   unite  — unité de quantité pour l'estimation des coûts.
+//   regle  — condition vérifiable qui active ou désactive la composante sans
+//            passer par l'IA (voir REGLES_GABARIT).
 const GABARIT_STRATEGIS = [
-  { cat: "terrain", name: "Stationnement et voies de circulation – Pavage", vu: 25 },
-  { cat: "terrain", name: "Bordures de béton", vu: 35 },
-  { cat: "terrain", name: "Voies de circulation", vu: 25 },
-  { cat: "terrain", name: "Allées piétonnières – Béton", vu: 35 },
-  { cat: "terrain", name: "Murets de soutènement – Modules de béton", vu: 40 },
-  { cat: "terrain", name: "Murets de soutènement – Bois traité", vu: 25 },
-  { cat: "terrain", name: "Garde-corps", vu: 40 },
-  { cat: "terrain", name: "Garde-corps – Peinture – Allocation", vu: 10 },
-  { cat: "terrain", name: "Terrasse sur sol – Pavé de béton", vu: 25 },
-  { cat: "terrain", name: "Clôture – Acier grillagé", vu: 30 },
-  { cat: "terrain", name: "Clôture – Bois", vu: 15 },
-  { cat: "terrain", name: "Structures de bois traité", vu: 25 },
-  { cat: "structure", name: "Murs de fondation – Allocation", vu: 10 },
-  { cat: "structure", name: "Structure – Allocation", vu: 10 },
-  { cat: "structure", name: "Stationnement intérieur – Dalle sur sol et dalle structurale – Allocation", vu: 20 },
-  { cat: "structure", name: "Stationnement intérieur – Membrane de surface", vu: 35 },
-  { cat: "structure", name: "Stationnement intérieur – Membrane de toit-terrasse", vu: 40 },
-  { cat: "structure", name: "Inspection des stationnements étagés – Loi 122", vu: 5 },
-  { cat: "enveloppe", name: "Surface de toit plat – Membrane", vu: 35 },
-  { cat: "enveloppe", name: "Surface de toit en pente – Bardeaux de gravier fin", vu: 25 },
-  { cat: "enveloppe", name: "Gouttières – Allocation", vu: 10 },
-  { cat: "enveloppe", name: "Puits de lumière", vu: 45 },
-  { cat: "enveloppe", name: "Toitures des saillies – Sous-terrasses", vu: 30 },
-  { cat: "enveloppe", name: "Marquise – Panneaux de verre trempé", vu: 35 },
-  { cat: "enveloppe", name: "Marquise – Structure d'acier", vu: 50 },
-  { cat: "enveloppe", name: "Structure de services – Bois traité", vu: 30 },
-  { cat: "enveloppe", name: "Parement – Panneaux de béton préfabriqués", vu: 75 },
-  { cat: "enveloppe", name: "Parement – Maçonnerie – Allocation", vu: 10 },
-  { cat: "enveloppe", name: "Parement – Linteaux – Allocation", vu: 10 },
-  { cat: "enveloppe", name: "Parement – Scellants de rencontre", vu: 10 },
-  { cat: "enveloppe", name: "Inspection des façades (5 étages et plus) – Loi 122", vu: 5 },
-  { cat: "enveloppe", name: "Parement – Métallique – Allocation", vu: 20 },
-  { cat: "enveloppe", name: "Parement – Vinyle", vu: 35 },
-  { cat: "enveloppe", name: "Parement – Fibre de bois dur", vu: 30 },
-  { cat: "enveloppe", name: "Parement – Enduit acrylique – Allocation", vu: 20 },
-  { cat: "enveloppe", name: "Parement – Agrégats – Allocation", vu: 20 },
-  { cat: "ouvertures", name: "Portes d'entrée", vu: 45 },
-  { cat: "ouvertures", name: "Portes d'entrée – Allocation", vu: 10 },
-  { cat: "ouvertures", name: "Porte et vitrage du vestibule intérieur", vu: 45 },
-  { cat: "ouvertures", name: "Porte et vitrage du vestibule intérieur – Allocation", vu: 10 },
-  { cat: "ouvertures", name: "Blocs de verre", vu: 40 },
-  { cat: "ouvertures", name: "Portes de service – Acier", vu: 35 },
-  { cat: "ouvertures", name: "Portes de service – Allocation", vu: 10 },
-  { cat: "ouvertures", name: "Portes-patio et portes de balcon", vu: 40 },
-  { cat: "ouvertures", name: "Porte simple – Balcon", vu: 40 },
-  { cat: "ouvertures", name: "Fenêtres – Vinyle", vu: 40 },
-  { cat: "ouvertures", name: "Fenêtres et portes-fenêtres – Aluminium", vu: 45 },
-  { cat: "ouvertures", name: "Fenêtres – Allocation", vu: 10 },
-  { cat: "ouvertures", name: "Scellants d'ouverture – Allocation", vu: 7 },
-  { cat: "ouvertures", name: "Porte de garage", vu: 30 },
-  { cat: "ouvertures", name: "Porte de garage – Moteur – Allocation", vu: 10 },
-  { cat: "ouvertures", name: "Mur-rideau", vu: 75 },
-  { cat: "ouvertures", name: "Mur-rideau – Allocation", vu: 20 },
-  { cat: "balcons", name: "Balcons – Acier – Membrures et escaliers", vu: 50 },
-  { cat: "balcons", name: "Balcons – Acier – Membrures et escaliers – Allocation", vu: 10 },
-  { cat: "balcons", name: "Balcons – Pontage en fibre de verre", vu: 25 },
-  { cat: "balcons", name: "Balcons – Structure de bois", vu: 25 },
-  { cat: "balcons", name: "Balcons – Garde-corps métalliques", vu: 40 },
-  { cat: "balcons", name: "Balcons – Structure d'acier – Allocation", vu: 15 },
-  { cat: "balcons", name: "Terrasses urbaines – Bois traité", vu: 25 },
-  { cat: "balcons", name: "Terrasses urbaines – Garde-corps métalliques", vu: 40 },
-  { cat: "interieur", name: "Revêtement de placoplâtre – Peinture – Allocation", vu: 15 },
-  { cat: "interieur", name: "Tuiles acoustiques suspendues – Allocation", vu: 20 },
-  { cat: "interieur", name: "Lambris de bois – Allocation", vu: 20 },
-  { cat: "interieur", name: "Revêtement de sol – Tapis", vu: 20 },
-  { cat: "interieur", name: "Revêtement de sol – Carreaux de céramique – Allocation", vu: 10 },
-  { cat: "interieur", name: "Revêtement de sol – Tuiles de vinyle", vu: 20 },
-  { cat: "interieur", name: "Revêtement de sol – Bois franc", vu: 40 },
-  { cat: "interieur", name: "Revêtement de sol – Bois franc – Allocation", vu: 10 },
-  { cat: "interieur", name: "Revêtement de sol – Béton – Allocation", vu: 5 },
-  { cat: "interieur", name: "Surfaces vitrées intérieures – Allocation", vu: 10 },
-  { cat: "interieur", name: "Escaliers intérieurs – Allocation", vu: 15 },
-  { cat: "interieur", name: "Portes des unités", vu: 50 },
-  { cat: "interieur", name: "Portes des unités – Allocation", vu: 10 },
-  { cat: "interieur", name: "Portes de service intérieures", vu: 50 },
-  { cat: "interieur", name: "Portes de service intérieures – Allocation", vu: 10 },
-  { cat: "interieur", name: "Portes de service – Bois", vu: 50 },
-  { cat: "interieur", name: "Portes de service – Bois – Allocation", vu: 10 },
-  { cat: "equipements", name: "Système d'incendie – Éclairage d'urgence et panneaux de sortie", vu: 10 },
-  { cat: "equipements", name: "Système d'incendie – Panneau central, stations manuelles et avertisseurs", vu: 10 },
-  { cat: "equipements", name: "Système d'incendie – Détecteurs d'incendie et extincteurs", vu: 10 },
-  { cat: "equipements", name: "Détecteurs d'incendie – Privatifs – Allocation", vu: 10 },
-  { cat: "equipements", name: "Interphones", vu: 20 },
-  { cat: "equipements", name: "Système de surveillance – Caméras en circuit fermé", vu: 20 },
-  { cat: "equipements", name: "Casiers postaux – Allocation", vu: 10 },
-  { cat: "equipements", name: "Mobilier – Espaces communs – Allocation", vu: 15 },
-  { cat: "equipements", name: "Mobilier fixe – Espaces communs – Allocation", vu: 20 },
-  { cat: "equipements", name: "Mobilier fixe – Portes-rideaux", vu: 20 },
-  { cat: "equipements", name: "Équipements de buanderie – Allocation", vu: 15 },
-  { cat: "equipements", name: "Équipements sportifs – Espaces communs – Allocation", vu: 10 },
-  { cat: "equipements", name: "Chute à déchets – Système de compacteur", vu: 25 },
-  { cat: "equipements", name: "Chute à déchets – Allocation", vu: 10 },
-  { cat: "equipements", name: "Système d'ascenseur – Modernisation", vu: 35 },
-  { cat: "equipements", name: "Foyers et cheminées préfabriqués", vu: 10 },
-  { cat: "cvac", name: "Plinthes électriques", vu: 25 },
-  { cat: "cvac", name: "Aérothermes muraux", vu: 25 },
-  { cat: "cvac", name: "Aérothermes suspendus – Stationnement intérieur", vu: 30 },
-  { cat: "cvac", name: "Système de ventilation – Privatif – Allocation", vu: 3 },
-  { cat: "cvac", name: "Chauffage CVAC – Communs – Toiture", vu: 35 },
-  { cat: "cvac", name: "Climatisation de zone – Salles de services", vu: 25 },
-  { cat: "cvac", name: "Ventilation des salles de services", vu: 20 },
-  { cat: "cvac", name: "Système de détection des gaz", vu: 25 },
-  { cat: "cvac", name: "Ventilation du stationnement intérieur et volets motorisés", vu: 25 },
-  { cat: "cvac", name: "Dispositifs d'obturation", vu: 50 },
-  { cat: "electrique", name: "Alimentation électrique principale – Allocation", vu: 10 },
-  { cat: "electrique", name: "Alimentation en gaz naturel – Allocation", vu: 10 },
-  { cat: "electrique", name: "Appareils d'éclairage intérieurs", vu: 35 },
-  { cat: "electrique", name: "Appareils d'éclairage extérieurs", vu: 25 },
-  { cat: "electrique", name: "Lampadaires", vu: 30 },
-  { cat: "electrique", name: "Alimentation d'urgence – Génératrice et moteurs", vu: 40 },
-  { cat: "electrique", name: "Alimentation d'urgence – Chargeur", vu: 35 },
-  { cat: "electrique", name: "Alimentation d'urgence – Interrupteur de transfert", vu: 40 },
-  { cat: "electrique", name: "Alimentation d'urgence – Conduit d'échappement", vu: 30 },
-  { cat: "electrique", name: "Alimentation d'urgence – Réservoir de mazout", vu: 25 },
-  { cat: "plomberie", name: "Système d'alimentation en eau potable – Allocation", vu: 10 },
-  { cat: "plomberie", name: "Inspection des dispositifs antirefoulement (DAR)", vu: 1 },
-  { cat: "plomberie", name: "Système d'évacuation pluviale et sanitaire – Allocation", vu: 10 },
-  { cat: "plomberie", name: "Système d'évacuation sanitaire – Nettoyage des colonnes – Allocation", vu: 5 },
-  { cat: "plomberie", name: "Équipements de plomberie – Espaces communs", vu: 25 },
-  { cat: "plomberie", name: "Réservoir d'eau chaude – Conciergerie", vu: 10 },
-  { cat: "plomberie", name: "Réservoirs d'eau chaude – Communs de l'immeuble", vu: 25 },
-  { cat: "plomberie", name: "Système d'incendie – Gicleurs et pompe – Allocation", vu: 10 },
-  { cat: "piscines", name: "Piscine extérieure – Enceinte en toile – Allocation", vu: 10 },
-  { cat: "piscines", name: "Piscine extérieure – Contour de terrasse en béton", vu: 50 },
-  { cat: "piscines", name: "Piscine extérieure – Contour de terrasse en pavé de béton", vu: 25 },
-  { cat: "piscines", name: "Piscine extérieure – Système de filtration", vu: 20 },
-  { cat: "piscines", name: "Piscine extérieure – Système de chauffage (thermopompe)", vu: 20 },
-  { cat: "piscines", name: "Piscine intérieure – Système de filtration", vu: 20 },
-  { cat: "piscines", name: "Piscine intérieure – Système de chauffage", vu: 20 },
-  { cat: "piscines", name: "Piscine intérieure – Système de contrôle de l'humidité", vu: 25 },
-  { cat: "piscines", name: "Centre aquatique – Mobilier – Allocation", vu: 10 },
-  { cat: "piscines", name: "Sauna – Structure de bois", vu: 25 },
-  { cat: "piscines", name: "Sauna – Système de chauffage", vu: 20 }
+  { cat: "terrain", name: "Aménagement paysager", vu: 25, code: "G40.10-50", type: "remplacement", unite: "global" },
+  { cat: "terrain", name: "Stationnement et voies de circulation – Pavage", vu: 25, code: "G10.10-30", type: "remplacement", unite: "m²" },
+  { cat: "terrain", name: "Voies de circulation – Débarcadère et accès", vu: 25, code: "G10.10-30", type: "remplacement", unite: "m²" },
+  { cat: "terrain", name: "Bordures de béton", vu: 35, code: "G10.10-30", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Lignage du stationnement extérieur – Allocation", vu: 5, code: "G10.10-30", type: "allocation", unite: "global" },
+  { cat: "terrain", name: "Allées piétonnières – Béton", vu: 35, code: "G20.10-30", type: "remplacement", unite: "m²" },
+  { cat: "terrain", name: "Escaliers et perrons extérieurs – Béton", vu: 35, code: "G20.10-30", type: "remplacement", unite: "u" },
+  { cat: "terrain", name: "Murets de soutènement – Modules de béton", vu: 40, code: "G30.20", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Murets de soutènement – Bois traité", vu: 25, code: "G30.20", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Garde-corps", vu: 40, code: "G20.30", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Garde-corps – Peinture – Allocation", vu: 10, code: "G20.30", type: "allocation", unite: "global" },
+  { cat: "terrain", name: "Terrasse sur sol – Pavé de béton", vu: 25, code: "B10.50", type: "remplacement", unite: "m²" },
+  { cat: "terrain", name: "Clôture – Acier grillagé", vu: 30, code: "G30.10", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Clôture – Bois", vu: 15, code: "G30.10", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Structures de bois traité", vu: 25, code: "G30.10", type: "remplacement", unite: "global" },
+  { cat: "terrain", name: "Structure en acier galvanisé – Accès et rampes", vu: 40, code: "G30.10", type: "remplacement", unite: "global" },
+  { cat: "terrain", name: "Puisards et regards pluviaux – Allocation", vu: 10, code: "G30.30", type: "allocation", unite: "u" },
+  { cat: "structure", name: "Murs de fondation – Allocation", vu: 10, code: "A10.10", type: "allocation", unite: "global" },
+  { cat: "structure", name: "Fondation – Drain français – Allocation", vu: 30, code: "A10.10", type: "allocation", unite: "ml" },
+  { cat: "structure", name: "Structure – Allocation", vu: 10, code: "B10.10", type: "allocation", unite: "global" },
+  { cat: "structure", name: "Stationnement intérieur – Dalle sur sol et dalle structurale – Allocation", vu: 20, code: "A40.10", type: "allocation", unite: "m²", regle: "stationnement_int" },
+  { cat: "structure", name: "Stationnement intérieur – Membrane de surface", vu: 35, code: "A40.10", type: "remplacement", unite: "m²", regle: "stationnement_int" },
+  { cat: "structure", name: "Stationnement intérieur – Membrane de toit-terrasse", vu: 40, code: "A30.10", type: "remplacement", unite: "m²", regle: "stationnement_int" },
+  { cat: "structure", name: "Inspection des stationnements étagés – Loi 122", vu: 5, code: "A30.10", type: "allocation", unite: "global", regle: "stationnement_int" },
+  { cat: "enveloppe", name: "Surface de toit plat – Membrane", vu: 35, code: "B30.10-40", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Surface de toit en pente – Bardeaux de gravier fin", vu: 25, code: "B30.10-40", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Solins, parapets et couronnements – Allocation", vu: 10, code: "B30.10-40", type: "allocation", unite: "ml" },
+  { cat: "enveloppe", name: "Gouttières – Allocation", vu: 10, code: "B30.10-40", type: "allocation", unite: "ml" },
+  { cat: "enveloppe", name: "Soffites et fascias – Aluminium", vu: 35, code: "B20.40", type: "remplacement", unite: "ml" },
+  { cat: "enveloppe", name: "Puits de lumière", vu: 45, code: "B40.80", type: "remplacement", unite: "u" },
+  { cat: "enveloppe", name: "Toitures des saillies – Sous-terrasses", vu: 30, code: "B30.10", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Marquise – Panneaux de verre trempé", vu: 35, code: "B30.20", type: "remplacement", unite: "u" },
+  { cat: "enveloppe", name: "Marquise – Structure d'acier", vu: 50, code: "B30.20", type: "remplacement", unite: "u" },
+  { cat: "enveloppe", name: "Structure de service en bois traité – Trottoirs et accès de toiture", vu: 30, code: "B10.70", type: "remplacement", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Panneaux de béton préfabriqués", vu: 75, code: "B20.50", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Parement – Maçonnerie – Allocation", vu: 10, code: "B20.10", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Pierre – Allocation", vu: 10, code: "B20.10", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Linteaux – Allocation", vu: 10, code: "B20.10", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Scellants de rencontre", vu: 10, code: "B20.10", type: "remplacement", unite: "ml" },
+  { cat: "enveloppe", name: "Inspection des façades (5 étages et plus) – Loi 122", vu: 5, code: "B20.10", type: "allocation", unite: "global", regle: "etages5" },
+  { cat: "enveloppe", name: "Parement – Métallique – Allocation", vu: 20, code: "B20.40", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Vinyle", vu: 35, code: "B20.40", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Parement – Fibre de bois dur", vu: 30, code: "B20.40", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Parement – Fibrociment", vu: 50, code: "B20.30", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Parement – Panneaux composites", vu: 30, code: "B20.30", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Parement – Enduit acrylique – Allocation", vu: 20, code: "B20.30", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Stuc – Allocation", vu: 20, code: "B20.30", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Agrégats – Allocation", vu: 20, code: "B20.30", type: "allocation", unite: "global" },
+  { cat: "ouvertures", name: "Portes d'entrée", vu: 45, code: "B40.40", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Portes d'entrée – Allocation", vu: 10, code: "B40.40", type: "allocation", unite: "global" },
+  { cat: "ouvertures", name: "Porte et vitrage du vestibule intérieur", vu: 45, code: "C10.30", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Porte et vitrage du vestibule intérieur – Allocation", vu: 10, code: "C10.30", type: "allocation", unite: "global" },
+  { cat: "ouvertures", name: "Blocs de verre", vu: 40, code: "C10.30", type: "remplacement", unite: "m²" },
+  { cat: "ouvertures", name: "Portes de service – Acier", vu: 35, code: "B40.50", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Portes de service – Allocation", vu: 10, code: "B40.50", type: "allocation", unite: "global" },
+  { cat: "ouvertures", name: "Portes-patio et portes de balcon", vu: 40, code: "B40.20", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Porte simple – Balcon", vu: 40, code: "B40.50", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Fenêtres – Vinyle", vu: 40, code: "B40.10", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Fenêtres – Bois", vu: 45, code: "B40.10", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Fenêtres et portes-fenêtres – Aluminium", vu: 45, code: "B40.10", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Fenêtres – Allocation", vu: 10, code: "B40.10", type: "allocation", unite: "global" },
+  { cat: "ouvertures", name: "Scellants d'ouverture – Allocation", vu: 7, code: "B40.10", type: "allocation", unite: "ml" },
+  { cat: "ouvertures", name: "Porte de garage", vu: 30, code: "B40.60", type: "remplacement", unite: "u", regle: "stationnement_int" },
+  { cat: "ouvertures", name: "Porte de garage – Moteur – Allocation", vu: 10, code: "B40.60", type: "allocation", unite: "u", regle: "stationnement_int" },
+  { cat: "ouvertures", name: "Mur-rideau", vu: 75, code: "B20.60", type: "remplacement", unite: "m²" },
+  { cat: "ouvertures", name: "Mur-rideau – Allocation", vu: 20, code: "B20.60", type: "allocation", unite: "global" },
+  { cat: "balcons", name: "Balcons – Dalles de béton", vu: 50, code: "B10.10-30", type: "remplacement", unite: "u" },
+  { cat: "balcons", name: "Balcons – Étanchéité des dalles de béton – Allocation", vu: 15, code: "B10.10-30", type: "allocation", unite: "m²" },
+  { cat: "balcons", name: "Balcons – Acier – Membrures et escaliers", vu: 50, code: "B10.10-30", type: "remplacement", unite: "u" },
+  { cat: "balcons", name: "Balcons – Acier – Membrures et escaliers – Allocation", vu: 10, code: "B10.10-30", type: "allocation", unite: "global" },
+  { cat: "balcons", name: "Balcons – Pontage en fibre de verre", vu: 25, code: "B10.70", type: "remplacement", unite: "m²" },
+  { cat: "balcons", name: "Balcons – Pontage métallique", vu: 35, code: "B10.70", type: "remplacement", unite: "m²" },
+  { cat: "balcons", name: "Balcons – Structure de bois", vu: 25, code: "B10.30", type: "remplacement", unite: "u" },
+  { cat: "balcons", name: "Balcons – Garde-corps métalliques", vu: 40, code: "B10.80", type: "remplacement", unite: "ml" },
+  { cat: "balcons", name: "Balcons – Garde-corps en aluminium et verre", vu: 40, code: "B10.80", type: "remplacement", unite: "ml" },
+  { cat: "balcons", name: "Balcons – Structure d'acier – Peinture – Allocation", vu: 15, code: "B10.70", type: "allocation", unite: "global" },
+  { cat: "balcons", name: "Terrasses urbaines – Bois traité", vu: 25, code: "B10.70", type: "remplacement", unite: "m²" },
+  { cat: "balcons", name: "Terrasses urbaines – Garde-corps métalliques", vu: 40, code: "B10.80", type: "remplacement", unite: "ml" },
+  { cat: "interieur", name: "Vides sous toit – Ventilation et isolation – Allocation", vu: 10, code: "B30.10-40", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Revêtement de placoplâtre – Peinture – Allocation", vu: 15, code: "C30.10", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Tuiles acoustiques suspendues – Allocation", vu: 20, code: "C30.20", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Lambris de bois – Allocation", vu: 20, code: "C30.10", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Revêtement de sol – Tapis", vu: 20, code: "C30.30", type: "remplacement", unite: "m²" },
+  { cat: "interieur", name: "Revêtement de sol – Carreaux de céramique – Allocation", vu: 10, code: "C30.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Revêtement de sol – Tuiles de vinyle", vu: 20, code: "C30.30", type: "remplacement", unite: "m²" },
+  { cat: "interieur", name: "Revêtement de sol – Bois franc", vu: 40, code: "C30.30", type: "remplacement", unite: "m²" },
+  { cat: "interieur", name: "Revêtement de sol – Bois franc – Allocation", vu: 10, code: "C30.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Revêtement de sol – Béton – Allocation", vu: 5, code: "C30.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Surfaces vitrées intérieures – Allocation", vu: 10, code: "C10.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Escaliers intérieurs – Allocation", vu: 15, code: "C40.21", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Portes des unités", vu: 50, code: "C20.20", type: "remplacement", unite: "u" },
+  { cat: "interieur", name: "Portes des unités – Allocation", vu: 10, code: "C20.20", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Portes de service intérieures – Acier", vu: 50, code: "C20.30", type: "remplacement", unite: "u" },
+  { cat: "interieur", name: "Portes de service intérieures – Acier – Allocation", vu: 10, code: "C20.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Portes de service intérieures – Bois", vu: 50, code: "C20.30", type: "remplacement", unite: "u" },
+  { cat: "interieur", name: "Portes de service intérieures – Bois – Allocation", vu: 10, code: "C20.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Portes coupe-feu – Ferme-portes et quincaillerie – Allocation", vu: 10, code: "C20.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Rangements grillagés – Allocation", vu: 10, code: "C20.30", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Système d'incendie – Éclairage d'urgence et panneaux de sortie", vu: 10, code: "D50.40-50", type: "remplacement", unite: "u" },
+  { cat: "equipements", name: "Système d'incendie – Panneau central, stations manuelles et avertisseurs", vu: 10, code: "D50.31", type: "remplacement", unite: "global" },
+  { cat: "equipements", name: "Système d'incendie – Inspection annuelle de l'alarme incendie (CAN/ULC-S536)", vu: 1, code: "D50.31", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Système d'incendie – Détecteurs d'incendie et extincteurs", vu: 10, code: "D50.32", type: "remplacement", unite: "u" },
+  { cat: "equipements", name: "Détecteurs d'incendie – Privatifs – Allocation", vu: 10, code: "D50.32", type: "allocation", unite: "u" },
+  { cat: "equipements", name: "Système d'incendie – Gicleurs et pompe – Allocation", vu: 10, code: "D40.10", type: "allocation", unite: "global", regle: "gicleurs" },
+  { cat: "equipements", name: "Système d'incendie – Inspection annuelle des gicleurs (NFPA 25)", vu: 1, code: "D40.10", type: "allocation", unite: "global", regle: "gicleurs" },
+  { cat: "equipements", name: "Interphones et système d'accès contrôlé", vu: 20, code: "D50.30", type: "remplacement", unite: "global" },
+  { cat: "equipements", name: "Système de surveillance – Caméras en circuit fermé", vu: 20, code: "D50.30", type: "remplacement", unite: "global" },
+  { cat: "equipements", name: "Casiers postaux – Allocation", vu: 10, code: "E10.90", type: "allocation", unite: "u" },
+  { cat: "equipements", name: "Mobilier – Espaces communs – Allocation", vu: 15, code: "E30.20", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Mobilier fixe – Espaces communs – Allocation", vu: 20, code: "E30.20", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Mobilier fixe – Portes-rideaux", vu: 20, code: "E30.20", type: "remplacement", unite: "u" },
+  { cat: "equipements", name: "Équipements de buanderie – Allocation", vu: 15, code: "E10.90", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Équipements sportifs – Espaces communs – Allocation", vu: 10, code: "E10.20", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Chute à déchets – Système de compacteur", vu: 25, code: "E10.30", type: "remplacement", unite: "u" },
+  { cat: "equipements", name: "Chute à déchets – Allocation", vu: 10, code: "E10.30", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Système d'ascenseur – Modernisation", vu: 35, code: "D10.10-20", type: "remplacement", unite: "u", regle: "ascenseur" },
+  { cat: "equipements", name: "Système d'ascenseur – Inspection annuelle", vu: 1, code: "D10.10-20", type: "allocation", unite: "global", regle: "ascenseur" },
+  { cat: "equipements", name: "Foyers et cheminées préfabriqués", vu: 10, code: "E10.90", type: "remplacement", unite: "u" },
+  { cat: "equipements", name: "Honoraires – Révision de l'étude du fonds de prévoyance (Loi 16)", vu: 5, code: "Z10", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Honoraires – Révision du carnet d'entretien (Loi 16)", vu: 5, code: "Z10", type: "allocation", unite: "global" },
+  { cat: "cvac", name: "Plinthes électriques", vu: 25, code: "D30.10", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Aérothermes muraux", vu: 25, code: "D30.10", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Aérothermes suspendus – Stationnement intérieur", vu: 30, code: "D30.10", type: "remplacement", unite: "u", regle: "stationnement_int" },
+  { cat: "cvac", name: "Chauffage à eau chaude – Chaudière", vu: 25, code: "D30.20", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Chauffage à eau chaude – Pompes de circulation – Allocation", vu: 10, code: "D30.20", type: "allocation", unite: "global" },
+  { cat: "cvac", name: "Système de ventilation – Privatif – Allocation", vu: 3, code: "D30.46", type: "allocation", unite: "global" },
+  { cat: "cvac", name: "Échangeurs d'air (VRC) – Espaces communs", vu: 20, code: "D30.45", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Chauffage CVAC – Communs – Toiture", vu: 35, code: "D30.45", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Climatisation de zone – Salles de services", vu: 25, code: "D30.45", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Ventilation des salles de services", vu: 20, code: "D30.44", type: "remplacement", unite: "global" },
+  { cat: "cvac", name: "Système de détection des gaz d'échappement (monoxyde de carbone)", vu: 25, code: "D30.47", type: "remplacement", unite: "global", regle: "stationnement_int" },
+  { cat: "cvac", name: "Ventilation du stationnement intérieur et volets motorisés", vu: 25, code: "D30.41", type: "remplacement", unite: "global", regle: "stationnement_int" },
+  { cat: "cvac", name: "Dispositifs d'obturation (volets coupe-feu)", vu: 50, code: "D30.40", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Alimentation électrique principale – Allocation", vu: 10, code: "D50.10", type: "allocation", unite: "global" },
+  { cat: "electrique", name: "Panneaux de distribution et disjoncteurs", vu: 40, code: "D50.10", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Inspection thermographique des installations électriques", vu: 5, code: "D50.10", type: "allocation", unite: "global" },
+  { cat: "electrique", name: "Appareils d'éclairage intérieurs", vu: 35, code: "D50.23", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Appareils d'éclairage extérieurs", vu: 25, code: "D50.22", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Lampadaires", vu: 30, code: "D50.20", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Bornes de recharge pour véhicules électriques", vu: 15, code: "D50.90", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Alimentation d'urgence – Génératrice et moteurs", vu: 40, code: "D50.61", type: "remplacement", unite: "u", regle: "generatrice" },
+  { cat: "electrique", name: "Alimentation d'urgence – Chargeur", vu: 35, code: "D50.61", type: "remplacement", unite: "u", regle: "generatrice" },
+  { cat: "electrique", name: "Alimentation d'urgence – Interrupteur de transfert", vu: 40, code: "D50.61", type: "remplacement", unite: "u", regle: "generatrice" },
+  { cat: "electrique", name: "Alimentation d'urgence – Conduit d'échappement", vu: 30, code: "D50.61", type: "remplacement", unite: "global", regle: "generatrice" },
+  { cat: "electrique", name: "Alimentation d'urgence – Réservoir de mazout", vu: 25, code: "D50.63", type: "remplacement", unite: "u", regle: "generatrice" },
+  { cat: "plomberie", name: "Système d'alimentation en eau potable – Allocation", vu: 10, code: "D20.20", type: "allocation", unite: "global" },
+  { cat: "plomberie", name: "Pompes de surpression d'eau", vu: 20, code: "D20.20", type: "remplacement", unite: "u" },
+  { cat: "plomberie", name: "Inspection des dispositifs antirefoulement (DAR)", vu: 1, code: "D20.20", type: "allocation", unite: "u" },
+  { cat: "plomberie", name: "Système d'évacuation pluviale et sanitaire – Allocation", vu: 10, code: "D20.30-41", type: "allocation", unite: "global" },
+  { cat: "plomberie", name: "Système d'évacuation sanitaire – Nettoyage des colonnes – Allocation", vu: 5, code: "D20.30-41", type: "allocation", unite: "global" },
+  { cat: "plomberie", name: "Clapets antiretour et regards de nettoyage – Allocation", vu: 10, code: "D20.30-41", type: "allocation", unite: "u" },
+  { cat: "plomberie", name: "Pompes de puisard et fosses de retenue", vu: 15, code: "D20.30-41", type: "remplacement", unite: "u" },
+  { cat: "plomberie", name: "Équipements de plomberie – Espaces communs", vu: 25, code: "D20.27", type: "remplacement", unite: "global" },
+  { cat: "plomberie", name: "Réservoir d'eau chaude – Conciergerie", vu: 10, code: "D20.26", type: "remplacement", unite: "u" },
+  { cat: "plomberie", name: "Réservoirs d'eau chaude – Communs de l'immeuble", vu: 25, code: "D20.27", type: "remplacement", unite: "u" },
+  { cat: "plomberie", name: "Alimentation en gaz naturel – Allocation", vu: 10, code: "D20.90", type: "allocation", unite: "global" },
+  { cat: "piscines", name: "Piscine extérieure – Bassin et revêtement – Allocation", vu: 15, code: "F10.10-12", type: "allocation", unite: "m²", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine extérieure – Enceinte en toile – Allocation", vu: 10, code: "F10.10-12", type: "allocation", unite: "global", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine extérieure – Contour de terrasse en béton", vu: 50, code: "F10.10-12", type: "remplacement", unite: "m²", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine extérieure – Contour de terrasse en pavé de béton", vu: 25, code: "F10.10-12", type: "remplacement", unite: "m²", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine extérieure – Système de filtration", vu: 20, code: "F10.40", type: "remplacement", unite: "u", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine extérieure – Système de chauffage (thermopompe)", vu: 20, code: "F10.40", type: "remplacement", unite: "u", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine intérieure – Bassin et revêtement – Allocation", vu: 15, code: "F10.10-12", type: "allocation", unite: "m²", regle: "piscine_interieure" },
+  { cat: "piscines", name: "Piscine intérieure – Système de filtration", vu: 20, code: "F10.40", type: "remplacement", unite: "u", regle: "piscine_interieure" },
+  { cat: "piscines", name: "Piscine intérieure – Système de chauffage", vu: 20, code: "F10.40", type: "remplacement", unite: "u", regle: "piscine_interieure" },
+  { cat: "piscines", name: "Piscine intérieure – Système de contrôle de l'humidité", vu: 25, code: "F10.50", type: "remplacement", unite: "u", regle: "piscine_interieure" },
+  { cat: "piscines", name: "Centre aquatique – Mobilier – Allocation", vu: 10, code: "E30.20", type: "allocation", unite: "global" },
+  { cat: "piscines", name: "Sauna – Structure de bois", vu: 25, code: "F10.20", type: "remplacement", unite: "u" },
+  { cat: "piscines", name: "Sauna – Système de chauffage", vu: 20, code: "F10.20", type: "remplacement", unite: "u" }
 ];
+// Conditions certaines. Chacune rend true (la composante existe), false (elle
+// n'existe pas) ou undefined (on ne sait pas encore : l'IA ou l'inspecteur décide).
+// Les réponses viennent de la fiche d'immeuble remplie en terrain.
+const REGLES_GABARIT = {
+  // Loi 122 : l'inspection des façades vise les bâtiments de 5 étages et plus.
+  etages5: ({ etages }) => (etages > 0 ? etages >= 5 : void 0),
+  stationnement_int: ({ caracs }) => nombreOuInconnu(caracs.nb_stationnements_int),
+  ascenseur: ({ caracs }) => nombreOuInconnu(caracs.nb_ascenseurs),
+  gicleurs: ({ caracs }) => ouiNonOuInconnu(caracs.gicleurs),
+  generatrice: ({ caracs }) => ouiNonOuInconnu(caracs.generatrice),
+  piscine_interieure: ({ caracs }) => ouiNonOuInconnu(caracs.piscine_interieure),
+  piscine_exterieure: ({ caracs }) => ouiNonOuInconnu(caracs.piscine_exterieure)
+};
+function nombreOuInconnu(v) {
+  if (v == null || String(v).trim() === "") return void 0;
+  const n = Number(String(v).replace(",", "."));
+  return Number.isFinite(n) ? n > 0 : void 0;
+}
+function ouiNonOuInconnu(v) {
+  const t = String(v ?? "").trim().toLowerCase();
+  return t === "oui" ? true : t === "non" ? false : void 0;
+}
+function evaluerRegles(dossier) {
+  const contexte = {
+    etages: Number(dossier?.floors) || 0,
+    caracs: objetJson(dossier?.batiment_info)?.caracteristiques ?? {}
+  };
+  const resultat = {};
+  for (const [cle, regle] of Object.entries(REGLES_GABARIT)) resultat[cle] = regle(contexte);
+  return resultat;
+}
 // Désactive, selon le profil du syndicat, les composantes du gabarit qui ont
 // peu de chances d'exister dans l'immeuble (ascenseur dans un triplex, piscine,
 // génératrice…). Rien n'est supprimé : une composante désactivée reste au
@@ -3699,6 +3773,7 @@ const LIMITE_RELEVE = {
 const CYCLES_REGLEMENTAIRES = [
   { re: /loi\s*122|inspection\s+des\s+fa[çc]ades|stationnements?\s+[ée]tag/i, cycle: 5, libelle: "Étude et rapport", texte: "Selon la loi 122, cette vérification périodique doit être reprise tous les 5 ans. Le calcul planifie pour l'étude et le rapport correspondants." },
   { re: /\bDAR\b|anti-?refoulement/i, cycle: 1, libelle: "Allocation", texte: "La vérification du dispositif anti-refoulement (DAR) est annuelle. Le calcul planifie pour des entretiens réguliers de sécurité sur un cycle de 1 an." },
+  { re: /fonds\s+de\s+pr[ée]voyance|carnet\s+d['’]entretien/i, cycle: 5, libelle: "Étude et rapport", texte: "Depuis la Loi 16, l'étude du fonds de prévoyance et le carnet d'entretien doivent être révisés par un professionnel au moins tous les 5 ans. Le calcul planifie pour les honoraires correspondants." },
   { re: /nettoyage\s+des\s+colonnes|colonnes?\s+(?:sanitaires?|pluviales?)/i, cycle: 5, libelle: "Allocation", texte: "Nous vous rappelons que vous avez avantage à planifier, tous les 3 à 5 ans, un nettoyage de ces conduits. Le calcul planifie pour ces travaux sur un cycle de 5 ans." }
 ];
 const MARQUEURS_ALLOCATION = /allocation|entretien|inspection|nettoyage|peinture|mise\s+[àa]\s+niveau|r[ée]parations?\s+ponctuelle|cyclique/i;
@@ -3718,6 +3793,10 @@ function ligneDureeVie(component, dossier) {
     allocation = true;
   } else if (attributs.allocation === false || String(attributs.type ?? "").toLowerCase() === "remplacement") {
     allocation = false;
+  } else if (/\ballocations?\b/i.test(nom)) {
+    // « Détecteurs d'incendie – Privatifs – Allocation » : le mot explicite
+    // l'emporte sur « détecteur », que MARQUEURS_REMPLACEMENT classe en remplacement.
+    allocation = true;
   } else if (MARQUEURS_REMPLACEMENT.test(nom)) {
     allocation = false;
   } else if (MARQUEURS_ALLOCATION.test(nom)) {
@@ -44205,6 +44284,7 @@ dossiers.post("/", async (c) => {
     user.id,
     user.company_id
   ).run();
+  const regles = evaluerRegles({ floors: body2.floors ?? null, batiment_info: null });
   const filtre = await filtrerGabarit(c.env.ANTHROPIC_API_KEY, {
     units: body2.units ?? 0,
     floors: body2.floors ?? null,
@@ -44212,12 +44292,16 @@ dossiers.post("/", async (c) => {
   });
   // ai_suggested reste à 0 : la liste vient du gabarit, l'IA n'a fait que la filtrer.
   const stmt = c.env.DB.prepare(
-    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code, actif) VALUES (?1, ?2, ?3, ?4, '—', 0, ?5, ?6, NULL, ?7)`
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code, attributs, actif) VALUES (?1, ?2, ?3, ?4, '—', 0, ?5, ?6, ?7, ?8, ?9)`
   );
   await c.env.DB.batch(
-    GABARIT_STRATEGIS.map(
-      (item, i) => stmt.bind(newId("cmp"), id, item.cat, item.name, i, item.vu, filtre.inactifs.has(i) ? 0 : 1)
-    )
+    GABARIT_STRATEGIS.map((item, i) => {
+      // Une règle certaine l'emporte sur le jugement de l'IA.
+      const certain = item.regle ? regles[item.regle] : void 0;
+      const actif = certain !== void 0 ? certain : !filtre.inactifs.has(i);
+      const attributs = JSON.stringify({ type: item.type, "unité": item.unite });
+      return stmt.bind(newId("cmp"), id, item.cat, item.name, i, item.vu, item.code, attributs, actif ? 1 : 0);
+    })
   );
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
   return c.json({
@@ -44306,6 +44390,30 @@ dossiers.get("/:id/report.xlsx", async (c) => {
     }
   });
 });
+// Quand une réponse de la fiche d'immeuble (ou le nombre d'étages) change et
+// tranche une règle, les composantes qu'elle gouverne suivent : « piscine
+// extérieure : non » désactive toute la piscine extérieure. Seules les règles
+// dont la réponse vient de changer sont appliquées, pour ne pas défaire à chaque
+// enregistrement une réactivation faite à la main par l'inspecteur.
+async function appliquerReglesModifiees(db, avant, apres) {
+  const anciennes = evaluerRegles(avant);
+  const nouvelles = evaluerRegles(apres);
+  const requetes = [];
+  for (const [cle, valeur] of Object.entries(nouvelles)) {
+    if (valeur === void 0 || valeur === anciennes[cle]) continue;
+    const noms = GABARIT_STRATEGIS.filter((item) => item.regle === cle).map((item) => item.name);
+    if (!noms.length) continue;
+    requetes.push(
+      db.prepare(
+        `UPDATE components SET actif = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+           WHERE dossier_id = ?2 AND actif != ?1 AND name IN (${noms.map((_, i) => `?${i + 3}`).join(", ")})`
+      ).bind(valeur ? 1 : 0, apres.id, ...noms)
+    );
+  }
+  if (!requetes.length) return 0;
+  const resultats = await db.batch(requetes);
+  return resultats.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
+}
 dossiers.patch("/:id", async (c) => {
   const id = c.req.param("id");
   const { dossier: owned } = await getOwnedDossier(c, id);
@@ -44337,7 +44445,8 @@ dossiers.patch("/:id", async (c) => {
     `UPDATE dossiers SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
   ).bind(...values).run();
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
-  return c.json({ ...dossier, stats: await dossierStats(c.env.DB, id) });
+  const composantesMisesAJour = await appliquerReglesModifiees(c.env.DB, owned, dossier);
+  return c.json({ ...dossier, stats: await dossierStats(c.env.DB, id), composantes_mises_a_jour: composantesMisesAJour });
 });
 const photos = new Hono();
 photos.get("/:id/file", async (c) => {

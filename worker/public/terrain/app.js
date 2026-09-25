@@ -742,6 +742,23 @@ function immSetLocal(sec, key, val) {
   if (!Object.keys(state.batiment[sec]).length) delete state.batiment[sec];
 }
 
+// Une réponse de la fiche d'immeuble (« piscine extérieure : non », nombre
+// d'ascenseurs…) peut activer ou désactiver des composantes côté serveur :
+// on recharge alors la liste pour que l'écran suive.
+async function suivreRegles(data) {
+  const n = data && data.composantes_mises_a_jour;
+  if (!n || !state.dossier) return;
+  try {
+    const components = await apiJson(`/api/dossiers/${state.dossier.id}/components`);
+    state.components = components.filter(c => c.actif !== 0);
+    state.inactifs = components.filter(c => c.actif === 0);
+    showToast(`${n} composante${n > 1 ? 's' : ''} ajustée${n > 1 ? 's' : ''} selon la fiche d'immeuble`);
+    render();
+  } catch (e) {
+    if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
+  }
+}
+
 async function saveBatiment() {
   if (!state.dossier) return;
   if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
@@ -755,6 +772,7 @@ async function saveBatiment() {
     });
     if (data && typeof data === 'object') state.dossier = Object.assign({}, state.dossier, data);
     setSaveStatus('immStatus', 'Enregistré');
+    await suivreRegles(data);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     setSaveStatus('immStatus', '');
@@ -788,6 +806,7 @@ async function saveDossierField(field, value) {
     });
     state.dossier = Object.assign({}, state.dossier, patch, (data && typeof data === 'object') ? data : {});
     setSaveStatus('immStatus', 'Enregistré');
+    await suivreRegles(data);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     setSaveStatus('immStatus', '');
