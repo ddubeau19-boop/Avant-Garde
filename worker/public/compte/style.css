@@ -19,3 +19,4 @@ button:disabled { opacity: .55; cursor: default; }
 .ok { background: var(--green-wash); color: var(--green); border-radius: 10px; padding: 11px 14px; font-size: 13.5px; line-height: 1.5; margin: 14px 0 0; }
 .discret { color: var(--ink-500); font-size: 13px; text-align: center; }
 .lien { display: block; text-align: center; margin-top: 18px; color: var(--ink-500); font-size: 13px; }
+.piege { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }

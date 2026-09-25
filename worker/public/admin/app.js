@@ -5,6 +5,7 @@
 // ============================================================
 
 import { creerBibliotheque } from '../shared/bibliotheque.js';
+import { creerModeles } from '../shared/modeles.js';
 
 const TOKEN_KEY = 'cs_admin_token';
 
@@ -52,22 +53,6 @@ const state = {
   newEngineerOpen: false,
   newEngName: '',
   newEngEmail: '',
-  template: null,          // { catalogue, sections, defauts, source_filename, ... }
-  templateLoading: false,
-  templateError: null,
-  templateNote: null,
-  templateUploading: false,
-  templateOpenCle: null,   // section dépliée dans l'éditeur
-  templateEdits: {},       // clé -> texte brut en cours d'édition
-  templateSaving: false,
-  theme: null,             // { theme, effectif, defauts } — identité du rapport
-  themeDraft: {},
-  themeSaving: false,
-  themeError: null,
-  themeNote: null,
-  miseEnPage: null,        // { importe, filename, analyse, champs, blocs }
-  miseEnPageUploading: false,
-  miseEnPageError: null,
   roleSaving: null,        // id du compte dont le rôle change
   newEngTitle: '',
   newEngOrdre: '',
@@ -274,6 +259,42 @@ function doLogout() {
 // ---------------------------------------------------------------
 // Actions — companies list
 // ---------------------------------------------------------------
+// Sauvegardes hebdomadaires de la base (R2) : liste, téléchargement, sauvegarde immédiate.
+const sauv = { liste: null, erreur: null, enCours: false };
+async function chargerSauvegardes() {
+  try { sauv.liste = await apiJson('/api/sauvegardes'); sauv.erreur = null; }
+  catch (e) { sauv.erreur = e.message || 'Impossible de lister les sauvegardes.'; }
+  render();
+}
+async function sauvegarderMaintenant() {
+  sauv.enCours = true; sauv.erreur = null; render();
+  try { await apiJson('/api/sauvegardes', { method: 'POST' }); await chargerSauvegardes(); }
+  catch (e) { sauv.erreur = e.message || 'La sauvegarde a échoué.'; }
+  sauv.enCours = false; render();
+}
+async function telechargerSauvegarde(nom) {
+  try {
+    const res = await apiRaw(`/api/sauvegardes/${encodeURIComponent(nom)}`);
+    if (!res.ok) throw new Error('Téléchargement impossible.');
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement('a'); a.href = url; a.download = nom;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  } catch (e) { sauv.erreur = e.message; render(); }
+}
+function sauvegardesHtml() {
+  const taille = (o) => o < 1024 * 1024 ? `${Math.max(1, Math.round(o / 1024))} Ko` : `${(o / 1024 / 1024).toFixed(1).replace('.', ',')} Mo`;
+  return `
+    <div class="eng-section-head"><span class="lbl">Sauvegardes de la base</span><div class="rule"></div>
+      <button class="btn-row-action" data-action="sauvegarder" ${sauv.enCours ? 'disabled' : ''}>${sauv.enCours ? 'Sauvegarde…' : 'Sauvegarder maintenant'}</button></div>
+    <div class="tpl-lead">Chaque dimanche, toute la base est copiée dans R2 (26 dernières gardées, six mois). D1 permet aussi de revenir à n'importe quel moment des 30 derniers jours. Procédure de restauration : <code>worker/SAUVEGARDES.md</code>.</div>
+    ${sauv.erreur ? `<div class="login-error" style="margin:10px 0">${escapeHtml(sauv.erreur)}</div>` : ''}
+    ${!sauv.liste ? spinnerBlock('Chargement…') : sauv.liste.length ? `
+    <div class="dossiers-table">${sauv.liste.slice(0, 8).map(x => `
+      <div class="dt-row champ-row"><div class="mono-cell">${escapeHtml(x.nom)}</div><div style="display:flex;justify-content:space-between;align-items:center"><span class="dt-sub">${fmtDate(x.le)} · ${taille(x.octets)}</span><button class="btn-row-action" data-action="sauvegarde-dl" data-nom="${escapeHtml(x.nom)}">Télécharger</button></div></div>`).join('')}
+    </div>` : '<div class="tpl-lead">Aucune sauvegarde pour l\'instant : la première aura lieu dimanche, ou maintenant.</div>'}`;
+}
+
 async function loadCompanies() {
   state.companiesLoading = true;
   state.companiesError = null;
@@ -284,6 +305,7 @@ async function loadCompanies() {
     state.companiesLoading = false;
     render();
     loadListLogos(state.companies);
+    chargerSauvegardes();
   } catch (e) {
     state.companiesLoading = false;
     state.companiesError = e.message || 'Impossible de charger les entreprises.';
@@ -340,6 +362,7 @@ async function openCompany(id) {
   state.tempPasswordInfo = null;
   state.logoError = null;
   bib.reset();
+  modeles.reset();
   await loadCompanyDetail(id);
 }
 
@@ -353,9 +376,7 @@ async function loadCompanyDetail(id) {
     state.companyLoading = false;
     render();
     loadCompanyLogo(id, !!data.hasLogo);
-    loadTemplate(id);
-    loadTheme(id);
-    loadMiseEnPage(id);
+    modeles.charger();
     bib.charger();
   } catch (e) {
     state.companyLoading = false;
@@ -365,75 +386,17 @@ async function loadCompanyDetail(id) {
 }
 
 // ---------------------------------------------------------------
-// Identité du rapport et gabarit Word de mise en page
-// ---------------------------------------------------------------
-async function loadTheme(id) {
-  try {
-    state.theme = await apiJson(`/api/companies/${id}/theme`);
-    state.themeDraft = Object.assign({}, state.theme.theme || {});
-    state.themeError = null;
-  } catch (e) {
-    state.themeError = e.message || "Impossible de charger l'identité du rapport.";
-  }
-  render();
-}
-
-async function saveTheme() {
-  if (state.themeSaving) return;
-  state.themeSaving = true;
-  state.themeError = null;
-  state.themeNote = null;
-  render();
-  try {
-    state.theme = await apiJson(`/api/companies/${state.companyId}/theme`, { method: 'PATCH', body: JSON.stringify(state.themeDraft) });
-    state.themeDraft = Object.assign({}, state.theme.theme || {});
-    state.themeNote = 'Identité enregistrée. Les prochains rapports Word la reprendront.';
-  } catch (e) {
-    state.themeError = e.message || "L'enregistrement a échoué.";
-  }
-  state.themeSaving = false;
-  render();
-}
-
-async function loadMiseEnPage(id) {
-  try {
-    state.miseEnPage = await apiJson(`/api/companies/${id}/mise-en-page`);
-    state.miseEnPageError = null;
-  } catch (e) {
-    state.miseEnPageError = e.message || 'Impossible de charger le gabarit de mise en page.';
-  }
-  render();
-}
-
-async function uploadMiseEnPage(file) {
-  if (!file || state.miseEnPageUploading) return;
-  state.miseEnPageUploading = true;
-  state.miseEnPageError = null;
-  render();
-  try {
-    const fd = new FormData();
-    fd.append('file', file);
-    state.miseEnPage = await apiJson(`/api/companies/${state.companyId}/mise-en-page`, { method: 'POST', body: fd });
-  } catch (e) {
-    state.miseEnPageError = e.message || "L'import du gabarit a échoué.";
-  }
-  state.miseEnPageUploading = false;
-  render();
-}
-
-async function deleteMiseEnPage() {
-  if (!confirm("Retirer le gabarit de mise en page ? Les rapports reprendront la mise en page intégrée, aux couleurs de l'entreprise.")) return;
-  try {
-    state.miseEnPage = await apiJson(`/api/companies/${state.companyId}/mise-en-page`, { method: 'DELETE' });
-  } catch (e) {
-    state.miseEnPageError = e.message || "L'opération a échoué.";
-  }
-  render();
-}
-
-// ---------------------------------------------------------------
 // Bibliothèque de composantes (page partagée avec la console bureau)
 // ---------------------------------------------------------------
+// Identité, mise en page et texte du rapport (page partagée avec la console bureau).
+const modeles = creerModeles({
+  apiJson: (path, opts) => apiJson(path, opts),
+  render: () => render(),
+  escapeHtml: (x) => escapeHtml(x),
+  fmtDate: (x) => fmtDate(x),
+  spinnerBlock: (x) => spinnerBlock(x),
+  companyId: () => state.companyId,
+});
 const bib = creerBibliotheque({
   apiJson: (path, opts) => apiJson(path, opts),
   apiRaw: (path, opts) => apiRaw(path, opts),
@@ -475,103 +438,6 @@ async function setEngineerRole(userId, role) {
   }
   state.roleSaving = null;
   render();
-}
-
-async function loadTemplate(id) {
-  state.templateLoading = true;
-  state.templateError = null;
-  render();
-  try {
-    state.template = await apiJson(`/api/companies/${id}/template`);
-    state.templateEdits = {};
-  } catch (e) {
-    state.templateError = e.message || 'Impossible de charger le gabarit.';
-  }
-  state.templateLoading = false;
-  render();
-}
-
-async function uploadTemplate(file) {
-  if (!file || state.templateUploading) return;
-  state.templateUploading = true;
-  state.templateError = null;
-  state.templateNote = null;
-  render();
-  try {
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await apiJson(`/api/companies/${state.companyId}/template`, { method: 'POST', body: fd });
-    const n = (res.sections_remplies || []).length;
-    const reste = (res.sections_par_defaut || []).length;
-    state.templateNote = res.note
-      || `${res.paragraphes} paragraphes lus. ${n} section${n > 1 ? 's' : ''} reprise${n > 1 ? 's' : ''} du document${reste ? `, ${reste} conservée${reste > 1 ? 's' : ''} au gabarit intégré faute de correspondance claire` : ''}. Relisez-les avant de produire un rapport.`;
-    await loadTemplate(state.companyId);
-  } catch (e) {
-    state.templateError = e.message || "L'import du gabarit a échoué.";
-  }
-  state.templateUploading = false;
-  render();
-}
-
-// Enregistre une section. Le texte saisi est renvoyé dans la forme attendue par
-// la section : une chaîne, une liste de lignes, ou des paires « terme : définition ».
-async function saveTemplateSection(cle) {
-  const sec = (state.template && state.template.catalogue || []).find(x => x.cle === cle);
-  if (!sec || state.templateSaving) return;
-  const brut = state.templateEdits[cle];
-  if (brut == null) { state.templateOpenCle = null; render(); return; }
-  let valeur;
-  const lignes = brut.split('\n').map(l => l.trim()).filter(Boolean);
-  if (sec.forme === 'texte') valeur = brut.trim();
-  else if (sec.forme === 'paires') valeur = lignes.map(l => { const i = l.indexOf(' : '); return i < 0 ? null : [l.slice(0, i).trim(), l.slice(i + 3).trim()]; }).filter(Boolean);
-  else valeur = lignes;
-
-  const sections = Object.assign({}, state.template.sections || {});
-  if ((Array.isArray(valeur) && valeur.length === 0) || (typeof valeur === 'string' && !valeur)) delete sections[cle];
-  else sections[cle] = valeur;
-
-  state.templateSaving = true;
-  render();
-  try {
-    await apiJson(`/api/companies/${state.companyId}/template`, { method: 'PATCH', body: JSON.stringify({ sections }) });
-    state.templateOpenCle = null;
-    state.templateNote = null;
-    await loadTemplate(state.companyId);
-  } catch (e) {
-    state.templateError = e.message || "L'enregistrement a échoué.";
-  }
-  state.templateSaving = false;
-  render();
-}
-
-async function clearTemplateSection(cle) {
-  const sections = Object.assign({}, state.template && state.template.sections || {});
-  delete sections[cle];
-  state.templateSaving = true;
-  render();
-  try {
-    await apiJson(`/api/companies/${state.companyId}/template`, { method: 'PATCH', body: JSON.stringify({ sections }) });
-    delete state.templateEdits[cle];
-    state.templateOpenCle = null;
-    await loadTemplate(state.companyId);
-  } catch (e) {
-    state.templateError = e.message || "L'opération a échoué.";
-  }
-  state.templateSaving = false;
-  render();
-}
-
-async function resetTemplate() {
-  if (!confirm("Remettre toutes les sections au gabarit intégré ? Le document importé reste conservé, mais son texte ne sera plus utilisé dans les rapports.")) return;
-  try {
-    await apiJson(`/api/companies/${state.companyId}/template`, { method: 'DELETE' });
-    state.templateNote = null;
-    state.templateEdits = {};
-    await loadTemplate(state.companyId);
-  } catch (e) {
-    state.templateError = e.message || "L'opération a échoué.";
-    render();
-  }
 }
 
 function backToCompanies() {
@@ -834,6 +700,7 @@ function renderCompanies() {
         <div><button class="btn-row-action" data-action="open-company" data-id="${c.id}">Ouvrir</button></div>
       </div>`).join('')}
     </div>`}
+    ${sauvegardesHtml()}
   </div>`;
 }
 
@@ -928,9 +795,9 @@ function renderCompanyDetail() {
     </div>
 
     ${bibliothequeCardHtml()}
-    ${themeCardHtml()}
-    ${miseEnPageCardHtml()}
-    ${templateCardHtml()}
+    ${modeles.themeCardHtml()}
+    ${modeles.miseEnPageCardHtml()}
+    ${modeles.templateCardHtml()}
   </div>`;
 }
 
@@ -957,158 +824,6 @@ function renderBibliotheque() {
 
 // Identité du rapport : couleurs, polices et coordonnées reprises par le
 // rapport Word. Un champ vide garde la valeur par défaut.
-const THEME_CHAMPS = [
-  { k: 'accent', label: "Couleur d'accent", type: 'couleur', aide: 'Titres de section, filets, cote « Mauvais ».' },
-  { k: 'encre', label: 'Couleur du texte', type: 'couleur' },
-  { k: 'gris', label: 'Couleur secondaire', type: 'couleur', aide: 'Étiquettes, légendes, pied de page.' },
-  { k: 'police', label: 'Police du texte', type: 'texte' },
-  { k: 'policeTitres', label: 'Police des titres', type: 'texte' },
-  { k: 'policeMono', label: 'Police des étiquettes', type: 'texte' },
-  { k: 'adresse', label: 'Adresse', type: 'texte' },
-  { k: 'telephone', label: 'Téléphone', type: 'texte' },
-  { k: 'courriel', label: 'Courriel', type: 'texte' },
-  { k: 'site', label: 'Site Web', type: 'texte' },
-];
-
-function themeCardHtml() {
-  const t = state.theme;
-  const d = state.themeDraft || {};
-  const eff = (t && t.effectif) || {};
-  const val = (k) => d[k] != null && d[k] !== '' ? d[k] : '';
-  const couleur = (k) => '#' + String(val(k) || eff[k] || '000000').replace(/^#/, '');
-  return `
-  <div>
-    <div class="eng-section-head">
-      <span class="lbl">Identité du rapport</span>
-      <div class="rule"></div>
-    </div>
-    <div class="tpl-lead">Couleurs, polices et coordonnées du rapport Word de cette entreprise. Un champ laissé vide garde la valeur par défaut. Les polices doivent être installées sur les postes qui ouvrent le document; sinon Word les remplace.</div>
-    ${state.themeError ? `<div class="login-error" style="margin:10px 0">${escapeHtml(state.themeError)}</div>` : ''}
-    ${state.themeNote ? `<div class="temp-pass-warn" style="margin:10px 0"><i data-lucide="check"></i><span>${escapeHtml(state.themeNote)}</span></div>` : ''}
-    ${!t ? spinnerBlock('Chargement…') : `
-    <div class="theme-grid">
-      ${THEME_CHAMPS.map(c => `
-      <label class="theme-field">
-        <span class="field-label">${escapeHtml(c.label)}</span>
-        ${c.type === 'couleur' ? `
-        <span class="theme-color-row">
-          <input type="color" data-role="theme-color" data-key="${c.k}" value="${escapeHtml(couleur(c.k))}">
-          <input type="text" data-role="theme-field" data-key="${c.k}" value="${escapeHtml(val(c.k))}" placeholder="${escapeHtml((t.defauts || {})[c.k] || '')}" maxlength="7">
-        </span>` : `
-        <input type="text" data-role="theme-field" data-key="${c.k}" value="${escapeHtml(val(c.k))}" placeholder="${escapeHtml(eff[c.k] || (t.defauts || {})[c.k] || '')}">`}
-        ${c.aide ? `<span class="theme-help">${escapeHtml(c.aide)}</span>` : ''}
-      </label>`).join('')}
-    </div>
-    <div class="theme-apercu" style="--acc:${couleur('accent')};--enc:${couleur('encre')};--gri:${couleur('gris')}">
-      <div class="ta-eyebrow">Enveloppe du bâtiment · B20.10</div>
-      <div class="ta-title">4.3.12 Parement – Maçonnerie</div>
-      <div class="ta-rule"></div>
-      <div class="ta-label">État de l'actif</div>
-      <div class="ta-text">Aperçu des couleurs d'une fiche composante.</div>
-    </div>
-    <div class="tpl-actions">
-      <button class="btn-primary" data-action="theme-save" ${state.themeSaving ? 'disabled' : ''}>${state.themeSaving ? 'Enregistrement…' : "Enregistrer l'identité"}</button>
-    </div>`}
-  </div>`;
-}
-
-function miseEnPageCardHtml() {
-  const m = state.miseEnPage;
-  const a = (m && m.analyse) || null;
-  const champs = (m && m.champs) || [];
-  const blocs = (m && m.blocs) || [];
-  const puces = (liste) => liste.map(k => `<code class="champ-chip">{{${escapeHtml(k)}}}</code>`).join(' ');
-  return `
-  <div>
-    <div class="eng-section-head">
-      <span class="lbl">Gabarit Word de mise en page</span>
-      <div class="rule"></div>
-      <label class="btn-pill-sm">${state.miseEnPageUploading ? 'Analyse du document…' : 'Importer un .docx'}<input type="file" accept=".docx" data-role="mise-en-page-file" style="display:none" ${state.miseEnPageUploading ? 'disabled' : ''}></label>
-    </div>
-    <div class="tpl-lead">Les pages que l'entreprise place avant le rapport (page de garde, présentation de la firme, explications de la Loi 16…), avec son en-tête, son pied de page et ses styles. Écrivez les champs entre accolades là où les données du dossier doivent apparaître, et placez <code>{{RAPPORT}}</code> à l'endroit où le rapport de la plateforme commence.</div>
-    ${state.miseEnPageError ? `<div class="login-error" style="margin:10px 0">${escapeHtml(state.miseEnPageError)}</div>` : ''}
-    ${!m ? spinnerBlock('Chargement…') : `
-    ${m.importe ? `
-    <div class="tpl-lead" style="margin:10px 0">Importé depuis <code>${escapeHtml(m.filename || '')}</code> le ${fmtDate(m.imported_at)} · <button class="btn-row-action" data-action="mise-en-page-delete">Retirer ce gabarit</button></div>
-    ${a && !a.repere ? `<div class="temp-pass-warn" style="margin:8px 0"><i data-lucide="info"></i><span>Aucun repère <code>{{RAPPORT}}</code> : le rapport sera ajouté à la fin du document, sur une nouvelle page.</span></div>` : ''}
-    ${a && a.inconnus && a.inconnus.length ? `<div class="temp-pass-warn" style="margin:8px 0"><i data-lucide="alert-triangle"></i><span>Champs inconnus, laissés tels quels dans le rapport : ${puces(a.inconnus)}</span></div>` : ''}
-    ${a && a.notes && a.notes.length ? `<div class="temp-pass-warn" style="margin:8px 0"><i data-lucide="alert-triangle"></i><span>Notes de rédaction internes trouvées dans les pages liminaires — elles seraient reprises telles quelles dans chaque rapport livré :<br>${a.notes.map(n => `« ${escapeHtml(n)} »`).join('<br>')}</span></div>` : ''}
-    ${a ? `<div class="tpl-lead" style="margin:8px 0">Champs reconnus : ${a.champs && a.champs.length ? puces(a.champs) : 'aucun'}${a.blocs && a.blocs.length ? ` · Blocs : ${puces(a.blocs.map(b => b.toUpperCase()))}` : ''}</div>` : ''}` : `
-    <div class="tpl-lead" style="margin:10px 0">Aucun gabarit importé : les rapports utilisent la mise en page intégrée, aux couleurs de l'entreprise.</div>`}
-    <details class="champs-details">
-    <summary>Voir les champs disponibles (${champs.length + blocs.length})</summary>
-    <div class="dossiers-table" style="margin-top:12px">
-      <div class="dt-row champ-row dt-head"><div>Champ</div><div>Remplacé par</div></div>
-      ${blocs.map(([k, d]) => `<div class="dt-row champ-row"><div><code class="champ-chip">{{${escapeHtml(k.toUpperCase())}}}</code></div><div class="dt-sub">${escapeHtml(d)}</div></div>`).join('')}
-      ${champs.map(([k, d]) => `<div class="dt-row champ-row"><div><code class="champ-chip">{{${escapeHtml(k)}}}</code></div><div class="dt-sub">${escapeHtml(d)}</div></div>`).join('')}
-    </div>
-    </details>`}
-  </div>`;
-}
-
-// Aperçu d'une section : ce que la firme a fourni, ou le texte intégré.
-function apercuSection(val) {
-  if (val == null) return '';
-  if (typeof val === 'string') return val;
-  if (Array.isArray(val)) {
-    if (val.length && Array.isArray(val[0])) return val.map(pr => pr.join(' : ')).join('\n');
-    return val.join('\n');
-  }
-  if (typeof val === 'object') return Object.entries(val).map(([k, v]) => k + '\n' + apercuSection(v)).join('\n\n');
-  return String(val);
-}
-
-function templateCardHtml() {
-  const t = state.template;
-  const importe = t && t.sections ? Object.keys(t.sections) : [];
-  return `
-  <div>
-    <div class="eng-section-head">
-      <span class="lbl">Gabarit de rapport</span>
-      <div class="rule"></div>
-      <label class="btn-pill-sm">${state.templateUploading ? 'Lecture du document…' : 'Importer un .docx'}<input type="file" accept=".docx" data-role="template-file" style="display:none" ${state.templateUploading ? 'disabled' : ''}></label>
-    </div>
-    <div class="tpl-lead">Le texte de fond des rapports de cette entreprise — méthodologie, limitations légales, déclaration, lexique. Les sections non fournies gardent le gabarit intégré.</div>
-
-    ${state.templateError ? `<div class="login-error" style="margin:10px 0">${escapeHtml(state.templateError)}</div>` : ''}
-    ${state.templateNote ? `<div class="temp-pass-warn" style="margin:10px 0"><i data-lucide="info"></i><span>${escapeHtml(state.templateNote)}</span></div>` : ''}
-
-    ${state.templateLoading ? spinnerBlock('Chargement du gabarit…') : !t ? '' : `
-      <div class="tpl-lead" style="margin:10px 0 14px">
-        ${t.source_filename ? `Importé depuis <code>${escapeHtml(t.source_filename)}</code> le ${fmtDate(t.imported_at)} · ` : ''}
-        <strong>${importe.length}</strong> section${importe.length > 1 ? 's' : ''} sur ${t.catalogue.length} proviennent de cette entreprise.
-        ${importe.length ? `<button class="btn-row-action" style="margin-left:10px" data-action="template-reset">Tout remettre au gabarit intégré</button>` : ''}
-      </div>
-
-      <div class="dossiers-table">
-        ${t.catalogue.map(sec => {
-          const propre = t.sections && t.sections[sec.cle] != null;
-          const ouvert = state.templateOpenCle === sec.cle;
-          const valeur = state.templateEdits[sec.cle] != null
-            ? state.templateEdits[sec.cle]
-            : apercuSection(propre ? t.sections[sec.cle] : (t.defauts || {})[sec.cle]);
-          return `
-          <div class="dt-row tpl-row">
-            <div class="dt-name">${escapeHtml(sec.label)}</div>
-            <div>${propre
-              ? `<span class="status-badge" style="background:#E8F5E9;color:#1B5E20">Gabarit de l'entreprise</span>`
-              : `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">Gabarit intégré</span>`}</div>
-            <div><button class="btn-row-action" data-action="template-toggle" data-cle="${escapeHtml(sec.cle)}">${ouvert ? 'Fermer' : 'Voir / corriger'}</button></div>
-          </div>
-          ${ouvert ? `
-          <div class="tpl-edit">
-            <div class="tpl-lead" style="margin-bottom:8px">${sec.forme === 'paires' ? 'Une ligne par entrée, au format « terme : définition ».' : sec.forme === 'texte' ? 'Un seul bloc de texte.' : 'Une ligne par paragraphe ou par puce.'}${sec.sous ? ' Cette section contient plusieurs sous-parties : la modifier à la main est déconseillé, préférez réimporter le .docx.' : ''}</div>
-            <textarea data-role="template-text" data-cle="${escapeHtml(sec.cle)}" rows="10" ${sec.sous ? 'readonly' : ''}>${escapeHtml(valeur)}</textarea>
-            ${sec.sous ? '' : `<div class="tpl-actions">
-              <button class="btn-primary" data-action="template-save" data-cle="${escapeHtml(sec.cle)}" ${state.templateSaving ? 'disabled' : ''}>${state.templateSaving ? 'Enregistrement…' : 'Enregistrer cette section'}</button>
-              ${propre ? `<button class="btn-secondary" data-action="template-clear" data-cle="${escapeHtml(sec.cle)}">Revenir au gabarit intégré</button>` : ''}
-            </div>`}
-          </div>` : ''}`;
-        }).join('')}
-      </div>`}
-  </div>`;
-}
-
 // ---------------------------------------------------------------
 // Event delegation
 // ---------------------------------------------------------------
@@ -1158,32 +873,13 @@ function initEvents() {
     else if (bib.input(t)) return;
     // Pas de render() ici : re-dessiner le textarea à chaque frappe renverrait
     // le curseur à la fin.
-    else if (t.matches('[data-role="template-text"]')) state.templateEdits[t.getAttribute('data-cle')] = t.value;
-    else if (t.matches('[data-role="theme-field"]')) state.themeDraft[t.getAttribute('data-key')] = t.value;
-    else if (t.matches('[data-role="theme-color"]')) {
-      // Le sélecteur de couleur met à jour le champ hexadécimal voisin.
-      const k = t.getAttribute('data-key');
-      state.themeDraft[k] = t.value.replace('#', '').toUpperCase();
-      const champ = t.parentElement && t.parentElement.querySelector('[data-role="theme-field"]');
-      if (champ) champ.value = state.themeDraft[k];
-    }
+    else if (modeles.input(t)) return;
   });
 
   app.addEventListener('change', (e) => {
     const t = e.target;
-    if (t && t.matches && t.matches('[data-role="template-file"]')) {
-      const f = t.files && t.files[0];
-      t.value = '';
-      if (f) uploadTemplate(f);
-      return;
-    }
+    if (t && t.matches && modeles.change(t)) return;
     if (t && t.matches && bib.change(t)) return;
-    if (t && t.matches && t.matches('[data-role="mise-en-page-file"]')) {
-      const f = t.files && t.files[0];
-      t.value = '';
-      if (f) uploadMiseEnPage(f);
-      return;
-    }
     if (t && t.matches && t.matches('[data-role="logo-file"]')) {
       const file = t.files && t.files[0];
       if (file) uploadLogo(file);
@@ -1195,15 +891,12 @@ function initEvents() {
     if (!btn) return;
     const action = btn.getAttribute('data-action');
     if (bib.click(action, btn)) return;
+    if (modeles.click(action, btn)) return;
     switch (action) {
+      case 'sauvegarder': sauvegarderMaintenant(); break;
+      case 'sauvegarde-dl': telechargerSauvegarde(btn.getAttribute('data-nom')); break;
       case 'logout':
         doLogout();
-        break;
-      case 'theme-save':
-        saveTheme();
-        break;
-      case 'mise-en-page-delete':
-        deleteMiseEnPage();
         break;
       case 'biblio-open':
         openBibliotheque();
@@ -1213,21 +906,6 @@ function initEvents() {
         break;
       case 'engineer-role':
         setEngineerRole(btn.getAttribute('data-id'), btn.getAttribute('data-role-cible'));
-        break;
-      case 'template-toggle': {
-        const cle = btn.getAttribute('data-cle');
-        state.templateOpenCle = state.templateOpenCle === cle ? null : cle;
-        render();
-        break;
-      }
-      case 'template-save':
-        saveTemplateSection(btn.getAttribute('data-cle'));
-        break;
-      case 'template-clear':
-        clearTemplateSection(btn.getAttribute('data-cle'));
-        break;
-      case 'template-reset':
-        resetTemplate();
         break;
       case 'new-company-open':
         openNewCompany();

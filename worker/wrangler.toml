@@ -27,6 +27,8 @@ database_id = "9bcbc6e3-574a-44f5-8d30-273906128282"
 
 [vars]
 CRM_COMPANY_ID = "com_980c47a26e91493593a8"
+# Inscription autonome des firmes (/compte/?nouvelle-firme=1) : « non » la ferme.
+INSCRIPTION_OUVERTE = "oui"
 # Adresse d'expédition des courriels (invitations, mots de passe). Tout
 # alias du domaine intégré à Email Service convient, sans boîte à créer.
 COURRIEL_EXPEDITEUR = "no-reply@stratege.io"
@@ -47,10 +49,11 @@ bucket_name = "stratege-fp-photos"
 pattern = "pga.stratege.io"
 custom_domain = true
 
-# Rappels du carnet d'entretien aux membres des portails : le 1er de chaque
-# mois, 11 h UTC (7 h à Montréal l'été, 6 h l'hiver).
+# Tâches planifiées (heures UTC ; 11 h UTC = 7 h à Montréal l'été, 6 h l'hiver).
 [triggers]
-crons = ["0 11 1 * *"]
+# Le 1er du mois à 11 h UTC : rappels du carnet et des révisions. Le dimanche
+# à 7 h UTC : sauvegarde complète de la base dans R2 (sauvegardes/).
+crons = ["0 11 1 * *", "0 7 * * 0"]
 
 [observability]
 enabled = true

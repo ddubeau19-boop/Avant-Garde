@@ -2946,6 +2946,79 @@ async function getCurrentUser(c) {
   return user;
 }
 // ============================================================================
+// JOURNAL — historique des modifications d'un dossier et de ses composantes.
+// Chaque entrée garde l'auteur, le moment et, champ par champ, l'ancienne et
+// la nouvelle valeur. Les saisies d'une même personne sur une même fiche à
+// quelques minutes d'intervalle forment une seule entrée : le terrain
+// enregistre à chaque champ, le journal resterait sinon illisible.
+// ============================================================================
+const JOURNAL_REGROUPEMENT_MS = 10 * 60 * 1e3;
+const JOURNAL_VALEUR_MAX = 300;
+const LIBELLES_CHAMPS = {
+  name: "Nom", done: "Documentée", etat: "État", residual: "Vie résiduelle (%)", install_year: "Année d'installation",
+  qty: "Quantité", note: "Note", replacement_cost: "Coût de remplacement", useful_life_years: "Vie utile",
+  confirmed: "Confirmée au bureau", rating: "Cote", r_flag: "Remplacement (R)", observation: "Constats",
+  cause_possible: "Cause possible", delai_suggere: "Délai suggéré", consequences: "Conséquences",
+  uniformat_code: "Code Uniformat", position: "Position", emplacement: "Emplacement", variante: "Variante",
+  attributs: "Attributs", actif: "Dans la visite", etendue: "Étendue", etendue_qte: "Quantité touchée",
+  limite_observation: "Limite d'observation", limite_detail: "Détail de la limite", nature_risque: "Nature du risque",
+  source_annee: "Source de l'année", projet_ca: "Projet du CA", taches_entretien: "Tâches du carnet",
+  travaux_periode: "Travaux de la période", travaux_annee: "Année des travaux", cat: "Catégorie",
+  address: "Adresse", city: "Ville", units: "Unités", floors: "Étages", built_year: "Année de construction",
+  status: "Statut", current_fund_balance: "Solde du fonds", cotisation_annuelle: "Cotisation annuelle",
+  published_at: "Publication", batiment_info: "Fiche d'immeuble", assigne_a: "Responsable", echeance: "Échéance",
+  photos: "Photos", revision_de: "Révision de l'étude", revise_par: "Révisée par le dossier", composantes: "Composantes importées"
+};
+// Champs dont la valeur brute n'aide pas à la lecture : on note le changement seul.
+const CHAMPS_SANS_VALEUR = new Set(["taches_entretien", "attributs", "batiment_info"]);
+function valeurJournal(champ, v) {
+  if (v == null || v === "") return null;
+  if (CHAMPS_SANS_VALEUR.has(champ)) return null;
+  const t = String(v);
+  return t.length > JOURNAL_VALEUR_MAX ? `${t.slice(0, JOURNAL_VALEUR_MAX)}…` : t;
+}
+function differences(avant, apres, champs) {
+  const liste = [];
+  for (const champ of champs) {
+    const a = avant?.[champ] ?? null, b = apres?.[champ] ?? null;
+    if (String(a ?? "") === String(b ?? "")) continue;
+    liste.push({ champ, avant: valeurJournal(champ, a), apres: valeurJournal(champ, b) });
+  }
+  return liste;
+}
+// N'interrompt jamais la modification qu'il consigne.
+async function noterJournal(db, { dossierId, componentId = null, userId = null, action, champs = [] }) {
+  try {
+    if (["modification", "suivi"].includes(action) && !champs.length) return;
+    if (["modification", "photo"].includes(action)) {
+      const depuis = new Date(Date.now() - JOURNAL_REGROUPEMENT_MS).toISOString();
+      const dernier = await db.prepare(
+        `SELECT id, champs FROM journal WHERE dossier_id = ?1 AND COALESCE(component_id, '') = ?2 AND COALESCE(user_id, '') = ?3
+           AND action = ?4 AND moment >= ?5 ORDER BY moment DESC LIMIT 1`
+      ).bind(dossierId, componentId ?? "", userId ?? "", action, depuis).first();
+      if (dernier) {
+        const fusion = JSON.parse(dernier.champs || "[]");
+        for (const ch of champs) {
+          const deja = fusion.find((x) => x.champ === ch.champ);
+          if (!deja) fusion.push(ch);
+          else if (action === "photo") deja.apres = String(Number(deja.apres || 0) + Number(ch.apres || 0));
+          else deja.apres = ch.apres;
+        }
+        // Un champ revenu à sa valeur de départ n'a, au bout du compte, pas changé.
+        const utiles = action === "photo" ? fusion : fusion.filter((x) => String(x.avant ?? "") !== String(x.apres ?? "") || CHAMPS_SANS_VALEUR.has(x.champ));
+        if (!utiles.length) await db.prepare("DELETE FROM journal WHERE id = ?1").bind(dernier.id).run();
+        else await db.prepare("UPDATE journal SET champs = ?1, moment = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2")
+          .bind(JSON.stringify(utiles), dernier.id).run();
+        return;
+      }
+    }
+    await db.prepare("INSERT INTO journal (id, dossier_id, component_id, user_id, action, champs) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+      .bind(newId("jnl"), dossierId, componentId, userId, action, JSON.stringify(champs)).run();
+  } catch (e) {
+    console.error("journal non écrit", action, e?.message);
+  }
+}
+// ============================================================================
 // COMPTES AUTONOMES — invitations, mot de passe oublié, changement de mot de
 // passe. Les liens envoyés par courriel portent un jeton aléatoire dont seule
 // l'empreinte SHA-256 est gardée en base ; il sert une seule fois.
@@ -3116,6 +3189,118 @@ auth.post("/jeton/:jeton", async (c) => {
   const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(j.user_id).first();
   const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
   return c.json({ token, user: await publicUser(c.env.DB, user) });
+});
+// ---- Inscription d'une firme ---------------------------------------------------
+// Une firme ouvre son compte seule. Rien n'est créé avant que l'adresse soit
+// confirmée par le lien reçu : la firme et son premier administrateur naissent
+// à ce moment. Le super admin est averti de chaque nouvelle firme.
+// INSCRIPTION_OUVERTE = "non" ferme la porte.
+const DUREE_INSCRIPTION = 48 * 3600e3;
+const inscriptionFermee = (env) => String(env.INSCRIPTION_OUVERTE ?? "oui").toLowerCase() === "non";
+async function lireInscription(db, jeton) {
+  if (!jeton || !/^[A-Za-z0-9_-]{30,60}$/.test(jeton)) return null;
+  const row = await db.prepare("SELECT * FROM inscriptions WHERE id = ?1").bind(await empreinteJeton(jeton)).first();
+  if (!row || row.utilise_le || Date.now() > Number(row.expire_le)) return null;
+  return row;
+}
+auth.get("/inscription", (c) => c.json({ ouverte: !inscriptionFermee(c.env), longueur_min: LONGUEUR_MIN_MOT_DE_PASSE }));
+auth.post("/inscription", async (c) => {
+  if (inscriptionFermee(c.env)) return c.json({ error: "Les inscriptions sont fermées pour l'instant. Écrivez-nous pour ouvrir un compte." }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const firme = String(body2.firme ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+  const nom = String(body2.nom ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+  const email = String(body2.email ?? "").trim().toLowerCase().slice(0, 160);
+  if (!firme || !nom) return c.json({ error: "Le nom de la firme et votre nom sont requis." }, 400);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return c.json({ error: "Adresse courriel invalide." }, 400);
+  const reponse = { ok: true, message: `Un courriel de confirmation vient d'être envoyé à ${email}. Le lien est valable 48 heures.` };
+  // Champ piège, invisible pour une personne : un robot le remplit.
+  if (body2.site) return c.json(reponse);
+  const ip = c.req.header("cf-connecting-ip") ?? "inconnue";
+  if (await tentativesRecentes(c.env.DB, `inscription:${email}`, 60) >= 3 || await tentativesRecentes(c.env.DB, `inscription-ip:${ip}`, 24 * 60) >= 10) {
+    return c.json({ error: "Trop de demandes d'inscription. Réessayez plus tard." }, 429);
+  }
+  await noterTentative(c.env.DB, `inscription:${email}`);
+  await noterTentative(c.env.DB, `inscription-ip:${ip}`);
+  const origine = origineDe(c);
+  try {
+    // Adresse déjà inscrite : même réponse, et un courriel qui le lui dit.
+    const existant = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(email).first();
+    if (existant) {
+      await envoyerCourriel(c.env, {
+        to: email,
+        subject: "Vous avez déjà un compte sur Condo Stratégis",
+        titre: "Vous avez déjà un compte",
+        paragraphes: [`Une inscription a été demandée pour ${email}, mais cette adresse a déjà un compte. Connectez-vous, ou choisissez un nouveau mot de passe si vous l'avez oublié.`],
+        bouton: { texte: "Mot de passe oublié", url: `${origine}/compte/?courriel=${encodeURIComponent(email)}` },
+        pied: "Si vous n'avez rien demandé, ignorez ce courriel."
+      });
+      return c.json(reponse);
+    }
+    const jeton = toBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+    await c.env.DB.prepare("INSERT INTO inscriptions (id, firme, nom, email, expire_le) VALUES (?1, ?2, ?3, ?4, ?5)")
+      .bind(await empreinteJeton(jeton), firme, nom, email, Date.now() + DUREE_INSCRIPTION).run();
+    await envoyerCourriel(c.env, {
+      to: email,
+      subject: `Confirmez l'inscription de ${firme}`,
+      titre: `Bienvenue, ${nom}`,
+      paragraphes: [
+        `Confirmez votre adresse pour ouvrir le compte de ${firme} sur Condo Stratégis. Vous en serez l'administrateur : vous inviterez ensuite votre équipe, importerez votre bibliothèque de composantes et réglerez l'identité de vos rapports.`
+      ],
+      bouton: { texte: "Confirmer et choisir mon mot de passe", url: `${origine}/compte/?inscription=${jeton}` },
+      pied: "Ce lien est valable 48 heures. Si vous n'avez rien demandé, ignorez ce courriel : aucun compte ne sera créé."
+    });
+  } catch (e) {
+    console.error("inscription : courriel non envoyé", e?.code, e?.message);
+    return c.json({ error: "Le courriel de confirmation n'a pas pu être envoyé. Réessayez dans quelques minutes." }, 502);
+  }
+  return c.json(reponse);
+});
+auth.get("/inscription/:jeton", async (c) => {
+  const i = await lireInscription(c.env.DB, c.req.param("jeton"));
+  if (!i) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Recommencez l'inscription." }, 404);
+  return c.json({ firme: i.firme, nom: i.nom, email: i.email, longueur_min: LONGUEUR_MIN_MOT_DE_PASSE });
+});
+auth.post("/inscription/:jeton", async (c) => {
+  const i = await lireInscription(c.env.DB, c.req.param("jeton"));
+  if (!i) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Recommencez l'inscription." }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const refus = motDePasseRefuse(body2.password);
+  if (refus) return c.json({ error: refus }, 400);
+  if (await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(i.email).first()) {
+    return c.json({ error: "Cette adresse a déjà un compte. Connectez-vous." }, 409);
+  }
+  // Marqué utilisé d'abord : deux clics simultanés ne créent qu'une firme.
+  const pris = await c.env.DB.prepare("UPDATE inscriptions SET utilise_le = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1 AND utilise_le IS NULL").bind(i.id).run();
+  if (!pris.meta?.changes) return c.json({ error: "Ce lien a déjà servi." }, 409);
+  const companyId = newId("com");
+  let slug = slugify(i.firme) || companyId;
+  if (await c.env.DB.prepare("SELECT id FROM companies WHERE slug = ?1").bind(slug).first()) slug = `${slug}-${companyId.slice(-5)}`;
+  const { hash, salt } = await hashPassword(body2.password);
+  const champ = (v, max) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null);
+  const userId = newId("usr");
+  await c.env.DB.batch([
+    c.env.DB.prepare("INSERT INTO companies (id, name, slug) VALUES (?1, ?2, ?3)").bind(companyId, i.firme, slug),
+    c.env.DB.prepare(
+      `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role, title, ordre_professionnel, no_membre)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'admin', ?7, ?8, ?9)`
+    ).bind(userId, i.email, i.nom, hash, salt, companyId, champ(body2.title, 60), champ(body2.ordre_professionnel, 10)?.toUpperCase() ?? null, champ(body2.no_membre, 30))
+  ]);
+  try {
+    const admins = (await c.env.DB.prepare("SELECT email FROM users WHERE role = 'super_admin' AND actif = 1").all()).results;
+    for (const a of admins) {
+      await envoyerCourriel(c.env, {
+        to: a.email,
+        subject: `Nouvelle firme inscrite : ${i.firme}`,
+        titre: "Nouvelle firme inscrite",
+        paragraphes: [`${i.nom} (${i.email}) vient d'ouvrir le compte de ${i.firme}.`],
+        bouton: { texte: "Ouvrir l'administration", url: `${origineDe(c)}/admin/` }
+      });
+    }
+  } catch (e) {
+    console.error("inscription : avis au super admin non envoyé", e?.message);
+  }
+  const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(userId).first();
+  return c.json({ token: await createSessionToken(userId, c.env.SESSION_SECRET), user: await publicUser(c.env.DB, user) }, 201);
 });
 // Changer son mot de passe (connecté) : les autres sessions se ferment, la
 // session courante reçoit un nouveau jeton.
@@ -3643,7 +3828,8 @@ const COLONNES_AJOUTEES = [
   ["dossiers", "rappel_revision_le", "TEXT"],
   // Suivi des dossiers : qui s'en occupe, et pour quand.
   ["dossiers", "assigne_a", "TEXT"],
-  ["dossiers", "echeance", "TEXT"]
+  ["dossiers", "echeance", "TEXT"],
+  ["dossiers", "client_id", "TEXT"]
 ];
 // Tables ajoutées après la mise en production, créées au premier appel.
 const TABLES_AJOUTEES = [
@@ -3677,7 +3863,42 @@ const TABLES_AJOUTEES = [
      fait_le    TEXT NOT NULL,
      fait_par   TEXT,
      note       TEXT,
-     UNIQUE (dossier_id, cle_tache, annee, mois))`
+     UNIQUE (dossier_id, cle_tache, annee, mois))`,
+  // Historique des modifications : qui a changé quoi, et quand.
+  `CREATE TABLE IF NOT EXISTS journal (
+     id           TEXT PRIMARY KEY,
+     dossier_id   TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+     component_id TEXT,
+     user_id      TEXT,
+     action       TEXT NOT NULL,
+     champs       TEXT,
+     moment       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
+  `CREATE INDEX IF NOT EXISTS idx_journal_dossier ON journal(dossier_id, moment)`,
+  // Clients de la firme : les syndicats, leurs contacts et leurs études.
+  `CREATE TABLE IF NOT EXISTS clients (
+     id                 TEXT PRIMARY KEY,
+     company_id         TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+     nom                TEXT NOT NULL,
+     adresse            TEXT,
+     ville              TEXT,
+     code_postal        TEXT,
+     unites             INTEGER,
+     annee_construction INTEGER,
+     neq                TEXT,
+     contacts           TEXT,
+     notes              TEXT,
+     crm_id             TEXT,
+     cree_le            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
+  `CREATE INDEX IF NOT EXISTS idx_clients_firme ON clients(company_id, nom)`,
+  // Inscriptions de firmes en attente de confirmation de l'adresse.
+  `CREATE TABLE IF NOT EXISTS inscriptions (
+     id        TEXT PRIMARY KEY,
+     firme     TEXT NOT NULL,
+     nom       TEXT NOT NULL,
+     email     TEXT NOT NULL,
+     expire_le INTEGER NOT NULL,
+     utilise_le TEXT,
+     cree_le   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`
 ];
 let colonnesPretes = null;
 function assurerColonnes(db) {
@@ -5920,6 +6141,11 @@ components.patch("/:id", async (c) => {
     `UPDATE components SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
   ).bind(...values).run();
   const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
+  const auteur = await getCurrentUser(c);
+  await noterJournal(c.env.DB, {
+    dossierId: component.dossier_id, componentId: id, userId: auteur?.id, action: "modification",
+    champs: differences(owned, component, Object.keys(body2).filter((k) => k in LIBELLES_CHAMPS))
+  });
   return c.json({ ...component, entretien: tachesPourComposante(component, { avecRetirees: true, biblio: await bibliothequeDuDossier(c.env.DB, component.dossier_id) }).map(tacheAffichee) });
 });
 components.post("/:id/analyze", async (c) => {
@@ -5975,6 +6201,7 @@ components.post("/:id/photos", async (c) => {
   });
   await c.env.DB.prepare("INSERT INTO photos (id, component_id, r2_key, tag) VALUES (?1, ?2, ?3, ?4)").bind(id, componentId, r2Key, tag).run();
   const photo = await c.env.DB.prepare("SELECT * FROM photos WHERE id = ?1").bind(id).first();
+  await noterJournal(c.env.DB, { dossierId: component.dossier_id, componentId, userId: (await getCurrentUser(c))?.id, action: "photo", champs: [{ champ: "photos", avant: null, apres: "1" }] });
   return c.json(photo, 201);
 });
 components.post("/:id/structure-note", async (c) => {
@@ -46529,19 +46756,29 @@ companies.patch("/:id", async (c) => {
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
   return c.json({ ...company, hasLogo: !!company.logo_r2_key });
 });
+// Le super admin, ou un administrateur de la firme. Celui-ci n'envoie qu'une
+// image PNG ou JPEG vérifiée : un SVG servi depuis le domaine de la plateforme
+// peut porter du script.
 companies.post("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
-  const deny = requireSuperAdmin(c, user);
-  if (deny) return deny;
   const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const company = await c.env.DB.prepare("SELECT id FROM companies WHERE id = ?1").bind(id).first();
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
   const form = await c.req.formData();
   const file = form.get("file");
   if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
-  const ext = file.type === "image/png" ? "png" : file.type === "image/svg+xml" ? "svg" : "jpg";
+  const octets = await file.arrayBuffer();
+  if (octets.byteLength > 5 * 1024 * 1024) return c.json({ error: "logo trop volumineux (max 5 Mo)" }, 413);
+  const t = new Uint8Array(octets.slice(0, 8));
+  const png = t[0] === 0x89 && t[1] === 0x50 && t[2] === 0x4e && t[3] === 0x47;
+  const jpeg = t[0] === 0xff && t[1] === 0xd8 && t[2] === 0xff;
+  const svg = file.type === "image/svg+xml" && user.role === "super_admin";
+  if (!png && !jpeg && !svg) return c.json({ error: "le logo doit être une image PNG ou JPEG" }, 400);
+  const ext = png ? "png" : jpeg ? "jpg" : "svg";
   const r2Key = `company-logos/${id}.${ext}`;
-  await c.env.PHOTOS.put(r2Key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type || "image/png" } });
+  await c.env.PHOTOS.put(r2Key, octets, { httpMetadata: { contentType: png ? "image/png" : jpeg ? "image/jpeg" : "image/svg+xml" } });
   await c.env.DB.prepare(
     "UPDATE companies SET logo_r2_key = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
   ).bind(r2Key, id).run();
@@ -46797,7 +47034,13 @@ companies.get("/:id/logo", async (c) => {
   const obj = await c.env.PHOTOS.get(company.logo_r2_key);
   if (!obj) return c.notFound();
   return new Response(obj.body, {
-    headers: { "content-type": obj.httpMetadata?.contentType ?? "image/png", "cache-control": "private, max-age=3600" }
+    headers: {
+      "content-type": obj.httpMetadata?.contentType ?? "image/png",
+      "cache-control": "private, max-age=3600",
+      // Une image, jamais un document actif, même ouverte directement.
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+      "x-content-type-options": "nosniff"
+    }
   });
 });
 companies.get("/:id/engineers", async (c) => {
@@ -46860,6 +47103,22 @@ function membreEquipe(u) {
     actif: u.actif !== 0, invitation_en_attente: !!u.invitation_en_attente
   };
 }
+companies.get("/:id/export.zip", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const d = await donneesDeFirme(c.env.DB, id);
+  if (!d.firme) return c.json({ error: "entreprise introuvable" }, 404);
+  const noParDossier = new Map(d.dossiers.map((x) => [x.id, x.dossier_no]));
+  const octets = await zipper([
+    ["LISEZ-MOI.txt", LISEZ_MOI_EXPORT],
+    ["donnees.json", JSON.stringify(d, null, 1)],
+    ["dossiers.csv", csvExcel(CSV_DOSSIERS, d.dossiers)],
+    ["composantes.csv", csvExcel(CSV_COMPOSANTES, d.composantes.map((x) => ({ ...x, dossier_no: noParDossier.get(x.dossier_id) })))]
+  ]);
+  return reponseZip(octets, `export-${d.firme.slug || id}-${new Date().toISOString().slice(0, 10)}.zip`);
+});
 // L'équipe active, en noms seulement : de quoi choisir un responsable de dossier.
 companies.get("/:id/membres", async (c) => {
   const user = await getCurrentUser(c);
@@ -47161,6 +47420,375 @@ async function rappelsRevisions(env, origine) {
   console.log("rappels des révisions", JSON.stringify(bilan));
   return bilan;
 }
+// ============================================================================
+// CLIENTS — les syndicats de la firme : coordonnées, contacts, études.
+// Tout membre de la firme les tient à jour ; seul un administrateur en
+// supprime un, et jamais un client qui a encore des dossiers.
+// ============================================================================
+async function numeroPris(db, no) {
+  return !!await db.prepare("SELECT id FROM dossiers WHERE dossier_no = ?1").bind(String(no ?? "").trim()).first();
+}
+function texteClient(v, max = 200) {
+  const t = String(v ?? "").replace(/\s+/g, " ").trim();
+  return t ? t.slice(0, max) : null;
+}
+function entierClient(v, min, max) {
+  const n = Number(v);
+  return v === "" || v == null || !Number.isInteger(n) || n < min || n > max ? null : n;
+}
+function contactsClient(v) {
+  const liste = Array.isArray(v) ? v : [];
+  return liste.slice(0, 20).map((x) => ({
+    nom: texteClient(x?.nom, 120),
+    fonction: texteClient(x?.fonction, 80),
+    courriel: texteClient(x?.courriel, 160),
+    telephone: texteClient(x?.telephone, 40)
+  })).filter((x) => x.nom || x.courriel || x.telephone);
+}
+// Les champs d'une fiche, validés ; seuls ceux présents dans le corps.
+function champsClient(body2) {
+  const champs = {};
+  if ("nom" in body2) champs.nom = texteClient(body2.nom);
+  if ("adresse" in body2) champs.adresse = texteClient(body2.adresse);
+  if ("ville" in body2) champs.ville = texteClient(body2.ville, 80);
+  if ("code_postal" in body2) champs.code_postal = texteClient(body2.code_postal, 10)?.toUpperCase() ?? null;
+  if ("unites" in body2) champs.unites = entierClient(body2.unites, 1, 5000);
+  if ("annee_construction" in body2) champs.annee_construction = entierClient(body2.annee_construction, 1800, 2200);
+  if ("neq" in body2) champs.neq = texteClient(body2.neq, 20);
+  if ("contacts" in body2) champs.contacts = JSON.stringify(contactsClient(body2.contacts));
+  if ("notes" in body2) champs.notes = texteClient(body2.notes, 4000);
+  return champs;
+}
+function vueClient(r, dossiersDuClient = []) {
+  const tries = dossiersDuClient.slice().sort((a, b) => anneeEtude(b) - anneeEtude(a));
+  const actuel = tries.find((d) => !dossiersDuClient.some((x) => x.revision_de === d.id)) ?? tries[0] ?? null;
+  return {
+    id: r.id, nom: r.nom, adresse: r.adresse, ville: r.ville, code_postal: r.code_postal, unites: r.unites,
+    annee_construction: r.annee_construction, neq: r.neq, contacts: parseJsonArraySafe(r.contacts), notes: r.notes,
+    crm_id: r.crm_id, cree_le: r.cree_le,
+    dossiers: tries.map((d) => ({
+      id: d.id, dossier_no: d.dossier_no, name: d.name, annee: anneeEtude(d), published_at: d.published_at,
+      revision_de: d.revision_de, ...infoRevision(d, dossiersDuClient)
+    })),
+    etude_actuelle: actuel ? { id: actuel.id, dossier_no: actuel.dossier_no, annee: anneeEtude(actuel), publiee: !!actuel.published_at, ...infoRevision(actuel, dossiersDuClient) } : null
+  };
+}
+function parseJsonArraySafe(t) {
+  try { const v = JSON.parse(t || "[]"); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+async function clientDeFirme(c, id) {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return { user, client: null };
+  const client = await c.env.DB.prepare("SELECT * FROM clients WHERE id = ?1 AND company_id = ?2").bind(id, user.company_id).first();
+  return { user, client };
+}
+const clientsApi = new Hono();
+clientsApi.get("/", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json({ clients: [], sans_client: [] });
+  const [clients, dossiersFirme] = await Promise.all([
+    c.env.DB.prepare("SELECT * FROM clients WHERE company_id = ?1 ORDER BY nom COLLATE NOCASE").bind(user.company_id).all(),
+    c.env.DB.prepare("SELECT id, dossier_no, name, address, city, units, built_year, published_at, created_at, revision_de, client_id FROM dossiers WHERE company_id = ?1").bind(user.company_id).all()
+  ]);
+  const tous = dossiersFirme.results;
+  // Les dossiers sans client, regroupés par immeuble (une étude et ses révisions).
+  const racine = (d) => {
+    let r = d;
+    for (let i = 0; i < 20 && r.revision_de; i++) {
+      const precedent = tous.find((x) => x.id === r.revision_de);
+      if (!precedent) break;
+      r = precedent;
+    }
+    return r;
+  };
+  const groupes = new Map();
+  for (const d of tous.filter((x) => !x.client_id)) {
+    const r = racine(d);
+    if (!groupes.has(r.id)) groupes.set(r.id, { nom: d.name, adresse: d.address, ville: d.city, unites: d.units, annee_construction: d.built_year, dossiers: [] });
+    groupes.get(r.id).dossiers.push({ id: d.id, dossier_no: d.dossier_no, annee: anneeEtude(d) });
+  }
+  return c.json({
+    clients: clients.results.map((r) => vueClient(r, tous.filter((d) => d.client_id === r.id))),
+    sans_client: [...groupes.values()],
+    crm: !crmRefus(c, user)
+  });
+});
+clientsApi.post("/", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const champs = champsClient(body2);
+  if (!champs.nom) return c.json({ error: "le nom du syndicat est requis" }, 400);
+  const id = newId("cli");
+  const cols = Object.keys(champs);
+  await c.env.DB.prepare(`INSERT INTO clients (id, company_id, ${cols.join(", ")}) VALUES (?1, ?2, ${cols.map((_, i) => `?${i + 3}`).join(", ")})`)
+    .bind(id, user.company_id, ...cols.map((k) => champs[k])).run();
+  // Dossiers existants rattachés à la création (un immeuble et ses révisions).
+  const ids = Array.isArray(body2.dossiers) ? body2.dossiers.map(String).slice(0, 50) : [];
+  if (ids.length) {
+    await c.env.DB.batch(ids.map((d) => c.env.DB.prepare("UPDATE dossiers SET client_id = ?1 WHERE id = ?2 AND company_id = ?3").bind(id, d, user.company_id)));
+  }
+  const r = await c.env.DB.prepare("SELECT * FROM clients WHERE id = ?1").bind(id).first();
+  const siens = (await c.env.DB.prepare("SELECT * FROM dossiers WHERE client_id = ?1").bind(id).all()).results;
+  return c.json(vueClient(r, siens), 201);
+});
+// Syndicats du CRM Stratégis pas encore importés — Condo Stratégis seulement.
+clientsApi.get("/crm", async (c) => {
+  const user = await getCurrentUser(c);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const deja = new Set((await c.env.DB.prepare("SELECT crm_id FROM clients WHERE company_id = ?1 AND crm_id IS NOT NULL").bind(user.company_id).all()).results.map((r) => r.crm_id));
+  const rows = (await c.env.CRM.prepare(
+    `SELECT id, nom, address, city, units, neq, annee_construction, gestionnaire_name, gestionnaire_email FROM syndicats
+       WHERE actif = 1 AND superseded_by_syndicat_id IS NULL ORDER BY nom COLLATE NOCASE LIMIT 2000`
+  ).all()).results;
+  return c.json(rows.filter((r) => !deja.has(r.id)).map((r) => ({ id: r.id, nom: r.nom, adresse: r.address, ville: r.city, unites: r.units, gestionnaire: r.gestionnaire_name })));
+});
+clientsApi.post("/crm", async (c) => {
+  const user = await getCurrentUser(c);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const ids = Array.isArray(body2.ids) ? [...new Set(body2.ids.map(String))].slice(0, 500) : [];
+  if (!ids.length) return c.json({ error: "aucun syndicat choisi" }, 400);
+  const deja = new Set((await c.env.DB.prepare("SELECT crm_id FROM clients WHERE company_id = ?1 AND crm_id IS NOT NULL").bind(user.company_id).all()).results.map((r) => r.crm_id));
+  const lignes = [];
+  for (let i = 0; i < ids.length; i += 90) {
+    const lot = ids.slice(i, i + 90);
+    lignes.push(...(await c.env.CRM.prepare(
+      `SELECT id, nom, address, city, units, neq, annee_construction, gestionnaire_name, gestionnaire_email FROM syndicats WHERE id IN (${lot.map((_, k) => `?${k + 1}`).join(", ")})`
+    ).bind(...lot).all()).results);
+  }
+  const nouveaux = lignes.filter((r) => !deja.has(r.id));
+  const stmt = c.env.DB.prepare(
+    `INSERT INTO clients (id, company_id, nom, adresse, ville, unites, annee_construction, neq, contacts, crm_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+  );
+  for (let i = 0; i < nouveaux.length; i += 50) {
+    await c.env.DB.batch(nouveaux.slice(i, i + 50).map((r) => {
+      const ch = champsClient({ nom: r.nom, adresse: r.address, ville: r.city, unites: r.units, annee_construction: r.annee_construction, neq: r.neq,
+        contacts: r.gestionnaire_name || r.gestionnaire_email ? [{ nom: r.gestionnaire_name, fonction: "Gestionnaire", courriel: r.gestionnaire_email }] : [] });
+      return stmt.bind(newId("cli"), user.company_id, ch.nom ?? "Syndicat sans nom", ch.adresse, ch.ville, ch.unites, ch.annee_construction, ch.neq, ch.contacts, r.id);
+    }));
+  }
+  return c.json({ importes: nouveaux.length, deja: lignes.length - nouveaux.length });
+});
+clientsApi.get("/:id", async (c) => {
+  const { client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const siens = (await c.env.DB.prepare("SELECT * FROM dossiers WHERE client_id = ?1").bind(client.id).all()).results;
+  return c.json(vueClient(client, siens));
+});
+clientsApi.patch("/:id", async (c) => {
+  const { client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const champs = champsClient(await c.req.json().catch(() => ({})));
+  if ("nom" in champs && !champs.nom) return c.json({ error: "le nom du syndicat est requis" }, 400);
+  const cols = Object.keys(champs);
+  if (!cols.length) return c.json({ error: "rien à modifier" }, 400);
+  await c.env.DB.prepare(`UPDATE clients SET ${cols.map((k, i) => `${k} = ?${i + 1}`).join(", ")} WHERE id = ?${cols.length + 1}`)
+    .bind(...cols.map((k) => champs[k]), client.id).run();
+  const r = await c.env.DB.prepare("SELECT * FROM clients WHERE id = ?1").bind(client.id).first();
+  const siens = (await c.env.DB.prepare("SELECT * FROM dossiers WHERE client_id = ?1").bind(client.id).all()).results;
+  return c.json(vueClient(r, siens));
+});
+clientsApi.delete("/:id", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  if (!peutAdministrerFirme(user, client.company_id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const n = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM dossiers WHERE client_id = ?1").bind(client.id).first();
+  if (n?.n) return c.json({ error: "ce client a des dossiers : détachez-les d'abord" }, 409);
+  await c.env.DB.prepare("DELETE FROM clients WHERE id = ?1").bind(client.id).run();
+  return c.json({ ok: true });
+});
+// Rattacher un dossier (avec ses révisions) à ce client, ou l'en détacher.
+clientsApi.put("/:id/dossiers/:dossierId", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const d = await c.env.DB.prepare("SELECT id FROM dossiers WHERE id = ?1 AND company_id = ?2").bind(c.req.param("dossierId"), user.company_id).first();
+  if (!d) return c.json({ error: "dossier introuvable" }, 404);
+  await c.env.DB.prepare("UPDATE dossiers SET client_id = ?1 WHERE id = ?2").bind(client.id, d.id).run();
+  return c.json({ ok: true });
+});
+clientsApi.delete("/:id/dossiers/:dossierId", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  await c.env.DB.prepare("UPDATE dossiers SET client_id = NULL WHERE id = ?1 AND client_id = ?2 AND company_id = ?3").bind(c.req.param("dossierId"), client.id, user.company_id).run();
+  return c.json({ ok: true });
+});
+// Nouvelle étude pour ce client : le dossier reprend ses coordonnées.
+clientsApi.post("/:id/dossiers", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const no = texteClient(body2.dossier_no, 40);
+  if (!no) return c.json({ error: "numéro de dossier requis" }, 400);
+  if (await numeroPris(c.env.DB, no)) return c.json({ error: `le numéro de dossier ${no} est déjà utilisé` }, 409);
+  const floors = entierClient(body2.floors, 1, 200);
+  return c.json(await creerDossier(c, user, {
+    dossier_no: no, name: client.nom, address: client.adresse, city: client.ville, units: client.unites ?? 0,
+    floors, built_year: client.annee_construction, client_id: client.id
+  }), 201);
+});
+// ============================================================================
+// EXPORT ET SAUVEGARDES
+// ----------------------------------------------------------------------------
+// Export : tout ce qu'une firme a confié à la plateforme, pour qu'elle le
+// garde ou le reprenne ailleurs — sans mot de passe ni jeton. Archive d'un
+// dossier : ses données et ses photos. Sauvegarde : chaque semaine, toute la
+// base dans R2, conservée six mois, en plus du retour dans le temps de D1.
+// ============================================================================
+const EXPORT_VERSION = 1;
+const COLONNES_SECRETES = new Set(["password_hash", "password_salt", "sessions_apres"]);
+const sansSecrets = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).filter(([k]) => !COLONNES_SECRETES.has(k))));
+async function toutes(db, sql, ...params) {
+  return (await db.prepare(sql).bind(...params).all()).results;
+}
+async function donneesDeFirme(db, companyId) {
+  const dossiersFirme = `SELECT id FROM dossiers WHERE company_id = ?1`;
+  const [firme, equipe, clients2, dossiers2, composantes, photos2, journal2, regles, suivi2, portail2, gabarit, redactions2, prix2, sources] = await Promise.all([
+    db.prepare("SELECT * FROM companies WHERE id = ?1").bind(companyId).first(),
+    toutes(db, "SELECT * FROM users WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM clients WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM dossiers WHERE company_id = ?1", companyId),
+    toutes(db, `SELECT * FROM components WHERE dossier_id IN (${dossiersFirme}) ORDER BY dossier_id, sort_order`, companyId),
+    toutes(db, `SELECT p.* FROM photos p JOIN components cmp ON cmp.id = p.component_id WHERE cmp.dossier_id IN (${dossiersFirme})`, companyId),
+    toutes(db, `SELECT * FROM journal WHERE dossier_id IN (${dossiersFirme}) ORDER BY moment`, companyId),
+    toutes(db, `SELECT * FROM carnet_regles WHERE dossier_id IN (${dossiersFirme})`, companyId),
+    toutes(db, `SELECT * FROM carnet_suivi WHERE dossier_id IN (${dossiersFirme})`, companyId),
+    toutes(db, `SELECT a.dossier_id, a.fonction, a.cree_le, u.id AS user_id, u.name, u.email, u.actif FROM portail_acces a JOIN users u ON u.id = a.user_id WHERE a.dossier_id IN (${dossiersFirme})`, companyId),
+    db.prepare("SELECT company_id, sections, source_filename, imported_at, updated_at FROM company_templates WHERE company_id = ?1").bind(companyId).first(),
+    toutes(db, "SELECT * FROM redactions WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM price_observations WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM price_observation_sources WHERE company_id = ?1", companyId)
+  ]);
+  return {
+    format: "condo-strategis-export", version: EXPORT_VERSION, exporte_le: (/* @__PURE__ */ new Date()).toISOString(),
+    firme, equipe: sansSecrets(equipe), clients: clients2, dossiers: dossiers2, composantes, photos: photos2,
+    journal: journal2, carnet: { regles, suivi: suivi2 }, portail: portail2, gabarit_texte: gabarit ?? null,
+    redactions: redactions2, prix: { observations: prix2, sources }
+  };
+}
+// CSV pour Excel en français : point-virgule, BOM UTF-8, virgule décimale.
+function csvExcel(entetes, lignes) {
+  const cellule = (v) => {
+    if (v == null) return "";
+    const t = typeof v === "number" ? String(v).replace(".", ",") : String(v);
+    return /[;"\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  return "\uFEFF" + [entetes.map(([, lib]) => cellule(lib)).join(";"), ...lignes.map((l) => entetes.map(([k]) => cellule(l[k])).join(";"))].join("\r\n");
+}
+const CSV_DOSSIERS = [["dossier_no", "Dossier"], ["name", "Syndicat"], ["address", "Adresse"], ["city", "Ville"], ["units", "Unités"], ["floors", "Étages"], ["built_year", "Construction"], ["current_fund_balance", "Solde du fonds"], ["cotisation_annuelle", "Cotisation annuelle"], ["published_at", "Publié le"], ["created_at", "Créé le"], ["id", "Identifiant"]];
+const CSV_COMPOSANTES = [["dossier_no", "Dossier"], ["cat", "Catégorie"], ["name", "Composante"], ["uniformat_code", "Uniformat"], ["actif", "Dans la visite"], ["done", "Documentée"], ["rating", "Cote"], ["install_year", "Année d'installation"], ["useful_life_years", "Vie utile"], ["replacement_cost", "Coût de remplacement"], ["qty", "Quantité"], ["observation", "Constats"], ["id", "Identifiant"]];
+const LISEZ_MOI_EXPORT = `Export des données — Condo Stratégis
+
+donnees.json     Toutes les données de la firme : équipe (sans mots de passe), clients,
+                 dossiers, composantes, métadonnées des photos, historique des
+                 modifications, carnets d'entretien, membres des portails, textes du
+                 rapport, rédactions et banque de prix.
+dossiers.csv     Les dossiers, à ouvrir dans Excel.
+composantes.csv  Les composantes de tous les dossiers, à ouvrir dans Excel.
+
+Les photos ne sont pas dans cet export : elles se téléchargent dossier par
+dossier (« Archive du dossier », dans la console bureau), avec les données du
+dossier.
+`;
+async function zipper(fichiers) {
+  const JSZip = import_jszip_min.default;
+  const zip = new JSZip();
+  for (const [nom, contenu, opts] of fichiers) zip.file(nom, contenu, opts);
+  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+function reponseZip(octets, nom) {
+  return new Response(octets, {
+    headers: {
+      "content-type": "application/zip",
+      "content-disposition": `attachment; filename="${nom.replace(/[^A-Za-z0-9._-]/g, "_")}"`,
+      "cache-control": "no-store"
+    }
+  });
+}
+// Budget des photos d'une archive : un Worker n'a que 128 Mo de mémoire.
+const ARCHIVE_PHOTOS_OCTETS = 60 * 1024 * 1024;
+async function archiveDossier(env, dossier) {
+  const [composantes, photos2, journal2, regles, suivi2] = await Promise.all([
+    toutes(env.DB, "SELECT * FROM components WHERE dossier_id = ?1 ORDER BY sort_order", dossier.id),
+    toutes(env.DB, "SELECT p.* FROM photos p JOIN components cmp ON cmp.id = p.component_id WHERE cmp.dossier_id = ?1 ORDER BY p.created_at", dossier.id),
+    toutes(env.DB, "SELECT * FROM journal WHERE dossier_id = ?1 ORDER BY moment", dossier.id),
+    toutes(env.DB, "SELECT * FROM carnet_regles WHERE dossier_id = ?1", dossier.id),
+    toutes(env.DB, "SELECT * FROM carnet_suivi WHERE dossier_id = ?1", dossier.id)
+  ]);
+  const noms = new Map(composantes.map((c) => [c.id, c]));
+  const fichiers = [];
+  let budget = ARCHIVE_PHOTOS_OCTETS;
+  const absentes = [];
+  const rang = new Map();
+  for (const p of photos2) {
+    const c = noms.get(p.component_id);
+    const n = (rang.get(p.component_id) ?? 0) + 1;
+    rang.set(p.component_id, n);
+    const obj = await env.PHOTOS.get(p.r2_key);
+    if (!obj || obj.size > budget) { absentes.push(p.id); continue; }
+    budget -= obj.size;
+    const ext = p.r2_key.endsWith(".png") ? "png" : "jpg";
+    const dossierPhoto = `${String((c?.sort_order ?? 0) + 1).padStart(3, "0")} ${(c?.name ?? "composante").replace(/[\\/:*?"<>|]/g, "-").slice(0, 80)}`;
+    p.fichier = `photos/${dossierPhoto}/${n}${p.tag ? ` - ${String(p.tag).replace(/[\\/:*?"<>|]/g, "-")}` : ""}.${ext}`;
+    // Déjà compressées : stockées telles quelles.
+    fichiers.push([p.fichier, new Uint8Array(await obj.arrayBuffer()), { compression: "STORE" }]);
+  }
+  const donnees = { format: "condo-strategis-dossier", version: EXPORT_VERSION, exporte_le: (/* @__PURE__ */ new Date()).toISOString(), dossier, composantes, photos: photos2, journal: journal2, carnet: { regles, suivi: suivi2 }, photos_non_incluses: absentes };
+  fichiers.unshift(
+    ["donnees.json", JSON.stringify(donnees, null, 1)],
+    ["composantes.csv", csvExcel(CSV_COMPOSANTES, composantes.map((c) => ({ ...c, dossier_no: dossier.dossier_no })))]
+  );
+  if (absentes.length) fichiers.push(["PHOTOS-MANQUANTES.txt", `${absentes.length} photo(s) n'ont pas pu être incluses (taille de l'archive limitée à 60 Mo, ou fichier absent). Leurs identifiants sont dans donnees.json, clé photos_non_incluses.\n`]);
+  return zipper(fichiers);
+}
+// Sauvegarde complète : chaque table, chaque ligne, en JSON compressé.
+const SAUVEGARDES_GARDEES = 26;
+const CRON_SAUVEGARDE = "0 7 * * 0";
+async function sauvegarderBase(env) {
+  const tables = (await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'd1_%' ORDER BY name"
+  ).all()).results.map((r) => r.name);
+  const contenu = { format: "condo-strategis-sauvegarde", version: EXPORT_VERSION, cree_le: (/* @__PURE__ */ new Date()).toISOString(), tables: {} };
+  for (const t of tables) {
+    const lignes = [];
+    for (let depart = 0; ; depart += 1000) {
+      const lot = (await env.DB.prepare(`SELECT * FROM "${t.replace(/"/g, "")}" LIMIT 1000 OFFSET ?1`).bind(depart).all()).results;
+      lignes.push(...lot);
+      if (lot.length < 1000) break;
+    }
+    contenu.tables[t] = lignes;
+  }
+  const flux = new Blob([JSON.stringify(contenu)]).stream().pipeThrough(new CompressionStream("gzip"));
+  const octets = new Uint8Array(await new Response(flux).arrayBuffer());
+  const cle = `sauvegardes/stratege-fp-${contenu.cree_le.slice(0, 19).replace(/[:T]/g, "-")}.json.gz`;
+  await env.PHOTOS.put(cle, octets, { httpMetadata: { contentType: "application/gzip" }, customMetadata: { tables: String(tables.length) } });
+  // Les plus anciennes au-delà de six mois de sauvegardes hebdomadaires.
+  const liste = (await env.PHOTOS.list({ prefix: "sauvegardes/" })).objects.sort((a, b) => a.key < b.key ? -1 : 1);
+  for (const vieille of liste.slice(0, Math.max(0, liste.length - SAUVEGARDES_GARDEES))) await env.PHOTOS.delete(vieille.key);
+  console.log("sauvegarde", cle, octets.length, "octets", tables.length, "tables");
+  return { cle, octets: octets.length, tables: tables.length };
+}
+// Liste et téléchargement des sauvegardes : super admin seulement.
+const sauvegardes = new Hono();
+sauvegardes.use("*", async (c, next) => {
+  const user = await getCurrentUser(c);
+  if (user?.role !== "super_admin") return c.json({ error: "réservé au super administrateur" }, 403);
+  return next();
+});
+sauvegardes.get("/", async (c) => {
+  const liste = (await c.env.PHOTOS.list({ prefix: "sauvegardes/" })).objects.sort((a, b) => a.key < b.key ? 1 : -1);
+  return c.json(liste.map((o) => ({ nom: o.key.slice("sauvegardes/".length), octets: o.size, le: o.uploaded })));
+});
+sauvegardes.post("/", async (c) => c.json(await sauvegarderBase(c.env), 201));
+sauvegardes.get("/:nom", async (c) => {
+  const nom = c.req.param("nom");
+  if (!/^stratege-fp-[\d-]+\.json\.gz$/.test(nom)) return c.json({ error: "nom invalide" }, 400);
+  const obj = await c.env.PHOTOS.get(`sauvegardes/${nom}`);
+  if (!obj) return c.json({ error: "sauvegarde introuvable" }, 404);
+  return new Response(obj.body, { headers: { "content-type": "application/gzip", "content-disposition": `attachment; filename="${nom}"`, "cache-control": "no-store" } });
+});
 // ---- Côté firme : membres et répartition, depuis la console bureau -------------
 async function dossierPortail(c, { ecriture = false } = {}) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
@@ -47479,6 +48107,11 @@ dossiers.patch("/:id/suivi", async (c) => {
   await c.env.DB.prepare(`UPDATE dossiers SET ${sets.join(", ")} WHERE id = ?${vals.length}`).bind(...vals).run();
   const d = await c.env.DB.prepare("SELECT id, assigne_a, echeance FROM dossiers WHERE id = ?1").bind(dossier.id).first();
   const nom = d.assigne_a ? (await c.env.DB.prepare("SELECT name FROM users WHERE id = ?1").bind(d.assigne_a).first())?.name : null;
+  const nomAvant = dossier.assigne_a ? (await c.env.DB.prepare("SELECT name FROM users WHERE id = ?1").bind(dossier.assigne_a).first())?.name : null;
+  await noterJournal(c.env.DB, {
+    dossierId: dossier.id, userId: user.id, action: "suivi",
+    champs: differences({ assigne_a: nomAvant, echeance: dossier.echeance }, { assigne_a: nom, echeance: d.echeance }, ["assigne_a", "echeance"])
+  });
   return c.json({ ...d, assigne: d.assigne_a ? { id: d.assigne_a, name: nom } : null });
 });
 // Où en est le dossier dans le cycle des révisions : l'étude qu'il révise,
@@ -47513,9 +48146,9 @@ dossiers.post("/:id/revision", async (c) => {
   const facteur = facteurIndexation(anneeSource, annee);
   const id = newId("dos");
   await c.env.DB.prepare(
-    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id, batiment_info, revision_de)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`
-  ).bind(id, dossierNo, source.name, source.address, source.city, source.units ?? 0, source.floors, source.built_year, user.id, source.company_id, source.batiment_info, source.id).run();
+    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id, batiment_info, revision_de, client_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`
+  ).bind(id, dossierNo, source.name, source.address, source.city, source.units ?? 0, source.floors, source.built_year, user.id, source.company_id, source.batiment_info, source.id, source.client_id ?? null).run();
   const anciennes = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 ORDER BY sort_order ASC, created_at ASC").bind(source.id).all();
   const nouveauxIds = new Map(anciennes.results.map((comp) => [comp.id, newId("cmp")]));
   const colonnes = ["id", "dossier_id", ...CHAMPS_REPRIS_REVISION, "replacement_cost", "parent_id", "origine_id"];
@@ -47534,6 +48167,8 @@ dossiers.post("/:id/revision", async (c) => {
     c.env.DB.prepare("INSERT OR IGNORE INTO carnet_regles (dossier_id, cle, user_id) SELECT ?1, cle, user_id FROM carnet_regles WHERE dossier_id = ?2").bind(id, source.id)
   ]);
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  await noterJournal(c.env.DB, { dossierId: id, userId: user.id, action: "creation", champs: [{ champ: "revision_de", avant: null, apres: String(source.dossier_no ?? "") }] });
+  await noterJournal(c.env.DB, { dossierId: source.id, userId: user.id, action: "revision", champs: [{ champ: "revise_par", avant: null, apres: dossierNo }] });
   return c.json({
     ...dossier,
     stats: await dossierStats(c.env.DB, id),
@@ -47546,10 +48181,19 @@ dossiers.post("/", async (c) => {
   if (!user.company_id) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
   const body2 = await c.req.json();
   if (!body2.dossier_no || !body2.name) return c.json({ error: "dossier_no et name requis" }, 400);
+  if (await numeroPris(c.env.DB, body2.dossier_no)) return c.json({ error: `le numéro de dossier ${body2.dossier_no} est déjà utilisé` }, 409);
+  if (body2.client_id && !await c.env.DB.prepare("SELECT id FROM clients WHERE id = ?1 AND company_id = ?2").bind(body2.client_id, user.company_id).first()) {
+    return c.json({ error: "client introuvable" }, 404);
+  }
+  return c.json(await creerDossier(c, user, body2), 201);
+});
+// Nouveau dossier et sa liste de départ : celle de la firme, filtrée pour
+// l'immeuble par l'IA quand une clé est configurée.
+async function creerDossier(c, user, body2) {
   const id = newId("dos");
   await c.env.DB.prepare(
-    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id, client_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`
   ).bind(
     id,
     body2.dossier_no,
@@ -47560,7 +48204,8 @@ dossiers.post("/", async (c) => {
     body2.floors ?? null,
     body2.built_year ?? null,
     user.id,
-    user.company_id
+    user.company_id,
+    body2.client_id ?? null
   ).run();
   const regles = evaluerRegles({ floors: body2.floors ?? null, batiment_info: null });
   // La liste de la firme, si elle en a importé une ; sinon celle de Condo Stratégis.
@@ -47585,7 +48230,8 @@ dossiers.post("/", async (c) => {
     })
   );
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
-  return c.json({
+  await noterJournal(c.env.DB, { dossierId: id, userId: user.id, action: "creation", champs: [] });
+  return {
     ...dossier,
     stats: await dossierStats(c.env.DB, id),
     // L'inspecteur doit savoir si la liste a été filtrée pour son immeuble ou
@@ -47596,8 +48242,8 @@ dossiers.post("/", async (c) => {
       total: gabarit.length,
       desactivees: filtre.inactifs.size
     }
-  }, 201);
-});
+  };
+}
 async function getOwnedDossier(c, id) {
   const user = await getCurrentUser(c);
   if (!user) return { user: null, dossier: null };
@@ -47617,6 +48263,39 @@ dossiers.get("/:id/components", async (c) => {
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
 });
+// Historique du dossier, du plus récent au plus ancien ; ?composante= pour
+// une seule fiche.
+dossiers.get("/:id/journal", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const composante = c.req.query("composante");
+  const limite = Math.min(Math.max(Number(c.req.query("limite")) || 100, 1), 500);
+  const rows = (await c.env.DB.prepare(
+    `SELECT j.*, u.name AS auteur, cmp.name AS composante FROM journal j
+       LEFT JOIN users u ON u.id = j.user_id
+       LEFT JOIN components cmp ON cmp.id = j.component_id
+       WHERE j.dossier_id = ?1 ${composante ? "AND j.component_id = ?3" : ""}
+       ORDER BY j.moment DESC LIMIT ?2`
+  ).bind(...composante ? [dossier.id, limite, composante] : [dossier.id, limite]).all()).results;
+  return c.json(rows.map((r) => ({
+    id: r.id,
+    moment: r.moment,
+    action: r.action,
+    auteur: r.auteur ?? null,
+    composante: r.component_id ? { id: r.component_id, name: r.composante ?? "Composante supprimée" } : null,
+    champs: JSON.parse(r.champs || "[]").map((x) => ({
+      ...x,
+      libelle: LIBELLES_CHAMPS[x.champ] ?? x.champ,
+      avant: x.champ === "rating" && x.avant ? RATING_LABELS[x.avant] ?? x.avant : x.avant,
+      apres: x.champ === "rating" && x.apres ? RATING_LABELS[x.apres] ?? x.apres : x.apres
+    }))
+  })));
+});
+dossiers.get("/:id/archive.zip", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  return reponseZip(await archiveDossier(c.env, dossier), `archive-${dossier.dossier_no}.zip`);
+});
 // Catalogue de la firme pour l'ajout sur le terrain : sa bibliothèque, ou la
 // liste de Condo Stratégis quand elle n'en a pas importé.
 dossiers.get("/:id/catalogue", async (c) => {
@@ -47629,7 +48308,7 @@ dossiers.get("/:id/catalogue", async (c) => {
 // venir de l'appareil : une création faite hors connexion et rejouée deux fois
 // (réponse perdue en route) ne crée qu'une composante.
 dossiers.post("/:id/components", async (c) => {
-  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   const body2 = await c.req.json().catch(() => ({}));
   const name = String(body2.name ?? "").replace(/\s+/g, " ").trim();
@@ -47663,6 +48342,7 @@ dossiers.post("/:id/components", async (c) => {
      VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, 1)`
   ).bind(id, dossier.id, cat, name, qty, (depart?.m ?? -1) + 1, vu, code, attributs).run();
   const creee = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
+  await noterJournal(c.env.DB, { dossierId: dossier.id, componentId: id, userId: user?.id, action: "ajout", champs: [{ champ: "name", avant: null, apres: name }] });
   return c.json(await composanteComplete(c.env.DB, creee, biblio), 201);
 });
 // Toute la visite en un appel, pour la préparer hors connexion : chaque
@@ -47741,6 +48421,7 @@ dossiers.post("/:id/components/import", async (c) => {
       item.code ?? null
     ))
   );
+  await noterJournal(c.env.DB, { dossierId: dossier.id, userId: (await getCurrentUser(c))?.id, action: "import", champs: [{ champ: "composantes", avant: null, apres: String(items.length) }] });
   return c.json({
     ok: true,
     composantes_importees: items.length,
@@ -47963,7 +48644,7 @@ async function appliquerReglesModifiees(db, avant, apres, gabarit = GABARIT_STRA
 }
 dossiers.patch("/:id", async (c) => {
   const id = c.req.param("id");
-  const { dossier: owned } = await getOwnedDossier(c, id);
+  const { user: auteur, dossier: owned } = await getOwnedDossier(c, id);
   if (!owned) return c.json({ error: "dossier introuvable" }, 404);
   const body2 = await c.req.json();
   const fields = [];
@@ -47992,6 +48673,10 @@ dossiers.patch("/:id", async (c) => {
     `UPDATE dossiers SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
   ).bind(...values).run();
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  const changes = differences(owned, dossier, Object.keys(body2).filter((k) => k in LIBELLES_CHAMPS));
+  const publication = changes.filter((x) => x.champ === "published_at");
+  if (publication.length) await noterJournal(c.env.DB, { dossierId: id, userId: auteur?.id, action: dossier.published_at ? "publication" : "depublication", champs: publication });
+  await noterJournal(c.env.DB, { dossierId: id, userId: auteur?.id, action: "modification", champs: changes.filter((x) => x.champ !== "published_at") });
   // Les conditions viennent de la liste de la firme, complétée de celle de
   // Condo Stratégis pour les dossiers créés avant son import.
   const biblio = await bibliothequeDuDossier(c.env.DB, id);
@@ -48624,7 +49309,7 @@ app.use("/api/*", async (c, next) => {
   return next();
 });
 app.use("/api/*", async (c, next) => {
-  if (["/api/dossiers", "/api/components", "/api/companies", "/api/auth", "/api/portail"].some((p) => c.req.path.startsWith(p))) {
+  if (["/api/dossiers", "/api/components", "/api/companies", "/api/auth", "/api/portail", "/api/clients"].some((p) => c.req.path.startsWith(p))) {
     await assurerColonnes(c.env.DB);
   }
   return next();
@@ -48637,13 +49322,17 @@ app.route("/api/components", components);
 app.route("/api/photos", photos);
 app.route("/api/prix", prix);
 app.route("/api/portail", portail);
+app.route("/api/clients", clientsApi);
+app.route("/api/sauvegardes", sauvegardes);
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 const index = {
   fetch: app.fetch,
   // Le 1er de chaque mois : les tâches du carnet partent par courriel aux
   // membres des portails.
+  // Le dimanche : sauvegarde complète de la base dans R2.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(rappelsMensuels(env));
+    if (event.cron === CRON_SAUVEGARDE) ctx.waitUntil(sauvegarderBase(env));
+    else ctx.waitUntil(rappelsMensuels(env));
   }
 };
 export {

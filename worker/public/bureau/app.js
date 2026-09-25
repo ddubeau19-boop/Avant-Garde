@@ -4,6 +4,7 @@
 // ============================================================
 
 import { creerBibliotheque } from '../shared/bibliotheque.js';
+import { creerModeles } from '../shared/modeles.js';
 
 const TOKEN_KEY = 'cs_bureau_token';
 
@@ -796,6 +797,7 @@ async function deletePrix(id) {
 }
 
 async function openDossier(id) {
+  journal.ouvert = false; journal.entrees = null;
   revokeReviewPhotos();
   state.dossierId = id;
   state.screen = 'revision';
@@ -1199,6 +1201,34 @@ async function downloadReport(kind) {
   }
 }
 
+// Téléchargement d'un fichier de l'API sous le nom donné.
+async function telecharger(chemin, nom) {
+  const res = await apiRaw(chemin);
+  if (!res.ok) {
+    let msg = 'Téléchargement impossible.';
+    try { msg = (await res.json()).error || msg; } catch (e) { /* pas du JSON */ }
+    throw new Error(msg);
+  }
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement('a');
+  a.href = url; a.download = nom;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+const exportFirme = { enCours: false, erreur: null };
+async function exporterFirme() {
+  exportFirme.enCours = true; exportFirme.erreur = null; render();
+  try { await telecharger(`/api/companies/${idFirme()}/export.zip`, `export-${new Date().toISOString().slice(0, 10)}.zip`); }
+  catch (e) { exportFirme.erreur = e.message; }
+  exportFirme.enCours = false; render();
+}
+async function archiverDossier() {
+  state.archiveEnCours = true; render();
+  try { await telecharger(`/api/dossiers/${state.dossierId}/archive.zip`, `archive-${(state.dossier && state.dossier.dossier_no) || 'dossier'}.zip`); }
+  catch (e) { state.revisionFlashError = e.message; }
+  state.archiveEnCours = false; render();
+}
+
 // ---------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------
@@ -1256,12 +1286,12 @@ function renderLogin() {
         <p>Accès réservé aux ingénieurs.</p>
         ${state.loginError ? `<div class="login-error">${escapeHtml(state.loginError)}</div>` : ''}
         <label class="field-label" for="login-email">Courriel</label>
-        <div class="field-box"><i data-lucide="mail"></i><input id="login-email" data-role="login-email" name="email" type="email" autocomplete="username" placeholder="prenom.nom@condostrategis.ca" value="${escapeHtml(state.loginEmail || '')}" required></div>
+        <div class="field-box"><i data-lucide="mail"></i><input id="login-email" data-role="login-email" name="email" type="email" autocomplete="username" placeholder="prenom.nom@votrefirme.ca" value="${escapeHtml(state.loginEmail || '')}" required></div>
         <label class="field-label" for="login-password">Mot de passe</label>
         <div class="field-box"><i data-lucide="lock"></i><input id="login-password" data-role="login-password" name="password" type="password" autocomplete="current-password" placeholder="Mot de passe" value="${escapeHtml(state.loginPassword || '')}" required></div>
         <button type="submit" class="btn-primary" style="width:100%" ${state.loginLoading ? 'disabled' : ''}>${state.loginLoading ? 'Connexion…' : 'Se connecter'}<i data-lucide="${state.loginLoading ? 'loader-2' : 'arrow-right'}" class="${state.loginLoading ? 'spin' : ''}"></i></button>
         <a href="/compte/?retour=/bureau/" style="display:block;text-align:center;margin-top:14px;font-size:12.5px;color:var(--ink-500)">Mot de passe oublié ?</a>
-        <div class="login-forgot">Mot de passe oublié ?</div>
+        <div class="login-forgot">Votre firme n'a pas encore de compte ? <a href="/compte/?nouvelle-firme=1" style="color:var(--accent-press);font-weight:600">Ouvrir un compte</a></div>
       </form>
     </div>
   </div>`;
@@ -1274,9 +1304,9 @@ function railHtml() {
     { key: 'prix', label: 'Banque de prix', icon: 'receipt', action: 'go-prix', active: state.screen === 'prix' },
     { key: 'bibliotheque', label: 'Bibliothèque', icon: 'library', action: 'go-bibliotheque', active: state.screen === 'bibliotheque' },
     ...(estAdminFirme() ? [{ key: 'equipe', label: 'Équipe', icon: 'users-round', action: 'go-equipe', active: state.screen === 'equipe' }] : []),
-    { key: 'clients', label: 'Clients', icon: 'users', disabled: true },
+    { key: 'clients', label: 'Clients', icon: 'users', action: 'go-clients', active: state.screen === 'clients' },
     { key: 'carnet', label: "Carnet d'entretien", icon: 'calendar-clock', action: 'go-carnet', active: state.screen === 'carnet' },
-    { key: 'modeles', label: 'Modèles', icon: 'file-stack', disabled: true },
+    { key: 'modeles', label: 'Modèles', icon: 'file-stack', action: 'go-modeles', active: state.screen === 'modeles' },
   ];
   const initials = initialsOf(state.user && state.user.name);
   return `
@@ -1309,6 +1339,8 @@ function renderShell() {
   else if (state.screen === 'reviewIA') main = renderReviewIA();
   else if (state.screen === 'equipe') main = renderEquipe();
   else if (state.screen === 'carnet') main = renderCarnet();
+  else if (state.screen === 'clients') main = renderClients();
+  else if (state.screen === 'modeles') main = renderModeles();
   else if (state.screen === 'bibliotheque') main = `<div class="page-pad cscr" style="padding:0">${bib.html({ eyebrow: (state.user && state.user.company && state.user.company.name) || '' })}</div>`;
   return `<div class="shell">${railHtml()}<div class="main">${main}</div></div>`;
 }
@@ -1327,6 +1359,53 @@ const bib = creerBibliotheque({
   spinnerBlock: (x) => spinnerBlock(x),
   companyId: () => state.user && state.user.company && state.user.company.id,
 });
+
+// ---------------------------------------------------------------
+// Modèles de rapport : identité, mise en page Word et texte de fond.
+// Tous les consultent ; un administrateur de la firme les modifie.
+// ---------------------------------------------------------------
+const modeles = creerModeles({
+  apiJson: (path, opts) => apiJson(path, opts),
+  render: () => render(),
+  escapeHtml: (x) => escapeHtml(x),
+  fmtDate: (iso) => {
+    const d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleDateString('fr-CA', { day: 'numeric', month: 'short', year: 'numeric' });
+  },
+  spinnerBlock: (x) => spinnerBlock(x),
+  companyId: () => idFirme(),
+});
+const logoFirme = { envoi: false, erreur: null };
+
+async function envoyerLogo(file) {
+  logoFirme.envoi = true; logoFirme.erreur = null; render();
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    await apiJson(`/api/companies/${idFirme()}/logo`, { method: 'POST', body: fd });
+    if (state.user && state.user.company) state.user.company.hasLogo = true;
+    await loadCompanyLogo();
+  } catch (e) { logoFirme.erreur = e.message || "Échec de l'envoi du logo."; }
+  logoFirme.envoi = false; render();
+}
+
+function renderModeles() {
+  const admin = estAdminFirme();
+  return `
+  <div class="page-pad cscr modeles-page ${admin ? '' : 'lecture-seule'}">
+    <div class="eyebrow-orange">${escapeHtml((state.user && state.user.company && state.user.company.name) || '')}</div>
+    <h1 class="page-title">Modèles</h1>
+    <p class="eq-lead">Ce que chaque rapport Word de la firme reprend : son logo et ses couleurs, ses pages liminaires et le texte de fond des sections.${admin ? '' : " Seul un administrateur de la firme les modifie."}</p>
+    <div class="eng-section-head"><span class="lbl">Logo</span><div class="rule"></div>
+      ${admin ? `<label class="btn-pill-sm">${logoFirme.envoi ? 'Envoi…' : 'Changer le logo'}<input type="file" accept="image/png,image/jpeg" data-role="logo-firme" style="display:none" ${logoFirme.envoi ? 'disabled' : ''}></label>` : ''}
+    </div>
+    ${logoFirme.erreur ? errorBanner(logoFirme.erreur) : ''}
+    <div class="logo-apercu">${state.companyLogoUrl ? `<img src="${state.companyLogoUrl}" alt="Logo de la firme">` : '<span class="dt-sub">Aucun logo : les rapports paraissent sans logo.</span>'}</div>
+    ${modeles.themeCardHtml()}
+    ${modeles.miseEnPageCardHtml()}
+    ${modeles.templateCardHtml()}
+  </div>`;
+}
 
 // ---------------------------------------------------------------
 // Équipe de la firme : l'administrateur invite ses ingénieurs par
@@ -1439,6 +1518,10 @@ function renderEquipe() {
     ${equipe.note ? `<div class="temp-pass-warn" style="margin:12px 0"><i data-lucide="${equipe.lien ? 'alert-triangle' : 'check'}"></i><span>${escapeHtml(equipe.note)}${equipe.lien ? `<br><input class="eq-lien" readonly value="${escapeHtml(equipe.lien)}" onclick="this.select()">` : ''}</span></div>` : ''}
     ${d && !d.courriel ? `<div class="temp-pass-warn"><i data-lucide="info"></i><span>L'envoi de courriels n'est pas configuré : chaque invitation affichera un lien à transmettre vous-même.</span></div>` : ''}
 
+    <div class="eng-section-head" style="margin-top:22px"><span class="lbl">Données de la firme</span><div class="rule"></div>
+      <button class="btn-pill-sm" data-action="export-firme" ${exportFirme.enCours ? 'disabled' : ''}>${exportFirme.enCours ? 'Préparation…' : "Télécharger l'export (.zip)"}</button></div>
+    <p class="eq-lead" style="margin-bottom:6px">Tout ce que la firme a confié à la plateforme — clients, dossiers, composantes, historique, carnets, banque de prix — en JSON, avec les dossiers et les composantes en CSV pour Excel. Les photos se téléchargent dossier par dossier (« Archive du dossier »). Une sauvegarde complète de la plateforme est aussi faite chaque semaine.</p>
+    ${exportFirme.erreur ? errorBanner(exportFirme.erreur) : ''}
     ${!d ? spinnerBlock("Chargement de l'équipe…") : `
     <div class="dossiers-table" style="margin-top:18px">
       <div class="dt-row eq-row dt-head"><div>Nom</div><div>Rôle</div><div>Statut</div><div></div></div>
@@ -1450,6 +1533,206 @@ function renderEquipe() {
         <div class="eq-actions">${actions(m)}</div>
       </div>`).join('')}
     </div>`}
+  </div>`;
+}
+
+// ---------------------------------------------------------------
+// Clients : les syndicats de la firme, leurs contacts et leurs études.
+// ---------------------------------------------------------------
+const clients = { data: null, courant: null, recherche: '', erreur: null, note: null, saving: false, crm: null };
+const CHAMPS_CLIENT = [
+  ['nom', 'Nom du syndicat', 'Syndicat de copropriété…'], ['adresse', 'Adresse', ''], ['ville', 'Ville', ''],
+  ['code_postal', 'Code postal', ''], ['unites', 'Unités', ''], ['annee_construction', 'Année de construction', ''], ['neq', 'NEQ', ''],
+];
+
+async function chargerClients() {
+  try { clients.data = await apiJson('/api/clients'); clients.erreur = null; }
+  catch (e) { clients.erreur = e.message || 'Impossible de charger les clients.'; }
+  render();
+}
+async function ouvrirClient(id) {
+  clients.erreur = null; clients.note = null;
+  try { clients.courant = await apiJson(`/api/clients/${id}`); if (!clients.courant.contacts.length) clients.courant.contacts.push({}); }
+  catch (e) { clients.erreur = e.message; }
+  render();
+}
+function clientDepuisGroupe(i) {
+  const g = clients.data && clients.data.sans_client[i];
+  if (!g) return;
+  clients.courant = { id: null, nom: g.nom || '', adresse: g.adresse, ville: g.ville, unites: g.unites, annee_construction: g.annee_construction, contacts: [{}], dossiers: [], aLier: g.dossiers };
+  clients.erreur = null; render();
+}
+// Les champs du formulaire tels que saisis, avant tout nouveau rendu.
+function lireFormClient() {
+  const c = clients.courant; if (!c) return;
+  for (const [k] of CHAMPS_CLIENT) { const el = document.getElementById(`cli-${k}`); if (el) c[k] = el.value; }
+  const notes = document.getElementById('cli-notes'); if (notes) c.notes = notes.value;
+  c.contacts = c.contacts.map((x, i) => {
+    const v = (k) => { const el = document.getElementById(`cli-ct-${i}-${k}`); return el ? el.value : x[k]; };
+    return { nom: v('nom'), fonction: v('fonction'), courriel: v('courriel'), telephone: v('telephone') };
+  });
+}
+async function enregistrerClient() {
+  lireFormClient();
+  const c = clients.courant;
+  if (!String(c.nom || '').trim()) { clients.erreur = 'Le nom du syndicat est requis.'; render(); return; }
+  const corps = { nom: c.nom, adresse: c.adresse, ville: c.ville, code_postal: c.code_postal, unites: c.unites, annee_construction: c.annee_construction, neq: c.neq, notes: c.notes, contacts: c.contacts };
+  if (!c.id && c.aLier) corps.dossiers = c.aLier.map(d => d.id);
+  clients.saving = true; clients.erreur = null; render();
+  try {
+    const r = await apiJson(c.id ? `/api/clients/${c.id}` : '/api/clients', { method: c.id ? 'PATCH' : 'POST', body: JSON.stringify(corps) });
+    clients.courant = r; if (!r.contacts.length) r.contacts.push({});
+    clients.note = 'Fiche enregistrée.';
+  } catch (e) { clients.erreur = e.message; }
+  clients.saving = false; render();
+}
+async function supprimerClient() {
+  const c = clients.courant;
+  if (!c || !c.id || !confirm(`Supprimer la fiche de ${c.nom} ?`)) return;
+  try { await apiJson(`/api/clients/${c.id}`, { method: 'DELETE' }); clients.courant = null; chargerClients(); }
+  catch (e) { clients.erreur = e.message; render(); }
+}
+async function detacherDossier(id) {
+  const c = clients.courant;
+  if (!c || !confirm('Détacher ce dossier de la fiche client ?')) return;
+  try { await apiJson(`/api/clients/${c.id}/dossiers/${id}`, { method: 'DELETE' }); ouvrirClient(c.id); }
+  catch (e) { clients.erreur = e.message; render(); }
+}
+async function nouveauDossierClient() {
+  const c = clients.courant; if (!c || !c.id) return;
+  const no = (document.getElementById('cli-no') || {}).value || '';
+  const etages = (document.getElementById('cli-etages') || {}).value || '';
+  if (!no.trim()) { clients.erreur = 'Donnez un numéro au nouveau dossier.'; render(); return; }
+  clients.saving = true; clients.erreur = null; render();
+  try {
+    const d = await apiJson(`/api/clients/${c.id}/dossiers`, { method: 'POST', body: JSON.stringify({ dossier_no: no.trim(), floors: etages }) });
+    clients.saving = false;
+    state.dossiers = []; loadDossiers();
+    openDossier(d.id);
+    return;
+  } catch (e) { clients.erreur = e.message; }
+  clients.saving = false; render();
+}
+async function ouvrirCrm() {
+  clients.crm = { liste: null, recherche: '', choix: new Set(), erreur: null, enCours: false }; render();
+  try { clients.crm.liste = await apiJson('/api/clients/crm'); }
+  catch (e) { clients.crm.erreur = e.message; }
+  render();
+}
+function crmFiltres() {
+  const q = (clients.crm.recherche || '').toLowerCase().trim();
+  return (clients.crm.liste || []).filter(x => !q || `${x.nom} ${x.adresse || ''} ${x.ville || ''}`.toLowerCase().includes(q));
+}
+async function importerCrm() {
+  const ids = [...clients.crm.choix];
+  if (!ids.length) return;
+  clients.crm.enCours = true; render();
+  try {
+    const r = await apiJson('/api/clients/crm', { method: 'POST', body: JSON.stringify({ ids }) });
+    clients.crm = null;
+    clients.note = `${r.importes} syndicat${r.importes > 1 ? 's' : ''} importé${r.importes > 1 ? 's' : ''} du CRM.`;
+    chargerClients();
+  } catch (e) { clients.crm.erreur = e.message; clients.crm.enCours = false; render(); }
+}
+
+function etudeBadge(e) {
+  if (!e) return '<span class="dt-sub">Aucune étude</span>';
+  return `<div class="dt-no">${escapeHtml(e.dossier_no)} · ${e.annee}</div>
+    ${e.revision_due ? `<span class="status-badge" style="background:var(--orange-wash);color:var(--accent-press)">Révision due · ${e.revision_echeance}</span>` : e.publiee ? `<div class="dt-sub">Prochaine révision : ${e.revision_echeance}</div>` : '<div class="dt-sub">En cours</div>'}`;
+}
+
+function renderClients() {
+  const entete = `<div class="eyebrow-orange">${escapeHtml((state.user && state.user.company && state.user.company.name) || '')}</div>`;
+  if (clients.courant) return renderFicheClient(entete);
+  const d = clients.data;
+  const q = clients.recherche.toLowerCase().trim();
+  const liste = d ? d.clients.filter(c => !q || `${c.nom} ${c.adresse || ''} ${c.ville || ''} ${c.contacts.map(x => x.nom || '').join(' ')}`.toLowerCase().includes(q)) : [];
+  const crm = clients.crm;
+  return `
+  <div class="page-pad cscr">
+    ${entete}
+    <h1 class="page-title">Clients</h1>
+    <p class="eq-lead">Les syndicats de la firme : coordonnées, contacts et études. Une nouvelle étude se crée depuis la fiche du client.</p>
+    <div class="filters-row">
+      <button class="btn-primary" data-action="client-nouveau"><i data-lucide="plus"></i>Nouveau client</button>
+      ${d && d.crm ? `<button class="btn-row-action" data-action="client-crm">Importer du CRM</button>` : ''}
+      <input class="cli-recherche" data-role="clients-recherche" id="clients-recherche" placeholder="Rechercher un syndicat, une ville, un contact…" value="${escapeHtml(clients.recherche)}">
+    </div>
+    ${clients.erreur ? errorBanner(clients.erreur) : ''}
+    ${clients.note ? `<div class="temp-pass-warn" style="margin:0 0 14px"><i data-lucide="check"></i><span>${escapeHtml(clients.note)}</span></div>` : ''}
+    ${d && d.sans_client.length ? `
+    <div class="cli-orphelins">
+      <div class="cli-orph-titre">${d.sans_client.length} immeuble${d.sans_client.length > 1 ? 's ont' : ' a'} des dossiers sans fiche client</div>
+      ${d.sans_client.map((g, i) => `<div class="cli-orph"><span><b>${escapeHtml(g.nom || '—')}</b>${g.ville ? ` · ${escapeHtml(g.ville)}` : ''} · ${g.dossiers.map(x => escapeHtml(x.dossier_no)).join(', ')}</span><button class="btn-row-action" data-action="client-depuis-groupe" data-i="${i}">Créer la fiche</button></div>`).join('')}
+    </div>` : ''}
+    ${!d ? spinnerBlock('Chargement des clients…') : `
+    <div class="dossiers-table">
+      <div class="dt-row cli-row dt-head"><div>Syndicat</div><div>Unités</div><div>Étude actuelle</div><div>Contact</div><div></div></div>
+      ${liste.length ? liste.map(c => {
+        const ct = c.contacts.find(x => x.nom || x.courriel);
+        return `<div class="dt-row cli-row">
+          <div><div class="dt-name">${escapeHtml(c.nom)}</div><div class="dt-sub">${escapeHtml([c.adresse, c.ville].filter(Boolean).join(', '))}</div></div>
+          <div class="dt-no">${c.unites || '—'}</div>
+          <div>${etudeBadge(c.etude_actuelle)}</div>
+          <div>${ct ? `<div class="dt-resp">${escapeHtml(ct.nom || ct.courriel)}</div><div class="dt-sub">${escapeHtml(ct.fonction || ct.courriel || '')}</div>` : '<span class="dt-sub">—</span>'}</div>
+          <div><button class="btn-row-action" data-action="client-ouvrir" data-id="${c.id}">Ouvrir</button></div>
+        </div>`;
+      }).join('') : `<div class="empty-state">${d.clients.length ? 'Aucun client ne correspond.' : 'Aucun client pour l\'instant.'}</div>`}
+    </div>`}
+  </div>
+  ${crm ? `
+  <div class="cli-modal-fond"><div class="cli-modal">
+    <div class="cli-modal-tete"><b>Importer des syndicats du CRM</b><button class="lien-mini" data-action="client-crm-fermer">Fermer</button></div>
+    ${crm.erreur ? errorBanner(crm.erreur) : ''}
+    ${!crm.liste ? spinnerBlock('Lecture du CRM…') : `
+    <input class="cli-recherche" style="width:100%;margin:0 0 10px" data-role="crm-recherche" id="crm-recherche" placeholder="Filtrer…" value="${escapeHtml(crm.recherche)}">
+    <div class="cli-crm-liste">${crmFiltres().map(x => `<label class="cli-crm-ligne"><input type="checkbox" data-role="crm-choix" data-id="${escapeHtml(x.id)}" ${crm.choix.has(x.id) ? 'checked' : ''}><span><b>${escapeHtml(x.nom)}</b><br><span class="dt-sub">${escapeHtml([x.adresse, x.ville].filter(Boolean).join(', '))}${x.unites ? ` · ${x.unites} unités` : ''}</span></span></label>`).join('') || '<div class="empty-state">Tous les syndicats du CRM sont déjà importés.</div>'}</div>
+    <div class="cli-modal-pied">
+      <button class="btn-row-action" data-action="client-crm-tout">Tout cocher (${crmFiltres().length})</button>
+      <button class="btn-primary" data-action="client-crm-importer" ${crm.choix.size && !crm.enCours ? '' : 'disabled'}>${crm.enCours ? 'Import…' : `Importer ${crm.choix.size}`}</button>
+    </div>`}
+  </div></div>` : ''}`;
+}
+
+function renderFicheClient(entete) {
+  const c = clients.courant;
+  const admin = estAdminFirme();
+  const champ = ([k, lib, ph]) => `<label class="cli-champ ${k === 'nom' || k === 'adresse' ? 'large' : ''}"><span>${lib}</span><input id="cli-${k}" value="${escapeHtml(c[k] == null ? '' : c[k])}" placeholder="${escapeHtml(ph)}" ${['unites', 'annee_construction'].includes(k) ? 'inputmode="numeric"' : ''}></label>`;
+  const contact = (x, i) => `<div class="cli-contact">
+    ${['nom', 'fonction', 'courriel', 'telephone'].map(k => `<input id="cli-ct-${i}-${k}" value="${escapeHtml(x[k] || '')}" placeholder="${{ nom: 'Nom', fonction: 'Fonction (président du CA, gestionnaire…)', courriel: 'Courriel', telephone: 'Téléphone' }[k]}">`).join('')}
+    <button class="lien-mini" data-action="client-contact-retirer" data-i="${i}" title="Retirer">retirer</button>
+  </div>`;
+  return `
+  <div class="page-pad cscr">
+    <button class="lien-mini" data-action="client-liste">← Tous les clients</button>
+    ${entete}
+    <h1 class="page-title">${escapeHtml(c.id ? c.nom : 'Nouveau client')}</h1>
+    ${clients.erreur ? errorBanner(clients.erreur) : ''}
+    ${clients.note ? `<div class="temp-pass-warn" style="margin:0 0 14px"><i data-lucide="check"></i><span>${escapeHtml(clients.note)}</span></div>` : ''}
+    ${c.aLier ? `<div class="temp-pass-warn" style="margin:0 0 14px"><i data-lucide="link"></i><span>Les dossiers ${c.aLier.map(x => escapeHtml(x.dossier_no)).join(', ')} seront rattachés à cette fiche.</span></div>` : ''}
+    <div class="cli-grille">${CHAMPS_CLIENT.map(champ).join('')}</div>
+    <div class="cli-sous-titre">Contacts</div>
+    ${c.contacts.map(contact).join('')}
+    <button class="lien-mini" data-action="client-contact-ajouter">+ Ajouter un contact</button>
+    <label class="cli-champ large" style="margin-top:14px"><span>Notes</span><textarea id="cli-notes" rows="3">${escapeHtml(c.notes || '')}</textarea></label>
+    <div class="filters-row" style="margin-top:14px">
+      <button class="btn-primary" data-action="client-enregistrer" ${clients.saving ? 'disabled' : ''}>${clients.saving ? 'Enregistrement…' : 'Enregistrer la fiche'}</button>
+      ${c.id && admin && !c.dossiers.length ? `<button class="btn-row-action" data-action="client-supprimer">Supprimer</button>` : ''}
+    </div>
+    ${c.id ? `
+    <div class="cli-sous-titre">Études</div>
+    <div class="dossiers-table">
+      ${c.dossiers.length ? c.dossiers.map(d => `<div class="dt-row cli-dos-row">
+        <div><div class="dt-name">${escapeHtml(d.dossier_no)} · ${d.annee}</div><div class="dt-sub">${d.published_at ? 'Publiée' : 'En cours'}${d.revision_de ? ' · révision' : ''}${d.revision_due ? ` · révision due en ${d.revision_echeance}` : ''}</div></div>
+        <div style="display:flex;gap:6px;justify-content:flex-end"><button class="btn-row-action" data-action="open-dossier" data-id="${d.id}">Ouvrir</button><button class="lien-mini" data-action="client-detacher" data-id="${d.id}">détacher</button></div>
+      </div>`).join('') : '<div class="empty-state">Aucune étude pour ce client.</div>'}
+    </div>
+    <div class="eq-form" style="margin-top:14px">
+      <input id="cli-no" placeholder="Numéro du nouveau dossier">
+      <input id="cli-etages" placeholder="Étages (facultatif)" inputmode="numeric" style="flex:0 0 160px;min-width:0">
+      <button class="btn-primary" data-action="client-nouveau-dossier" ${clients.saving ? 'disabled' : ''}>Nouvelle étude</button>
+    </div>
+    <div class="dt-sub" style="margin-top:6px">Le dossier reprend le nom, l'adresse, les unités et l'année de construction du client, avec la liste de départ de votre bibliothèque. La visite se fait ensuite dans l'application terrain.</div>` : ''}
   </div>`;
 }
 
@@ -1650,7 +1933,8 @@ function renderDossiers() {
   <div class="page-pad">
     <div class="eyebrow-orange">Tableau de bord</div>
     <h1 class="page-title">Dossiers</h1>
-    <p class="page-lead">Révisez les données du terrain, ajustez le fonds de prévoyance et générez les rapports.</p>
+    <div class="titre-actions"><p class="page-lead">Révisez les données du terrain, ajustez le fonds de prévoyance et générez les rapports.</p>
+      <button class="btn-primary" data-action="go-clients" title="Une étude se crée depuis la fiche de son client"><i data-lucide="plus"></i>Nouvelle étude</button></div>
     ${state.dossiersError ? errorBanner(state.dossiersError, 'retry-dossiers') : ''}
     ${tuilesHtml(rows)}
     ${suivi.erreur ? errorBanner(suivi.erreur) : ''}
@@ -2078,6 +2362,10 @@ function executiveSummaryHtml(proj, selectedCode) {
   </div>`;
 }
 
+function archiveHtml() {
+  return `<button class="report-item" data-action="archive-dossier" ${state.archiveEnCours ? 'disabled' : ''}><div class="report-icon"><i data-lucide="archive"></i></div><div style="flex:1"><div class="report-name">${state.archiveEnCours ? 'Préparation de l\'archive…' : 'Archive du dossier'}</div><div class="report-sub">Données et photos · .zip</div></div><i data-lucide="download"></i></button>`;
+}
+
 function reportsCardHtml(allConf, remaining) {
   if (allConf) {
     return `
@@ -2086,6 +2374,7 @@ function reportsCardHtml(allConf, remaining) {
       <button class="report-item" data-action="download-docx"><div class="report-icon"><i data-lucide="file-text"></i></div><div style="flex:1"><div class="report-name">Étude de fonds</div><div class="report-sub">Word · .docx</div></div><i data-lucide="download"></i></button>
       <button class="report-item" data-action="download-xlsx"><div class="report-icon green"><i data-lucide="table-2"></i></div><div style="flex:1"><div class="report-name">Durées de vie + carnet</div><div class="report-sub">Excel · .xlsx</div></div><i data-lucide="download"></i></button>
       <button class="report-item" data-action="download-suivi"><div class="report-icon"><i data-lucide="calendar-check"></i></div><div style="flex:1"><div class="report-name">Tableur suivi d'entretien</div><div class="report-sub">Excel · tâches par saison</div></div><i data-lucide="download"></i></button>
+      ${archiveHtml()}
       <div class="reports-note ready"><i data-lucide="check-circle-2"></i>Texte confirmé — rapports générés et à jour à chaque édition.</div>
     </div>`;
   }
@@ -2094,6 +2383,7 @@ function reportsCardHtml(allConf, remaining) {
     <div class="reports-eyebrow">Rapports finaux</div>
     <div class="report-item locked"><div class="report-icon locked"><i data-lucide="file-text"></i></div><div style="flex:1"><div class="report-name muted">Étude de fonds</div><div class="report-sub muted">Word · verrouillé</div></div><i data-lucide="lock"></i></div>
     <div class="report-item locked"><div class="report-icon locked"><i data-lucide="table-2"></i></div><div style="flex:1"><div class="report-name muted">Durées de vie + carnet</div><div class="report-sub muted">Excel · verrouillé</div></div><i data-lucide="lock"></i></div>
+    ${archiveHtml()}
     <div class="reports-note locked"><i data-lucide="alert-circle"></i>Confirmez le texte des ${remaining} composante(s) restante(s) pour générer les rapports.</div>
   </div>`;
 }
@@ -2316,6 +2606,69 @@ function batimentPanelHtml(d) {
   </div>`;
 }
 
+/* ---------- Historique des modifications ---------- */
+
+const journal = { ouvert: false, dossierId: null, entrees: null, chargement: false, erreur: null };
+const ACTIONS_JOURNAL = {
+  creation: 'a créé le dossier', modification: 'a modifié', ajout: 'a ajouté une composante', photo: 'a ajouté des photos',
+  import: 'a importé des composantes', suivi: 'a changé le suivi', publication: 'a publié le rapport',
+  depublication: 'a retiré la publication', revision: 'a commencé la révision',
+};
+
+async function chargerJournal(id) {
+  journal.dossierId = id; journal.chargement = true; journal.erreur = null; render();
+  try {
+    journal.entrees = await apiJson(`/api/dossiers/${id}/journal?limite=200`);
+  } catch (e) {
+    journal.erreur = e.message || "Impossible de charger l'historique.";
+  }
+  journal.chargement = false; render();
+}
+
+function momentJournal(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return d.toLocaleString('fr-CA', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function journalPanelHtml(d) {
+  const head = `
+    <button class="imm-head" data-action="toggle-journal" aria-expanded="${journal.ouvert ? 'true' : 'false'}">
+      <div class="imm-head-icon"><i data-lucide="history"></i></div>
+      <div style="flex:1">
+        <div class="imm-head-title">Historique des modifications</div>
+        <div class="imm-head-sub">Qui a changé quoi, et quand — au terrain comme au bureau</div>
+      </div>
+      <i data-lucide="${journal.ouvert ? 'chevron-up' : 'chevron-down'}" style="color:var(--ink-500)"></i>
+    </button>`;
+  if (!journal.ouvert) return `<div class="imm-panel">${head}</div>`;
+  let corps;
+  if (journal.chargement || journal.dossierId !== d.id) corps = spinnerBlock("Chargement de l'historique…");
+  else if (journal.erreur) corps = errorBanner(journal.erreur);
+  else if (!journal.entrees || !journal.entrees.length) corps = `<div class="empty-state">Aucune modification consignée pour l'instant.</div>`;
+  else corps = journal.entrees.map(e => {
+    const MONTANTS = ['current_fund_balance', 'cotisation_annuelle', 'replacement_cost'];
+    const valeur = (v, champ) => {
+      if (v == null || v === '') return '<span class="jn-vide">vide</span>';
+      if (MONTANTS.includes(champ) && !isNaN(Number(v))) return escapeHtml(fmt(Number(v)) + ' $');
+      if (champ === 'published_at' || champ === 'echeance') return escapeHtml(momentJournal(v.length === 10 ? v + 'T12:00:00' : v).replace(/,? \d+ h \d+$/, ''));
+      if (champ === 'useful_life_years') return escapeHtml(v + ' ans');
+      if (['done', 'confirmed', 'r_flag', 'actif'].includes(champ)) return v === '1' ? 'oui' : 'non';
+      return escapeHtml(v);
+    };
+    const champs = e.action === 'photo'
+      ? `<div class="jn-champ">${escapeHtml((e.champs[0] && e.champs[0].apres) || '1')} photo(s)</div>`
+      : e.champs.filter(ch => ch.champ !== 'photos').map(ch => ch.avant == null && ch.apres == null
+        ? `<div class="jn-champ"><b>${escapeHtml(ch.libelle)}</b> modifié</div>`
+        : `<div class="jn-champ"><b>${escapeHtml(ch.libelle)}</b> : ${valeur(ch.avant, ch.champ)} → ${valeur(ch.apres, ch.champ)}</div>`).join('');
+    return `<div class="jn-entree">
+      <div class="jn-tete"><span class="jn-qui">${escapeHtml(e.auteur || 'Système')}</span> ${ACTIONS_JOURNAL[e.action] || escapeHtml(e.action)}${e.composante ? ` <span class="jn-comp">${escapeHtml(e.composante.name)}</span>` : ''}<span class="jn-quand">${escapeHtml(momentJournal(e.moment))}</span></div>
+      ${champs}
+    </div>`;
+  }).join('');
+  return `<div class="imm-panel open">${head}<div class="imm-body jn-corps">${corps}</div></div>`;
+}
+
 function renderRevision() {
   if (state.revisionLoading) return `<div class="rev-shell">${spinnerBlock('Chargement du dossier…')}</div>`;
   if (state.revisionError) return `<div class="rev-shell"><div class="page-pad">${errorBanner(state.revisionError, 'retry-revision')}</div></div>`;
@@ -2374,6 +2727,7 @@ function renderRevision() {
       </button>
 
       ${batimentPanelHtml(d)}
+      ${journalPanelHtml(d)}
 
       <div class="comp-section-head">
         <span class="lbl">Composantes · ${docCount}/${total} documentées</span>
@@ -2678,7 +3032,11 @@ function initEvents() {
     if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
     else if (bib.input(t)) return;
+    else if (state.screen === 'modeles' && modeles.input(t)) return;
     else if (t.matches('[data-role="equipe-name"]')) equipe.form.name = t.value;
+    else if (t.matches('[data-role="clients-recherche"]')) { clients.recherche = t.value; render(); }
+    else if (t.id && t.id.startsWith('cli-') && clients.courant) lireFormClient();
+    else if (t.matches('[data-role="crm-recherche"]')) { clients.crm.recherche = t.value; render(); }
     else if (t.matches('[data-role="carnet-name"]')) carnet.form.name = t.value;
     else if (t.matches('[data-role="carnet-email"]')) carnet.form.email = t.value;
     else if (t.matches('[data-role="carnet-fonction"]')) carnet.form.fonction = t.value;
@@ -2694,11 +3052,18 @@ function initEvents() {
   app.addEventListener('change', (e) => {
     const t = e.target;
     if (t && t.matches && bib.change(t)) return;
+    if (t && t.matches && state.screen === 'modeles' && modeles.change(t)) return;
+    if (t && t.matches && t.matches('[data-role="logo-firme"]')) { const f = t.files && t.files[0]; t.value = ''; if (f) envoyerLogo(f); return; }
     if (t && t.matches && t.matches('[data-role="equipe-role"]')) { equipe.form.role = t.value; return; }
     if (t && t.matches && t.matches('[data-role="carnet-dossier"]')) { ouvrirCarnet(t.value); return; }
     if (t && t.matches && t.matches('[data-role="suivi-assigne"]')) { majSuivi(t.getAttribute('data-id'), { assigne_a: t.value || null }); return; }
     if (t && t.matches && t.matches('[data-role="suivi-echeance"]')) { majSuivi(t.getAttribute('data-id'), { echeance: t.value || null }); return; }
     if (t && t.matches && t.matches('[data-role="suivi-filtre"]')) { suivi.responsable = t.value; render(); return; }
+    if (t && t.matches && t.matches('[data-role="crm-choix"]')) {
+      const id = t.getAttribute('data-id');
+      if (t.checked) clients.crm.choix.add(id); else clients.crm.choix.delete(id);
+      render(); return;
+    }
     if (t && t.matches && t.matches('[data-role="carnet-defaut"]')) {
       if (t.value) carnet.edits.defauts[t.getAttribute('data-q')] = t.value; else delete carnet.edits.defauts[t.getAttribute('data-q')];
       carnet.dirty = true; render(); return;
@@ -2721,6 +3086,7 @@ function initEvents() {
     if (!btn) return;
     const action = btn.getAttribute('data-action');
     if (bib.click(action, btn)) return;
+    if (state.screen === 'modeles' && modeles.click(action, btn)) return;
     switch (action) {
       case 'go-carnet':
         leaveReviewIA();
@@ -2734,6 +3100,36 @@ function initEvents() {
       case 'nouvelle-revision':
         nouvelleRevision(btn.getAttribute('data-id'));
         break;
+      case 'export-firme': exporterFirme(); break;
+      case 'archive-dossier': archiverDossier(); break;
+      case 'go-modeles':
+        leaveReviewIA();
+        state.screen = 'modeles';
+        modeles.reset();
+        render();
+        modeles.charger();
+        break;
+      case 'go-clients':
+        leaveReviewIA();
+        state.screen = 'clients';
+        clients.courant = null; clients.erreur = null; clients.note = null;
+        render();
+        chargerClients();
+        break;
+      case 'client-ouvrir': ouvrirClient(btn.getAttribute('data-id')); break;
+      case 'client-liste': clients.courant = null; clients.erreur = null; clients.note = null; render(); chargerClients(); break;
+      case 'client-nouveau': clients.courant = { id: null, nom: '', contacts: [{}], dossiers: [] }; clients.erreur = null; render(); break;
+      case 'client-depuis-groupe': clientDepuisGroupe(Number(btn.getAttribute('data-i'))); break;
+      case 'client-enregistrer': enregistrerClient(); break;
+      case 'client-contact-ajouter': lireFormClient(); clients.courant.contacts.push({}); render(); break;
+      case 'client-contact-retirer': lireFormClient(); clients.courant.contacts.splice(Number(btn.getAttribute('data-i')), 1); render(); break;
+      case 'client-supprimer': supprimerClient(); break;
+      case 'client-detacher': detacherDossier(btn.getAttribute('data-id')); break;
+      case 'client-nouveau-dossier': nouveauDossierClient(); break;
+      case 'client-crm': ouvrirCrm(); break;
+      case 'client-crm-fermer': clients.crm = null; render(); break;
+      case 'client-crm-importer': importerCrm(); break;
+      case 'client-crm-tout': clients.crm.choix = new Set(crmFiltres().map(x => x.id)); render(); break;
       case 'go-equipe':
         leaveReviewIA();
         state.screen = 'equipe';
@@ -2863,6 +3259,10 @@ function initEvents() {
         render();
         break;
       }
+      case 'toggle-journal':
+        journal.ouvert = !journal.ouvert;
+        if (journal.ouvert && state.dossier) chargerJournal(state.dossier.id); else render();
+        break;
       case 'toggle-batiment':
         state.batimentOpen = !state.batimentOpen;
         render();
