@@ -1191,6 +1191,7 @@ function renderLogin() {
         <label class="field-label" for="login-password">Mot de passe</label>
         <div class="field-box"><i data-lucide="lock"></i><input id="login-password" data-role="login-password" name="password" type="password" autocomplete="current-password" placeholder="Mot de passe" value="${escapeHtml(state.loginPassword || '')}" required></div>
         <button type="submit" class="btn-primary" style="width:100%" ${state.loginLoading ? 'disabled' : ''}>${state.loginLoading ? 'Connexion…' : 'Se connecter'}<i data-lucide="${state.loginLoading ? 'loader-2' : 'arrow-right'}" class="${state.loginLoading ? 'spin' : ''}"></i></button>
+        <a href="/compte/?retour=/bureau/" style="display:block;text-align:center;margin-top:14px;font-size:12.5px;color:var(--ink-500)">Mot de passe oublié ?</a>
         <div class="login-forgot">Mot de passe oublié ?</div>
       </form>
     </div>
@@ -1203,6 +1204,7 @@ function railHtml() {
     { key: 'dossiers', label: 'Dossiers', icon: 'folder', action: 'go-dossiers', active: dossiersActive },
     { key: 'prix', label: 'Banque de prix', icon: 'receipt', action: 'go-prix', active: state.screen === 'prix' },
     { key: 'bibliotheque', label: 'Bibliothèque', icon: 'library', action: 'go-bibliotheque', active: state.screen === 'bibliotheque' },
+    ...(estAdminFirme() ? [{ key: 'equipe', label: 'Équipe', icon: 'users-round', action: 'go-equipe', active: state.screen === 'equipe' }] : []),
     { key: 'clients', label: 'Clients', icon: 'users', disabled: true },
     { key: 'carnet', label: "Carnet d'entretien", icon: 'calendar-clock', disabled: true },
     { key: 'modeles', label: 'Modèles', icon: 'file-stack', disabled: true },
@@ -1222,6 +1224,7 @@ function railHtml() {
           <div class="rail-user-name">${escapeHtml((state.user && state.user.name) || 'Utilisateur')}</div>
           <div class="rail-user-sub">${escapeHtml((state.user && state.user.email) || '')}</div>
         </div>
+        <a class="btn-logout" href="/compte/?changer=1&retour=/bureau/" title="Changer mon mot de passe"><i data-lucide="key-round"></i></a>
         <button class="btn-logout" data-action="logout" title="Déconnexion"><i data-lucide="log-out"></i></button>
       </div>
     </div>
@@ -1235,6 +1238,7 @@ function renderShell() {
   else if (state.screen === 'revision') main = renderRevision();
   else if (state.screen === 'publier') main = renderPublier();
   else if (state.screen === 'reviewIA') main = renderReviewIA();
+  else if (state.screen === 'equipe') main = renderEquipe();
   else if (state.screen === 'bibliotheque') main = `<div class="page-pad cscr" style="padding:0">${bib.html({ eyebrow: (state.user && state.user.company && state.user.company.name) || '' })}</div>`;
   return `<div class="shell">${railHtml()}<div class="main">${main}</div></div>`;
 }
@@ -1253,6 +1257,131 @@ const bib = creerBibliotheque({
   spinnerBlock: (x) => spinnerBlock(x),
   companyId: () => state.user && state.user.company && state.user.company.id,
 });
+
+// ---------------------------------------------------------------
+// Équipe de la firme : l'administrateur invite ses ingénieurs par
+// courriel, renvoie une invitation, nomme un autre administrateur ou
+// désactive un compte.
+// ---------------------------------------------------------------
+const equipe = { data: null, error: null, note: null, lien: null, form: { name: '', email: '', role: 'engineer' }, saving: false, actionId: null };
+
+function estAdminFirme() {
+  const r = state.user && state.user.role;
+  return r === 'admin' || r === 'super_admin';
+}
+function idFirme() { return state.user && state.user.company && state.user.company.id; }
+
+async function chargerEquipe() {
+  try {
+    equipe.data = await apiJson(`/api/companies/${idFirme()}/equipe`);
+    equipe.error = null;
+  } catch (e) {
+    equipe.error = e.message || "Impossible de charger l'équipe.";
+  }
+  render();
+}
+
+function resultatInvitation(r, nom) {
+  if (r.envoye) {
+    equipe.note = `Invitation envoyée à ${nom}. Le lien est valable 7 jours.`;
+    equipe.lien = null;
+  } else {
+    equipe.note = `L'invitation n'a pas pu partir par courriel (${r.erreur}). Transmettez ce lien à ${nom}, valable 7 jours :`;
+    equipe.lien = r.lien;
+  }
+}
+
+async function inviterMembre() {
+  const f = equipe.form;
+  if (!f.name.trim() || !f.email.trim()) { equipe.error = 'Le nom et le courriel sont requis.'; render(); return; }
+  if (equipe.saving) return;
+  equipe.saving = true; equipe.error = null; equipe.note = null; equipe.lien = null;
+  render();
+  try {
+    const r = await apiJson(`/api/companies/${idFirme()}/equipe`, { method: 'POST', body: JSON.stringify({ name: f.name.trim(), email: f.email.trim(), role: f.role }) });
+    resultatInvitation(r, f.name.trim());
+    equipe.form = { name: '', email: '', role: 'engineer' };
+    await chargerEquipe();
+  } catch (e) {
+    equipe.error = e.message || "L'invitation a échoué.";
+  }
+  equipe.saving = false;
+  render();
+}
+
+async function actionMembre(id, action) {
+  if (equipe.actionId) return;
+  const m = equipe.data && equipe.data.membres.find(x => x.id === id);
+  if (!m) return;
+  if (action === 'desactiver' && !confirm(`Désactiver le compte de ${m.name} ? Ses sessions ouvertes se ferment tout de suite. Ses dossiers restent à la firme, et vous pourrez le réactiver.`)) return;
+  equipe.actionId = id; equipe.error = null; equipe.note = null; equipe.lien = null;
+  render();
+  try {
+    const base = `/api/companies/${idFirme()}/equipe/${id}`;
+    if (action === 'renvoyer') resultatInvitation(await apiJson(`${base}/invitation`, { method: 'POST' }), m.name);
+    else if (action === 'desactiver') await apiJson(base, { method: 'PATCH', body: JSON.stringify({ actif: false }) });
+    else if (action === 'reactiver') await apiJson(base, { method: 'PATCH', body: JSON.stringify({ actif: true }) });
+    else if (action === 'admin') await apiJson(base, { method: 'PATCH', body: JSON.stringify({ role: 'admin' }) });
+    else if (action === 'ingenieur') await apiJson(base, { method: 'PATCH', body: JSON.stringify({ role: 'engineer' }) });
+    await chargerEquipe();
+  } catch (e) {
+    equipe.error = e.message || "L'opération a échoué.";
+  }
+  equipe.actionId = null;
+  render();
+}
+
+function renderEquipe() {
+  const d = equipe.data;
+  const f = equipe.form;
+  const badge = (fond, texte, libelle) => `<span class="status-badge" style="background:${fond};color:${texte}">${libelle}</span>`;
+  const statut = (m) => !m.actif ? badge('var(--ink-100)', 'var(--ink-500)', 'Désactivé')
+    : m.invitation_en_attente ? badge('var(--orange-wash)', 'var(--ink-800)', 'Invitation envoyée')
+    : badge('var(--green-wash)', 'var(--green)', 'Actif');
+  const role = (m) => m.role === 'super_admin' ? 'Super admin' : m.role === 'admin' ? 'Admin de la firme' : 'Ingénieur';
+  const actions = (m) => {
+    if (!d || m.id === d.moi || m.role === 'super_admin') return m.id === d.moi ? '<span class="dt-sub">Vous</span>' : '';
+    const occ = equipe.actionId ? 'disabled' : '';
+    const b = (a, t) => `<button class="btn-row-action" data-action="equipe-action" data-id="${m.id}" data-op="${a}" ${occ}>${equipe.actionId === m.id ? '…' : t}</button>`;
+    const l = [];
+    if (m.invitation_en_attente && m.actif) l.push(b('renvoyer', "Renvoyer l'invitation"));
+    if (m.actif) l.push(m.role === 'admin' ? b('ingenieur', 'Retirer admin') : b('admin', 'Nommer admin'));
+    l.push(m.actif ? b('desactiver', 'Désactiver') : b('reactiver', 'Réactiver'));
+    return l.join('');
+  };
+  return `
+  <div class="page-pad cscr">
+    <div class="eyebrow-orange">${escapeHtml((state.user && state.user.company && state.user.company.name) || '')}</div>
+    <h1 class="page-title">Équipe</h1>
+    <p class="eq-lead">Invitez vos ingénieurs par courriel : chacun choisit son mot de passe et complète son bloc de signature. Un administrateur de la firme gère l'équipe et la bibliothèque de composantes.</p>
+
+    <form class="eq-form" id="equipe-form">
+      <input type="text" data-role="equipe-name" placeholder="Nom complet" value="${escapeHtml(f.name)}">
+      <input type="email" data-role="equipe-email" placeholder="Courriel" value="${escapeHtml(f.email)}">
+      <select data-role="equipe-role">
+        <option value="engineer" ${f.role === 'engineer' ? 'selected' : ''}>Ingénieur</option>
+        <option value="admin" ${f.role === 'admin' ? 'selected' : ''}>Admin de la firme</option>
+      </select>
+      <button type="submit" class="btn-primary" ${equipe.saving ? 'disabled' : ''}>${equipe.saving ? 'Envoi…' : "Envoyer l'invitation"}</button>
+    </form>
+
+    ${equipe.error ? errorBanner(equipe.error) : ''}
+    ${equipe.note ? `<div class="temp-pass-warn" style="margin:12px 0"><i data-lucide="${equipe.lien ? 'alert-triangle' : 'check'}"></i><span>${escapeHtml(equipe.note)}${equipe.lien ? `<br><input class="eq-lien" readonly value="${escapeHtml(equipe.lien)}" onclick="this.select()">` : ''}</span></div>` : ''}
+    ${d && !d.courriel ? `<div class="temp-pass-warn"><i data-lucide="info"></i><span>L'envoi de courriels n'est pas configuré : chaque invitation affichera un lien à transmettre vous-même.</span></div>` : ''}
+
+    ${!d ? spinnerBlock("Chargement de l'équipe…") : `
+    <div class="dossiers-table" style="margin-top:18px">
+      <div class="dt-row eq-row dt-head"><div>Nom</div><div>Rôle</div><div>Statut</div><div></div></div>
+      ${d.membres.map(m => `
+      <div class="dt-row eq-row">
+        <div><div class="dt-name">${escapeHtml(m.name)}</div><div class="dt-sub">${escapeHtml(m.email)}${m.ordre_professionnel && m.no_membre ? ` · ${escapeHtml(m.ordre_professionnel)} ${escapeHtml(m.no_membre)}` : ''}</div></div>
+        <div>${role(m)}</div>
+        <div>${statut(m)}</div>
+        <div class="eq-actions">${actions(m)}</div>
+      </div>`).join('')}
+    </div>`}
+  </div>`;
+}
 
 function renderDossiers() {
   if (state.dossiersLoading && state.dossiers.length === 0) {
@@ -2268,6 +2397,9 @@ function initEvents() {
     } else if (e.target && e.target.id === 'prix-form') {
       e.preventDefault();
       submitPrix();
+    } else if (e.target && e.target.id === 'equipe-form') {
+      e.preventDefault();
+      inviterMembre();
     }
   });
 
@@ -2280,6 +2412,8 @@ function initEvents() {
     if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
     else if (bib.input(t)) return;
+    else if (t.matches('[data-role="equipe-name"]')) equipe.form.name = t.value;
+    else if (t.matches('[data-role="equipe-email"]')) equipe.form.email = t.value;
     else if (t.matches('[data-role="prix-field"]')) {
       const champ = t.getAttribute('data-field');
       state.prixForm[champ] = t.type === 'checkbox' ? t.checked : t.value;
@@ -2291,6 +2425,7 @@ function initEvents() {
   app.addEventListener('change', (e) => {
     const t = e.target;
     if (t && t.matches && bib.change(t)) return;
+    if (t && t.matches && t.matches('[data-role="equipe-role"]')) { equipe.form.role = t.value; return; }
     if (t && t.matches && t.matches('[data-role="composantes-import-file"]')) {
       const f = t.files && t.files[0];
       t.value = '';
@@ -2304,6 +2439,16 @@ function initEvents() {
     const action = btn.getAttribute('data-action');
     if (bib.click(action, btn)) return;
     switch (action) {
+      case 'go-equipe':
+        leaveReviewIA();
+        state.screen = 'equipe';
+        equipe.note = null; equipe.lien = null; equipe.error = null;
+        render();
+        chargerEquipe();
+        break;
+      case 'equipe-action':
+        actionMembre(btn.getAttribute('data-id'), btn.getAttribute('data-op'));
+        break;
       case 'go-bibliotheque':
         leaveReviewIA();
         state.screen = 'bibliotheque';

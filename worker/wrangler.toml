@@ -27,6 +27,14 @@ database_id = "9bcbc6e3-574a-44f5-8d30-273906128282"
 
 [vars]
 CRM_COMPANY_ID = "com_980c47a26e91493593a8"
+# Adresse d'expédition des courriels (invitations, mots de passe). Tout
+# alias du domaine intégré à Email Service convient, sans boîte à créer.
+COURRIEL_EXPEDITEUR = "no-reply@stratege.io"
+
+# Cloudflare Email Service : envoi des invitations et des liens de
+# réinitialisation. Le domaine stratege.io y est intégré (Email Sending).
+[[send_email]]
+name = "EMAIL"
 
 [[r2_buckets]]
 binding = "PHOTOS"

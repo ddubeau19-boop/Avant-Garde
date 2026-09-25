@@ -30,8 +30,26 @@ CREATE TABLE users (
   -- Bloc de signature, repris tel quel à la section 8.0 Déclaration du rapport.
   title               TEXT,  -- ex. « ing., M.Sc.A. », « T.P. »
   ordre_professionnel TEXT,  -- ex. « OIQ », « OTPQ », « OAQ »
-  no_membre           TEXT
+  no_membre           TEXT,
+  actif                 INTEGER NOT NULL DEFAULT 1,  -- 0 : désactivé par l'administrateur de la firme
+  invitation_en_attente INTEGER NOT NULL DEFAULT 0,  -- 1 : invité, mot de passe pas encore choisi
+  sessions_apres        INTEGER                      -- ms : sessions émises avant refusées
 );
+
+-- Liens envoyés par courriel (invitation, réinitialisation) : seule
+-- l'empreinte SHA-256 du jeton est gardée ; un lien sert une fois.
+CREATE TABLE jetons_compte (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type       TEXT NOT NULL,     -- 'invitation' | 'reinitialisation'
+  expire_le  INTEGER NOT NULL,  -- ms
+  utilise_le TEXT,
+  cree_le    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Tentatives de connexion et demandes de réinitialisation, pour les limiter.
+CREATE TABLE tentatives_connexion (cle TEXT NOT NULL, moment INTEGER NOT NULL);
+CREATE INDEX idx_tentatives_cle ON tentatives_connexion(cle, moment);
 
 CREATE TABLE dossiers (
   id                   TEXT PRIMARY KEY,
