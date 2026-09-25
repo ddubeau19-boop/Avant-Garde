@@ -24,7 +24,6 @@ jobs:
   verification:
     name: Vérification du worker
     runs-on: ubuntu-latest
-    environment: Production
     steps:
       - uses: actions/checkout@v4
 
@@ -94,7 +93,7 @@ jobs:
     needs: verification
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-     environment: Production
+    environment: Production
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
