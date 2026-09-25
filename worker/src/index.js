@@ -5500,9 +5500,21 @@ components.post("/:id/photos", async (c) => {
   const form = await c.req.formData();
   const file = form.get("file");
   if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  // Une photo prise hors connexion arrive avec l'identifiant choisi par
+  // l'appareil : si l'envoi est rejoué après une coupure, on rend la photo
+  // déjà reçue au lieu d'en créer une seconde.
+  const idClient = String(form.get("id") ?? "");
+  const idValide = /^pho_[a-f0-9]{20}$/.test(idClient);
+  if (idValide) {
+    const deja = await c.env.DB.prepare("SELECT * FROM photos WHERE id = ?1").bind(idClient).first();
+    if (deja) {
+      if (deja.component_id !== componentId) return c.json({ error: "identifiant de photo déjà utilisé" }, 409);
+      return c.json(deja, 200);
+    }
+  }
   const existing = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM photos WHERE component_id = ?1").bind(componentId).first();
   const tag = TAG_ORDER[existing?.n ?? 0] ?? `Photo ${(existing?.n ?? 0) + 1}`;
-  const id = `pho_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
+  const id = idValide ? idClient : `pho_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
   const ext = file.type === "image/png" ? "png" : "jpg";
   const r2Key = `photos/${componentId}/${id}.${ext}`;
   await c.env.PHOTOS.put(r2Key, await file.arrayBuffer(), {
@@ -46488,6 +46500,34 @@ dossiers.get("/:id/components", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
+});
+// Toute la visite en un appel, pour la préparer hors connexion : chaque
+// composante avec ses photos, son guide et ses tâches du carnet, sous la
+// même forme que GET /api/components/:id.
+dossiers.get("/:id/hors-ligne", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const rows = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 ORDER BY sort_order ASC, created_at ASC").bind(dossier.id).all();
+  const photos2 = await c.env.DB.prepare(
+    `SELECT p.* FROM photos p JOIN components cmp ON cmp.id = p.component_id
+       WHERE cmp.dossier_id = ?1 ORDER BY p.created_at ASC`
+  ).bind(dossier.id).all();
+  const parComposante = new Map();
+  for (const p of photos2.results) {
+    if (!parComposante.has(p.component_id)) parComposante.set(p.component_id, []);
+    parComposante.get(p.component_id).push(p);
+  }
+  const biblio = await bibliothequeDuDossier(c.env.DB, dossier.id);
+  const composantes = rows.results.map((component) => {
+    const guide = guidePour(component);
+    return {
+      ...component,
+      photos: parComposante.get(component.id) ?? [],
+      guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats },
+      entretien: tachesPourComposante(component, { avecRetirees: true, biblio }).map(tacheAffichee)
+    };
+  });
+  return c.json({ dossier, composantes, genere_le: new Date().toISOString() });
 });
 dossiers.post("/:id/components/import", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));

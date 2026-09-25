@@ -8,6 +8,8 @@
 //   attributs typés libres, et l'année anticipée de remplacement dérivée de
 //   « année de construction ou réparation + durée de vie utile ».
 
+import * as HL from './hors-ligne.js';
+
 const TOKEN_KEY = 'cs_terrain_token';
 
 /* ---------- Taxonomie maison : 11 catégories ---------- */
@@ -181,6 +183,14 @@ const state = {
   projectionLoading: false,
   downloadingDocx: false,
   downloadingXlsx: false,
+
+  // Hors connexion
+  envois: [],            // modifications en attente d'envoi (copie de la file IndexedDB)
+  synchro: false,        // envoi de la file en cours
+  reseauInstable: false, // le navigateur se dit en ligne, mais les requêtes échouent
+  rejets: [],            // modifications refusées par le serveur à la synchronisation
+  prepa: null,           // { dossierId, etat, faites, total, … } — visite préparée hors connexion
+  photoIndispo: {},      // id -> true : photo absente de l'appareil et pas de réseau
 };
 
 try { state.token = localStorage.getItem(TOKEN_KEY) || null; } catch (e) { state.token = null; }
@@ -225,6 +235,7 @@ function friendlyError(e) {
   if (!e) return 'Une erreur est survenue.';
   if (e.message === 'OFFLINE') return 'Vous êtes hors connexion.';
   if (e.message === 'SESSION_EXPIRED') return 'Votre session a expiré.';
+  if (e.message === 'PAS_EN_CACHE') return "Ces données n'ont pas encore été téléchargées sur l'appareil. Ouvrez-les une fois avec du réseau pour les avoir hors connexion.";
   return e.message || 'Une erreur est survenue.';
 }
 
@@ -250,10 +261,18 @@ async function apiFetch(path, opts, config) {
   const headers = Object.assign({}, opts.headers || {});
   if (auth && state.token) headers['Authorization'] = 'Bearer ' + state.token;
   let res;
+  // Un sous-sol ou un garage laisse souvent une connexion qui ne répond plus :
+  // passé le délai, la requête compte comme hors connexion.
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  const minuterie = ctrl ? setTimeout(() => ctrl.abort(), config.timeout || 20000) : null;
   try {
-    res = await fetch(path, Object.assign({}, opts, { headers }));
+    res = await fetch(path, Object.assign({}, opts, { headers }, ctrl ? { signal: ctrl.signal } : {}));
   } catch (e) {
-    throw new Error('Erreur réseau. Vérifiez votre connexion.');
+    const err = new Error('Erreur réseau. Vérifiez votre connexion.');
+    err.reseau = true;
+    throw err;
+  } finally {
+    if (minuterie) clearTimeout(minuterie);
   }
   if (auth && res.status === 401) {
     try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
@@ -270,22 +289,363 @@ async function apiJson(path, opts, config) {
   const res = await apiFetch(path, opts, config);
   let data = null;
   try { data = await res.json(); } catch (e) {}
-  if (!res.ok) throw new Error((data && data.error) || `Erreur (${res.status})`);
+  if (!res.ok) {
+    const err = new Error((data && data.error) || `Erreur (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
+}
+
+/* ============================================================
+   Hors connexion : copies locales, file d'envois, synchronisation
+   ------------------------------------------------------------
+   Chaque lecture passe par le serveur quand c'est possible et garde une
+   copie sur l'appareil ; sans réseau, la copie répond. Chaque
+   modification faite sans réseau entre dans une file, rejouée dans
+   l'ordre au retour de la connexion. Tant que la file n'est pas vide,
+   les nouvelles modifications s'y ajoutent aussi, pour qu'une ancienne
+   valeur ne passe jamais après une plus récente.
+   ============================================================ */
+
+function sansReseau(e) {
+  return !!e && (e.message === 'OFFLINE' || e.reseau === true);
+}
+
+async function lireApi(cle, path, config) {
+  try {
+    const data = await apiJson(path, null, config);
+    HL.ecrire(cle, data);
+    state.reseauInstable = false;
+    return data;
+  } catch (e) {
+    if (!sansReseau(e)) throw e;
+    if (state.online) state.reseauInstable = true;
+    const copie = await HL.lire(cle);
+    if (copie == null) throw new Error('PAS_EN_CACHE');
+    return copie;
+  }
+}
+
+let envoiEnCours = null;
+
+async function chargerEnvois() {
+  state.envois = await HL.envoisTous();
+}
+
+async function enfiler(op) {
+  op.userId = state.user && state.user.id;
+  if (!op.dossierId && state.dossier) op.dossierId = state.dossier.id;
+  op.cree_le = new Date().toISOString();
+  // Une modification du même objet encore en attente absorbe la nouvelle :
+  // une seule requête partira au retour du réseau.
+  if (op.kind === 'patch-component' || op.kind === 'patch-dossier') {
+    for (let i = state.envois.length - 1; i >= 0; i--) {
+      const a = state.envois[i];
+      if (a.kind === op.kind && a.id === op.id && a.n !== envoiEnCours) {
+        a.body = Object.assign({}, a.body, op.body);
+        await HL.envoiRemplacer(a);
+        paintNetBar();
+        return a;
+      }
+    }
+  }
+  const enregistre = await HL.envoiAjouter(op);
+  // Sans IndexedDB, la file vit en mémoire : elle tient jusqu'au rechargement.
+  state.envois.push(enregistre || Object.assign(op, { n: Date.now() + Math.random() }));
+  paintNetBar();
+  return enregistre || op;
+}
+
+async function retirerEnvoi(n) {
+  state.envois = state.envois.filter(o => o.n !== n);
+  await HL.envoiRetirer(n);
+}
+
+// Les modifications en attente, appliquées par-dessus la copie du serveur.
+function avecEnAttente(comp) {
+  let c = Object.assign({}, comp);
+  for (const op of state.envois) {
+    if (op.kind === 'patch-component' && op.id === c.id) {
+      const entretien = op.body.taches_entretien != null && Array.isArray(c.entretien)
+        ? { entretien: entretienLocal(c.entretien, op.body.taches_entretien) } : {};
+      c = Object.assign(c, op.body, entretien);
+    } else if (op.kind === 'photo' && op.componentId === c.id) {
+      if (Array.isArray(c.photos)) {
+        if (!c.photos.some(p => p.id === op.photoId)) c.photos = c.photos.concat([{ id: op.photoId, component_id: c.id, tag: "En attente d'envoi", local: true }]);
+      } else {
+        c.photos = (c.photos || 0) + 1;
+      }
+    }
+  }
+  return c;
+}
+
+function dossierAvecEnAttente(d) {
+  const r = Object.assign({}, d);
+  for (const op of state.envois) if (op.kind === 'patch-dossier' && op.id === d.id) Object.assign(r, op.body);
+  return r;
+}
+
+// Tâches du carnet recalculées sur l'appareil après un retrait, un
+// rétablissement ou un ajout fait hors connexion. Le serveur refait le
+// calcul exact à la synchronisation.
+function entretienLocal(entretien, persoBrut) {
+  const p = parseJsonObject(persoBrut);
+  const retirees = new Set(Array.isArray(p.retirees) ? p.retirees : []);
+  const ajoutees = Array.isArray(p.ajoutees) ? p.ajoutees : [];
+  const idsAjoutees = new Set(ajoutees.map(t => t.id));
+  const liste = entretien
+    .filter(t => !t.perso || idsAjoutees.has(t.id))
+    .map(t => (t.perso ? t : Object.assign({}, t, { retiree: retirees.has(t.id) })));
+  for (const t of ajoutees) if (!liste.some(x => x.id === t.id)) liste.push(tacheLocale(t));
+  return liste;
+}
+function tacheLocale(t) {
+  const mois = (t.mois || []).map(Number).sort((a, b) => a - b);
+  const freq = FREQ_TACHE.find(f => f[0] === t.f);
+  const qui = QUI_TACHE.find(q => q[0] === (t.q || ''));
+  return {
+    id: t.id, texte: t.x, element: '', code: t.f, mois,
+    frequence: freq ? freq[1] : 'Aux mois indiqués',
+    quand: mois.map(m => MOIS_COURTS[m - 1]).join(', '),
+    responsable: qui ? qui[1] : 'Syndicat / gestionnaire',
+    perso: true, retiree: false, aPreciser: false,
+  };
+}
+
+function idAleatoire(prefixe, n, alphabet) {
+  const octets = new Uint8Array(n);
+  crypto.getRandomValues(octets);
+  return prefixe + Array.from(octets, b => alphabet[b % alphabet.length]).join('');
+}
+const nouvelIdPhoto = () => idAleatoire('pho_', 20, '0123456789abcdef');
+const nouvelIdTache = () => idAleatoire('p_', 10, 'abcdefghijklmnopqrstuvwxyz0123456789');
+
+// Copie locale d'une composante et de sa ligne dans la liste du dossier,
+// mises à jour avec ce que le serveur vient de confirmer.
+async function fusionnerCacheComposante(id, champs, dossierId) {
+  if (!champs || typeof champs !== 'object') return;
+  const cle = `component:${id}`;
+  const actuelle = await HL.lire(cle);
+  if (actuelle) await HL.ecrire(cle, Object.assign({}, actuelle, champs, { photos: actuelle.photos, guide: actuelle.guide }));
+  const cleListe = `components:${dossierId || champs.dossier_id || (state.dossier && state.dossier.id)}`;
+  const liste = await HL.lire(cleListe);
+  if (Array.isArray(liste)) {
+    const i = liste.findIndex(x => x.id === id);
+    if (i >= 0) {
+      const { photos, guide, entretien, ...ligne } = champs;
+      liste[i] = Object.assign({}, liste[i], ligne, typeof photos === 'number' ? { photos } : {});
+      await HL.ecrire(cleListe, liste);
+    }
+  }
+}
+
+async function ajouterPhotoAuCache(compId, photo, dossierId) {
+  const cle = `component:${compId}`;
+  const comp = await HL.lire(cle);
+  if (comp && Array.isArray(comp.photos) && !comp.photos.some(p => p.id === photo.id)) {
+    comp.photos.push(photo);
+    await HL.ecrire(cle, comp);
+  }
+  const cleListe = `components:${dossierId}`;
+  const liste = await HL.lire(cleListe);
+  if (Array.isArray(liste)) {
+    const ligne = liste.find(x => x.id === compId);
+    if (ligne) { ligne.photos = (ligne.photos || 0) + 1; await HL.ecrire(cleListe, liste); }
+  }
+}
+
+async function envoyerPhoto(compId, photoId, blob, dossierId) {
+  const fd = new FormData();
+  fd.append('id', photoId);
+  fd.append('file', blob, (blob && blob.name) || 'photo.jpg');
+  const res = await apiFetch(`/api/components/${compId}/photos`, { method: 'POST', body: fd }, { timeout: 90000 });
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    const err = new Error((data && data.error) || 'Le téléversement de la photo a échoué.');
+    err.status = res.status;
+    throw err;
+  }
+  await ajouterPhotoAuCache(compId, data, dossierId);
+  return data;
+}
+
+function descriptionEnvoi(op) {
+  if (op.kind === 'photo') return 'Photo';
+  if (op.kind === 'patch-dossier') return "Fiche d'immeuble";
+  const c = state.components.concat(state.inactifs).find(x => x.id === op.id);
+  return c ? c.name : 'Composante';
+}
+
+async function executerEnvoi(op) {
+  if (op.kind === 'patch-component') {
+    const data = await apiJson(`/api/components/${op.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(op.body),
+    }, { timeout: 20000 });
+    await fusionnerCacheComposante(op.id, data, op.dossierId);
+    // Les tâches du carnet recalculées par le serveur remplacent le calcul
+    // local, sauf si une autre modification du carnet attend encore.
+    const autre = state.envois.some(o => o.n !== op.n && o.kind === 'patch-component' && o.id === op.id && o.body.taches_entretien != null);
+    if (data && data.entretien && !autre && state.activeComponent && state.activeComponent.id === op.id) {
+      state.activeComponent = Object.assign({}, state.activeComponent, { entretien: data.entretien });
+    }
+    return;
+  }
+  if (op.kind === 'patch-dossier') {
+    const data = await apiJson(`/api/dossiers/${op.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(op.body),
+    }, { timeout: 20000 });
+    if (data) await HL.ecrire(`dossier:${op.id}`, data);
+    return;
+  }
+  if (op.kind === 'photo') {
+    const blob = await HL.photoLire(op.photoId);
+    if (!blob) return; // fichier disparu de l'appareil : rien à envoyer
+    const photo = await envoyerPhoto(op.componentId, op.photoId, blob, op.dossierId);
+    const c = state.activeComponent;
+    if (c && c.id === op.componentId && Array.isArray(c.photos)) {
+      state.activeComponent = Object.assign({}, c, { photos: c.photos.map(p => (p.id === photo.id ? photo : p)) });
+    }
+  }
+}
+
+let synchroEnCours = false;
+async function synchroniser() {
+  if (synchroEnCours || !state.online || !state.token || !state.envois.length) return;
+  synchroEnCours = true;
+  state.synchro = true;
+  paintNetBar();
+  const touches = new Set();
+  let envoyes = 0;
+  try {
+    while (state.envois.length && state.online) {
+      const op = state.envois[0];
+      if (op.userId && state.user && op.userId !== state.user.id) { await retirerEnvoi(op.n); continue; }
+      envoiEnCours = op.n;
+      try {
+        await executerEnvoi(op);
+      } catch (e) {
+        envoiEnCours = null;
+        if (sansReseau(e)) { state.reseauInstable = true; break; }
+        if (e.message === 'SESSION_EXPIRED') break;
+        // Refus définitif (composante supprimée, valeur invalide…) : on le
+        // signale et on passe à la suite plutôt que de bloquer toute la file.
+        if (e.status >= 400 && e.status < 500 && ![408, 425, 429].includes(e.status)) {
+          state.rejets.push(`${descriptionEnvoi(op)} : ${e.message}`);
+          await retirerEnvoi(op.n);
+          continue;
+        }
+        break; // erreur du serveur : on réessaiera plus tard
+      }
+      envoiEnCours = null;
+      await retirerEnvoi(op.n);
+      envoyes += 1;
+      if (op.dossierId) touches.add(op.dossierId);
+      state.reseauInstable = false;
+      paintNetBar();
+    }
+  } finally {
+    envoiEnCours = null;
+    synchroEnCours = false;
+    state.synchro = false;
+  }
+  if (envoyes && state.dossier && touches.has(state.dossier.id)) await rafraichirDossier();
+  if (envoyes && !state.envois.length) state.toast = 'Modifications hors connexion envoyées';
+  renderSiPossible();
+  if (state.toast === 'Modifications hors connexion envoyées') {
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { state.toast = null; renderSiPossible(); }, 2600);
+  }
+}
+
+// Après une synchronisation : la liste et le dossier tels que le serveur les
+// voit maintenant (règles de la fiche d'immeuble, tâches recalculées…).
+async function rafraichirDossier() {
+  const id = state.dossier && state.dossier.id;
+  if (!id) return;
+  try {
+    const [dossier, components] = await Promise.all([
+      apiJson(`/api/dossiers/${id}`),
+      apiJson(`/api/dossiers/${id}/components`),
+    ]);
+    HL.ecrire(`dossier:${id}`, dossier);
+    HL.ecrire(`components:${id}`, components);
+    if (!state.dossier || state.dossier.id !== id) return;
+    state.dossier = dossierAvecEnAttente(dossier);
+    state.batiment = parseJsonObject(state.dossier.batiment_info);
+    const tous = components.map(avecEnAttente);
+    state.components = tous.filter(c => c.actif !== 0);
+    state.inactifs = tous.filter(c => c.actif === 0);
+  } catch (e) { /* on garde l'affichage actuel */ }
+}
+
+// Toute la visite sur l'appareil : fiches complètes et photos, en arrière-plan.
+let prepaEnCours = null;
+async function preparerHorsLigne(id) {
+  if (prepaEnCours === id || !state.online) return;
+  prepaEnCours = id;
+  const maj = (p) => {
+    if (state.dossier && state.dossier.id === id) { state.prepa = p; paintPrepa(); }
+  };
+  try {
+    maj({ dossierId: id, etat: 'fiches' });
+    const lot = await apiJson(`/api/dossiers/${id}/hors-ligne`, null, { timeout: 60000 });
+    await HL.ecrireLot(lot.composantes.map(c => [`component:${c.id}`, c]));
+    const photos = lot.composantes.flatMap(c => c.photos || []);
+    const presentes = await HL.photosPresentes();
+    const manquantes = photos.filter(p => !presentes.has(p.id));
+    let faites = photos.length - manquantes.length;
+    maj({ dossierId: id, etat: 'photos', faites, total: photos.length });
+    let i = 0;
+    const travailleur = async () => {
+      while (i < manquantes.length && state.online) {
+        const p = manquantes[i++];
+        try {
+          const res = await apiFetch(`/api/photos/${p.id}/file`, null, { timeout: 45000 });
+          if (res.ok) { await HL.photoEcrire(p.id, await res.blob()); faites += 1; }
+        } catch (e) { /* photo réessayée à la prochaine préparation */ }
+        maj({ dossierId: id, etat: 'photos', faites, total: photos.length });
+      }
+    };
+    await Promise.all([travailleur(), travailleur(), travailleur()]);
+    const fin = {
+      dossierId: id, etat: faites >= photos.length ? 'pret' : 'partiel',
+      faites, total: photos.length, fiches: lot.composantes.length, le: new Date().toISOString(),
+    };
+    await HL.ecrire(`prepa:${id}`, fin);
+    maj(fin);
+  } catch (e) {
+    maj(Object.assign({}, state.prepa && state.prepa.le ? state.prepa : {}, { dossierId: id, etat: 'erreur' }));
+  } finally {
+    prepaEnCours = null;
+  }
+}
+
+function enregistrerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.register('./sw.js').catch(() => { /* l'application reste utilisable en ligne */ });
 }
 
 async function loadCompanyLogo() {
   if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
   const co = state.user && state.user.company;
   if (!co || !co.hasLogo) { render(); return; }
+  let blob = null;
   try {
     const res = await apiFetch(`/api/companies/${co.id}/logo`);
     if (!res.ok) throw new Error('logo indisponible');
-    const blob = await res.blob();
-    state.companyLogoUrl = URL.createObjectURL(blob);
+    blob = await res.blob();
+    HL.photoEcrire(`logo:${co.id}`, blob);
   } catch (e) {
-    state.companyLogoUrl = null;
+    blob = await HL.photoLire(`logo:${co.id}`);
   }
+  state.companyLogoUrl = blob ? URL.createObjectURL(blob) : null;
   render();
 }
 
@@ -294,15 +654,22 @@ async function loadCompanyLogo() {
    ============================================================ */
 
 async function boot() {
+  enregistrerServiceWorker();
+  await chargerEnvois();
   if (state.token) {
     state.screen = 'loading';
     render();
     try {
-      state.user = await apiJson('/api/auth/me');
+      state.user = await lireApi('me', '/api/auth/me');
       loadCompanyLogo();
       await loadDossiers();
+      synchroniser();
     } catch (e) {
-      if (e.message !== 'SESSION_EXPIRED') { state.screen = 'login'; render(); }
+      if (e.message !== 'SESSION_EXPIRED') {
+        state.screen = 'login';
+        if (e.message === 'PAS_EN_CACHE') state.loginError = "Connectez-vous une première fois avec du réseau pour utiliser l'application hors connexion.";
+        render();
+      }
     }
   } else {
     state.screen = 'login';
@@ -321,8 +688,15 @@ async function doLogin(email, password) {
     }, { auth: false });
     state.token = data.token; state.user = data.user;
     try { localStorage.setItem(TOKEN_KEY, data.token); } catch (e) {}
+    const precedent = await HL.lire('me');
+    if (precedent && data.user && precedent.id !== data.user.id) {
+      await HL.toutEffacer();
+      state.envois = [];
+    }
+    if (data.user) HL.ecrire('me', data.user);
     loadCompanyLogo();
     await loadDossiers();
+    synchroniser();
   } catch (e) {
     state.loginError = friendlyError(e);
     state.loginPassword = '';
@@ -331,7 +705,13 @@ async function doLogin(email, password) {
   }
 }
 
-function logout() {
+async function logout() {
+  const n = state.envois.length;
+  if (n && !confirm(`${n} modification${n > 1 ? 's' : ''} faite${n > 1 ? 's' : ''} hors connexion ${n > 1 ? "n'ont" : "n'a"} pas encore été envoyée${n > 1 ? 's' : ''}. Vous déconnecter l${n > 1 ? 'es' : 'a'} effacera de cet appareil. Continuer ?`)) return;
+  // Les données de visite ne restent pas sur l'appareil après la déconnexion.
+  await HL.toutEffacer();
+  state.envois = [];
+  state.prepa = null;
   try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
   if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
   Object.assign(state, {
@@ -345,7 +725,7 @@ function logout() {
 async function loadDossiers() {
   state.screen = 'loading'; state.error = null; render();
   try {
-    const dossiers = await apiJson('/api/dossiers');
+    const dossiers = await lireApi('dossiers', '/api/dossiers');
     state.dossiers = dossiers;
     if (dossiers.length === 1) {
       await selectDossier(dossiers[0].id);
@@ -354,6 +734,10 @@ async function loadDossiers() {
     state.screen = 'dossiers';
     render();
   } catch (e) {
+    if (e.message === 'PAS_EN_CACHE') {
+      state.dossiers = []; state.error = friendlyError(e); state.screen = 'dossiers'; render();
+      return;
+    }
     if (e.message !== 'SESSION_EXPIRED') {
       state.screen = 'login';
       state.loginError = friendlyError(e);
@@ -374,19 +758,23 @@ function parseJsonObject(raw) {
 async function selectDossier(id) {
   state.screen = 'loading'; render();
   try {
-    const [dossier, components] = await Promise.all([
-      apiJson(`/api/dossiers/${id}`),
-      apiJson(`/api/dossiers/${id}/components`),
+    const [dossierBrut, componentsBruts] = await Promise.all([
+      lireApi(`dossier:${id}`, `/api/dossiers/${id}`),
+      lireApi(`components:${id}`, `/api/dossiers/${id}/components`),
     ]);
+    const dossier = dossierAvecEnAttente(dossierBrut);
+    const components = componentsBruts.map(avecEnAttente);
     state.dossier = dossier;
     state.components = components.filter(c => c.actif !== 0);
     state.inactifs = components.filter(c => c.actif === 0);
     state.batiment = parseJsonObject(dossier.batiment_info);
     state.naChosen = {};
     state.filter = 'all'; state.search = '';
+    state.prepa = (await HL.lire(`prepa:${id}`)) || null;
     state.screen = 'accueil';
     render();
     loadProjection(id);
+    if (state.online) preparerHorsLigne(id);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') {
       state.error = friendlyError(e);
@@ -399,7 +787,7 @@ async function selectDossier(id) {
 async function loadProjection(id) {
   state.projectionLoading = true; render();
   try {
-    state.projection = await apiJson(`/api/dossiers/${id}/projection`);
+    state.projection = await lireApi(`projection:${id}`, `/api/dossiers/${id}/projection`);
   } catch (e) {
     state.projection = null;
   } finally {
@@ -418,7 +806,7 @@ async function openFiche(id) {
   state.attrKeyDraft = ''; state.attrValDraft = ''; state.facetsOpen = false;
   render();
   try {
-    const comp = await apiJson(`/api/components/${id}`);
+    const comp = avecEnAttente(await lireApi(`component:${id}`, `/api/components/${id}`));
     state.activeComponent = comp;
     state.facetsOpen = !!(comp.position || comp.emplacement || comp.variante);
     state.ficheLoading = false;
@@ -433,37 +821,61 @@ async function openFiche(id) {
 async function loadPhotoBlobs(photos) {
   for (const p of photos) {
     if (state.photoBlobUrls[p.id]) continue;
-    try {
-      const res = await apiFetch(`/api/photos/${p.id}/file`);
-      if (!res.ok) continue;
-      const blob = await res.blob();
+    // La copie de l'appareil d'abord : elle s'affiche sans réseau.
+    let blob = await HL.photoLire(p.id);
+    if (!blob && !p.local && state.online) {
+      try {
+        const res = await apiFetch(`/api/photos/${p.id}/file`);
+        if (res.ok) { blob = await res.blob(); HL.photoEcrire(p.id, blob); }
+      } catch (e) { /* ignore individual photo failures */ }
+    }
+    if (blob) {
       state.photoBlobUrls[p.id] = URL.createObjectURL(blob);
-      render();
-    } catch (e) { /* ignore individual photo failures */ }
+      delete state.photoIndispo[p.id];
+    } else if (!state.online || state.reseauInstable) {
+      state.photoIndispo[p.id] = true;
+    }
+    renderSiPossible();
   }
 }
 
 function applyComponentPatch(id, patch) {
+  const appliquer = (c) => {
+    const suivant = Object.assign({}, c, patch);
+    if (patch.taches_entretien != null && !patch.entretien && Array.isArray(c.entretien)) {
+      suivant.entretien = entretienLocal(c.entretien, patch.taches_entretien);
+    }
+    return suivant;
+  };
   if (state.activeComponent && state.activeComponent.id === id) {
-    state.activeComponent = Object.assign({}, state.activeComponent, patch);
+    state.activeComponent = appliquer(state.activeComponent);
   }
-  state.components = state.components.map(c => (c.id === id ? Object.assign({}, c, patch) : c));
+  state.components = state.components.map(c => (c.id === id ? appliquer(c) : c));
 }
 
+// Rend la réponse du serveur, ou { enAttente: true } quand la modification
+// est gardée sur l'appareil pour être envoyée plus tard.
 async function patchComponent(id, patch) {
+  const garder = async () => {
+    await enfiler({ kind: 'patch-component', id, body: patch });
+    applyComponentPatch(id, patch);
+    synchroniser();
+    return { enAttente: true };
+  };
+  if (!state.online || state.envois.length) return garder();
   try {
-    const res = await apiFetch(`/api/components/${id}`, {
+    const data = await apiJson(`/api/components/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
-    });
-    let data = null;
-    try { data = await res.json(); } catch (e) {}
-    if (!res.ok) throw new Error((data && data.error) || `Erreur (${res.status})`);
+    }, { timeout: 15000 });
     const merged = Object.assign({}, patch, (data && typeof data === 'object') ? data : {});
     applyComponentPatch(id, merged);
+    state.reseauInstable = false;
+    fusionnerCacheComposante(id, data);
     return merged;
   } catch (e) {
+    if (sansReseau(e)) { state.reseauInstable = true; return garder(); }
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     throw e;
   }
@@ -499,12 +911,11 @@ function saveCompField(field, value, opts) {
   const cur = state.activeComponent[field];
   const same = (cur == null ? '' : String(cur)) === (value == null ? '' : String(value));
   if (same && !force) return false;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return false; }
   const patch = {}; patch[field] = value;
   applyComponentPatch(id, patch);
   setSaveStatus('ficheStatus', 'Enregistrement…');
   patchComponent(id, patch)
-    .then(() => setSaveStatus('ficheStatus', 'Enregistré'))
+    .then((r) => setSaveStatus('ficheStatus', r && r.enAttente ? "Gardé sur l'appareil" : 'Enregistré'))
     .catch(() => setSaveStatus('ficheStatus', ''));
   return true;
 }
@@ -592,7 +1003,6 @@ function onAttrValueBlur(key, e) {
 /* ---------- photos ---------- */
 
 function triggerPhotoInput() {
-  if (!state.online) { showToast('Hors connexion : ajout de photo indisponible.'); return; }
   const input = document.getElementById('photoFileInput');
   if (input) input.click();
 }
@@ -624,25 +1034,38 @@ async function onPhotoFileChange(e) {
   const file = e.target.files && e.target.files[0];
   e.target.value = '';
   if (!file || !state.activeId) return;
+  const compId = state.activeId;
+  const dossierId = state.dossier && state.dossier.id;
   state.uploadingPhoto = true; state.error = null; render();
-  try {
-    const fd = new FormData();
-    fd.append('file', await reduirePhoto(file));
-    const res = await apiFetch(`/api/components/${state.activeId}/photos`, { method: 'POST', body: fd });
-    let data = null;
-    try { data = await res.json(); } catch (e2) {}
-    if (!res.ok) throw new Error((data && data.error) || 'Le téléversement de la photo a échoué.');
-    if (state.activeComponent) {
-      state.activeComponent = Object.assign({}, state.activeComponent, { photos: (state.activeComponent.photos || []).concat([data]) });
+  const photo = await reduirePhoto(file);
+  // Choisi par l'appareil : l'envoi peut être rejoué sans créer de doublon.
+  const photoId = nouvelIdPhoto();
+  await HL.photoEcrire(photoId, photo);
+  state.photoBlobUrls[photoId] = URL.createObjectURL(photo);
+  let envoyee = null;
+  if (state.online && !state.envois.length) {
+    try {
+      envoyee = await envoyerPhoto(compId, photoId, photo, dossierId);
+      state.reseauInstable = false;
+    } catch (e2) {
+      if (!sansReseau(e2)) {
+        state.uploadingPhoto = false;
+        HL.photoEffacer(photoId);
+        if (e2.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e2); render(); }
+        return;
+      }
+      state.reseauInstable = true;
     }
-    state.components = state.components.map(c => (c.id === state.activeId ? Object.assign({}, c, { photos: (c.photos || 0) + 1 }) : c));
-    state.uploadingPhoto = false;
-    render();
-    loadPhotoBlobs([data]);
-  } catch (e2) {
-    state.uploadingPhoto = false;
-    if (e2.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e2); render(); }
   }
+  if (!envoyee) await enfiler({ kind: 'photo', componentId: compId, photoId, dossierId });
+  const affichee = envoyee || { id: photoId, component_id: compId, tag: "En attente d'envoi", local: true };
+  if (state.activeComponent && state.activeComponent.id === compId) {
+    state.activeComponent = Object.assign({}, state.activeComponent, { photos: (state.activeComponent.photos || []).concat([affichee]) });
+  }
+  state.components = state.components.map(c => (c.id === compId ? Object.assign({}, c, { photos: (c.photos || 0) + 1 }) : c));
+  state.uploadingPhoto = false;
+  render();
+  if (!envoyee) synchroniser();
 }
 
 /* ---------- AI analyze ---------- */
@@ -672,7 +1095,6 @@ function parseCostEstimate(v) {
 
 async function applyAi() {
   if (!state.aiResult || !state.activeId) return;
-  if (!state.online) { showToast('Hors connexion : impossible d’appliquer les valeurs.'); return; }
   const r = state.aiResult;
   const patch = {};
   if (typeof r.rating === 'number' && r.rating >= 1 && r.rating <= 4) patch.rating = r.rating;
@@ -743,7 +1165,15 @@ async function submitTranscript(transcript) {
 function onNoteFallbackSend() {
   const val = (state.noteDraft || '').trim();
   if (!val) return;
-  if (!state.online) { showToast('Hors connexion : impossible d’envoyer la note.'); return; }
+  // Sans réseau, l'IA ne peut pas mettre la note en forme : elle est
+  // ajoutée telle quelle, et gardée sur l'appareil.
+  if (!state.online) {
+    const c = state.activeComponent;
+    state.noteDraft = '';
+    saveCompField('note', c && c.note ? `${c.note}\n${val}` : val, { force: true });
+    showToast("Note ajoutée telle quelle (la mise en forme par l'IA demande du réseau)");
+    return;
+  }
   state.noteDraft = '';
   render();
   submitTranscript(val);
@@ -751,7 +1181,6 @@ function onNoteFallbackSend() {
 
 async function saveFiche() {
   if (!state.activeId) return;
-  if (!state.online) { showToast('Hors connexion : impossible d’enregistrer.'); return; }
   const id = state.activeId;
   applyComponentPatch(id, { done: 1 });
   state.screen = 'liste';
@@ -794,20 +1223,40 @@ async function suivreRegles(data) {
   }
 }
 
-async function saveBatiment() {
-  if (!state.dossier) return;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
-  setSaveStatus('immStatus', 'Enregistrement…');
+// Rend la réponse du serveur, ou { enAttente: true } si la modification est
+// gardée sur l'appareil.
+async function patchDossier(body) {
+  const id = state.dossier.id;
+  const garder = async () => {
+    await enfiler({ kind: 'patch-dossier', id, body, dossierId: id });
+    state.dossier = Object.assign({}, state.dossier, body);
+    synchroniser();
+    return { enAttente: true };
+  };
+  if (!state.online || state.envois.length) return garder();
   try {
-    const payload = JSON.stringify(state.batiment || {});
-    const data = await apiJson(`/api/dossiers/${state.dossier.id}`, {
+    const data = await apiJson(`/api/dossiers/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ batiment_info: payload }),
-    });
-    if (data && typeof data === 'object') state.dossier = Object.assign({}, state.dossier, data);
-    setSaveStatus('immStatus', 'Enregistré');
-    await suivreRegles(data);
+      body: JSON.stringify(body),
+    }, { timeout: 15000 });
+    state.dossier = Object.assign({}, state.dossier, body, (data && typeof data === 'object') ? data : {});
+    if (data) HL.ecrire(`dossier:${id}`, data);
+    state.reseauInstable = false;
+    return data || {};
+  } catch (e) {
+    if (sansReseau(e)) { state.reseauInstable = true; return garder(); }
+    throw e;
+  }
+}
+
+async function saveBatiment() {
+  if (!state.dossier) return;
+  setSaveStatus('immStatus', 'Enregistrement…');
+  try {
+    const data = await patchDossier({ batiment_info: JSON.stringify(state.batiment || {}) });
+    setSaveStatus('immStatus', data.enAttente ? "Gardé sur l'appareil" : 'Enregistré');
+    if (!data.enAttente) await suivreRegles(data);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     setSaveStatus('immStatus', '');
@@ -830,18 +1279,12 @@ function onImmTextBlur(sec, key, e) {
 
 async function saveDossierField(field, value) {
   if (!state.dossier) return;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
   setSaveStatus('immStatus', 'Enregistrement…');
   try {
     const patch = {}; patch[field] = value;
-    const data = await apiJson(`/api/dossiers/${state.dossier.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    });
-    state.dossier = Object.assign({}, state.dossier, patch, (data && typeof data === 'object') ? data : {});
-    setSaveStatus('immStatus', 'Enregistré');
-    await suivreRegles(data);
+    const data = await patchDossier(patch);
+    setSaveStatus('immStatus', data.enAttente ? "Gardé sur l'appareil" : 'Enregistré');
+    if (!data.enAttente) await suivreRegles(data);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     setSaveStatus('immStatus', '');
@@ -983,11 +1426,14 @@ function computeDecades(projection) {
 async function downloadReport(kind) {
   if (!state.dossier) return;
   if (!state.online) { showToast('Téléchargement indisponible hors connexion.'); return; }
+  // Le rapport se génère sur le serveur : ce qui attend encore sur l'appareil n'y serait pas.
+  if (state.envois.length) await synchroniser();
+  if (state.envois.length) showToast("Des modifications attendent encore l'envoi : le rapport ne les contient pas.");
   const key = kind === 'docx' ? 'downloadingDocx' : kind === 'suivi' ? 'downloadingSuivi' : 'downloadingXlsx';
   state[key] = true; state.error = null; render();
   try {
     const chemin = kind === 'suivi' ? 'suivi-entretien.xlsx' : `report.${kind}`;
-    const res = await apiFetch(`/api/dossiers/${state.dossier.id}/${chemin}`);
+    const res = await apiFetch(`/api/dossiers/${state.dossier.id}/${chemin}`, null, { timeout: 180000 });
     if (!res.ok) throw new Error("Le rapport n'est pas disponible pour le moment.");
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
@@ -1036,9 +1482,19 @@ function render() {
   }
 }
 
+// Un rendu complet pendant la saisie effacerait le texte pas encore
+// enregistré (il l'est à la sortie du champ) : il attend la sortie du champ.
+let renduDiffere = false;
+function renderSiPossible() {
+  const a = document.activeElement;
+  const saisie = a && (a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'file', 'submit'].includes(a.type)));
+  if (saisie) { renduDiffere = true; paintNetBar(); paintPrepa(); return; }
+  render();
+}
+
 function screenHtml() {
   if (state.screen === 'login') return loginHtml() + toastHtml();
-  return `<div class="app-shell">${offlineBarHtml()}${errorBannerHtml()}${bodyForScreen()}</div>${toastHtml()}`;
+  return `<div class="app-shell">${offlineBarHtml()}${errorBannerHtml()}${rejetsHtml()}${bodyForScreen()}</div>${toastHtml()}`;
 }
 
 function bodyForScreen() {
@@ -1055,8 +1511,52 @@ function bodyForScreen() {
 }
 
 function offlineBarHtml() {
-  if (state.online) return '';
-  return `<div class="offline-bar"><i data-lucide="wifi-off"></i>Hors connexion — certaines actions sont indisponibles</div>`;
+  const n = state.envois.length;
+  const attente = n ? ` · ${n} en attente d'envoi` : '';
+  if (!state.online || state.reseauInstable) {
+    return `<div class="offline-bar" id="barreReseau"><i data-lucide="wifi-off"></i>${state.online ? 'Connexion instable' : 'Hors connexion'} — vos modifications sont gardées sur l'appareil${attente}</div>`;
+  }
+  if (n) {
+    return `<div class="offline-bar sync-bar" id="barreReseau"><i data-lucide="refresh-cw" class="${state.synchro ? 'spin' : ''}"></i>${state.synchro ? 'Envoi de' : 'En attente :'} ${n} modification${n > 1 ? 's' : ''} faite${n > 1 ? 's' : ''} hors connexion</div>`;
+  }
+  return '<div id="barreReseau" hidden></div>';
+}
+// Met la barre à jour sans redessiner l'écran (saisie en cours préservée).
+function paintNetBar() {
+  const el = document.getElementById('barreReseau');
+  if (!el) return;
+  el.outerHTML = offlineBarHtml();
+  if (window.lucide) window.lucide.createIcons();
+}
+
+function rejetsHtml() {
+  if (!state.rejets.length) return '';
+  const n = state.rejets.length;
+  return `<div class="error-banner"><i data-lucide="alert-triangle"></i><div class="msg">${n} modification${n > 1 ? 's' : ''} faite${n > 1 ? 's' : ''} hors connexion ${n > 1 ? 'ont été refusées' : 'a été refusée'} par le serveur :<br>${state.rejets.slice(0, 5).map(esc).join('<br>')}</div><button data-action="dismiss-rejets" aria-label="Fermer"><i data-lucide="x" style="width:15px;height:15px"></i></button></div>`;
+}
+
+function prepaTexte() {
+  const p = state.prepa;
+  if (!p) {
+    return state.online
+      ? { icone: 'loader-2', classe: 'spin', texte: 'Préparation de la visite hors connexion…' }
+      : { icone: 'cloud-off', classe: '', texte: 'Visite non préparée : seules les fiches déjà ouvertes sont disponibles hors connexion.' };
+  }
+  if (p.etat === 'fiches') return { icone: 'loader-2', classe: 'spin', texte: 'Préparation hors connexion : téléchargement des fiches…' };
+  if (p.etat === 'photos') return { icone: 'loader-2', classe: 'spin', texte: `Préparation hors connexion : photos ${p.faites}/${p.total}` };
+  if (p.etat === 'pret') return { icone: 'check-circle-2', classe: 'ok', texte: `Visite disponible hors connexion · ${p.fiches} fiches, ${p.total} photo${p.total > 1 ? 's' : ''}` };
+  if (p.etat === 'partiel') return { icone: 'check-circle-2', classe: 'ok', texte: `Visite disponible hors connexion, sauf ${p.total - p.faites} photo${p.total - p.faites > 1 ? 's' : ''} (reprise avec le réseau)` };
+  return { icone: 'alert-triangle', classe: '', texte: p.le ? 'Mise à jour hors connexion interrompue : la dernière préparation reste disponible.' : 'Préparation hors connexion interrompue : elle reprendra avec le réseau.' };
+}
+function prepaHtml() {
+  const t = prepaTexte();
+  return `<div class="prepa-ligne" id="prepaLigne"><i data-lucide="${t.icone}" class="${t.classe}"></i><span>${esc(t.texte)}</span></div>`;
+}
+function paintPrepa() {
+  const el = document.getElementById('prepaLigne');
+  if (!el) return;
+  el.outerHTML = prepaHtml();
+  if (window.lucide) window.lucide.createIcons();
 }
 
 function errorBannerHtml() {
@@ -1155,6 +1655,7 @@ function accueilHtml() {
         <div class="progress-track"><div class="progress-fill" style="width:${st.pct}%"></div></div>
       </div>
     </div>
+    ${prepaHtml()}
     <div class="stats-grid">
       <div class="stat-tile"><div class="num">${st.photosTotal}</div><div class="lbl">Photos</div></div>
       <div class="stat-tile"><div class="num accent">${st.critical}</div><div class="lbl">À traiter</div></div>
@@ -1306,7 +1807,7 @@ function inactifRowHtml(c) {
       <div class="sub">Désactivée</div>
     </div>
     <div class="comp-end">
-      <button class="reactiver" data-action="reactiver" data-id="${esc(c.id)}" ${!state.online ? 'disabled' : ''}><i data-lucide="rotate-ccw"></i>Réactiver</button>
+      <button class="reactiver" data-action="reactiver" data-id="${esc(c.id)}"><i data-lucide="rotate-ccw"></i>Réactiver</button>
     </div>
   </div>`;
 }
@@ -1421,7 +1922,6 @@ function persoEntretien(c) {
 async function enregistrerEntretien(perso) {
   const c = state.activeComponent;
   if (!c) return;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
   try {
     await patchComponent(c.id, { taches_entretien: JSON.stringify(perso) });
     render();
@@ -1446,7 +1946,7 @@ function ajouterTache() {
   if (!f.x.trim()) { showToast('Décrivez la tâche.'); return; }
   if (!f.mois.length) { showToast('Choisissez au moins un mois.'); return; }
   const p = persoEntretien(c);
-  p.ajoutees.push({ x: f.x.trim(), f: f.f, q: f.q, mois: f.mois.slice().sort((a, b) => a - b) });
+  p.ajoutees.push({ id: nouvelIdTache(), x: f.x.trim(), f: f.f, q: f.q, mois: f.mois.slice().sort((a, b) => a - b) });
   state.tacheForm = null;
   enregistrerEntretien(p);
 }
@@ -1461,7 +1961,7 @@ function carnetHtml(c) {
         <div class="tache-texte">${esc(t.texte)}${t.perso ? '<span class="tache-perso">ajoutée</span>' : ''}</div>
         <div class="tache-sub">${esc(t.frequence)} · ${esc(t.quand)} · ${esc(t.responsable)}${t.aPreciser ? ' · <b>mois à préciser</b>' : ''}</div>
       </div>
-      <button class="tache-x" data-action="tache-retirer" data-id="${esc(t.id)}" aria-label="Retirer cette tâche" ${!state.online ? 'disabled' : ''}><i data-lucide="x"></i></button>
+      <button class="tache-x" data-action="tache-retirer" data-id="${esc(t.id)}" aria-label="Retirer cette tâche"><i data-lucide="x"></i></button>
     </div>`;
   const f = state.tacheForm;
   const formulaire = f ? `
@@ -1475,7 +1975,7 @@ function carnetHtml(c) {
       <div class="quick-chips">${QUI_TACHE.map(([k, l]) => `<button class="quick-chip ${f.q === k ? 'on' : ''}" data-action="tache-qui" data-val="${esc(k)}">${esc(l)}</button>`).join('')}</div>
       <div class="tache-actions">
         <button class="btn-outline" style="margin-top:0" data-action="tache-annuler">Annuler</button>
-        <button class="btn-cta" data-action="tache-ajouter" ${!state.online ? 'disabled' : ''}><i data-lucide="plus"></i>Ajouter</button>
+        <button class="btn-cta" data-action="tache-ajouter"><i data-lucide="plus"></i>Ajouter</button>
       </div>
     </div>` : `<button class="btn-outline" data-action="tache-form"><i data-lucide="plus"></i>Ajouter une tâche</button>`;
   return `
@@ -1539,7 +2039,8 @@ function ficheHtml() {
 
   const photoThumbsHtml = photos.map(p => {
     const url = state.photoBlobUrls[p.id];
-    return `<div class="photo-thumb ${url ? '' : 'loading'}">${url ? `<img src="${url}" alt="">` : `<i data-lucide="loader-2"></i>`}${url ? `<div class="tag">${esc(p.tag || '')}</div>` : ''}</div>`;
+    if (!url && state.photoIndispo[p.id]) return `<div class="photo-thumb indispo" title="Photo pas encore téléchargée sur l'appareil"><i data-lucide="image-off"></i></div>`;
+    return `<div class="photo-thumb ${url ? '' : 'loading'} ${p.local ? 'en-attente' : ''}">${url ? `<img src="${url}" alt="">` : `<i data-lucide="loader-2"></i>`}${url ? `<div class="tag">${esc(p.local ? "En attente d'envoi" : (p.tag || ''))}</div>` : ''}</div>`;
   }).join('');
 
   const aiCardHtml = state.aiResult ? aiResultHtml(state.aiResult, c) : '';
@@ -1550,7 +2051,7 @@ function ficheHtml() {
     </button>` : `
     <div class="note-fallback">
       <textarea id="noteFallbackText" data-role="note-fallback-text" placeholder="Reconnaissance vocale indisponible sur cet appareil. Écrivez votre note ici…">${esc(state.noteDraft)}</textarea>
-      <button class="send" data-action="note-fallback-send" ${!state.online ? 'disabled' : ''}>Envoyer la note</button>
+      <button class="send" data-action="note-fallback-send">Envoyer la note</button>
     </div>`;
 
   const noteCard = c.note ? `<div class="note-card"><div class="note-card-hdr"><i data-lucide="sparkles"></i><span>Note structurée</span></div><div class="note-card-body">${esc(c.note)}</div></div>` : '';
@@ -1580,7 +2081,7 @@ function ficheHtml() {
     <div class="fiche-body">
       <div class="section-lbl">Photos (${photos.length})</div>
       <div class="photo-strip scr">
-        <button class="photo-add ${state.uploadingPhoto ? 'uploading' : ''}" data-action="add-photo" ${!state.online ? 'disabled' : ''}>
+        <button class="photo-add ${state.uploadingPhoto ? 'uploading' : ''}" data-action="add-photo">
           <i data-lucide="${state.uploadingPhoto ? 'loader-2' : 'camera'}"></i><span>${state.uploadingPhoto ? 'Envoi…' : 'Photo'}</span>
         </button>
         ${photoThumbsHtml}
@@ -1683,10 +2184,10 @@ function ficheHtml() {
       ${micSection}
       ${noteCard}
 
-      <button class="btn-outline btn-retirer" data-action="desactiver" data-id="${esc(c.id)}" ${!state.online ? 'disabled' : ''}><i data-lucide="eye-off"></i>Retirer de la visite (absente de l'immeuble)</button>
+      <button class="btn-outline btn-retirer" data-action="desactiver" data-id="${esc(c.id)}"><i data-lucide="eye-off"></i>Retirer de la visite (absente de l'immeuble)</button>
     </div>
     <div class="fiche-bottom">
-      <button class="btn-cta" data-action="save-fiche" ${!state.online ? 'disabled' : ''}><i data-lucide="check"></i>Enregistrer &amp; suivante</button>
+      <button class="btn-cta" data-action="save-fiche"><i data-lucide="check"></i>Enregistrer &amp; suivante</button>
     </div>
   </div>`;
 }
@@ -1850,6 +2351,7 @@ function onRootClick(e) {
     case 'download-suivi': downloadReport('suivi'); break;
     case 'generate-reports': generateReports(); break;
     case 'dismiss-error': state.error = null; render(); break;
+    case 'dismiss-rejets': state.rejets = []; render(); break;
     case 'logout': logout(); break;
   }
 }
@@ -1894,6 +2396,11 @@ function onRootFocusout(e) {
   if (t.matches('[data-role="imm-text"]')) { onImmTextBlur(t.dataset.sec, t.dataset.key, e); return; }
   if (t.matches('[data-role="dossier-number"]')) { onDossierNumberBlur(t.dataset.field, e); return; }
 }
+// Un rendu reporté pendant la saisie a lieu à la sortie du champ.
+root.addEventListener('focusout', () => {
+  if (!renduDiffere) return;
+  setTimeout(() => { if (renduDiffere) { renduDiffere = false; renderSiPossible(); } }, 60);
+});
 
 function onRootSubmit(e) {
   if (e.target && e.target.id === 'loginForm') {
@@ -1910,7 +2417,23 @@ root.addEventListener('change', onRootChange);
 root.addEventListener('focusout', onRootFocusout);
 root.addEventListener('submit', onRootSubmit);
 
-window.addEventListener('online', () => { state.online = true; render(); });
-window.addEventListener('offline', () => { state.online = false; showToast('Vous êtes hors connexion.'); render(); });
+window.addEventListener('online', () => {
+  state.online = true;
+  state.reseauInstable = false;
+  renderSiPossible();
+  synchroniser();
+  if (state.dossier && !(state.prepa && state.prepa.etat === 'pret')) preparerHorsLigne(state.dossier.id);
+});
+window.addEventListener('offline', () => {
+  state.online = false;
+  state.toast = "Hors connexion : vos modifications sont gardées sur l'appareil.";
+  renderSiPossible();
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { state.toast = null; renderSiPossible(); }, 3200);
+});
+// Filet de sécurité : l'événement « online » ne vient pas toujours (réseau
+// revenu sans changement d'interface, connexion instable qui se rétablit).
+setInterval(() => { if (state.online && state.envois.length) synchroniser(); }, 30000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) synchroniser(); });
 
 boot();
