@@ -3966,6 +3966,25 @@ async function avecPrecedents(db, composantes, { complet = true } = {}) {
   });
 }
 // Section « Évolution depuis l'étude précédente » du rapport.
+// Ce que l'étude précédente prévoyait pour aujourd'hui : sa projection refaite
+// telle qu'elle a été produite (même année de départ, mêmes composantes), lue
+// au début de l'année courante.
+function previsionEtudePrecedente(r, anneeCourante) {
+  const ecart = anneeCourante - r.annee;
+  if (ecart < 1 || ecart > RESERVE_FUND_PARAMS.projectionYears) return null;
+  if (r.dossier.current_fund_balance == null && r.dossier.cotisation_annuelle == null) return null;
+  const projection = projectReserveFund(r.composantes.filter(estActive), {
+    currentFundBalance: r.dossier.current_fund_balance,
+    baseCotisation: r.dossier.cotisation_annuelle,
+    units: r.dossier.units
+  }, { ...RESERVE_FUND_PARAMS, anneeReference: r.annee });
+  const scenario = scenarioRetenu(projection);
+  if (!scenario) return null;
+  // L'année 1 de la projection est l'année qui suit l'étude.
+  const solde = ecart === 1 ? projection.currentFundBalance : scenario.years[ecart - 2]?.soldeFin;
+  const cotisation = scenario.years[ecart - 1]?.cotisation;
+  return solde == null ? null : { solde, cotisation: cotisation ?? null, scenario: scenario.label };
+}
 function sectionEvolution(ctx, outils, anneeCourante) {
   const r = ctx.revision;
   if (!r) return [];
@@ -3979,12 +3998,24 @@ function sectionEvolution(ctx, outils, anneeCourante) {
     titre2("1.7 Évolution depuis l'étude précédente"),
     body(`La présente étude révise l'étude ${String(r.dossier.dossier_no ?? "").trim()} réalisée en ${r.annee}, conformément à l'obligation de mise à jour au moins tous les cinq ans. Pour la comparaison, les coûts de l'étude précédente sont indexés de ${pourcent(facteur - 1)}, soit l'inflation des coûts de la construction de ${r.annee} à ${anneeCourante}.`)
   ];
-  // Fonds de prévoyance
+  // Fonds de prévoyance : réel aux deux études, et ce que la première prévoyait.
   if (r.dossier.current_fund_balance != null || ctx.dossier.current_fund_balance != null) {
-    out.push(tableauMaison(["", `Étude ${r.annee}`, `Étude ${anneeCourante}`], [
-      ["Solde du fonds de prévoyance", montantMaison(r.dossier.current_fund_balance) ?? "—", montantMaison(ctx.dossier.current_fund_balance) ?? "—"],
-      ["Cotisation annuelle", montantMaison(r.dossier.cotisation_annuelle) ?? "—", montantMaison(ctx.dossier.cotisation_annuelle) ?? "—"]
+    const prevision = previsionEtudePrecedente(r, anneeCourante);
+    out.push(tableauMaison(prevision ? ["", `Étude ${r.annee}`, `Prévu pour ${anneeCourante}`, `Réel ${anneeCourante}`] : ["", `Étude ${r.annee}`, `Étude ${anneeCourante}`], [
+      ["Solde du fonds de prévoyance", montantMaison(r.dossier.current_fund_balance) ?? "—", ...prevision ? [montantMaison(prevision.solde) ?? "—"] : [], montantMaison(ctx.dossier.current_fund_balance) ?? "—"],
+      ["Cotisation annuelle", montantMaison(r.dossier.cotisation_annuelle) ?? "—", ...prevision ? [montantMaison(prevision.cotisation) ?? "—"] : [], montantMaison(ctx.dossier.cotisation_annuelle) ?? "—"]
     ]));
+    const reel = ctx.dossier.current_fund_balance;
+    if (prevision && reel != null) {
+      const diff = Number(reel) - prevision.solde;
+      const relatif = prevision.solde > 0 ? ` (${pourcent(Math.abs(diff) / prevision.solde)})` : "";
+      const constat = Math.abs(diff) < Math.max(1000, Math.abs(prevision.solde) * 0.02)
+        ? "Le solde réel du fonds correspond à ce que l'étude précédente prévoyait."
+        : diff > 0
+          ? `Le solde réel du fonds dépasse de ${montantMaison(diff)}${relatif} celui que l'étude précédente prévoyait pour ${anneeCourante}.`
+          : `Le solde réel du fonds est inférieur de ${montantMaison(-diff)}${relatif} à celui que l'étude précédente prévoyait pour ${anneeCourante} : cotisations moins élevées que recommandé ou dépenses plus hâtives que prévu, l'écart est à rattraper dans le scénario retenu.`;
+      out.push(body(`${constat} La prévision est celle du scénario « ${prevision.scenario} » de l'étude ${r.annee}, recalculée avec ses hypothèses d'origine.`));
+    }
   }
   // Travaux prévus dans la période
   const parStatut = (statut) => actives.filter((c) => c.travaux_periode === statut);
@@ -6089,7 +6120,9 @@ function replacementEventsForComponent(c, params) {
   // Règle maison : l'année anticipée de remplacement est ancrée sur l'année de construction
   // ou de dernière réparation, plus la durée de vie utile. Un remplacement déjà échu est
   // reporté en première année de l'horizon.
-  const currentYear = (/* @__PURE__ */ new Date()).getFullYear();
+  // Année de départ de la projection : l'année courante, ou celle d'une étude
+  // passée qu'on recalcule telle qu'elle a été faite.
+  const currentYear = params.anneeReference ?? (/* @__PURE__ */ new Date()).getFullYear();
   let firstReplacementYear;
   if (c.install_year) {
     firstReplacementYear = Math.max(1, c.install_year + usefulLife - currentYear);
@@ -47752,13 +47785,17 @@ async function buildReportContext(c, opts = {}) {
     } : {}
   };
 }
+// Scénario dont le rapport tire la cotisation recommandée.
+function scenarioRetenu(projection) {
+  return projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
+    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+}
 // Valeurs des champs {{…}} d'un gabarit de firme.
 function valeursChamps(ctx) {
   const { dossier, projection, theme, signataire } = ctx;
   const info = infoBatiment(dossier);
   const ordre = ordreDuSignataire(signataire);
-  const scenario = projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
-    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  const scenario = scenarioRetenu(projection);
   const cotisation = scenario?.years?.[0]?.cotisation ?? null;
   const unites = Number(dossier.units);
   const valeur = (v) => v == null || v === "" ? "" : String(v);
