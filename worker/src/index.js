@@ -3638,7 +3638,12 @@ const COLONNES_AJOUTEES = [
   ["dossiers", "revision_de", "TEXT"],
   ["origine_id", "TEXT"],
   ["travaux_periode", "TEXT"],
-  ["travaux_annee", "INTEGER"]
+  ["travaux_annee", "INTEGER"],
+  // Dernier rappel envoyé à la firme pour une étude à réviser.
+  ["dossiers", "rappel_revision_le", "TEXT"],
+  // Suivi des dossiers : qui s'en occupe, et pour quand.
+  ["dossiers", "assigne_a", "TEXT"],
+  ["dossiers", "echeance", "TEXT"]
 ];
 // Tables ajoutées après la mise en production, créées au premier appel.
 const TABLES_AJOUTEES = [
@@ -3964,6 +3969,25 @@ async function avecPrecedents(db, composantes, { complet = true } = {}) {
   });
 }
 // Section « Évolution depuis l'étude précédente » du rapport.
+// Ce que l'étude précédente prévoyait pour aujourd'hui : sa projection refaite
+// telle qu'elle a été produite (même année de départ, mêmes composantes), lue
+// au début de l'année courante.
+function previsionEtudePrecedente(r, anneeCourante) {
+  const ecart = anneeCourante - r.annee;
+  if (ecart < 1 || ecart > RESERVE_FUND_PARAMS.projectionYears) return null;
+  if (r.dossier.current_fund_balance == null && r.dossier.cotisation_annuelle == null) return null;
+  const projection = projectReserveFund(r.composantes.filter(estActive), {
+    currentFundBalance: r.dossier.current_fund_balance,
+    baseCotisation: r.dossier.cotisation_annuelle,
+    units: r.dossier.units
+  }, { ...RESERVE_FUND_PARAMS, anneeReference: r.annee });
+  const scenario = scenarioRetenu(projection);
+  if (!scenario) return null;
+  // L'année 1 de la projection est l'année qui suit l'étude.
+  const solde = ecart === 1 ? projection.currentFundBalance : scenario.years[ecart - 2]?.soldeFin;
+  const cotisation = scenario.years[ecart - 1]?.cotisation;
+  return solde == null ? null : { solde, cotisation: cotisation ?? null, scenario: scenario.label };
+}
 function sectionEvolution(ctx, outils, anneeCourante) {
   const r = ctx.revision;
   if (!r) return [];
@@ -3977,12 +4001,24 @@ function sectionEvolution(ctx, outils, anneeCourante) {
     titre2("1.7 Évolution depuis l'étude précédente"),
     body(`La présente étude révise l'étude ${String(r.dossier.dossier_no ?? "").trim()} réalisée en ${r.annee}, conformément à l'obligation de mise à jour au moins tous les cinq ans. Pour la comparaison, les coûts de l'étude précédente sont indexés de ${pourcent(facteur - 1)}, soit l'inflation des coûts de la construction de ${r.annee} à ${anneeCourante}.`)
   ];
-  // Fonds de prévoyance
+  // Fonds de prévoyance : réel aux deux études, et ce que la première prévoyait.
   if (r.dossier.current_fund_balance != null || ctx.dossier.current_fund_balance != null) {
-    out.push(tableauMaison(["", `Étude ${r.annee}`, `Étude ${anneeCourante}`], [
-      ["Solde du fonds de prévoyance", montantMaison(r.dossier.current_fund_balance) ?? "—", montantMaison(ctx.dossier.current_fund_balance) ?? "—"],
-      ["Cotisation annuelle", montantMaison(r.dossier.cotisation_annuelle) ?? "—", montantMaison(ctx.dossier.cotisation_annuelle) ?? "—"]
+    const prevision = previsionEtudePrecedente(r, anneeCourante);
+    out.push(tableauMaison(prevision ? ["", `Étude ${r.annee}`, `Prévu pour ${anneeCourante}`, `Réel ${anneeCourante}`] : ["", `Étude ${r.annee}`, `Étude ${anneeCourante}`], [
+      ["Solde du fonds de prévoyance", montantMaison(r.dossier.current_fund_balance) ?? "—", ...prevision ? [montantMaison(prevision.solde) ?? "—"] : [], montantMaison(ctx.dossier.current_fund_balance) ?? "—"],
+      ["Cotisation annuelle", montantMaison(r.dossier.cotisation_annuelle) ?? "—", ...prevision ? [montantMaison(prevision.cotisation) ?? "—"] : [], montantMaison(ctx.dossier.cotisation_annuelle) ?? "—"]
     ]));
+    const reel = ctx.dossier.current_fund_balance;
+    if (prevision && reel != null) {
+      const diff = Number(reel) - prevision.solde;
+      const relatif = prevision.solde > 0 ? ` (${pourcent(Math.abs(diff) / prevision.solde)})` : "";
+      const constat = Math.abs(diff) < Math.max(1000, Math.abs(prevision.solde) * 0.02)
+        ? "Le solde réel du fonds correspond à ce que l'étude précédente prévoyait."
+        : diff > 0
+          ? `Le solde réel du fonds dépasse de ${montantMaison(diff)}${relatif} celui que l'étude précédente prévoyait pour ${anneeCourante}.`
+          : `Le solde réel du fonds est inférieur de ${montantMaison(-diff)}${relatif} à celui que l'étude précédente prévoyait pour ${anneeCourante} : cotisations moins élevées que recommandé ou dépenses plus hâtives que prévu, l'écart est à rattraper dans le scénario retenu.`;
+      out.push(body(`${constat} La prévision est celle du scénario « ${prevision.scenario} » de l'étude ${r.annee}, recalculée avec ses hypothèses d'origine.`));
+    }
   }
   // Travaux prévus dans la période
   const parStatut = (statut) => actives.filter((c) => c.travaux_periode === statut);
@@ -5808,18 +5844,23 @@ async function getOwnedComponent(c, id) {
   ).bind(id, user.company_id).first();
   return component ?? null;
 }
-components.get("/:id", async (c) => {
-  const component = await getOwnedComponent(c, c.req.param("id"));
-  if (!component) return c.json({ error: "composante introuvable" }, 404);
-  const photos2 = await c.env.DB.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY created_at ASC").bind(component.id).all();
+// Une composante telle que la fiche du terrain la montre : photos, guide,
+// tâches du carnet et, en révision, l'étude précédente.
+async function composanteComplete(db, component, biblio) {
+  const photos2 = await db.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY created_at ASC").bind(component.id).all();
   const guide = guidePour(component);
-  return c.json({
+  return {
     ...component,
     photos: photos2.results,
     guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats },
-    entretien: tachesPourComposante(component, { avecRetirees: true, biblio: await bibliothequeDuDossier(c.env.DB, component.dossier_id) }).map(tacheAffichee),
-    precedent: component.origine_id ? (await precedentsPour(c.env.DB, [component])).get(component.origine_id) ?? null : null
-  });
+    entretien: tachesPourComposante(component, { avecRetirees: true, biblio: biblio ?? await bibliothequeDuDossier(db, component.dossier_id) }).map(tacheAffichee),
+    precedent: component.origine_id ? (await precedentsPour(db, [component])).get(component.origine_id) ?? null : null
+  };
+}
+components.get("/:id", async (c) => {
+  const component = await getOwnedComponent(c, c.req.param("id"));
+  if (!component) return c.json({ error: "composante introuvable" }, 404);
+  return c.json(await composanteComplete(c.env.DB, component));
 });
 components.patch("/:id", async (c) => {
   const id = c.req.param("id");
@@ -6082,7 +6123,9 @@ function replacementEventsForComponent(c, params) {
   // Règle maison : l'année anticipée de remplacement est ancrée sur l'année de construction
   // ou de dernière réparation, plus la durée de vie utile. Un remplacement déjà échu est
   // reporté en première année de l'horizon.
-  const currentYear = (/* @__PURE__ */ new Date()).getFullYear();
+  // Année de départ de la projection : l'année courante, ou celle d'une étude
+  // passée qu'on recalcule telle qu'elle a été faite.
+  const currentYear = params.anneeReference ?? (/* @__PURE__ */ new Date()).getFullYear();
   let firstReplacementYear;
   if (c.install_year) {
     firstReplacementYear = Math.max(1, c.install_year + usefulLife - currentYear);
@@ -46817,6 +46860,16 @@ function membreEquipe(u) {
     actif: u.actif !== 0, invitation_en_attente: !!u.invitation_en_attente
   };
 }
+// L'équipe active, en noms seulement : de quoi choisir un responsable de dossier.
+companies.get("/:id/membres", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const rows = await c.env.DB.prepare(
+    "SELECT id, name, role FROM users WHERE company_id = ?1 AND actif = 1 AND role != 'portail' AND COALESCE(invitation_en_attente, 0) = 0 ORDER BY name"
+  ).bind(id).all();
+  return c.json({ membres: rows.results, moi: user.id, admin: peutAdministrerFirme(user, id) });
+});
 companies.get("/:id/equipe", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
@@ -47046,6 +47099,67 @@ async function rappelsMensuels(env) {
       console.error("rappels du carnet en échec", dossier.id, e?.code, e?.message);
     }
   }
+  await rappelsRevisions(env, origine);
+}
+// Études publiées dont la révision aux cinq ans arrive (ou est dépassée) et
+// n'est pas commencée : un résumé par firme à ses administrateurs. Chaque
+// étude revient au plus une fois par trimestre, pas chaque mois.
+const RAPPEL_REVISION_JOURS = 90;
+async function rappelsRevisions(env, origine) {
+  const annee = (/* @__PURE__ */ new Date()).getUTCFullYear();
+  const limite = new Date(Date.now() - RAPPEL_REVISION_JOURS * 864e5).toISOString();
+  const dus = (await env.DB.prepare(
+    `SELECT d.* FROM dossiers d
+       WHERE d.published_at IS NOT NULL AND d.company_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM dossiers r WHERE r.revision_de = d.id)
+         AND (d.rappel_revision_le IS NULL OR d.rappel_revision_le < ?1)`
+  ).bind(limite).all()).results.filter((d) => anneeEtude(d) + 5 <= annee + 1);
+  const parFirme = new Map();
+  for (const d of dus) {
+    if (!parFirme.has(d.company_id)) parFirme.set(d.company_id, []);
+    parFirme.get(d.company_id).push(d);
+  }
+  const bilan = [];
+  for (const [firmeId, liste] of parFirme) {
+    try {
+      const comptes = (await env.DB.prepare(
+        `SELECT id, name, email, role FROM users
+           WHERE company_id = ?1 AND actif = 1 AND COALESCE(invitation_en_attente, 0) = 0 AND role != 'portail'`
+      ).bind(firmeId).all()).results;
+      // Les administrateurs de la firme ; à défaut, toute l'équipe.
+      const admins = comptes.filter((u) => u.role === "admin" || u.role === "super_admin");
+      const destinataires = admins.length ? admins : comptes;
+      if (!destinataires.length) continue;
+      liste.sort((a, b) => anneeEtude(a) - anneeEtude(b));
+      const ligne = (d) => {
+        const echeance = anneeEtude(d) + 5;
+        const quand = echeance < annee ? `en retard depuis ${echeance}` : echeance === annee ? `due cette année` : `due en ${echeance}`;
+        return `${d.dossier_no} — ${d.name}${d.city ? `, ${d.city}` : ""} : étude de ${anneeEtude(d)}, révision ${quand}`;
+      };
+      const n = liste.length;
+      for (const u of destinataires) {
+        await envoyerCourriel(env, {
+          to: u.email,
+          subject: n > 1 ? `${n} études de fonds de prévoyance à réviser` : `Étude à réviser — ${liste[0].name}`,
+          titre: n > 1 ? `${n} études arrivent à leur révision` : "Une étude arrive à sa révision",
+          paragraphes: [
+            `Bonjour ${u.name}, la loi demande de mettre à jour l'étude du fonds de prévoyance tous les cinq ans. ${n > 1 ? "Ces études de votre firme arrivent" : "Cette étude de votre firme arrive"} à échéance et aucune révision n'a encore été commencée.`,
+            "La révision reprend l'inventaire et les coûts indexés de l'étude précédente : il reste à revoir l'immeuble sur place."
+          ],
+          liste: [...liste.slice(0, 40).map(ligne), ...n > 40 ? [`… et ${n - 40} autres études, dans la console bureau`] : []],
+          bouton: { texte: "Ouvrir la console bureau", url: `${origine}/bureau/` },
+          pied: "Ce rappel revient chaque trimestre tant que la révision n'est pas commencée."
+        });
+      }
+      const maintenant = (/* @__PURE__ */ new Date()).toISOString();
+      await env.DB.batch(liste.map((d) => env.DB.prepare("UPDATE dossiers SET rappel_revision_le = ?1 WHERE id = ?2").bind(maintenant, d.id)));
+      bilan.push({ firme: firmeId, etudes: n, destinataires: destinataires.length });
+    } catch (e) {
+      console.error("rappel des révisions en échec", firmeId, e?.message);
+    }
+  }
+  console.log("rappels des révisions", JSON.stringify(bilan));
+  return bilan;
 }
 // ---- Côté firme : membres et répartition, depuis la console bureau -------------
 async function dossierPortail(c, { ecriture = false } = {}) {
@@ -47300,6 +47414,7 @@ async function dossierStats(db, dossierId) {
          COUNT(*) AS total,
          SUM(done) AS done,
          SUM(CASE WHEN done = 1 AND rating >= 3 THEN 1 ELSE 0 END) AS critical,
+         MAX(updated_at) AS derniere_modif,
          (SELECT COUNT(*) FROM photos p JOIN components c2 ON c2.id = p.component_id WHERE c2.dossier_id = ?1) AS photos_total
        FROM components WHERE dossier_id = ?1 AND actif = 1`
   ).bind(dossierId).first();
@@ -47311,6 +47426,7 @@ async function dossierStats(db, dossierId) {
     todo: total - done,
     critical: row?.critical ?? 0,
     photosTotal: row?.photos_total ?? 0,
+    derniereModif: row?.derniere_modif ?? null,
     pct: total > 0 ? Math.round(done / total * 100) : 0
   };
 }
@@ -47318,10 +47434,52 @@ dossiers.get("/", async (c) => {
   const user = await getCurrentUser(c);
   if (!user?.company_id) return c.json([]);
   const rows = await c.env.DB.prepare("SELECT * FROM dossiers WHERE company_id = ?1 ORDER BY created_at DESC").bind(user.company_id).all();
+  const noms = new Map((await c.env.DB.prepare("SELECT id, name FROM users WHERE company_id = ?1").bind(user.company_id).all()).results.map((u) => [u.id, u.name]));
   const withStats = await Promise.all(
     rows.results.map(async (d) => ({ ...d, stats: await dossierStats(c.env.DB, d.id) }))
   );
-  return c.json(withStats.map((d) => ({ ...d, ...infoRevision(d, rows.results) })));
+  return c.json(withStats.map((d) => ({
+    ...d,
+    ...infoRevision(d, rows.results),
+    assigne: d.assigne_a && noms.has(d.assigne_a) ? { id: d.assigne_a, name: noms.get(d.assigne_a) } : null
+  })));
+});
+// Suivi : responsable et échéance du dossier. Un administrateur de la firme
+// répartit les dossiers ; un ingénieur prend un dossier libre ou le sien, ou
+// s'en retire, et règle l'échéance de ceux qu'il porte.
+dossiers.patch("/:id/suivi", async (c) => {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const admin = peutAdministrerFirme(user, dossier.company_id);
+  const sets = [], vals = [];
+  if ("assigne_a" in body2) {
+    const cible = body2.assigne_a ? String(body2.assigne_a) : null;
+    if (!admin) {
+      const libreOuMien = !dossier.assigne_a || dossier.assigne_a === user.id;
+      if (!libreOuMien || (cible && cible !== user.id)) return c.json({ error: "seul un administrateur de la firme répartit les dossiers des autres" }, 403);
+    }
+    if (cible) {
+      const membre = await c.env.DB.prepare(
+        "SELECT id FROM users WHERE id = ?1 AND company_id = ?2 AND actif = 1 AND role != 'portail'"
+      ).bind(cible, dossier.company_id).first();
+      if (!membre) return c.json({ error: "cette personne ne fait pas partie de l'équipe active de la firme" }, 400);
+    }
+    sets.push(`assigne_a = ?${sets.length + 1}`); vals.push(cible);
+  }
+  if ("echeance" in body2) {
+    const e = body2.echeance ? String(body2.echeance) : null;
+    if (e && (!/^\d{4}-\d{2}-\d{2}$/.test(e) || Number.isNaN(Date.parse(`${e}T00:00:00Z`)))) return c.json({ error: "échéance invalide (AAAA-MM-JJ)" }, 400);
+    const porteur = ("assigne_a" in body2 ? body2.assigne_a : dossier.assigne_a) === user.id;
+    if (!admin && !porteur) return c.json({ error: "l'échéance se règle par le responsable du dossier ou un administrateur" }, 403);
+    sets.push(`echeance = ?${sets.length + 1}`); vals.push(e);
+  }
+  if (!sets.length) return c.json({ error: "rien à modifier" }, 400);
+  vals.push(dossier.id);
+  await c.env.DB.prepare(`UPDATE dossiers SET ${sets.join(", ")} WHERE id = ?${vals.length}`).bind(...vals).run();
+  const d = await c.env.DB.prepare("SELECT id, assigne_a, echeance FROM dossiers WHERE id = ?1").bind(dossier.id).first();
+  const nom = d.assigne_a ? (await c.env.DB.prepare("SELECT name FROM users WHERE id = ?1").bind(d.assigne_a).first())?.name : null;
+  return c.json({ ...d, assigne: d.assigne_a ? { id: d.assigne_a, name: nom } : null });
 });
 // Où en est le dossier dans le cycle des révisions : l'étude qu'il révise,
 // celle qui le révise, et si sa révision aux cinq ans est due.
@@ -47458,6 +47616,54 @@ dossiers.get("/:id/components", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
+});
+// Catalogue de la firme pour l'ajout sur le terrain : sa bibliothèque, ou la
+// liste de Condo Stratégis quand elle n'en a pas importé.
+dossiers.get("/:id/catalogue", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const liste = listeDeDepart(await bibliothequeDuDossier(c.env.DB, dossier.id));
+  return c.json(liste.map((item) => ({ cat: item.cat, name: item.name, vu: item.vu ?? null, code: item.code ?? null })));
+});
+// Composante trouvée sur place et absente de la liste. L'identifiant peut
+// venir de l'appareil : une création faite hors connexion et rejouée deux fois
+// (réponse perdue en route) ne crée qu'une composante.
+dossiers.post("/:id/components", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const name = String(body2.name ?? "").replace(/\s+/g, " ").trim();
+  if (!name) return c.json({ error: "le nom de la composante est requis" }, 400);
+  if (name.length > 200) return c.json({ error: "nom trop long (200 caractères au plus)" }, 400);
+  const idClient = String(body2.id ?? "");
+  if (idClient && !/^cmp_[a-f0-9]{20}$/.test(idClient)) return c.json({ error: "identifiant invalide" }, 400);
+  if (idClient) {
+    const existante = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(idClient).first();
+    if (existante) {
+      if (existante.dossier_id !== dossier.id) return c.json({ error: "identifiant déjà utilisé" }, 409);
+      return c.json(await composanteComplete(c.env.DB, existante));
+    }
+  }
+  // Une composante de la bibliothèque apporte sa vie utile, son code et son type.
+  const biblio = await bibliothequeDuDossier(c.env.DB, dossier.id);
+  const modele = listeDeDepart(biblio).find((item) => cleTexte(item.name) === cleTexte(name)) ?? null;
+  const cat = CATEGORIES[body2.cat] ? body2.cat : modele?.cat ?? "equipements";
+  const vuDemandee = Number(body2.useful_life_years);
+  const vu = Number.isInteger(vuDemandee) && vuDemandee > 0 && vuDemandee <= 150 ? vuDemandee
+    : modele?.vu ?? DEFAULT_USEFUL_LIFE_YEARS[cat] ?? ALLOCATION_USEFUL_LIFE;
+  const code = String(body2.uniformat_code ?? "").trim().slice(0, 40) || modele?.code || null;
+  const attributs = modele ? JSON.stringify({ type: modele.type, "unité": modele.unite }) : null;
+  const qty = String(body2.qty ?? "").trim().slice(0, 80) || "—";
+  const depart = await c.env.DB.prepare(
+    "SELECT COALESCE(MAX(sort_order), -1) AS m FROM components WHERE dossier_id = ?1"
+  ).bind(dossier.id).first();
+  const id = idClient || newId("cmp");
+  await c.env.DB.prepare(
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code, attributs, actif)
+     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, 1)`
+  ).bind(id, dossier.id, cat, name, qty, (depart?.m ?? -1) + 1, vu, code, attributs).run();
+  const creee = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
+  return c.json(await composanteComplete(c.env.DB, creee, biblio), 201);
 });
 // Toute la visite en un appel, pour la préparer hors connexion : chaque
 // composante avec ses photos, son guide et ses tâches du carnet, sous la
@@ -47636,13 +47842,17 @@ async function buildReportContext(c, opts = {}) {
     } : {}
   };
 }
+// Scénario dont le rapport tire la cotisation recommandée.
+function scenarioRetenu(projection) {
+  return projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
+    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+}
 // Valeurs des champs {{…}} d'un gabarit de firme.
 function valeursChamps(ctx) {
   const { dossier, projection, theme, signataire } = ctx;
   const info = infoBatiment(dossier);
   const ordre = ordreDuSignataire(signataire);
-  const scenario = projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
-    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  const scenario = scenarioRetenu(projection);
   const cotisation = scenario?.years?.[0]?.cotisation ?? null;
   const unites = Number(dossier.units);
   const valeur = (v) => v == null || v === "" ? "" : String(v);

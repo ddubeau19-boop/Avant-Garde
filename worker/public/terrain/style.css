@@ -561,3 +561,11 @@ input, textarea { font-family: var(--font-body); }
 .pc-annee { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: 13px; font-weight: 600; color: var(--ink-700); }
 .pc-annee input { width: 90px; border: 1.5px solid var(--ink-200); border-radius: 10px; padding: 8px 10px; font: inherit; font-size: 14px; }
 .pc-aide { font-size: 12px; color: var(--ink-500); margin-top: 6px; }
+
+/* Ajout d'une composante trouvée sur place */
+.ajout-btn { margin: 18px 0 8px; }
+.ajout-row { cursor: default; }
+.ajout-row .comp-end { flex-shrink: 0; }
+.ajout-libre { margin: 16px 0; padding: 14px; background: #fff; border: 1px solid var(--ink-100, #e5e5e5); border-radius: 12px; }
+.ajout-libre .ajout-nom { font-weight: 600; font-size: 15px; margin: 2px 0 10px; }
+.ajout-libre .btn-cta { margin-top: 14px; width: 100%; }

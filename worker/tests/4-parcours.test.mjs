@@ -102,6 +102,7 @@ test('révision aux cinq ans : coûts indexés, une seule révision, section Év
   assert.equal(reprise.rating, null);
   assert.equal(reprise.precedent.rating, 3);
   assert.equal((await api(`/api/dossiers/${etat.dossier}/revision`, { methode: 'POST', session: ingA, corps: { dossier_no: 'T-REV-2' } })).statut, 409);
+  await api(`/api/dossiers/${etat.revision}`, { methode: 'PATCH', session: ingA, corps: { current_fund_balance: 40000, cotisation_annuelle: 20000 } });
   await api(`/api/components/${reprise.id}`, { methode: 'PATCH', session: ingA, corps: { travaux_periode: 'fait', travaux_annee: Y - 1, install_year: Y - 1, rating: 1, done: 1, replacement_cost: 11000 } });
   const texte = texteDocx(await (await api(`/api/dossiers/${etat.revision}/report.docx`, { session: ingA, brut: true })).arrayBuffer());
   const i = texte.findIndex((t) => t.startsWith('1.7 Évolution depuis l'));
@@ -109,6 +110,9 @@ test('révision aux cinq ans : coûts indexés, une seule révision, section Év
   const section = texte.slice(i, texte.findIndex((t) => t.startsWith('2.0 '))).join('\n');
   assert.match(section, /réalisé en/);
   assert.match(section, /150\s000/);
+  // Le solde que l'étude précédente prévoyait pour cette année, face au réel.
+  assert.match(section, new RegExp(`Prévu pour ${Y}`));
+  assert.match(section, /Le solde réel du fonds est inférieur de [\d\s ]+\$/);
 });
 
 test('portail du syndicat : invitation, répartition, tâche cochée, rappels planifiés', async () => {
