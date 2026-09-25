@@ -82,7 +82,15 @@ CREATE TABLE components (
   variante       TEXT,
   attributs      TEXT,   -- JSON : attributs typés propres à la composante
   parent_id      TEXT,
-  actif          INTEGER NOT NULL DEFAULT 1   -- 0 : retirée de la visite, réactivable
+  actif          INTEGER NOT NULL DEFAULT 1,  -- 0 : retirée de la visite, réactivable
+  -- Gabarit de réponse du relevé (vocabulaire fermé, clés ci-dessous)
+  etendue            TEXT,   -- ponctuel | localise | generalise
+  etendue_qte        TEXT,   -- quantité touchée, ex. « ≈ 4 m² »
+  limite_observation TEXT,   -- de_pres | distance | partiel | inaccessible
+  limite_detail      TEXT,
+  nature_risque      TEXT,   -- securite | infiltration | degradation | conformite | esthetique
+  source_annee       TEXT,   -- plaque | carnet | administration | estimee
+  projet_ca          TEXT    -- travaux planifiés par le conseil d'administration
 );
 
 CREATE TABLE photos (

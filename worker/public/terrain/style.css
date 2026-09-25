@@ -360,6 +360,10 @@ input, textarea { font-family: var(--font-body); }
   border: 1.5px solid var(--ink-200); background: #fff; color: var(--ink-600);
   font-size: 12px; font-weight: 500; padding: 8px 12px; border-radius: 999px; cursor: pointer;
 }
+.guide-hint { font-size: 12.5px; color: var(--ink-600); line-height: 1.45; background: var(--ink-050); border-radius: 10px; padding: 10px 12px; margin-bottom: 14px; }
+.guide-hint b { display: block; font-family: var(--font-mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-500); margin-bottom: 3px; }
+.guide-lbl { font-size: 11.5px; color: var(--ink-500); margin-top: 10px; }
+.ai-line .v { white-space: pre-line; }
 .quick-chip.on { background: var(--ink); border-color: var(--ink); color: #fff; }
 
 /* ---------- facettes ---------- */

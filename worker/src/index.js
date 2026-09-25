@@ -3346,27 +3346,223 @@ Réponds UNIQUEMENT par les numéros séparés par des virgules, ou par le mot A
     return toutActif(`${e && e.message}${indice}`);
   }
 }
-// La colonne components.actif a été ajoutée après la mise en production. Elle
-// est créée au premier appel de chaque isolat plutôt que par une migration
+// Colonnes de components ajoutées après la mise en production. Elles sont
+// créées au premier appel de chaque isolat plutôt que par une migration
 // manuelle : un déploiement ne peut pas précéder la base qu'il suppose.
-let colonneActifPrete = null;
-function assurerColonneActif(db) {
-  if (!colonneActifPrete) {
-    colonneActifPrete = (async () => {
+const COLONNES_AJOUTEES = [
+  ["actif", "INTEGER NOT NULL DEFAULT 1"],
+  ["etendue", "TEXT"],
+  ["etendue_qte", "TEXT"],
+  ["limite_observation", "TEXT"],
+  ["limite_detail", "TEXT"],
+  ["nature_risque", "TEXT"],
+  ["source_annee", "TEXT"],
+  ["projet_ca", "TEXT"]
+];
+let colonnesPretes = null;
+function assurerColonnes(db) {
+  if (!colonnesPretes) {
+    colonnesPretes = (async () => {
       const colonnes = await db.prepare("PRAGMA table_info(components)").all();
-      if (!colonnes.results.some((col) => col.name === "actif")) {
-        await db.prepare("ALTER TABLE components ADD COLUMN actif INTEGER NOT NULL DEFAULT 1").run();
+      const presentes = new Set(colonnes.results.map((col) => col.name));
+      for (const [nom, type] of COLONNES_AJOUTEES) {
+        if (!presentes.has(nom)) await db.prepare(`ALTER TABLE components ADD COLUMN ${nom} ${type}`).run();
       }
     })().catch((e) => {
-      colonneActifPrete = null;
+      colonnesPretes = null;
       throw e;
     });
   }
-  return colonneActifPrete;
+  return colonnesPretes;
 }
 function estActive(component) {
   return component.actif !== 0;
 }
+// ============================================================================
+// GABARIT DE RÉPONSE — vocabulaire fermé du relevé et guides de rédaction.
+// ----------------------------------------------------------------------------
+// Le relevé (terrain, analyse photo) et la rédaction (ÉTAT DE L'ACTIF,
+// ATTENTION SPÉCIALE) partagent les mêmes champs et les mêmes valeurs pour
+// toutes les composantes. Les clés sont stockées ; les libellés s'impriment.
+// ============================================================================
+const ETENDUES = { ponctuel: "Ponctuel", localise: "Localisé", generalise: "Généralisé" };
+const LIMITES_OBSERVATION = {
+  de_pres: "Observé de près",
+  distance: "Observé à distance",
+  partiel: "Partiellement accessible",
+  inaccessible: "Non accessible"
+};
+const NATURES_RISQUE = {
+  securite: "Sécurité des personnes",
+  infiltration: "Infiltration d'eau",
+  degradation: "Dégradation accélérée",
+  conformite: "Conformité réglementaire",
+  esthetique: "Esthétique"
+};
+const SOURCES_ANNEE = {
+  plaque: "Plaque signalétique",
+  carnet: "Carnet d'entretien",
+  administration: "Administration",
+  estimee: "Estimée"
+};
+// Délais : des fourchettes qui tombent sur les années du calcul, au lieu de
+// « à planifier » ou « dans les 5 ans » qui se chevauchaient.
+const DELAIS_MAISON = [
+  { libelle: "Immédiat (moins de 1 an)", phrase: "immédiatement, soit d'ici un an" },
+  { libelle: "Court terme (1 à 2 ans)", phrase: "à court terme, soit d'ici 1 à 2 ans" },
+  { libelle: "Moyen terme (3 à 5 ans)", phrase: "à moyen terme, soit d'ici 3 à 5 ans" },
+  { libelle: "Long terme (plus de 5 ans)", phrase: "à long terme, soit au-delà de 5 ans" },
+  { libelle: "Aucun suivi particulier", phrase: null }
+];
+// Guides de rédaction par élément, tirés du gabarit de rapport de la firme
+// (« 2.12.2 RAPPORT - 26-000 PGA ») : ce qu'il faut décrire, la portée du
+// calcul, l'avis réglementaire, les défauts à surveiller (« Caractéristique à
+// retenir lors de la rédaction ») et des constats types. Les constats types
+// sont des formulations d'autres immeubles : jamais des faits de celui-ci.
+// Ordre significatif : première expression reconnue dans le nom.
+const GUIDES_REDACTION = [
+  {"re": /honoraires/i, "element": "Honoraires professionnels", "points": "Date de la dernière étude du fonds de prévoyance ou de la dernière révision du carnet d'entretien, professionnel mandaté, prochaine échéance légale.", "portee": [], "information": null, "defauts": [], "constats": []},
+  {"re": /am[ée]nagement paysager/i, "element": "Aménagement paysager", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Plusieurs endroits, à l'arrière de l'immeuble, où les pentes du sol sont négatives terrains bas et à risque d'accumulation d'eau près de la fondation", "Des arbres matures à proximité des fondations, au côté droit, posent un potentiel de dommages par leur système racinaire. Ces risques sont particulièrement en liens avec le système de drain français", "Le dégagement entre le sol et le haut de la fondation est un risque d'infiltration d'eau (moins de 6 à 8 pouces) à plusieurs endroits en façade avant", "Les plantes grimpantes posent un potentiel de dommages au mortier à long terme", "Aucun chaperon sur les murets de maçonnerie, fissure, mortier détérioré"]},
+  {"re": /^voies de circulation/i, "element": "Voies de circulation", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Le pavage de la voie principale, présente plusieurs fissurations, éclatement de la surface, grandes cavités, crevasse, bosses", "Certaines fissurations contour de certains cadres grillagés d'évacuation sont suffisamment importantes et semble avoir causé de l'érosion sous le pavage", "Plusieurs endroits, au côté nord, où les pentes du pavage sont négatives et à risque d'accumulation d'eau près du bâtiment", "À l'entrée du stationnement intérieur, des fissurations sont à risque d'infiltration d'eau en bas de pente près des grilles du système de drainage", "Les cadres grillagées du système d'évacuation pluviale de l'entrée du stationnement intérieur, semblent partiellement bloqués par des débris", "Certains cadres grillagés pluviaux sont instables"]},
+  {"re": /^stationnement et voies|lignage|bordures|puisards et regards/i, "element": "Stationnement et voies de circulation", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Le pavage de la voie principale, présente plusieurs fissurations, éclatement de la surface, grandes cavités, crevasse, bosses", "Des fissurations au contour de certains cadres grillagés d'évacuation sont suffisamment importantes et semble avoir causé de l'érosion sous le pavage", "Plusieurs endroits, au côté nord, où les pentes du pavage sont négatives et à risque d'accumulation d'eau près du bâtiment", "À l'entrée du stationnement intérieur, des fissurations sont à risque d'infiltration d'eau en bas de pente près des grilles du système de drainage", "Les cadres grillagées du système d'évacuation pluviale de l'entrée du stationnement intérieur, semblent partiellement bloqués par des débris", "Certains cadres grillagés pluviaux sont instables"]},
+  {"re": /all[ée]es pi[ée]tonni|perrons/i, "element": "Allées piétonnières", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Au passage principal, des sections de béton sont détériorées, affaissées", "Il y a érosion du sol au contour de certaines sections de trottoir menant au accès arrière", "Plusieurs endroits, en façade avant, où les pentes des trottoirs sont négatives et à risque d'accumulation d'eau près du bâtiment", "Plusieurs sections sont fissurées avec dénivelé inégal. Ceci est un risque de chute", "Des sections, près des escaliers arrières, sont instables"]},
+  {"re": /murets/i, "element": "Murets de soutènement", "points": null, "portee": ["Le calcul de ces éléments a été inclus à la section 'Fondations« ."], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Les murets de maçonnerie sont sans chaperon", "Il y a absence de système de drainage derrière les murets, aux aménagements arrière", "Les murets ayant plus de 50 cm (20 pouces) ne possèdent pas de garde-corps. Ceci est un risque de chute"]},
+  {"re": /^garde-corps/i, "element": "Garde-corps et mains courantes", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Des sections de garde-corps du passage avant, présentent une corrosion avancée", "Plusieurs poteaux des garde-corps longeant le stationnement ont des ancrages, bases instables", "Des composantes de quincaillerie sont brisées ou absent aux garde-corps des accès piétonniers près de l'entrée du stationnement intérieur"]},
+  {"re": /terrasse sur sol/i, "element": "Terrasses sur sol", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Plusieurs terrasses privatives arrières où les pentes sont négatives et à risque d'accumulation d'eau près du bâtiment", "Le dégagement entre le haut de la fondation et la terrasse est un risque d'infiltration d'eau à plusieurs terrasses", "Les grilles de drainage sont obstruées"]},
+  {"re": /cl[ôo]ture/i, "element": "Clôture", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Des sections de la clôture arrière présentent une corrosion, dégradation, pourriture avancée", "Plusieurs poteaux de la clôture mitoyenne de gauche ont des ancrages, bases instables, bois dégradés", "Des composantes de quincaillerie sont brisées ou absent aux portes côté stationnement", "Des sections de grillage sont détachées à la clôture du stationnement", "Les portes et/ou quincaillerie sont difficiles de mouvement"]},
+  {"re": /^structures de bois trait|^structure en acier/i, "element": "Structure en acier", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Des sections de la structure présentent une corrosion avancée", "Plusieurs poteaux ont des ancrages, bases instables", "Des composantes de quincaillerie sont brisées ou absent", "Le garde-corps de gauche est détaché de l'ancrage au mur"]},
+  {"re": /murs de fondation|drain fran/i, "element": "Murs de fondation", "points": "Type de fondation, portions visibles (intérieur, extérieur), présence d'un drain français et de regards de nettoyage, traces d'infiltration ou d'efflorescence.", "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Le crépi à la fondation arrière est endommagé et en perte d'adhérence", "Le crépi sur isolant rigide à la fondation arrière est endommagé et en perte d'adhérence", "Des fissures de moins de 2mm sont présentes et celle-ci semble migrer sous le niveau du sol au mur de gauche", "Des fissures de plus de 2mm avec indice de mouvement/ affaissement sont présentes et celle-ci semble migrer sous le niveau du sol au mur de gauche", "Au coin arrière gauche, une partie de la fondation est détachée et une section de maçonnerie est sans support", "Des traces d'efflorescence ont été observées aux salles techniques", "Des structures ou ancrage sont détaché ou arraché de la fondation à la salle technique des gicleurs", "Les margelles ne semblent pas avoir de système de drainage", "Le niveau du sol au fonds de la des margelles ne respecte pas le dégagement avec l'ouverture qu'elle protège", "Selon les informations obtenues, il semble que des infiltrations d'eau aient permis la détérioration des finis intérieurs à l'espace commun du vestibule avant", "Éclatement de surface du mortier, Fissuration communicative, Instabilité des pierres", "Dégradation du mortier"]},
+  {"re": /^structure – allocation/i, "element": "Structure", "points": null, "portee": ["Le calcul de la structure des balcons, incluant leur chape de béton, est inclus dans cette section.", "Le calcul de la structure des escaliers intérieurs, est inclus dans cette section."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Des fissures sont visibles aux finis intérieurs. Il semble que ces fissures suivent un même plan", "Des indices de mouvement longitudinaux sont visibles avec fissuration en cisaillement", "Plusieurs cadres de fenêtres sont désaxées ont leur solin écrasé et les volets présentent un mouvement d'ouverture/ fermeture difficile", "Des fissures ont été observées à la dalle du plafond", "En lien avec les fissures observées, des traces d'efflorescence sont présentes en périphérie", "Cette section est sous les aménagements extérieurs. Le constat d'infiltration d'eau laisse croire à une situations touchant la membrane d'.tanchéité", "Cette section est sous l'immeuble. Il s'agit possiblement d'une fuite d'eau par sinistre localisé . De traces présentes du moment de la construction", "Les deux cages d'escaliers présentes des traces de moisissures de surface près de la zone identifié avec infiltration d'eau par la firme d'ingénieurs près des sortie de robinet extérieur", "Le bas/ seuil de la porte de l'escalier qui mène au sous-sol présente des indices d'infiltration d'eau"]},
+  {"re": /stationnement int[ée]rieur –|stationnements [ée]tag/i, "element": "Stationnement intérieur", "points": "Dalle sur sol ou structurale, membrane de surface, drains, joints, colonnes et murs, nombre de niveaux, traces de sels ou d'efflorescence.", "portee": [], "information": "loi122_stationnements", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Ouverture non bouché (avec un scellant coupe-feu) dans la dalle de plafond", "Passage de conduit sans scellant pare-feu, scellant rouge, parfois gris", "Indices ou trace d'infiltration d'eau", "Infiltration avec détérioration des finis ou matériaux", "Isolation endommagée", "Traces d'infiltration d'eau, plancher mouillé, humide. (Photos B 12-13)", "Traces d'efflorescence. (Photo B 14)", "Traces de condensation sur les fenêtres", "Traces de moisissure", "Fissuration de surface", "Fissuration avec indice de mouvement", "Fissuration avec effritement et l'armature est apparente"]},
+  {"re": /toit plat|toit en pente|solins|goutti/i, "element": "Surface de toit principal, solins", "points": "Type de membrane ou de revêtement, pente, drains et gouttières, solins et parapets, accès à la toiture, équipements en toiture.", "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Pente, pente inverse-drain, drain et crépine", "Membrane élastomère", "Membrane sacrifice -passage des ouvriers", "Dégradation avancé des bardeaux sur le côté ensoleillée", "Cernes visibles au soffite. Ceci pourrait être un indice de ventilation inadéquate à l'entretoit", "Ruissellement entre la frise et la gouttière", "Il y a corrosion près des soudures sur les coins des solins en acier galvanisé", "Le niveau d'usure des bardeaux de plusieurs sections est avancé", "Les scellant d'ouverture sont fissuré ou en perte d'adhérence", "Des plis et délamination ont été observé sur la membrane", "Des bulles de bitumen ont été observes", "Il y a un manque de couverture de gravier"]},
+  {"re": /puits de lumi/i, "element": "Puits de lumière – Toiture principale", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Effritement du vitrage de plastique", "Vitrage fissuré", "Les scellant sont fissuré en perte d'adhérence", "Le boitier est instable", "Le recouvrement du boitier est détaché", "L'intérieur des puits de lumière présente des traces de moisissures, humidité", "La membrane de toiture ne semble pas remonter sur les faces du boitier"]},
+  {"re": /saillies/i, "element": "Toiture des saillies", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Pente, pente inverse-drain, drain et crépine", "Membrane élastomère", "Membrane sacrifice -passage des ouvriers", "Dégradation avancé des bardeaux sur le côté ensoleillée", "Cernes visibles au soffite. Ceci pourrait être un indice de ventilation inadéquate à l'entretoit", "Ruissellement entre la frise et la gouttière", "Il y a corrosion près des soudures sur les coins des solins en acier galvanisé", "Le niveau d'usure des bardeaux de plusieurs sections est avancé", "Les scellant d'ouverture sont fissuré ou en perte d'adhérence", "Des plis et délamination ont été observé sur la membrane", "Des bulles de bitumen ont été observes", "Il y a un manque de couverture de gravier"]},
+  {"re": /marquise/i, "element": "Marquise d'entrée", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Pente, pente inverse-drain, drain et crépine", "Membrane élastomère", "Membrane sacrifice -passage des ouvriers", "Dégradation avancé des bardeaux sur le côté ensoleillée", "Cernes visibles au soffite. Ceci pourrait être un indice de ventilation inadéquate à l'entretoit", "Ruissellement entre la frise et la gouttière", "Il y a corrosion près des soudures sur les coins des solins en acier galvanisé", "Le niveau d'usure des bardeaux de plusieurs sections est avancé", "Les scellant d'ouverture sont fissuré ou en perte d'adhérence", "Des plis et délamination ont été observé sur la membrane", "Des bulles de bitumen ont été observes", "Il y a un manque de couverture de gravier"]},
+  {"re": /structure de service/i, "element": "Structure de service en bois traité", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Les ancrages sont détachés", "La structure est instable et plusieurs pièces sont lâche", "Le fini de surface est défraichi et asséché", "Le bois est dégradé et pourri. Les supports n'ont aucune solidité", "Les coussins d'assise sur la membrane de la toiture sont déplacés. Il y risque de perforé la membrane"]},
+  {"re": /b[ée]ton pr[ée]fabriqu/i, "element": "Parement extérieur – Panneaux de béton préfabriqué", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie."], "information": "loi122_facades", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Mortier fissuré", "Panneaux fissurés", "Panneaux instables", "Bombement des sections", "Éclatement de surface", "Les scellant de rencontre sont fissuré ou absent", "Il y a absence de drain système de drainage", "Les drains sont bloqués par du scellant", "Les drains sont obstrués pas des insectes", "Dégagement avec le niveau du sol", "Drains de bas de panneaux bloqués", "Scellant en perte d'adhérence"]},
+  {"re": /ma[çc]onnerie|^parement – pierre|linteaux|scellants de rencontre|inspection des fa[çc]ades/i, "element": "Parement extérieur – Maçonnerie", "points": "Type de brique ou de pierre, linteaux (matériau et protection), chantepleures, joints de contrôle et scellants de rencontre, méthode d'observation (sol, balcons, jumelles).", "portee": ["Le calcul des scellants de rencontre architecturale des revêtements inclut les joints d'expansion et de contrôle."], "information": "loi122_facades", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Éclats, fissures", "Traces d'efflorescence sur les murs de briques. L'eau qui créé cette situation semble provenir de l'évacuation du toit de la terrasse", "La variation de la brique et du mortier permet de supposer qu'il y a déjà eu réparation", "Plusieurs briques sont éclatées et le mortier est fissuré et effrité", "La saillie de la brique reposant sur son appui de béton du côté gauche du garde-corps excède les 30 mm permis", "Les joints entre les éléments de béton du couronnement sont fissurés", "Une fissure en lézarde est présente au mur de gauche", "Plusieurs joints de mortier commencent à s'évider", "Les chantepleures en partie inférieure des murs creux ne sont pas distancées à 800 mm", "Il y a infiltration d'eau dans l'espace aménagé sous le balcon. Il n'y a pas de solin souple visible à la base des parapets, à la jonction de la dalle de balcon et des escaliers. L'infiltration proviendrait de cette jonction non étanche", "Le linteau en acier recouvert d'un fascia a subi une déflexion et un joint de scellant a été ajouté entre la brique et le linteau", "Les chantepleures au-dessus du linteau en acier recouvert d'un fascia sont scellées par un calfeutrant transparent"]},
+  {"re": /panneaux composites/i, "element": "Parement panneau composite", "points": null, "portee": ["Le calcul des scellants de rencontre des revêtements est inclus à la section Maçonnerie."], "information": "loi122_facades", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Panneaux fissurés", "Panneaux instables", "Bombement des sections", "Éclatement de surface", "Les scellant de rencontre sont fissuré ou absent", "Il y a absence de drain système de drainage", "Les drains sont bloqués par du scellant", "Les drains sont obstrués pas des insectes", "Dégagement avec le niveau du sol", "Drains de bas de panneaux bloqués", "Scellant en perte d'adhérence", "Ancrage déficient"]},
+  {"re": /fibrociment/i, "element": "Parement extérieur - Fibrociment", "points": null, "portee": ["Le calcul des scellants de rencontre des revêtements est inclus à la section Maçonnerie."], "information": "loi122_facades", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Panneaux fissurés", "Panneaux instables", "Bombement des sections", "Éclatement de surface", "Les scellant de rencontre sont fissuré ou absent", "Il y a absence de drain système de drainage", "Les drains sont bloqués par du scellant", "Les drains sont obstrués pas des insectes", "Dégagement avec le niveau du sol", "Drains de bas de panneaux bloqués", "Scellant en perte d'adhérence", "Ancrage déficient"]},
+  {"re": /agr[ée]gats/i, "element": "Parement extérieur – Agrégats", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie.", "Le calcul des scellants de rencontre des revêtements inclut les joints aux balcons si requis avec le type de revêtement."], "information": "loi122_facades", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Le crépi présente des fissures qui laisse croire à des mouvements saisonniers. Il y a possiblement un risque d'infiltration d'eau", "Les agrégats sont en perte d'adhérence. Cette situation est plutôt esthétique", "La rencontre avec les autres revêtements est sans scellants", "Une section au mur arrière est détaché et à risque de tomber"]},
+  {"re": /^parement – vinyle/i, "element": "Parement de vinyle", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie.", "Le calcul considère que l'enveloppe en 2e plan de protection (membrane sous revêtement), la structure et l'isolation sont intègres et ne requiert aucun correctif."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["La rencontre avec les autres revêtements est sans scellants", "Plusieurs sections au mur arrière sont détachées et pendant. Ceci est un risque de blessure et d'infiltration d'eau", "Certaines sections semblent ne pas avoir été fixé adéquatement. Celles-ci sont détachées et à risque d'infiltration d'eau et d'insectes"]},
+  {"re": /^parement – m[ée]tallique|soffites/i, "element": "Parement métallique et soffite", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["La rencontre avec les autres revêtements est sans scellants", "Plusieurs sections au mur arrière sont détachées et pendant. Ceci est un risque de blessure et d'infiltration d'eau", "Certaines sections semblent ne pas avoir été fixé adéquatement. Celles-ci sont détachées et à risque d'infiltration d'eau et d'insectes", "À plusieurs endroits sur ces façades, le parement d'acier est endommagé et il y a des joints soulevés", "Les solins de départ ont une pente négative (accumulation d'eau)", "Usure, ternissement, bris, absence, perforation", "La pose du solin horizontal à la jonction du parement de brique est déficiente. Le solin n'est pas rectiligne et les chevauchements ne sont pas jointifs. Il y a une contrepente qui favorise le ruissellement sur la brique", "Mur latéral droit. Il y a endommagement par impact du parement d'aluminium et perforations au coin gauche de la fenêtre inférieure", "Parement brisée, perforé", "Section de parement instable", "Scellant de rencontre fissurée ou absent", "Dégagement avec le niveau du sol"]},
+  {"re": /fibre de bois/i, "element": "Parement de panneaux de fibre de bois", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["La rencontre avec les autres revêtements est sans scellants", "Plusieurs sections au mur arrière sont détachées et pendant. Ceci est un risque de blessure et d'infiltration d'eau", "Certaines sections semblent ne pas avoir été fixé adéquatement. Celles-ci sont détachées et à risque d'infiltration d'eau et d'insectes", "La tête des clous a perforé le revêtement. Ceci facilitera l'infiltration d'eau par capillarité et le ‘'bois'' gonflera puis se dégradera prématurément"]},
+  {"re": /enduit acrylique|^parement – stuc/i, "element": "Parement extérieur - Enduit acrylique", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Le crépi présente des fissures qui laisse croire à des mouvements saisonniers. Il y a possiblement un risque d'infiltration d'eau", "Le fini est en perte d'adhérence. Cette situation est plutôt esthétique", "La rencontre avec les autres revêtements est sans scellants", "Une section au mur arrière semble détaché et à risque de tomber", "La majorité des surfaces de stuc sont fissurées et on note plusieurs zones avec gonflement et réparations au silicone", "Il n'y a aucun dégagement a la base du parement pour permettre le drainage de la cavité d'air", "Il y a des cernes sur le larmier de départ", "Le pare-air est visible ce qui pourrait nous indiquer qu'il n'est pas scellé", "Il y a des traces d'eau sous deux coins de la saillie avant et ce qui s'est en lien avec la déchirure de l'acier au coin droit", "À la base du parement avec la brique et la jonction du parement avec la toiture, il n'y a pas d'espace d'air et le solin est mal positionné", "Des traces d'eau en suintement sont observées. Nous suggérons de procéder avec une expertise du revêtement acrylique"]},
+  {"re": /^portes d'entr/i, "element": "Portes d'entrée", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Cadres : Qualité, bris, détachement, délamination", "Quincaillerie : durabilité, corrosion, mouvement difficile, fermeture difficile inopérant, ajustements", "Coupe froid, brisée, détaché, absent", "Calfeutrage (Scellement) : intégrité, bris, perte d'adhérence, absence, fissuration", "Intercalaire : corrosion", "Le mécanisme de fermeture", "Les charnières", "Le ferme porte", "Les recouvrements de finition en aluminium est bosselé et détaché. Ceci est un risque d'infiltration d'eau et d'innsecte", "Les vitrage ‘'thermos'' est embuée", "Les coupe-son de néoprène sont détaché ou absent", "Les charnières de l'entrée principale sont corrodées"]},
+  {"re": /vestibule/i, "element": "Cadre et vitrage du vestibule intérieur", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Portes exposés aux intempéries", "Parois détériorées", "Vestibule adossé à l'enceinte de la piscine n'a pas de système de ventilation. Détérioration des surfaces causés par la condensation", "Le mécanisme de fermeture. (Photo E 1 à 7)", "Les charnières. (Photo E 8)", "L'ajustement des portes", "Une corrosion du solin de porte", "Les coupe-son de néoprène sont détaché ou absent"]},
+  {"re": /^blocs de verre/i, "element": "Blocs de verre", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Au mur de gauche du vestibule principal, les blocs de verre du bas présentent des indices d'infiltration d'eau", "La situation d'infiltration affecte le mortier", "Le mortier est dégradé et semble permettre une infiltration d'eau au niveau de la céramique du plancher"]},
+  {"re": /^portes de service – /i, "element": "Portes d'issues extérieures – Services", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Porte et cadre abimé, corrosion, rouille, instable sur les charnières, dispositif de fermeture automatique inopérant, infiltration d'air, infiltration d'eau, bas de porte voilé sans contact avec la coupe froid", "Le bas/ seuil de la porte de l'escalier qui mène au sous-sol présente des indices d'infiltration d'eau"]},
+  {"re": /portes-patio/i, "element": "Portes patios", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement", "gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages"], "constats": ["Le scellant en partie supérieure est fissuré ou en perte d'adhérence", "La finition est incomplète et l'étanchéité déficiente au seuil de plusieurs portes", "Il y a un problème de condensation sur les composantes en métal de la porte d'entrée", "Le seuil est désolidarisé, le jambage de bois recouvert de PVC est pourri et gonflé. Le mouvement par glissement lors de l'ouverture est difficile", "Les ouvertures de drainage situées sur le seuil des portes sont obstruées par le scellant sur plusieurs portes patio", "Le prolongement en aluminium du seuil de plusieurs portes-patios est en pente négative", "Mouvement de fermeture", "Mécanisme de barrure", "Ajustement de la porte au cadrage", "Les coupe-son de néoprène sont détaché ou"]},
+  {"re": /porte simple/i, "element": "Portes simple - Balcon", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Le scellant en partie supérieure est fissuré ou en perte d'adhérence", "La finition extérieure est incomplète et l'étanchéité déficiente au seuil de plusieurs portes", "Il y a un problème de condensation sur les composantes en métal", "Le seuil est désolidarisé, le jambage de bois recouvert de PVC est pourri et le glissement lors de l'ouverture est difficile", "Les ouvertures de drainage situées sur le seuil des portes sont obstruées par le scellant sur plusieurs portes", "Le prolongement en aluminium du seuil de plusieurs portes de balcon est en pente négative", "Mouvement de fermeture", "Mécanisme de barrure", "Ajustement de la porte au cadrage", "Les coupe-son de néoprène sont détaché"]},
+  {"re": /^fen[êe]tres|scellants d'ouverture/i, "element": "Fenêtres", "points": "Type d'ouvrant, matériau du cadre, vitrage isolant (date inscrite à l'intercalaire), quincaillerie, scellants de contour, allèges.", "portee": ["Le calcul des scellants d'étanchéité des contours d'ouvertures; incluant les passages des conduits et des rencontres des balcons, est inclus dans cette section."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Cadres extérieurs : Qualité, bris, détachement, délamination, abîmé", "Quincaillerie : durabilité, corrosion, mouvement difficile, fermeture difficile inopérant, ajustements", "Intercalaire : corrosion", "Coupe froid, brisée, détaché, absent", "Calfeutrage (Scellement) : intégrité, bris, perte d'adhérence, absence, fissuration", "Allèges : fissurés, éclaté, mortier absent", "Linteaux : corrodé, écaillé, affaissé, soutient affecté déficient", "Il y a des thermos qui contiennent de l'humidité entre les deux verres descellés", "Il y a de la condensation sur l'allège intérieur de la fenêtre de l'étage, de la cage d'escalier arrière", "Il y a corrosion du mécanisme de la même fenêtre arrière et la fenêtre est difficile de manipulation", "Le mécanisme de la fenêtre est brisé", "Le mécanisme de la fenêtre de la cuisine est difficile de manipulation"]},
+  {"re": /porte de garage/i, "element": "Portes de garage", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Usures, corrosion des charnières, qualité des barrures", "Les fascias aux jambages et au-dessus des entrées sont bosselées, et la boiserie derrière ceux-ci est exposée", "Mécanisme de fermeture", "Mouvement de fermeture", "Mécanisme de sécurité", "Panneau abîmé", "Panneau écrasé", "Panneau corrodé", "Scellant fissuré ou absent", "Système d'ouverture manuel"]},
+  {"re": /mur-rideau/i, "element": "Mur rideau", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Le panneau de verre au-dessus de l'accès piscine est détaché. Il semble que les attaches intérieurs soient absentes. Ceci est un risque de blessure", "Nous avons observé des indices avec trace d'infiltration d'eau active au panneau surplombant le vestibule piscine", "Les cadrages métalliques qui assurent la continuité avec le mur de maçonnerie sont corrodés"]},
+  {"re": /^balcons – (pontage en fibre|structure de bois)/i, "element": "Balcons – Bois", "points": "Structure et pontage, garde-corps, escaliers, fixations, protection du bois et rencontres avec le parement.", "portee": ["Le calcul des scellants d'étanchéité des rencontres est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Corrosion des membrures", "Instabilité des poteaux", "Délamination, perforation du pontage de fibre de verre", "Instabilité au poids", "Hauteur du garde-corps / CNB 9.8.7.4 : 31 à 38 pouces (800 à 965mm) avec dégagement de2 pouces (50mm)", "Stabilité du garde-corps", "Stabilité des ancrages", "Scellant de rencontre balcon parement", "Fini défraichit des composantes de bois", "Les 2 pontages en fibre de verre sont délaminés et il y a début d'endommagement par la pourriture. Au balcon supérieur, il y a des éclats de fibre de verre", "En sous-face du balcon supérieur, il y a des cernes sur les soffites attribuables à la pénétration d'eau par les pontages endommagés", "Le larmier est fissuré et il y a début d'endommagement du contre-plaqué"]},
+  {"re": /^balcons – /i, "element": "Balcons - Béton –Acier", "points": "Structure (dalle de béton, membrures d'acier), étanchéité ou chape, garde-corps, escaliers, ancrages et rencontres avec le parement.", "portee": ["Le calcul des scellants d'étanchéité des rencontres est inclus à la section 'Fenêtre« ."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["L'escalier n'a pas de main courante, il dessert deux logements et compte plus de trois contremarches. Il y a une variation de hauteur de 30 mm entre deux marches", "Le garde-corps en façade avant est instable", "Les limons en acier de l'escalier arrière de l'immeuble s'appuient directement sur le sol", "L'escalier de la façade n'est pas appuyé sur une base de béton à l'épreuve du gel", "Les deux volées de marches en bois sont affaissées et présentent des pertes de niveaux importantes", "La hauteur des contremarches n'est pas uniforme pour l'ensemble des marches de l'escalier", "Il n'y a pas de main courante sur les garde-corps en briques des escaliers de béton", "Les poteaux en acier supportant les marquises sont encastrés dans les couronnements de béton et ne comportent aucune ouverture apparente à la base pour l'écoulement d'eau", "Escaliers avant et arrière. Ces escaliers sont munis de garde-corps, mais ceux-ci ne peuvent être considérés comme une main courante; le montant supérieur du garde-corps n'est pas continu et ne se prolonge pas de 300 mm horizontalement au bas des escaliers", "Escaliers de béton avant et arrière. Il y a décollement du crépi cimentaire", "Corrosion des membrures", "Instabilité des poteaux"]},
+  {"re": /terrasses urbaines/i, "element": "Terrasses urbaines – Toiture", "points": null, "portee": ["Le calcul des garde-corps est inclus à la section Balcons béton."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["On observe sur les garde-corps un peu de peinture écaillée et l'apparition de corrosion", "Quant au bois il est fortement recommandé de peindre ou de le teindre afin de le préserver", "Hauteur du garde-corps / CNB 9.8.7.4 : 31 à 38 pouces (800 à 965mm) avec dégagement de2 pouces (50mm)", "Les terrasses sont appuyées sur des morceaux de polystyrène. Cette installation est instable", "Le polystyrène se décompose sous l'effet du soleil et perd sa capacité de supporter des charges", "Les surfaces de bois sont défraîchies. Un entretien avec teinture est suggéré"]},
+  {"re": /vides sous toit/i, "element": "Vides sous toit", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Il y a de l'isolant sur les soffites de la corniche arrière, au-dessus de la porte-patio", "Les soffites de la corniche avant semblent mal dégagés", "L'isolant est mal placé aux abords des conduits et des câbles électriques", "Il y a un conduit avec volet motorisé s'ouvrant directement dans le vide sous toit", "Un conduit d'extracteur s'évacue dans le ventilateur Maximum, il y a des traces de formation de condensation", "Il manque une trappe pour aller dans une section des combles", "Il y a un manque de laine en général dans le comble visité", "La trappe a seulement 2 pouces d'isolation alors qu'elle devrait avoir plus de 5 pouces", "Il y a des traces de condensation/ moisissures dans le comble qui indiquent qu'il y a un problème de ventilation des combles", "Traces d'infiltration active", "Indice d'infiltration", "Extracteur de ventilation se terminant dans l'entre toit"]},
+  {"re": /placopl/i, "element": "Revêtement de placoplâtre", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Il y a des trous dans les murs de gypse qui sont situés dans les salles mécaniques", "Il y a plusieurs fissures aux plafonds des corridors. Aucun joint de dilatation n'est présent", "Usure normale. (Photo G 14)", "Bris de surface, écorchures, rayures", "Bris complet du panneau", "Fissures / indice de mouvement ?", "Vis apparente / indice d'humidité ?", "Peinture en perte d'adhérence ou gonflé / indice d'humidité ?", "Traces de moisissures"]},
+  {"re": /tuiles acoustiques/i, "element": "Tuiles acoustiques suspendues", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["La protection incendie des plafonds qui sont situés dans les salles mécaniques est déficiente", "Le plafond de tuiles acoustiques suspendues présente des signes d'infiltration d'eau (Photo G14.1)", "Indice d'instabilité", "Tuiles brisées", "Tuiles manquantes", "Toute situation d'infiltration d'eau doit être vérifiée et documentée. Dans le cas de plafonds avec espaces techniques, des solutions simples sont fréquemment possibles. Dans les situations moins évidentes, nous recommandons une expertise"]},
+  {"re": /lambris/i, "element": "Lambris de bois ou finis de maçonnerie", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Il y a des sections de bois manquante", "Il y a des cernes sur le bois du plafond de la salle du conseil, possiblement des fuites", "Il y a plusieurs fissures aux plafonds des corridors. Aucun joint de dilatation n'est présent", "Usure normale. (Photo G 14)", "Bris de surface, écorchures, rayures", "Fissures / indice de mouvement ?", "Sections I stables / indice de mauvaise installation ou d'humidité ?", "Traces de moisissures", "Assèchement et fissuration", "Perte esthétique de la teinture", "Usure normale selon l'âge"]},
+  {"re": /sol – tapis/i, "element": "Revêtement de sol – tapis", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Usure normale avec zone de haute circulation. (Photo F 1-2-3)", "Brûlures au tapis près des ascenseurs du niveau SS1. (Photo F 4-5)", "Tapis en perte adherence", "Transition mal exécuté tapis instable et risque de chute"]},
+  {"re": /c[ée]ramique/i, "element": "Revêtement de sol – Carreaux de céramique", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Le coulis des premières marches est désagrégé", "La rencontre carreau de céramique/ tapis à l'entrée de la salle du conseil est instable et présente un risque de blessure", "Certains carreaux sont fissurés, instable, absent"]},
+  {"re": /sol – tuiles de vinyle/i, "element": "Revêtement de sol – Tuiles de vinyle", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Les carreaux de vinyle sont en perte d'adhérence", "Certains carreaux de vinyle sont détachés, absent"]},
+  {"re": /bois franc/i, "element": "Revêtement de sol – Bois durs", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement", "gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion"], "constats": ["Certaines sections sont instables, se soulèvent et présentent un risque de chute", "Certaines planches présentent des indices d'humidité", "La rencontre sont instable, se soulèvent et présentent un risque de chute", "Les pavages sont"]},
+  {"re": /sol – b[ée]ton/i, "element": "Revêtement de sol – Planchers de béton", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": []},
+  {"re": /surfaces vitr/i, "element": "Surface vitrée – Intérieure", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Le cadrage de la fenêtre à la salle du conseil est détaché", "Le scellant de rencontre des vitrages à l'espace piscine est en perte d'adhérence", "Le vitrage être au poste d'accueil est fissuré"]},
+  {"re": /escaliers int/i, "element": "Escaliers intérieurs", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Il y a un décollement de la structure d'acier à l'extrémité d'un palier", "Les soudures de certaines rencontres de sections sont fissurées et détachées", "Au bas de l'escalier central, l'isolant giclé n'est pas protégé par du gypse", "Plusieurs surfaces en béton des paliers et des marches sont détériorées et fissurées", "La peinture est défraichie et absente sur plusieurs sections", "Il ne doit pas y avoir de rangement dans une cage d'escaliers"]},
+  {"re": /portes des unit/i, "element": "Portes des unités", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": []},
+  {"re": /portes de service int[ée]rieures – bois/i, "element": "Portes de services intérieures en bois", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Les fermes portes de la porte de l'espace casier ne sont pas ajustées", "Au stationnement intérieur, les portes des casiers privatifs visité ne referment pas adéquatement", "La porte du casier de l'administration frotte au seuil", "Le cadrage de la porte du casier de l'administration est détaché lâche", "Le vitrage de la porte donnant accès à l'espace casier est fissuré éclaté"]},
+  {"re": /portes de service int[ée]rieures|coupe-feu – ferme/i, "element": "Portes de service intérieures en acier", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Les fermes portes de la porte de la salle déchets/ recyclage ne sont pas ajustées", "Les coupes son sont déficients autour des portes des casiers", "Au stationnement intérieur, les portes de toutes salles techniques visitées ne referment pas adéquatement", "La porte de la salle du conseil frotte au seuil", "Le cadrage de la porte à la salle du conseil est détaché lâche", "Le vitrage de la porte au poste d'accueil est fissuré éclaté", "Le vitrage de la porte de service escalier 4e étage est fissuré éclaté"]},
+  {"re": /rangements grillag/i, "element": "Système grillagée intérieur - Rangement", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Les fermes portes de la porte de l'espace casier ne sont pas ajustées", "Au stationnement intérieur, les portes des casiers privatifs visité ne referment pas adéquatement", "La porte du casier de l'administration frotte au seuil", "Le cadrage de la porte du casier de l'administration est détaché lâche", "Le vitrage de la porte donnant accès à l'espace casier est fissuré éclaté"]},
+  {"re": /[ée]clairage d'urgence/i, "element": "Éclairage d'urgence et panneau de sortie", "points": null, "portee": [], "information": null, "defauts": ["ancrage instable", "panneaux brisée", "panneau de sortie détachée", "extincteur manquant"], "constats": ["Les appareils d'éclairages d'urgences du garage sont sales et poussiéreux", "Les panneaux de sorties sont sales et poussiéreux", "Certains panneaux de sortie du corridor central sont instable, détaché de leur socle", "Le luminaire d'urgence principale dans la salle électrique au bâtiment 10 n'est pas fonctionnel. Cette batterie alimente les autres luminaires d'urgence. À vérifier et corriger"]},
+  {"re": /panneau central|alarme incendie/i, "element": "Panneau alarme centrale, stations manuelles et avertisseurs sonores", "points": null, "portee": [], "information": null, "defauts": ["ancrage instable", "panneaux brisée", "panneau de sortie détachée", "extincteur manquant"], "constats": ["Le panneau clignote - Selon les informations obtenues, le panneau est relié à une centrale mais présente des codes et alarmes fréquentes", "Le panneau est éteint - Selon les informations obtenues, le panneau est débranché et est en planification de réparation", "Des stations manuelles sont ouvertes/ déclenchées – selon les informations obtenues, celles-ci sont planifiées en correctif à la prochaine inspection incendie", "Un avertisseur sonore du corridor central est détaché instable absent"]},
+  {"re": /d[ée]tecteurs d'incendie – privatifs/i, "element": "Détecteurs de fumée autonome - privatifs", "points": null, "portee": [], "information": "rbq_avertisseurs", "defauts": ["ancrage instable", "panneaux brisée", "panneau de sortie détachée", "extincteur manquant"], "constats": ["Les détecteurs sont"]},
+  {"re": /d[ée]tecteurs d'incendie et extincteurs/i, "element": "Détecteurs de fumée/chaleur et extincteurs portatifs", "points": null, "portee": [], "information": "rbq_avertisseurs", "defauts": ["ancrage instable", "panneaux brisée", "panneau de sortie détachée", "extincteur manquant"], "constats": ["Des extincteurs sont absents de leur poste – Selon les informations obtenues, ceux-ci ont disparues dernièrement sont planifiés en remplacement cette année", "Des capteurs de chaleur/ incendie sont détachés", "Des capteurs de chaleur/ incendie sont très sales et poussiéreux", "Dans la salle d'entrée d'eau principale, un extincteur vide est présent au sol. S'il n'est pas utile, vous devez vous en départir"]},
+  {"re": /gicleurs/i, "element": "Système protection incendie – Réseau de gicleurs", "points": "Type de réseau (sous eau, sous air), zones protégées, pompe incendie, date de la dernière inspection.", "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les pompes de surpressions présentent des signes de fuite condensation", "Les conduits d'entrée principale présentent une grande condensation qui s'accumule au sol sans possibilité de drainage adéquat", "La valve principale semble saisie. Nous suggérons une visite de service", "Les panneaux de contrôles sont inaccessibles par cause de rangement inapproprié", "Par suite d'une rénovation aux escaliers, une tête de gicleur semble à risque d'accrochage. Ceci est un risque de blessure. Nous suggérons une visite de service"]},
+  {"re": /interphones/i, "element": "Interphones et système d'accès contrôlé", "points": null, "portee": [], "information": null, "defauts": ["ancrage instable", "panneaux brisée", "panneau détachée"], "constats": ["Le panneau principal est instable", "Le panneau extérieur est corrodé et semble nécessiter un remplacement", "Le panneau extérieur ne possède aucun scellant et est exposés aux intempéries", "Les témoins lumineux du panneau principal au vestibule ne fonctionnent pas. Selon les informations obtenues, l'administration planifie un remplacement en"]},
+  {"re": /surveillance/i, "element": "Système de surveillance - Camera en circuit fermé", "points": null, "portee": [], "information": null, "defauts": ["ancrage instable", "panneaux brisée", "panneau détachée", "camera manquante"], "constats": ["Le système informatique est débranché et désuet. Selon les informations obtenues, l'administration est en étude et planifie un remplacement en . Le coût estimé est de", "Plusieurs ancrages/ socles de camera sont brisée et semble nécessiter un remplacement"]},
+  {"re": /casiers postaux/i, "element": "Casiers postaux – Boites postales", "points": null, "portee": [], "information": null, "defauts": ["panneau instable", "panneau brisée", "panneau détachée", "porte manquante"], "constats": ["Le panneau des casiers est brisée et désuet. Selon les informations obtenues, l'administration est en étude et planifie un remplacement en . Le coût estimé est de", "Plusieurs portes/ serrures de casiers sont brisée et semble nécessiter un remplacement"]},
+  {"re": /centre aquatique/i, "element": "Mobilier – Centre aquatique", "points": null, "portee": [], "information": null, "defauts": ["chaise brisée", "pièce manquante"], "constats": ["Plusieurs éléments du mobilier de confort sont brisées et désuets. Selon les informations obtenues, l'administration est en étude et planifie un remplacement en . Le coût estimé est de", "Plusieurs chaises sont brisées et semble nécessiter un remplacement"]},
+  {"re": /^mobilier/i, "element": "Mobilier – Vestibule – Espaces communs", "points": null, "portee": [], "information": null, "defauts": ["chaise brisée", "pièce manquante"], "constats": ["Plusieurs éléments du mobilier de confort au vestibule du 4e étage sont brisés et désuets. Selon les informations obtenues, l'administration est en étude et planifie un remplacement en . Le coût estimé est de", "À la cuisinette, certaines portes et tiroirs ont des mécanismes désajustés ou brisés et semble nécessiter un entretien", "Les appareils de lavage communs présentent des signes de fuite d'eau d'huile sont instables lors du fonctionnement"]},
+  {"re": /sportifs/i, "element": "Équipement sportif – Salle d'entrainement", "points": null, "portee": [], "information": null, "defauts": ["chaise brisée", "pièce manquante"], "constats": ["Certains appareils sont désajustés ou brisés et semble nécessiter un entretien", "Certaines portes des vestiaires (homme) sont instables détachées absentes. Selon les informations obtenues, le conseil d'administration planifie des remplacements cette année"]},
+  {"re": /chute [àa] d[ée]chets/i, "element": "Chutes à déchets – Salle des bacs", "points": null, "portee": [], "information": null, "defauts": ["composante brisée", "pièce manquante", "traces d'huile", "insalubre", "bruit anormal"], "constats": ["L'espace présente une odeur caractéristique. Un nettoyage régulier est suggéré", "Plusieurs systèmes de roulement des conteneurs sont brisés et désuets. Selon les informations obtenues, l'administration est en étude et planifie un remplacement en . Le coût estimé est de", "Certaines portes aux étages ont des mécanismes difficiles d'ouverture, désajustés ou brisés et semble nécessiter un entretien", "L'appareil de compaction présente des signes de fuite d'huile est instable lors du fonctionnement", "Au démarrage, l'appareil semble avoir un fonctionnement difficile et est bruyant. Selon les informations obtenues de l'administration l'entretien est prévue prochainement"]},
+  {"re": /ascenseur/i, "element": "Ascenseur", "points": "Nombre de cabines, marque, capacité, année d'installation ou de modernisation, contrat d'entretien, date du dernier certificat d'inspection.", "portee": [], "information": null, "defauts": [], "constats": []},
+  {"re": /foyers/i, "element": "Foyers au bois et Cheminées préfabriquées", "points": null, "portee": [], "information": null, "defauts": [], "constats": []},
+  {"re": /plinthes/i, "element": "Plinthes électriques", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le calorifère de l'espace rangement du sous-sol est détaché et pend au sol", "Les calorifères des paliers d'escaliers aux entrées sont très corrodés", "Le calorifère du vestibule avant est instable et bosselé", "Les calorifère/ plinthe électrique au mur du stationnement intérieur sont très corrodés et semble nécessiter en remplacement", "Le calorifère de la salle électrique extérieure à l'arrière est près d'une zone d'infiltration d'eau connue. Ceci est un risque de blessure"]},
+  {"re": /a[ée]rothermes muraux/i, "element": "Aérothermes muraux", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["L'appareil aérotherme mural de l'espace rangement du sous-sol est détaché et pend au sol", "Les appareils aérothermes muraux des paliers d'escaliers aux entrées sont très corrodés", "L'appareil aérotherme mural du vestibule avant est instable et bosselé", "Les appareils aérothermes muraux électrique au mur du stationnement intérieur sont très corrodés et semble nécessiter en remplacement", "L'appareil aérotherme mural de la salle électrique extérieure à l'arrière est près d'une zone d'infiltration d'eau connue. Ceci est un risque de blessure"]},
+  {"re": /a[ée]rothermes suspendus/i, "element": "Chauffage stationnement intérieur", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["L'appareil aérotherme plafonnier de l'espace rangement du sous-sol est détaché et pend. Ceci est un risque de blessure", "Les appareils aérothermes plafonniers aux entrées piétonnières sont très corrodés", "L'appareil aérotherme mural à la porte de garage est instable et bosselé", "Les appareils aérothermes électrique au mur du stationnement intérieur sont très corrodés et semble nécessiter en remplacement"]},
+  {"re": /ventilation – privatif/i, "element": "Systèmes d'extraction – Sorties privatives", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Plusieurs sorties de sécheuse présentent une accumulation de charpie. Prévoir le nettoyage régulier", "Deux extracteurs au niveau de la toiture nord-est sont instables"]},
+  {"re": /climatisation de zone/i, "element": "Climatisation de zone - Espaces communs", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le système d'évacuation du condensat est débranché", "Les attaches du support au mur sont instables et lâches", "L'appareil évaporateur de la salle du conseil présente une fuite d'eau", "L'appareil compresseur extérieur présente un bruit anormal", "Absence de scellant ignifuge aux passages des conduits", "Aucun cahier de suivi de service d'entretien n'est disponible"]},
+  {"re": /cvac|[ée]changeurs d'air|chaudi|pompes de circulation/i, "element": "Chauffage, ventilation et climatisation – Espaces communs", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["L'appareil au toit est hors fonction. Selon les informations obtenues, celui-ci est planifié en remplacement cette année", "L'appareil au toit présente un bruit anormal. Nous suggérons une visite de service", "Absence de scellant ignifuge aux passages des conduits", "Aucun cahier de suivi de service d'entretien n'est disponible", "Les filtres semblent sales. À remplacer"]},
+  {"re": /ventilation des salles de services/i, "element": "Ventilation d'extraction des salles de services", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le système de ventilation de la salle électrique est débranché. Selon les informations obtenues, celui-ci est très bruyant. Lorsque requis, les copropriétaires le branche manuellement", "Les attaches du support au mur sont instables et lâches", "L'appareil mural de l'espace rangement présente un bruit anormal", "L'appareil mural de l'espace rangement est très poussiéreux. Nous suggérons une visite de service", "Absence de scellant ignifuge aux passages des conduits", "Quelques-uns d'entre eux ne sont pas fonctionnels. Selon les informations obtenues, ceux-ci sont prévue en remplacement prochainement"]},
+  {"re": /d[ée]tection des gaz/i, "element": "Système de détection des gaz d'échappement", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les dates des derniers services ne sont pas affichées", "L'appareil central, à la salle électrique, est instable et semble sur le point de tomber", "Les capteurs de la section avant du stationnement intérieur sont très poussiéreux"]},
+  {"re": /ventilation du stationnement/i, "element": "Ventilation du stationnement intérieur et Volets motorisés", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les appareils sont très poussiéreux. Nous suggérons une visite de service", "Le fonctionnement des volets motorisés est difficile. Selon les informations obtenues, une visite de service est déjà planifiée", "Aucun cahier de suivi de service d'entretien n'est disponible"]},
+  {"re": /obturation/i, "element": "Dispositif d'obturation (volet coupe-feu)", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": []},
+  {"re": /alimentation [ée]lectrique principale|panneaux de distribution|thermographi|bornes de recharge/i, "element": "Alimentation électrique principale", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["La salle électrique n'a pas de système de ventilation", "Nous constatons que les périmètres de certains conduits devraient être scellés afin de préserver l'intégrité coupe-feu de la séparation", "La porte du panneau PP1 n'a pas de porte", "Plusieurs prises électriques dans les corridors sont mal fixées. Il y a même une prise dont le neutre est bloqué par un élément métallique", "Il y a absence de volet coupe-feu sur le grillage de la porte qui donne accès à la salle électrique", "Il manque une plaque sur une boîte de jonction qui est située dans le vestibule de l'ascenseur au niveau sous-sol", "Les transformateurs sont très poussiéreux", "Des câbles électriques sont les balcons avant sont détachées. Ceci est un risque de blessure", "Les prises extérieures vérifiées ne sont parfois pas munies de système DDFT. Nous recommandons de vous assurer que ces prises sont sur un circuit électrique muni d'un disjoncteur DDFT"]},
+  {"re": /gaz naturel/i, "element": "Alimentation au gaz naturel", "points": null, "portee": [], "information": null, "defauts": [], "constats": []},
+  {"re": /[ée]clairage int[ée]rieurs/i, "element": "Appareils d'éclairage intérieurs", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les luminaires du vestibule avant est instable et pend au bout des câblages", "Le luminaire mural de l'entrée arrière n'a pas de globe de protection", "Un des câbles gainés de type BX de l'éclairage à la salle de la valve principale est apparent et a été écrasé. Selon les informations obtenues, ceci a été causé lors des travaux en juin dernier. Un correctif est déjà planifié par le CA", "Il y a une boîte de jonction sans couvercle de protection dans la salle des déchets"]},
+  {"re": /[ée]clairage ext[ée]rieurs/i, "element": "Appareils d'éclairage extérieurs", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les luminaires à l'entrée principale présentent une corrosion et écaillure de la peinture", "Le luminaire mural de l'entrée arrière n'a pas de globe de protection", "Des câbles gainés de type BX sont visible à l'entrée arrière. On note de plus que la boîte de jonction fixée au mur n'est pas pour usage extérieur", "Il y a une boîte de jonction sans couvercle de protection à l'enclos des déchets/ recyclage"]},
+  {"re": /lampadaires/i, "element": "Lampadaires", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les lampadaires bas de l'entrée principale présentent une corrosion de surface et écaillure de la peinture", "Le lampadaire central au stationnement arrière n'a pas de globe de protection est instable détachés de sa base et est un risque de blessure", "Un des câbles gainés de type BX de l'éclairage périphérique du stationnement est apparent. On note de plus que la boîte de jonction n'est pas pour usage extérieur", "Au lampadaire nord-est, la boîte de jonction est sans couvercle de protection"]},
+  {"re": /r[ée]servoir de mazout/i, "element": "Alimentation d'urgences - Réservoirs de mazout", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["La salle du réservoir présente une forte odeur de carburant diesel (mazout)", "Des traces de mazout sont présentes au sol sous le réservoir. Ceci est un risque de blessure", "Beaucoup de rangement sont présent dans la salle du réservoir. Ceci est un risque de blessure"]},
+  {"re": /alimentation d'urgence/i, "element": "Alimentation d'urgences – Génératrices", "points": "Marque, puissance (kW), carburant, date d'installation, charges alimentées, date du dernier essai sous charge.", "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["La salle de la génératrice présente une forte d'odeur de carburant diesel (mazout)", "Des signes de fuite d'huile (mazout) sont présent au sol à l'arrière de la génératrice", "Beaucoup de rangement sont présent dans la salle de la génératrice. Ceci est un risque de blessure", "La batterie de démarrage présente une importante corrosion des pôles", "Les documents d'entretien et services réguliers ne sont pas disponibles"]},
+  {"re": /eau potable|surpression|antirefoulement/i, "element": "Système d'alimentation en eau potable", "points": null, "portee": [], "information": "rbq_dar", "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les pompes de surpressions présentent des signes de fuite condensation", "Les conduits d'entrée principale présentent une grande condensation qui s'accumule au sol sans possibilité de drainage adéquat", "La valve principale semble saisie. Nous suggérons une visite de service", "Les conduits principaux d'alimentation sont en acier. Ce type de conduit d'une autre époque est fréquemment très corrodé à l'intérieur. Ceci est un risque pour plusieurs appareils. Nous suggérons une visite de service", "La salle mécanique est à risque de gel. Ceci est un risque pour plusieurs appareils"]},
+  {"re": /[ée]vacuation|clapets|pompes de puisard/i, "element": "Système d'évacuation sanitaire et pluvial", "points": null, "portee": [], "information": "rbq_clapets", "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le drain au sous-sol présente un bruit sourd. Nous suggérons une visite de service", "Les drains des terrasses extérieures sont bloqués par des déchets et matières organique et semble avoir un fonctionnement inadéquat", "Plusieurs collets de raccordement présentent des fuites. Nous suggérons une visite de service", "Les plans de plomberies ne font pas partie du registre de la copropriété", "Au 10298 (passage souterrain), le conduit d'évacuation de la pompe est perforé. À corriger", "Au 10294, le mouvement de la flotte est restreint par les tuyaux et la pompe ne peut démarrer. À corriger", "Au 10300, les conduits sont sales, ce qui peut les obstruer et nous porte à croire que la protection des conduits d'amenée d'eau contre les débris est défaillante. À vérifier", "Les conduits reliés au puisard ne comportent pas de té sanitaire ou de siphon à garde d'eau", "De façon générale, les couvercles des puisards devraient être étanches à l'air pour éviter que des gaz et des odeurs ne se dispersent. Il est à noter que lors des travaux d'étanchéité, un évent devra être installé afin d'avoir une pression d'air adéquate dans le puisard. Le remplacement des couvercles est requis"]},
+  {"re": /[ée]quipements de plomberie/i, "element": "Appareils de plomberie –Espaces communs", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le lavabo l'évier de la salle du conseil semble partiellement bloqué. Nous suggérons une visite de service", "La toilette du vestiaire homme est instable et est à risque de fuite. Ceci est aussi une risque de blessure. Nous suggérons une visite de service"]},
+  {"re": /conciergerie/i, "element": "Réservoirs chauffe-eau électrique", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le chauffe-eau a plus de 10 ans et présente une corrosion à sa base", "Le chauffe-eau présente une fuite d'eau au sol"]},
+  {"re": /r[ée]servoirs d'eau chaude/i, "element": "Réservoirs chauffe-eau commun - Gaz naturel", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le chauffe-eau a plus de 20 ans et présente des suintements de corrosion à sa base des sections d'isolant déchirée et absent", "Le chauffe-eau présente une fuite d'eau au sol", "Les réservoirs d'eau chaude sont tous instable et créé une tension sur certains conduits. Ceci est aussi un risque de blessure. À corriger", "Le système en série présente plusieurs fuite d'eau et selon les informations obtenues est en service fréquent"]},
+  {"re": /sauna/i, "element": "Sauna", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le conduit d'alimentation présente une grande condensation qui s'accumule au sol sans possibilité de drainage adéquat", "Le système de chauffe est instable déplacée et ne fonctionne pas. Selon les informations obtenues, celui-ci n'est plus en usage .est planifié en remplacement cette année", "Les bancs de confort sont brisés et présente des risques de blessures", "La porte du sauna est difficile d'ouverture ne s'ouvre pas de l'intérieur"]},
+  {"re": /humidit/i, "element": "Condensateur – Contrôle d'humidité", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["L'appareil présente des signes de fuite condensation importante", "Les conduits présentent une grande condensation qui s'accumule au sol sans possibilité de drainage ou d'assèchement adéquat", "La conduits semblent lâche. Nous suggérons une visite de service", "L'appareil présente une grande corrosion. Nous suggérons une visite de service"]},
+  {"re": /filtration|piscine (ext|int)[ée]rieure – syst[èe]me de chauffage/i, "element": "Équipement de filtration et de chauffe-eau piscine", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les pompes de surpressions présentent des signes de fuite condensation", "L'appareil de chauffe-eau thermopompe est instable présente un bruit anormal. Une visite de service est suggérée"]},
+  {"re": /bassin|enceinte|contour de terrasse/i, "element": "Piscine", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant", "fissuration", "affaissement différentiel", "sécurité"], "constats": ["Le contour terrasse de béton de carreaux de céramique présente plusieurs fissures importantes et des sections détachées. Selon les informations obtenues, des travaux de réparation sont déjà planifiées", "Une section de la toile de vinyle est détachée de ses bandes de rétention. Nous suggérons une visite de service", "Aucun équipement de sauvetage n'est présent. Ceci est un risque. Nous suggérons de vérifier la documentation provinciale relative aux équipements obligatoires"]}
+];
+const POINTS_PAR_CATEGORIE = {
+  "terrain": "Matériau et type de surface, localisation sur le site, pentes et drainage, éléments connexes (bordures, puisards).",
+  "structure": "Type de fondation et de structure (béton coulé, acier, bois), niveaux concernés, accès pour l'observation, traces d'infiltration.",
+  "enveloppe": "Matériau et système (type de membrane ou de parement), façades ou versants concernés, éléments connexes (solins, linteaux, scellants), méthode d'observation.",
+  "ouvertures": "Type et matériau des cadres, vitrage, quincaillerie, scellants de contour, localisation (façades, entrées, communs).",
+  "balcons": "Structure, pontage ou surface, garde-corps, escaliers, fixations et étanchéité aux rencontres avec le parement.",
+  "interieur": "Matériau et fini, espaces communs concernés (corridors, halls, escaliers, stationnement), usure générale.",
+  "equipements": "Type d'équipement, marque, modèle et capacité si visibles, localisation, date de fabrication ou d'inspection, contrat d'entretien.",
+  "cvac": "Type d'appareil (électrique, gaz, eau chaude), marque, modèle et capacité si visibles, espaces desservis, contrat d'entretien.",
+  "electrique": "Type d'installation, capacité (ampérage, tension) si indiquée, localisation (salle électrique, extérieur), date de fabrication.",
+  "plomberie": "Type de réseau ou d'appareil, matériau des conduits visibles, capacité, localisation (salle mécanique, conciergerie), date de fabrication.",
+  "piscines": "Type de piscine (intérieure ou extérieure), revêtement du bassin, équipements (filtration, chauffage, déshumidification), marque et capacité si visibles."
+};
+
+function guidePour(component) {
+  const nom = String(component?.name ?? "");
+  const guide = GUIDES_REDACTION.find((g) => g.re.test(nom)) ?? null;
+  return {
+    element: guide?.element ?? null,
+    points: guide?.points ?? POINTS_PAR_CATEGORIE[component?.cat] ?? null,
+    portee: guide?.portee ?? [],
+    information: guide?.information ?? null,
+    defauts: guide?.defauts ?? [],
+    constats: (guide?.constats ?? []).map((c) => sansNotesInternes(c)).filter(Boolean)
+  };
+}
+// Avis réglementaires, repris du gabarit de rapport. La phrase d'assujettissement
+// n'est écrite que si les données du dossier permettent de trancher.
+const INFORMATIONS_REGLEMENTAIRES = {
+  loi122_facades: (d) => {
+    const etages = Number(d?.floors) || 0;
+    const suite = etages > 0 ? (etages >= 5 ? " Votre immeuble est assujetti à cette loi." : " Votre immeuble n'est pas assujetti à cette loi.") : "";
+    return "INFORMATION : Façades en hauteur - Depuis le 18 mars 2013, selon la loi 122, les façades en maçonnerie de tous les immeubles ayant au moins 5 étages doivent maintenant faire l'objet d'une vérification et d'un entretien périodique tous les 5 ans." + suite;
+  },
+  loi122_stationnements: () => "INFORMATION : Stationnements étagés - Depuis le 18 mars 2013, selon la loi 122, les garages ayant 2 étages et plus doivent maintenant faire l'objet d'une inspection de la dalle et de la structure tous les 5 ans.",
+  rbq_avertisseurs: () => "INFORMATION : La Régie du bâtiment du Québec (RBQ) rappelle que tout avertisseur de fumée doit être remplacé 10 ans après la date de fabrication indiquée sur le boîtier. Si aucune date n'est indiquée ou si elle est illisible, le dispositif doit être remplacé immédiatement.",
+  rbq_dar: (d) => {
+    const unites = Number(d?.units) || 0;
+    const etages = Number(d?.floors) || 0;
+    let suite = "";
+    if (unites > 0 && etages > 0) {
+      suite = unites >= 9 && etages >= 3 ? " Votre immeuble est visé par cette obligation." : " Votre immeuble est exclu de cette obligation.";
+    }
+    return "INFORMATION : La Régie du bâtiment du Québec (RBQ) rappelle aux propriétaires de bâtiment qu'ils ont l'obligation de protéger le réseau d'eau potable contre la contamination en installant un dispositif anti-refoulement (DAR) et en le faisant vérifier chaque année. Les bâtiments existants totalement résidentiels de moins de neuf (9) unités ou de moins de trois (3) étages sont exclus de cette obligation." + suite;
+  },
+  rbq_clapets: () => "INFORMATION : La Régie du bâtiment du Québec (RBQ) rappelle aux propriétaires que dans un réseau de plomberie, il est obligatoire de bien protéger les appareils sanitaires contre le refoulement potentiel des égouts. En effet, les refoulements des eaux d'égout et des eaux de pluie sont à l'origine de bien des dommages à l'intérieur des bâtiments. Ces refoulements constituent d'ailleurs une des causes de réclamation les plus fréquentes auprès des compagnies d'assurance habitation."
+};
 const JARGON_STYLE_GUIDE = `Méthode et registre de la firme (Plan de gestion de l'actif — PGA) :
 
 ÉCHELLE D'ÉTAT (obligatoire, 4 niveaux + na) :
@@ -3433,12 +3629,25 @@ async function analyzePhotos(apiKey, opts) {
       type: "text",
       text: `Composante inspectée : « ${opts.componentName} »${opts.uniformatCode ? ` (${opts.uniformatCode})` : ""}${opts.installYear ? `, dernier remplacement ou construction en ${opts.installYear}` : ""}${opts.usefulLife ? `, durée de vie utile de référence : ${opts.usefulLife} ans` : ""}.
 Tu relèves cette composante lors d'une visite de plan de gestion de l'actif. Analyse les
-photos et produis la fiche de relevé.
+photos et produis la fiche de relevé, selon le même gabarit pour toutes les composantes.
 
 ${JARGON_STYLE_GUIDE}
+${opts.guide?.defauts?.length ? `\nDÉFAUTS À SURVEILLER POUR CE TYPE D'ÉLÉMENT (grille de la firme) : ${opts.guide.defauts.join(", ")}.` : ""}
+${opts.guide?.constats?.length ? `FORMULATIONS TYPES DE LA FIRME (d'autres immeubles — la manière, jamais les faits) :\n${opts.guide.constats.slice(0, 6).map((c) => `· ${c}`).join("\n")}` : ""}
 
 Réponds UNIQUEMENT avec un objet JSON :
-{"rating": 1|2|3|4 (1=bon état, 2=entretien normal, 3=entretien requis, 4=remplacement requis ; null si non observable), "observation": "ce qui est visible sur les photos, en une à trois phrases, registre professionnel", "causePossible": "cause probable du constat, ou '' si aucun défaut", "delaiSuggere": "délai d'intervention suggéré (ex: 'à court terme', 'dans les 5 ans', 'à planifier', 'aucun suivi particulier')", "consequences": "conséquences additionnelles si rien n'est fait, ou ''", "cost": "coût de remplacement approximatif en $ CAD formaté (ex: '28 500 $'), arrondi à la centaine, ou 'à estimer' si non évaluable visuellement", "costEstimate": nombre brut CAD correspondant, ou null, "confidence": "pourcentage de confiance (ex: 82 %)"}
+{"rating": 1|2|3|4 (1=bon état, 2=entretien normal, 3=entretien requis, 4=remplacement requis ; null si non observable),
+ "constats": ["un constat par élément, au format « Localisation – ce qui est observé », registre professionnel ; [] si aucun défaut"],
+ "etendue": "ponctuel" | "localise" | "generalise" | null,
+ "etendueQte": "quantité touchée si estimable (ex: '≈ 4 m²', '3 fenêtres', '20 %'), ou ''",
+ "limiteObservation": "de_pres" | "distance" | "partiel" | "inaccessible",
+ "causePossible": "cause probable, modalisée (semble, serait), ou '' si aucun défaut",
+ "natureRisque": "securite" | "infiltration" | "degradation" | "conformite" | "esthetique" | null,
+ "delaiSuggere": ${DELAIS_MAISON.map((d) => `"${d.libelle}"`).join(" | ")},
+ "consequences": "conséquences additionnelles si rien n'est fait, ou ''",
+ "cost": "coût de remplacement approximatif en $ CAD formaté (ex: '28 500 $'), arrondi à la centaine, ou 'à estimer' si non évaluable visuellement",
+ "costEstimate": nombre brut CAD correspondant, ou null,
+ "confidence": "pourcentage de confiance (ex: 82 %)"}
 
 N'invente aucun défaut qui ne soit pas visible sur les photos. Si les photos ne permettent
 pas de statuer, mets "rating": null et explique-le dans "observation".`
@@ -3447,7 +3656,20 @@ pas de statuer, mets "rating": null et explique-le dans "observation".`
   try {
     const text = await callClaude(apiKey, { content, maxTokens: 700 });
     const parsed = extractJson(text);
-    return { ...parsed, ratingLabel: RATING_LABELS[parsed.rating] ?? null, source: "ia" };
+    // Les valeurs hors vocabulaire sont écartées plutôt que stockées : le
+    // gabarit de rédaction ne sait rien faire d'une étendue « moyenne ».
+    const constats = Array.isArray(parsed.constats) ? parsed.constats.map((c) => String(c).trim()).filter(Boolean) : [];
+    return {
+      ...parsed,
+      constats,
+      observation: constats.length ? constats.join("\n") : parsed.observation ?? "",
+      etendue: ETENDUES[parsed.etendue] ? parsed.etendue : null,
+      limiteObservation: LIMITES_OBSERVATION[parsed.limiteObservation] ? parsed.limiteObservation : null,
+      natureRisque: NATURES_RISQUE[parsed.natureRisque] ? parsed.natureRisque : null,
+      delaiSuggere: DELAIS_MAISON.some((d) => d.libelle === parsed.delaiSuggere) ? parsed.delaiSuggere : null,
+      ratingLabel: RATING_LABELS[parsed.rating] ?? null,
+      source: "ia"
+    };
   } catch {
     return heuristicEstimate(opts.installYear, opts.usefulLife);
   }
@@ -3874,41 +4096,81 @@ function phraseCarnet(dossier) {
   const info = infoBatiment(dossier);
   return info?.documents?.carnet_entretien === "oui" ? CARNET_REVISE : CARNET_ABSENT;
 }
-function etatDeterministe(component, dossier) {
-  const nom = sansNotesInternes(component?.name ?? "l'élément");
-  const cote = coteRapport(component?.rating);
+// Les 7 blocs, dans l'ordre fixe du gabarit maison. Seul le bloc 1 (la
+// description) peut venir du modèle ; les six autres sont écrits ici, à partir
+// des champs du relevé, pour que la même donnée donne la même phrase partout.
+//   1. Description   2. Méthode et limite d'observation   3. Portée du calcul
+//   4. Appréciation (imposée par la cote)   5. Année et sa source
+//   6. Projets du conseil d'administration   7. INFORMATION réglementaire
+function descriptionDeterministe(component) {
+  // « – Allocation » est un mode de calcul, pas une partie de l'élément décrit.
+  const nom = sansNotesInternes(component?.name ?? "l'élément").replace(/\s+[–-]\s+allocations?$/i, "");
   const localisation = localisationMaison(component);
-  const variante = sansNotesInternes(component?.variante ?? "");
-  const parties = [];
-  const description = localisation
-    ? [`« ${nom} » a été relevé à la ${localisation} de l'immeuble`]
-    : [`« ${nom} » fait partie des parties communes de l'immeuble`];
-  if (variante) description.push(` — ${variante}`);
-  description.push(".");
-  parties.push(description.join(""));
+  const variante = sansNotesInternes(component?.variante ?? "").replace(/[.;]$/, "");
+  const parties = [localisation
+    ? `L'élément « ${nom} » a été relevé à la ${localisation} de l'immeuble.`
+    : `L'élément « ${nom} » fait partie des parties communes de l'immeuble.`];
+  if (variante) parties.push(`Matériau ou type relevé : ${variante.charAt(0).toLowerCase()}${variante.slice(1)}.`);
   if (component?.qty && component.qty !== "—") parties.push(`Quantité relevée : ${sansNotesInternes(String(component.qty))}.`);
-  const observation = phraseFinale(component?.observation);
-  if (observation) parties.push(observation);
-  const cause = phraseFinale(component?.cause_possible);
-  if (cause) parties.push(`Selon nos observations, cette situation serait possiblement en lien avec : ${cause.charAt(0).toLowerCase()}${cause.slice(1)}`);
-  if (cote === "Bon") {
-    parties.push(observation
-      ? "Dans l'ensemble, l'état observé est bon."
-      : "L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée.");
-  } else if (cote === "Passable") {
-    parties.push(`Dans l'ensemble, l'état observé est passable et nécessite un entretien devancé. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.`);
-  } else if (cote === "Mauvais") {
-    parties.push(`Dans l'ensemble, l'état observé est mauvais et requiert la planification d'un remplacement. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.`);
-  } else if (!observation) {
-    parties.push("Aucune observation n'a été consignée pour cet élément lors de la visite; son état n'a pas été apprécié dans le cadre du présent relevé.");
-  }
-  const annee = anneeMaison(component?.install_year);
-  if (annee != null) parties.push(`Celles-ci sont de ${annee}.`);
-  else parties.push("Aucune information obtenue ne pouvait identifier le dernier remplacement.");
-  if (cote === "Bon") parties.push("Autre que l'entretien régulier, aucun suivi n'est prévu cette année.");
-  const limite = LIMITE_RELEVE[component?.cat];
-  if (limite) parties.push(limite);
   return assembler(parties);
+}
+function phraseLimite(component) {
+  const detail = sansNotesInternes(component?.limite_detail ?? "").replace(/[.;]$/, "");
+  const entre = detail ? ` (${detail})` : "";
+  switch (component?.limite_observation) {
+    case "distance":
+      return `L'observation s'est faite à distance${detail ? entre : " (du sol, des balcons ou à l'aide de jumelles)"}; certains défauts pourraient ne pas avoir été décelés.`;
+    case "partiel":
+      return `Cet élément n'était que partiellement accessible lors de la visite${entre}; l'appréciation se limite aux sections observées.`;
+    case "inaccessible":
+      return `Cet élément n'était pas accessible lors de la visite${entre}; son état n'a pu être apprécié et le calcul repose sur la durée de vie de référence.`;
+    default:
+      return "";
+  }
+}
+function phraseAppreciation(component) {
+  const cote = coteRapport(component?.rating);
+  const aConstats = !!String(component?.observation ?? "").trim();
+  if (cote === "Bon") {
+    return aConstats
+      ? "Dans l'ensemble, l'état observé est bon."
+      : "L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée.";
+  }
+  if (cote === "Passable") return "Dans l'ensemble, l'état observé est passable et nécessite un entretien devancé. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.";
+  if (cote === "Mauvais") return "Dans l'ensemble, l'état observé est mauvais et requiert la planification d'un remplacement. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.";
+  if (component?.limite_observation === "inaccessible") return "";
+  return "Aucune cote n'a été attribuée à cet élément lors de la visite; son état n'a pas été apprécié dans le cadre du présent relevé.";
+}
+function phraseAnnee(component) {
+  const annee = anneeMaison(component?.install_year);
+  if (annee == null) return "Aucune information obtenue ne pouvait identifier le dernier remplacement.";
+  switch (component?.source_annee) {
+    case "plaque": return `Celles-ci sont de ${annee}, selon la plaque signalétique.`;
+    case "carnet": return `Celles-ci sont de ${annee}, selon le carnet d'entretien.`;
+    case "administration": return `Celles-ci sont de ${annee}, selon les informations obtenues de l'administration.`;
+    case "estimee": return `Celles-ci seraient de ${annee}, selon notre estimation.`;
+    default: return `Celles-ci sont de ${annee}.`;
+  }
+}
+function blocsEtat(component, dossier, description) {
+  const guide = guidePour(component);
+  const cote = coteRapport(component?.rating);
+  const projet = phraseFinale(component?.projet_ca);
+  const information = guide.information ? INFORMATIONS_REGLEMENTAIRES[guide.information]?.(dossier) : null;
+  return assembler([
+    description || descriptionDeterministe(component),
+    phraseLimite(component),
+    guide.portee.join(" "),
+    phraseAppreciation(component),
+    phraseAnnee(component),
+    cote === "Bon" ? "Autre que l'entretien régulier, aucun suivi n'est prévu cette année." : null,
+    LIMITE_RELEVE[component?.cat] ?? null,
+    projet ? `Selon les informations obtenues, le conseil d'administration planifie ${projet.charAt(0).toLowerCase()}${projet.slice(1)}` : null,
+    information
+  ]);
+}
+function etatDeterministe(component, dossier) {
+  return blocsEtat(component, dossier, null);
 }
 function faitsElement(component, dossier, ligne) {
   const info = infoBatiment(dossier);
@@ -3924,7 +4186,14 @@ function faitsElement(component, dossier, ligne) {
     coteRapportLongue(component?.rating) ? `Cote au rapport : ${coteRapportLongue(component.rating)}` : null,
     anneeMaison(component?.install_year) != null ? `Année de construction ou de dernière réparation : ${anneeMaison(component.install_year)}` : "Année de construction ou de dernière réparation : inconnue",
     `Durée de vie retenue au calcul : ${ligne.duree} ans (${ligne.allocation ? "allocation cyclique" : "remplacement complet"})`,
-    component?.observation ? `Observation de l'inspecteur (données brutes) : ${component.observation}` : null,
+    component?.observation ? `Constats de l'inspecteur (données brutes) : ${component.observation}` : null,
+    ETENDUES[component?.etendue] ? `Étendue : ${ETENDUES[component.etendue]}${component?.etendue_qte ? ` (${component.etendue_qte})` : ""}` : null,
+    LIMITES_OBSERVATION[component?.limite_observation] ? `Limite d'observation : ${LIMITES_OBSERVATION[component.limite_observation]}${component?.limite_detail ? ` (${component.limite_detail})` : ""}` : null,
+    (() => {
+      const attributs = objetJson(component?.attributs);
+      const lignes = Object.entries(attributs).filter(([k]) => k !== "type" && k !== "unité").map(([k, v]) => `${k} : ${v}`);
+      return lignes.length ? `Attributs relevés : ${lignes.join(" · ")}` : null;
+    })(),
     component?.cause_possible ? `Cause possible relevée : ${component.cause_possible}` : null,
     component?.note ? `Note de visite : ${component.note}` : null,
     component?.r_flag ? "Travaux prévus au carnet précédent et non effectués : oui" : null,
@@ -4034,45 +4303,42 @@ d'autres immeubles : en importer un détail serait une faute dans un rapport sig
 
 async function etatDeLActif(component, dossier, apiKey, ligne, exemples) {
   const repli = etatDeterministe(component, dossier);
-  const sansDonnees = !String(component?.observation ?? "").trim() && component?.rating == null;
+  const sansDonnees = !String(component?.observation ?? "").trim() && component?.rating == null && !String(component?.variante ?? "").trim();
   if (!apiKey || sansDonnees) return { texte: repli, source: "gabarit" };
-  const prompt = `Tu rédiges la sous-section « ÉTAT DE L'ACTIF » d'une fiche d'élément du
-Plan de gestion de l'actif (carnet d'entretien) de Condo Stratégis, firme québécoise en
-science du bâtiment. Tu transposes la note brute de l'inspecteur dans le registre maison.
+  const guide = guidePour(component);
+  const prompt = `Tu rédiges le PREMIER BLOC — la description — de la sous-section « ÉTAT DE L'ACTIF »
+d'une fiche d'élément du Plan de gestion de l'actif de Condo Stratégis, firme québécoise en
+science du bâtiment. Les autres blocs (limite d'observation, portée du calcul, appréciation
+de l'état, année, projets du conseil, avis réglementaire) sont ajoutés après ton texte par
+le gabarit : ne les écris pas.
 
 ${JARGON_STYLE_GUIDE}
 
-ORDRE IMPOSÉ DE L'INFORMATION (gabarit maison) :
-1. Description matérielle et localisation, 1 à 3 phrases.
-2. Limite d'observation, seulement si les données le justifient.
-3. Appréciation d'état, avec les formules maison, par exemple :
-   « Dans l'ensemble, le parement est dans un bon état. »
-   « L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée. »
-   « Dans l'ensemble, l'état observé est passable et nécessite un entretien devancé.
-     Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE. »
-4. Année : « Celles-ci sont de <année>. » ou, à défaut, « Aucune information obtenue ne
-   pouvait identifier le dernier remplacement. » Si l'état est bon, clore par
-   « Autre que l'entretien régulier, aucun suivi n'est prévu cette année. »
+CE QUE TU ÉCRIS : 1 à 3 phrases qui décrivent l'élément tel qu'il est dans CET immeuble —
+matériau, système, localisation, éléments connexes — à partir des faits ci-dessous.
+${guide.points ? `Points à décrire pour ce type d'élément : ${guide.points}` : ""}
+
+CE QUE TU N'ÉCRIS PAS : aucune appréciation d'état (bon, passable, mauvais), aucune année,
+aucun défaut, aucune cause, aucun délai, aucun coût, aucune recommandation. Les défauts vont
+dans ATTENTION SPÉCIALE, écrite ailleurs.
 
 RÈGLES ABSOLUES :
-- N'invente AUCUN défaut, matériau, dimension, année ni quantité qui ne soit dans les faits
-  ci-dessous. Si une information manque, emploie la formule maison d'absence d'information.
-- Reste au constat : aucune cause certaine, aucun correctif prescrit, aucun coût.
-- Voix « nous » de firme, vouvoiement du client, modalisation constante
-  (semble, tout laisse croire, selon les informations obtenues).
-- Français du Québec. Aucun titre, aucune puce, aucun gras : 3 à 6 phrases en prose suivie.
+- N'invente AUCUN matériau, dimension ni quantité qui ne soit dans les faits. Si les faits ne
+  précisent pas le matériau, décris l'élément par sa fonction et sa localisation seulement.
+- Voix « nous » de firme, modalisation (semble, selon les informations obtenues).
+- Français du Québec. Aucun titre, aucune puce, aucun gras.
 - N'écris aucune note de rédaction interne, aucune mention d'un autre dossier, aucun « ??? ».
 
-${blocExemples(exemples)}
+${blocExemples(exemples)}${exemples && exemples.length ? "Dans ces exemples, ne prends modèle que sur la description matérielle du début.\n" : ""}
 FAITS DU RELEVÉ :
 ${faitsElement(component, dossier, ligne)}
 
-Réponds uniquement par le texte de la sous-section.`;
+Réponds uniquement par la description.`;
   try {
-    const brut = await callClaude(apiKey, { content: prompt, maxTokens: 700 });
-    const texte = sansNotesInternes(brut);
-    if (texte.length < 40) return { texte: repli, source: "gabarit" };
-    return { texte, source: exemples && exemples.length ? "ia+banque" : "ia" };
+    const brut = await callClaude(apiKey, { content: prompt, maxTokens: 400 });
+    const description = sansNotesInternes(brut);
+    if (description.length < 20) return { texte: repli, source: "gabarit" };
+    return { texte: blocsEtat(component, dossier, description), source: exemples && exemples.length ? "ia+banque" : "ia" };
   } catch {
     return { texte: repli, source: "gabarit" };
   }
@@ -4084,6 +4350,21 @@ Réponds uniquement par le texte de la sous-section.`;
 // commentaire ». Registre : « nous suggérons », jamais « nous exigeons ».
 // ----------------------------------------------------------------------------
 const AUCUNE_ATTENTION = "Aucun commentaire. Aucune situation pouvant affecter de façon significative la durée de vie de cet élément n'a été observée. Le suivi se limite à l'entretien régulier prévu au tableur suivi d'entretien.";
+const PHRASES_RISQUE = {
+  securite: "Cette situation présente un risque pour la sécurité des personnes.",
+  infiltration: "Cette situation présente un risque d'infiltration d'eau.",
+  degradation: "Cette situation risque d'accélérer la dégradation de l'élément.",
+  conformite: "Cette situation soulève un enjeu de conformité réglementaire.",
+  esthetique: "Cette situation est d'ordre esthétique."
+};
+function phraseDelai(valeur) {
+  const brut = sansNotesInternes(valeur ?? "").replace(/[.;]$/, "");
+  if (!brut) return "";
+  const maison = DELAIS_MAISON.find((d) => d.libelle.toLowerCase() === brut.toLowerCase());
+  if (maison) return maison.phrase ? `Selon notre opinion, l'intervention est à planifier ${maison.phrase}.` : "";
+  // Anciens relevés en texte libre (« à court terme », « dans les 5 ans »…).
+  return `Selon notre opinion, l'intervention est à planifier ${brut.charAt(0).toLowerCase()}${brut.slice(1)}.`;
+}
 function attentionSpeciale(component) {
   const rating = Number(component?.rating);
   const consequences = sansNotesInternes(component?.consequences ?? "");
@@ -4095,21 +4376,28 @@ function attentionSpeciale(component) {
   } else {
     parties.push("Cependant nous avons aussi remarqué des situations qui nécessitent un entretien devancé. Ce classement correspond à la cote « Passable – Nécessite un entretien » de notre légende.");
   }
+  // Un constat par ligne : « Localisation – ce qui est observé ». Une note d'un
+  // seul tenant, comme en saisissaient les anciens relevés, est coupée par phrase.
   const constats = [];
-  const observation = sansNotesInternes(component?.observation ?? "");
-  if (observation) {
-    for (const seg of observation.split(/(?<=[.;])\s+/)) {
-      const s = seg.trim().replace(/[.;]$/, "");
-      if (s) constats.push(`· ${s};`);
-    }
+  const observation = String(component?.observation ?? "");
+  const lignesConstats = observation.includes("\n") ? observation.split(/\n+/) : observation.split(/(?<=[.;])\s+/);
+  for (const seg of lignesConstats) {
+    const s = sansNotesInternes(seg).replace(/^[·•\-–]\s*/, "").replace(/[.;]$/, "");
+    if (s) constats.push(`· ${s};`);
+  }
+  if (ETENDUES[component?.etendue]) {
+    const qte = sansNotesInternes(component?.etendue_qte ?? "");
+    constats.push(`· Étendue : ${ETENDUES[component.etendue].toLowerCase()}${qte ? `, ${qte}` : ""};`);
   }
   const cause = sansNotesInternes(component?.cause_possible ?? "");
   if (cause) constats.push(`· Cause possible : ${cause.replace(/[.;]$/, "")};`);
   if (consequences) constats.push(`· ${consequences.replace(/[.;]$/, "")};`);
   if (constats.length === 0) constats.push("· Aucun commentaire détaillé n'a été consigné au relevé pour cette situation;");
   const suites = [];
-  const delai = sansNotesInternes(component?.delai_suggere ?? "");
-  if (delai) suites.push(`Selon notre opinion, l'intervention est à planifier ${delai.replace(/^[Àà]\s+/, "à ").replace(/[.;]$/, "")}.`);
+  const risque = PHRASES_RISQUE[component?.nature_risque];
+  if (risque) suites.push(risque);
+  const delai = phraseDelai(component?.delai_suggere);
+  if (delai) suites.push(delai);
   if (rating >= 4) {
     suites.push("Une inspection complémentaire ou une expertise par un professionnel, incluant un devis correctif et idéalement un processus d'appels d'offres seront requis afin d'évaluer le délai et les coûts connexes aux travaux.");
   } else {
@@ -4219,7 +4507,12 @@ components.get("/:id", async (c) => {
   const component = await getOwnedComponent(c, c.req.param("id"));
   if (!component) return c.json({ error: "composante introuvable" }, 404);
   const photos2 = await c.env.DB.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY created_at ASC").bind(component.id).all();
-  return c.json({ ...component, photos: photos2.results });
+  const guide = guidePour(component);
+  return c.json({
+    ...component,
+    photos: photos2.results,
+    guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats }
+  });
 });
 components.patch("/:id", async (c) => {
   const id = c.req.param("id");
@@ -4252,7 +4545,14 @@ components.patch("/:id", async (c) => {
     "variante",
     "attributs",
     "parent_id",
-    "actif"
+    "actif",
+    "etendue",
+    "etendue_qte",
+    "limite_observation",
+    "limite_detail",
+    "nature_risque",
+    "source_annee",
+    "projet_ca"
   ]) {
     if (key in body2) {
       fields.push(`${key} = ?${fields.length + 1}`);
@@ -4285,6 +4585,7 @@ components.post("/:id/analyze", async (c) => {
     installYear: component.install_year,
     usefulLife: component.useful_life_years ?? DEFAULT_USEFUL_LIFE_YEARS[component.cat] ?? null,
     uniformatCode: component.uniformat_code,
+    guide: guidePour(component),
     images
   });
   return c.json(analysis);
@@ -44481,7 +44782,7 @@ app.use("/api/*", async (c, next) => {
 });
 app.use("/api/*", async (c, next) => {
   if (c.req.path.startsWith("/api/dossiers") || c.req.path.startsWith("/api/components")) {
-    await assurerColonneActif(c.env.DB);
+    await assurerColonnes(c.env.DB);
   }
   return next();
 });

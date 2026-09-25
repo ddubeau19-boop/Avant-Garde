@@ -62,7 +62,14 @@ const EMPLACEMENTS = [
   { v: 'stationnement',label: 'Stationnement' },
 ];
 
-const DELAIS = ['à court terme', 'dans les 5 ans', 'à planifier', 'aucun suivi particulier'];
+/* ---------- Gabarit de réponse : vocabulaire fermé, identique pour toutes les composantes ---------- */
+
+const DELAIS = ['Immédiat (moins de 1 an)', 'Court terme (1 à 2 ans)', 'Moyen terme (3 à 5 ans)', 'Long terme (plus de 5 ans)', 'Aucun suivi particulier'];
+const ETENDUES = [['ponctuel', 'Ponctuel'], ['localise', 'Localisé'], ['generalise', 'Généralisé']];
+const LIMITES_OBS = [['de_pres', 'De près'], ['distance', 'À distance'], ['partiel', 'Partiellement accessible'], ['inaccessible', 'Non accessible']];
+const RISQUES = [['securite', 'Sécurité des personnes'], ['infiltration', "Infiltration d'eau"], ['degradation', 'Dégradation accélérée'], ['conformite', 'Conformité réglementaire'], ['esthetique', 'Esthétique']];
+const SOURCES_ANNEE = [['plaque', 'Plaque signalétique'], ['carnet', "Carnet d'entretien"], ['administration', 'Administration'], ['estimee', 'Estimée']];
+const libelleDe = (liste, cle) => { const x = liste.find(([k]) => k === cle); return x ? x[1] : ''; };
 
 const ATTR_SUGGESTIONS = ['Année', 'Marque', 'Modèle', 'Capacité', 'Nombre', "D'origine"];
 
@@ -647,7 +654,11 @@ async function applyAi() {
   if (typeof r.rating === 'number' && r.rating >= 1 && r.rating <= 4) patch.rating = r.rating;
   if (typeof r.observation === 'string' && r.observation.trim()) patch.observation = r.observation.trim();
   if (typeof r.causePossible === 'string' && r.causePossible.trim()) patch.cause_possible = r.causePossible.trim();
-  if (typeof r.delaiSuggere === 'string' && r.delaiSuggere.trim()) patch.delai_suggere = r.delaiSuggere.trim();
+  if (typeof r.delaiSuggere === 'string' && DELAIS.includes(r.delaiSuggere)) patch.delai_suggere = r.delaiSuggere;
+  if (r.etendue && libelleDe(ETENDUES, r.etendue)) patch.etendue = r.etendue;
+  if (typeof r.etendueQte === 'string' && r.etendueQte.trim()) patch.etendue_qte = r.etendueQte.trim();
+  if (r.limiteObservation && libelleDe(LIMITES_OBS, r.limiteObservation)) patch.limite_observation = r.limiteObservation;
+  if (r.natureRisque && libelleDe(RISQUES, r.natureRisque)) patch.nature_risque = r.natureRisque;
   if (typeof r.consequences === 'string' && r.consequences.trim()) patch.consequences = r.consequences.trim();
   if (typeof r.costEstimate === 'number' && !isNaN(r.costEstimate)) patch.replacement_cost = Math.round(r.costEstimate);
   if (!Object.keys(patch).length) { state.aiResult = null; showToast('Rien à appliquer.'); return; }
@@ -1353,6 +1364,23 @@ function ratingListHtml(c) {
   return `<div class="rating-list">${opts}${na}</div>`;
 }
 
+function choixHtml(field, liste, valeur) {
+  return `<div class="quick-chips">${liste.map(([k, lib]) => `<button class="quick-chip ${valeur === k ? 'on' : ''}" data-action="set-facet" data-field="${esc(field)}" data-val="${esc(k)}">${esc(lib)}</button>`).join('')}</div>`;
+}
+
+// Ajoute un défaut de la grille de la firme comme nouvelle ligne de constat ;
+// l'inspecteur y précise la localisation.
+function ajouterConstat(terme) {
+  const c = state.activeComponent;
+  if (!c || !terme) return;
+  const actuel = String(c.observation || '').replace(/\s+$/, '');
+  const ligne = `${terme.charAt(0).toUpperCase()}${terme.slice(1)} – `;
+  saveCompField('observation', actuel ? `${actuel}\n${ligne}` : ligne, { force: true });
+  render();
+  const el = document.getElementById('observationInput');
+  if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+}
+
 function obsFieldHtml(id, role, field, label, value, placeholder) {
   return `<div class="obs-field">
     <label for="${id}">${esc(label)}</label>
@@ -1422,7 +1450,9 @@ function ficheHtml() {
 
   const noteCard = c.note ? `<div class="note-card"><div class="note-card-hdr"><i data-lucide="sparkles"></i><span>Note structurée</span></div><div class="note-card-body">${esc(c.note)}</div></div>` : '';
 
-  const delaiChips = DELAIS.map(d => `<button class="quick-chip ${c.delai_suggere === d ? 'on' : ''}" data-action="pick-delai" data-val="${esc(d)}">${esc(d)}</button>`).join('');
+  const delaiChips = DELAIS.map(d => `<button class="quick-chip ${c.delai_suggere === d ? 'on' : ''}" data-action="set-facet" data-field="delai_suggere" data-val="${esc(d)}">${esc(d)}</button>`).join('');
+  const guide = c.guide || {};
+  const defautsChips = (guide.defauts || []).map(d => `<button class="quick-chip" data-action="add-constat" data-val="${esc(d)}">${esc(d)}</button>`).join('');
 
   const rep = replacementYear(c);
   const repSub = rep
@@ -1464,17 +1494,42 @@ function ficheHtml() {
       </div>
       ${ratingListHtml(c)}
 
-      <div class="section-lbl" style="margin-top:26px">Observations</div>
-      ${obsFieldHtml('observationInput', 'comp-textarea', 'observation', 'Observation', c.observation, 'Ce qui est constaté sur place…')}
-      ${obsFieldHtml('causeInput', 'comp-textarea', 'cause_possible', 'Cause possible', c.cause_possible, 'Origine probable du constat…')}
+      <div class="section-lbl" style="margin-top:26px">Relevé</div>
+      ${guide.points ? `<div class="guide-hint"><b>À décrire</b> ${esc(guide.points)}</div>` : ''}
 
       <div class="obs-field">
-        <label for="delaiInput">Délai suggéré</label>
-        <input id="delaiInput" class="fld-input" data-role="comp-text" data-field="delai_suggere" value="${esc(c.delai_suggere || '')}" placeholder="ex. à court terme">
+        <label for="observationInput">Constats — un par ligne</label>
+        <textarea id="observationInput" data-role="comp-textarea" data-field="observation" placeholder="Localisation – ce qui est observé&#10;ex. Façade arrière – joints de mortier effrités" rows="4">${esc(c.observation || '')}</textarea>
+        ${defautsChips ? `<div class="guide-lbl">À surveiller — touchez pour ajouter</div><div class="quick-chips">${defautsChips}</div>` : ''}
+      </div>
+
+      <div class="obs-field">
+        <label>Étendue</label>
+        ${choixHtml('etendue', ETENDUES, c.etendue)}
+        <input class="fld-input" style="margin-top:8px" data-role="comp-text" data-field="etendue_qte" value="${esc(c.etendue_qte || '')}" placeholder="Quantité touchée — ex. ≈ 4 m², 3 fenêtres, 20 %">
+      </div>
+
+      <div class="obs-field">
+        <label>Limite d'observation</label>
+        ${choixHtml('limite_observation', LIMITES_OBS, c.limite_observation)}
+        ${c.limite_observation && c.limite_observation !== 'de_pres' ? `<input class="fld-input" style="margin-top:8px" data-role="comp-text" data-field="limite_detail" value="${esc(c.limite_detail || '')}" placeholder="Raison ou méthode — ex. du sol à l'aide de jumelles, local verrouillé">` : ''}
+      </div>
+
+      ${obsFieldHtml('causeInput', 'comp-textarea', 'cause_possible', 'Cause possible', c.cause_possible, 'Origine probable, modalisée — ex. semble provenir de…')}
+
+      <div class="obs-field">
+        <label>Nature du risque</label>
+        ${choixHtml('nature_risque', RISQUES, c.nature_risque)}
+      </div>
+
+      <div class="obs-field">
+        <label>Délai suggéré</label>
         <div class="quick-chips">${delaiChips}</div>
+        ${c.delai_suggere && !DELAIS.includes(c.delai_suggere) ? `<div class="guide-lbl">Valeur antérieure : ${esc(c.delai_suggere)}</div>` : ''}
       </div>
 
       ${obsFieldHtml('consequencesInput', 'comp-textarea', 'consequences', 'Conséquences additionnelles', c.consequences, 'Si rien n’est fait…')}
+      ${obsFieldHtml('projetCaInput', 'comp-textarea', 'projet_ca', 'Travaux planifiés par le conseil', c.projet_ca, 'ex. le remplacement des fenêtres pour 2027')}
 
       <div class="sec-head" style="margin-top:26px">
         <span class="section-lbl" style="margin:0">Précisions</span>
@@ -1500,6 +1555,11 @@ function ficheHtml() {
           <label for="costInput">Coût de remplacement ($)</label>
           <input id="costInput" data-role="comp-number" data-field="replacement_cost" value="${esc(c.replacement_cost != null ? c.replacement_cost : '')}" inputmode="numeric" placeholder="—">
         </div>
+      </div>
+
+      <div class="obs-field" style="margin-top:14px">
+        <label>Source de l'année</label>
+        ${choixHtml('source_annee', SOURCES_ANNEE, c.source_annee)}
       </div>
 
       <div class="derived-card ${rep && rep.delta < 0 ? 'late' : ''}">
@@ -1536,8 +1596,11 @@ function aiResultHtml(r, c) {
         <div><div class="k">Composante</div><div class="v">${esc(c.name)}</div></div>
         <div><div class="k">Cote proposée</div><div class="v" style="color:${rInfo ? rInfo.color : 'var(--ink-500)'}">${esc(label)}</div></div>
       </div>
-      ${line('Observation', r.observation)}
+      ${line('Constats', r.observation)}
+      ${line('Étendue', [libelleDe(ETENDUES, r.etendue), r.etendueQte].filter(Boolean).join(' · '))}
+      ${line("Limite d'observation", libelleDe(LIMITES_OBS, r.limiteObservation))}
       ${line('Cause possible', r.causePossible)}
+      ${line('Nature du risque', libelleDe(RISQUES, r.natureRisque))}
       ${line('Délai suggéré', r.delaiSuggere)}
       ${line('Conséquences', r.consequences)}
       ${line('Coût de remplacement', cost)}
@@ -1642,7 +1705,7 @@ function onRootClick(e) {
     case 'toggle-rflag': onRflagClick(); break;
     case 'set-facet': onFacetClick(t.dataset.field, t.dataset.val); break;
     case 'toggle-facets': state.facetsOpen = !state.facetsOpen; render(); break;
-    case 'pick-delai': if (saveCompField('delai_suggere', t.dataset.val, { force: true })) render(); break;
+    case 'add-constat': ajouterConstat(t.dataset.val); break;
     case 'attr-add': onAttrAdd(); break;
     case 'attr-del': onAttrDelete(t.dataset.key); break;
     case 'attr-suggest': {
