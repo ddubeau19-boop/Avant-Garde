@@ -534,9 +534,25 @@ button { font-family: inherit; }
   font-size: 11.5px; font-weight: 600; padding: 5px 11px; border-radius: 999px; cursor: pointer; display: flex; align-items: center; gap: 5px;
 }
 .rvia-section.inactive .rvia-section-text { color: var(--ink-500); border-left-color: var(--ink-100); background: var(--ink-050); }
-.rvia-section.collapsed .rvia-section-text { display: none; }
+.rvia-section.collapsed .rvia-section-text, .rvia-section.collapsed .rvia-diff, .rvia-section.collapsed .rvia-diff-toggle { display: none; }
 .rvia-inactive-tag { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-400); background: var(--ink-100); border-radius: 5px; padding: 2px 6px; }
 .rvia-section-toggle { margin-left: auto; border: none; background: none; color: var(--ink-500); font-family: var(--font-body); font-size: 11.5px; font-weight: 600; cursor: pointer; padding: 0; text-decoration: underline; }
+
+/* diff mot-à-mot : texte généré par l'IA vs texte courant */
+.rvia-diff-toggle {
+  margin-left: auto; border: 1.5px solid var(--ink-200); background: #fff; color: var(--ink-500); font-family: var(--font-body);
+  font-size: 10.5px; font-weight: 600; padding: 3px 9px 3px 8px; border-radius: 999px; cursor: pointer; display: flex; align-items: center; gap: 4px;
+}
+.rvia-section.inactive .rvia-diff-toggle { margin-left: 8px; }
+.rvia-diff-toggle.on { border-color: var(--orange); background: var(--orange-wash); color: var(--accent-press); }
+.rvia-diff {
+  margin: 8px 0 0; padding: 10px 11px; border-radius: 8px; background: var(--ink-050); border: 1px solid var(--line-soft);
+  font-size: 13px; line-height: 1.6; color: var(--ink-700);
+}
+.rvia-diff-stats { font-family: var(--font-mono); font-size: 10px; letter-spacing: .04em; color: var(--ink-400); text-transform: uppercase; margin-bottom: 6px; }
+.rvia-diff-empty { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-400); }
+.rvia-diff-text ins { text-decoration: none; background: var(--green-wash); color: var(--green); border-radius: 3px; padding: 0 1px; }
+.rvia-diff-text del { text-decoration: line-through; background: var(--orange-wash); color: var(--accent-press); border-radius: 3px; padding: 0 1px; opacity: .8; }
 .rvia-table-wrap { margin-top: 10px; overflow-x: auto; border: 1px solid var(--ink-200); border-radius: 10px; }
 .rvia-table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
 .rvia-table th, .rvia-table td { padding: 8px 11px; text-align: left; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
