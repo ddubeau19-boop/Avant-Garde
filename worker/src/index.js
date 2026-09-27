@@ -47745,7 +47745,7 @@ async function archiveDossier(env, dossier) {
 }
 // Sauvegarde complète : chaque table, chaque ligne, en JSON compressé.
 const SAUVEGARDES_GARDEES = 26;
-const CRON_SAUVEGARDE = "0 7 * * 0";
+const CRON_SAUVEGARDE = "0 7 * * SUN";
 async function sauvegarderBase(env) {
   const tables = (await env.DB.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'd1_%' ORDER BY name"

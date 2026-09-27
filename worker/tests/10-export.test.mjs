@@ -87,7 +87,7 @@ test('sauvegarde complète : réservée au super admin, et restaurable dans une 
   // La tâche du dimanche fait la même sauvegarde.
   const avant = (await api('/api/sauvegardes', { session: superAdmin })).json.length;
   await new Promise((ok) => setTimeout(ok, 1100)); // noms à la seconde près
-  assert.equal((await api('/__scheduled?cron=0+7+*+*+0', { brut: true })).status, 200);
+  assert.equal((await api('/__scheduled?cron=0+7+*+*+SUN', { brut: true })).status, 200);
   let apres = avant;
   for (let i = 0; i < 20 && apres === avant; i++) {
     await new Promise((ok) => setTimeout(ok, 250));
