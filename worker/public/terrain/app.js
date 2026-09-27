@@ -49,31 +49,14 @@ function ratingInfo(v) {
   return RATINGS.find(r => r.v === v) || null;
 }
 
-/* ---------- Facettes ---------- */
-
-const POSITIONS = [
-  { v: 'AV',  label: 'Avant' },
-  { v: 'GA',  label: 'Gauche' },
-  { v: 'ARR', label: 'Arrière' },
-  { v: 'DR',  label: 'Droite' },
-];
-
+/* ---------- Facettes ----------
+   Conservé pour l'affichage en lecture seule (liste, étude précédente) —
+   la saisie terrain ne les propose plus (voir ficheHtml). */
 const EMPLACEMENTS = [
   { v: 'corridors',    label: 'Corridors' },
   { v: 'escaliers',    label: 'Escaliers' },
   { v: 'stationnement',label: 'Stationnement' },
 ];
-
-/* ---------- Gabarit de réponse : vocabulaire fermé, identique pour toutes les composantes ---------- */
-
-const DELAIS = ['Immédiat (moins de 1 an)', 'Court terme (1 à 2 ans)', 'Moyen terme (3 à 5 ans)', 'Long terme (plus de 5 ans)', 'Aucun suivi particulier'];
-const ETENDUES = [['ponctuel', 'Ponctuel'], ['localise', 'Localisé'], ['generalise', 'Généralisé']];
-const LIMITES_OBS = [['de_pres', 'De près'], ['distance', 'À distance'], ['partiel', 'Partiellement accessible'], ['inaccessible', 'Non accessible']];
-const RISQUES = [['securite', 'Sécurité des personnes'], ['infiltration', "Infiltration d'eau"], ['degradation', 'Dégradation accélérée'], ['conformite', 'Conformité réglementaire'], ['esthetique', 'Esthétique']];
-const SOURCES_ANNEE = [['plaque', 'Plaque signalétique'], ['carnet', "Carnet d'entretien"], ['administration', 'Administration'], ['estimee', 'Estimée']];
-const libelleDe = (liste, cle) => { const x = liste.find(([k]) => k === cle); return x ? x[1] : ''; };
-
-const ATTR_SUGGESTIONS = ['Année', 'Marque', 'Modèle', 'Capacité', 'Nombre', "D'origine"];
 
 /* ---------- Fiche d'immeuble ---------- */
 
@@ -167,13 +150,7 @@ const state = {
   ficheLoading: false,
   photoBlobUrls: {},
   uploadingPhoto: false,
-  facetsOpen: false,
   naChosen: {},          // id -> true : « na » choisi dans la session courante
-  attrKeyDraft: '',
-  attrValDraft: '',
-
-  analyzing: false,
-  aiResult: null,
 
   recording: false,
   speechSupported: !!(window.SpeechRecognition || window.webkitSpeechRecognition),
@@ -185,6 +162,9 @@ const state = {
   projectionLoading: false,
   downloadingDocx: false,
   downloadingXlsx: false,
+
+  analyzingVisit: false, // analyse groupée par l'IA, lancée une fois la visite terminée
+  analyzeProgress: { done: 0, total: 0 },
 
   // Hors connexion
   envois: [],            // modifications en attente d'envoi (copie de la file IndexedDB)
@@ -831,10 +811,9 @@ async function loadProjection(id) {
    ============================================================ */
 
 async function openFiche(id) {
-  state.activeId = id; state.screen = 'fiche'; state.aiResult = null;
-  state.analyzing = false; state.recording = false; state.noteDraft = ''; state.tacheForm = null;
+  state.activeId = id; state.screen = 'fiche';
+  state.recording = false; state.noteDraft = ''; state.tacheForm = null;
   state.ficheLoading = true; state.activeComponent = null; state.error = null;
-  state.attrKeyDraft = ''; state.attrValDraft = ''; state.facetsOpen = false;
   render();
   try {
     const enAttente = creationEnAttente(id);
@@ -842,10 +821,9 @@ async function openFiche(id) {
       ? ((await HL.lire(`component:${id}`)) || enAttente.local)
       : await lireApi(`component:${id}`, `/api/components/${id}`));
     state.activeComponent = comp;
-    state.facetsOpen = !!(comp.position || comp.emplacement || comp.variante);
     state.ficheLoading = false;
     render();
-    loadPhotoBlobs((comp.photos || []).concat(comp.precedent ? comp.precedent.photos || [] : []));
+    loadPhotoBlobs(comp.photos || []);
   } catch (e) {
     state.ficheLoading = false;
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
@@ -1104,75 +1082,6 @@ function onRatingClick(raw) {
   render();
 }
 
-function onRflagClick() {
-  const c = state.activeComponent;
-  if (!c) return;
-  if (saveCompField('r_flag', c.r_flag ? 0 : 1, { force: true })) render();
-}
-
-function onFacetClick(field, value) {
-  const c = state.activeComponent;
-  if (!c) return;
-  const next = (c[field] === value) ? null : value;
-  if (saveCompField(field, next, { force: true })) render();
-}
-
-function onYearBlur(e) {
-  if (!state.activeComponent) return;
-  const v = e.target.value.trim();
-  let payload;
-  if (v === '') payload = null;
-  else if (/^\d{4}$/.test(v)) payload = parseInt(v, 10);
-  else payload = v;
-  if (saveCompField('install_year', payload)) render();
-}
-
-function onNumberBlur(field, e) {
-  if (!state.activeComponent) return;
-  const v = toInt(e.target.value);
-  if (saveCompField(field, v)) render();
-}
-
-/* ---------- attributs ---------- */
-
-function componentAttrs(c) {
-  return parseJsonObject(c && c.attributs);
-}
-
-function saveAttrs(obj) {
-  const keys = Object.keys(obj);
-  const payload = keys.length ? JSON.stringify(obj) : null;
-  return saveCompField('attributs', payload, { force: true });
-}
-
-function onAttrAdd() {
-  const c = state.activeComponent;
-  if (!c) return;
-  const k = (state.attrKeyDraft || '').trim();
-  const v = (state.attrValDraft || '').trim();
-  if (!k) { showToast('Nommez le champ à ajouter.'); return; }
-  const attrs = componentAttrs(c);
-  attrs[k] = v;
-  if (saveAttrs(attrs)) { state.attrKeyDraft = ''; state.attrValDraft = ''; render(); }
-}
-
-function onAttrDelete(key) {
-  const c = state.activeComponent;
-  if (!c) return;
-  const attrs = componentAttrs(c);
-  delete attrs[key];
-  if (saveAttrs(attrs)) render();
-}
-
-function onAttrValueBlur(key, e) {
-  const c = state.activeComponent;
-  if (!c) return;
-  const attrs = componentAttrs(c);
-  const v = e.target.value;
-  if ((attrs[key] == null ? '' : String(attrs[key])) === v) return;
-  attrs[key] = v;
-  saveAttrs(attrs);
-}
 
 /* ---------- photos ---------- */
 
@@ -1242,50 +1151,62 @@ async function onPhotoFileChange(e) {
   if (!envoyee) synchroniser();
 }
 
-/* ---------- AI analyze ---------- */
+/* ---------- Analyse IA groupée (déclenchée une fois la visite terminée) ---------- */
 
-async function analyze() {
-  if (state.analyzing || !state.activeId) return;
+// La visite terrain ne capture que photos, cote, quantité et note. L'IA
+// remplit ensuite constats, étendue, cause, limite d'observation, nature du
+// risque, délai, conséquences et coût de remplacement à partir des photos —
+// une seule passe, pour toutes les composantes documentées, plutôt qu'une
+// analyse par fiche sur le terrain. Le serveur valide déjà chaque valeur
+// contre son propre vocabulaire fermé (etendue, limiteObservation, etc.),
+// donc le client applique la réponse telle quelle plutôt que de la
+// revalider avec les listes qui servaient à afficher les choix.
+function pendingAnalysisComponents() {
+  // delai_suggere est renseigné par toute analyse (IA ou repli heuristique),
+  // contrairement à observation qui peut rester vide sans photo — c'est
+  // donc le marqueur fiable d'une composante déjà passée par l'IA.
+  return state.components.filter(c => c.done && !c.delai_suggere);
+}
+
+async function analyzeVisit() {
+  if (state.analyzingVisit) return;
   if (!state.online) { showToast('Analyse indisponible hors connexion.'); return; }
-  state.analyzing = true; state.error = null; render();
-  try {
-    const result = await apiJson(`/api/components/${state.activeId}/analyze`, { method: 'POST' });
-    state.aiResult = result;
-  } catch (e) {
-    if (e.message !== 'SESSION_EXPIRED') state.error = friendlyError(e);
-  } finally {
-    state.analyzing = false; render();
-  }
-}
-
-function parseCostEstimate(v) {
-  if (v == null) return null;
-  if (typeof v === 'number') return isNaN(v) ? null : Math.round(v);
-  const cleaned = String(v).replace(/[^\d.,]/g, '');
-  if (!cleaned) return null;
-  const n = parseFloat(cleaned.replace(/\s/g, '').replace(/,(\d{3})/g, '$1').replace(',', '.'));
-  return isNaN(n) ? null : Math.round(n);
-}
-
-async function applyAi() {
-  if (!state.aiResult || !state.activeId) return;
-  const r = state.aiResult;
-  const patch = {};
-  if (typeof r.rating === 'number' && r.rating >= 1 && r.rating <= 4) patch.rating = r.rating;
-  if (typeof r.observation === 'string' && r.observation.trim()) patch.observation = r.observation.trim();
-  if (typeof r.causePossible === 'string' && r.causePossible.trim()) patch.cause_possible = r.causePossible.trim();
-  if (typeof r.delaiSuggere === 'string' && DELAIS.includes(r.delaiSuggere)) patch.delai_suggere = r.delaiSuggere;
-  if (r.etendue && libelleDe(ETENDUES, r.etendue)) patch.etendue = r.etendue;
-  if (typeof r.etendueQte === 'string' && r.etendueQte.trim()) patch.etendue_qte = r.etendueQte.trim();
-  if (r.limiteObservation && libelleDe(LIMITES_OBS, r.limiteObservation)) patch.limite_observation = r.limiteObservation;
-  if (r.natureRisque && libelleDe(RISQUES, r.natureRisque)) patch.nature_risque = r.natureRisque;
-  if (typeof r.consequences === 'string' && r.consequences.trim()) patch.consequences = r.consequences.trim();
-  if (typeof r.costEstimate === 'number' && !isNaN(r.costEstimate)) patch.replacement_cost = Math.round(r.costEstimate);
-  if (!Object.keys(patch).length) { state.aiResult = null; showToast('Rien à appliquer.'); return; }
-  applyComponentPatch(state.activeId, patch);
-  state.aiResult = null;
+  const todo = pendingAnalysisComponents();
+  if (!todo.length) return;
+  state.analyzingVisit = true; state.error = null;
+  state.analyzeProgress = { done: 0, total: todo.length };
   render();
-  try { await patchComponent(state.activeId, patch); } catch (e) { /* error already surfaced */ }
+  for (const comp of todo) {
+    try {
+      const result = await apiJson(`/api/components/${comp.id}/analyze`, { method: 'POST' });
+      const patch = {};
+      if (typeof result.observation === 'string' && result.observation.trim()) patch.observation = result.observation.trim();
+      if (typeof result.causePossible === 'string' && result.causePossible.trim()) patch.cause_possible = result.causePossible.trim();
+      if (typeof result.delaiSuggere === 'string' && result.delaiSuggere.trim()) patch.delai_suggere = result.delaiSuggere.trim();
+      if (result.etendue) patch.etendue = result.etendue;
+      if (typeof result.etendueQte === 'string' && result.etendueQte.trim()) patch.etendue_qte = result.etendueQte.trim();
+      if (result.limiteObservation) patch.limite_observation = result.limiteObservation;
+      if (result.natureRisque) patch.nature_risque = result.natureRisque;
+      if (typeof result.consequences === 'string' && result.consequences.trim()) patch.consequences = result.consequences.trim();
+      if (typeof result.costEstimate === 'number' && !isNaN(result.costEstimate)) patch.replacement_cost = Math.round(result.costEstimate);
+      if (comp.note && comp.note.trim()) {
+        try {
+          const noteData = await apiJson(`/api/components/${comp.id}/structure-note`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transcript: comp.note }),
+          });
+          if (noteData && typeof noteData.note === 'string') patch.note = noteData.note;
+        } catch (e) { /* la note reste telle quelle si la reformulation échoue */ }
+      }
+      if (Object.keys(patch).length) await patchComponent(comp.id, patch);
+    } catch (e) { /* on continue avec les composantes suivantes */ }
+    state.analyzeProgress = { done: state.analyzeProgress.done + 1, total: todo.length };
+    render();
+  }
+  state.analyzingVisit = false;
+  render();
+  showToast('Analyse de la visite terminée.');
 }
 
 /* ---------- voice note ---------- */
@@ -1322,32 +1243,19 @@ function toggleVoice() {
   try { recognition.start(); } catch (e) { state.recording = false; render(); }
 }
 
-async function submitTranscript(transcript) {
-  try {
-    const data = await apiJson(`/api/components/${state.activeId}/structure-note`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcript }),
-    });
-    applyComponentPatch(state.activeId, { note: data.note });
-  } catch (e) {
-    if (e.message !== 'SESSION_EXPIRED') state.error = friendlyError(e);
-  }
-  render();
+// La note est enregistrée telle quelle (ajoutée à la suite d'une note
+// existante), sans reformulation IA — celle-ci a lieu en une seule passe
+// pour toute la visite (voir analyzeVisit). Fonctionne donc identiquement
+// en ligne ou hors connexion : c'est patchComponent qui gère la file d'attente.
+function submitTranscript(transcript) {
+  const c = state.activeComponent;
+  const val = (c && c.note ? c.note + '\n' : '') + transcript;
+  if (saveCompField('note', val, { force: true })) render();
 }
 
 function onNoteFallbackSend() {
   const val = (state.noteDraft || '').trim();
   if (!val) return;
-  // Sans réseau, l'IA ne peut pas mettre la note en forme : elle est
-  // ajoutée telle quelle, et gardée sur l'appareil.
-  if (!state.online) {
-    const c = state.activeComponent;
-    state.noteDraft = '';
-    saveCompField('note', c && c.note ? `${c.note}\n${val}` : val, { force: true });
-    showToast("Note ajoutée telle quelle (la mise en forme par l'IA demande du réseau)");
-    return;
-  }
   state.noteDraft = '';
   render();
   submitTranscript(val);
@@ -1476,14 +1384,6 @@ function onDossierNumberBlur(field, e) {
 /* ============================================================
    Derived view data
    ============================================================ */
-
-function replacementYear(c) {
-  const yr = toInt(c && c.install_year);
-  const vu = toInt(c && c.useful_life_years);
-  if (!yr || !vu) return null;
-  const year = yr + vu;
-  return { year, delta: year - new Date().getFullYear() };
-}
 
 function computeStats() {
   const comps = state.components;
@@ -1782,6 +1682,7 @@ function dossiersHtml() {
     </div>`;
   }).join('');
   return `<div class="picker-screen">
+    ${state.dossier ? `<button class="hdr-back" data-action="go-accueil"><i data-lucide="chevron-left"></i>${esc(state.dossier.name)}</button>` : ''}
     <div class="top-row" style="margin-bottom:20px">
       <div class="brand"><img src="${state.companyLogoUrl || '../assets/logo-mark.png'}" alt=""><span>${esc((state.user && state.user.company && state.user.company.name) || 'Condo Stratégis')}</span></div>
       <div style="display:flex;gap:14px;align-items:center">
@@ -1813,7 +1714,10 @@ function accueilHtml() {
   <div class="scr-accueil">
     <div class="top-row">
       <div class="brand"><img src="${state.companyLogoUrl || '../assets/logo-mark.png'}" alt=""><span>${esc((state.user && state.user.company && state.user.company.name) || 'Condo Stratégis')}</span></div>
-      <div class="net-badge ${state.online ? 'online' : 'offline'}"><i data-lucide="${state.online ? 'wifi' : 'wifi-off'}"></i>${state.online ? 'En ligne' : 'Hors connexion'}</div>
+      <div class="top-actions">
+        ${state.dossiers.length > 1 ? `<button class="switch-btn" data-action="go-dossiers" title="Changer de dossier"><i data-lucide="building-2"></i></button>` : ''}
+        <div class="net-badge ${state.online ? 'online' : 'offline'}"><i data-lucide="${state.online ? 'wifi' : 'wifi-off'}"></i>${state.online ? 'En ligne' : 'Hors connexion'}</div>
+      </div>
     </div>
     <div class="eyebrow">Étude de fonds de prévoyance</div>
     <h1 class="page-title">Visite<br>terrain</h1>
@@ -2073,22 +1977,6 @@ function ratingListHtml(c) {
   return `<div class="rating-list">${opts}${na}</div>`;
 }
 
-function choixHtml(field, liste, valeur) {
-  return `<div class="quick-chips">${liste.map(([k, lib]) => `<button class="quick-chip ${valeur === k ? 'on' : ''}" data-action="set-facet" data-field="${esc(field)}" data-val="${esc(k)}">${esc(lib)}</button>`).join('')}</div>`;
-}
-
-// Ajoute un défaut de la grille de la firme comme nouvelle ligne de constat ;
-// l'inspecteur y précise la localisation.
-function ajouterConstat(terme) {
-  const c = state.activeComponent;
-  if (!c || !terme) return;
-  const actuel = String(c.observation || '').replace(/\s+$/, '');
-  const ligne = `${terme.charAt(0).toUpperCase()}${terme.slice(1)} – `;
-  saveCompField('observation', actuel ? `${actuel}\n${ligne}` : ligne, { force: true });
-  render();
-  const el = document.getElementById('observationInput');
-  if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
-}
 
 /* ---------- Carnet d'entretien de la composante ---------- */
 
@@ -2169,129 +2057,6 @@ function carnetHtml(c) {
     ${formulaire}`;
 }
 
-function obsFieldHtml(id, role, field, label, value, placeholder) {
-  return `<div class="obs-field">
-    <label for="${id}">${esc(label)}</label>
-    <textarea id="${id}" data-role="${role}" data-field="${esc(field)}" placeholder="${esc(placeholder)}" rows="3">${esc(value || '')}</textarea>
-  </div>`;
-}
-
-function facetsHtml(c) {
-  const posHtml = POSITIONS.map(p => `<button class="seg-btn ${c.position === p.v ? 'on' : ''}" data-action="set-facet" data-field="position" data-val="${p.v}"><b>${p.v}</b><span>${esc(p.label)}</span></button>`).join('');
-  const empHtml = EMPLACEMENTS.map(p => `<button class="seg-btn ${c.emplacement === p.v ? 'on' : ''}" data-action="set-facet" data-field="emplacement" data-val="${p.v}">${esc(p.label)}</button>`).join('');
-  return `
-  <div class="facet-block">
-    <div class="facet-lbl">Position de façade</div>
-    <div class="seg seg-4">${posHtml}</div>
-  </div>
-  <div class="facet-block">
-    <div class="facet-lbl">Emplacement</div>
-    <div class="seg">${empHtml}</div>
-  </div>
-  <div class="facet-block">
-    <div class="facet-lbl">Variante de matériau ou de type</div>
-    <input id="varianteInput" class="fld-input" data-role="comp-text" data-field="variante" value="${esc(c.variante || '')}" placeholder="ex. Modules de béton, Bois traité">
-  </div>`;
-}
-
-function attributsHtml(c) {
-  const attrs = componentAttrs(c);
-  const keys = Object.keys(attrs);
-  const rows = keys.map((k, i) => `
-    <div class="attr-row">
-      <span class="k">${esc(k)}</span>
-      <input id="attrVal_${i}" class="v" data-role="attr-value" data-key="${esc(k)}" value="${esc(attrs[k])}" placeholder="—">
-      <button class="del" data-action="attr-del" data-key="${esc(k)}" aria-label="Retirer ${esc(k)}"><i data-lucide="x"></i></button>
-    </div>`).join('');
-  const sugg = ATTR_SUGGESTIONS.map(s => `<button class="quick-chip" data-action="attr-suggest" data-key="${esc(s)}">${esc(s)}</button>`).join('');
-  return `
-    ${keys.length ? `<div class="attr-list">${rows}</div>` : '<div class="attr-empty">Aucun attribut consigné.</div>'}
-    <div class="quick-chips">${sugg}</div>
-    <div class="attr-add">
-      <input id="attrKeyInput" data-role="attr-key-draft" value="${esc(state.attrKeyDraft)}" placeholder="Champ (ex. Marque)">
-      <input id="attrValInput" data-role="attr-val-draft" value="${esc(state.attrValDraft)}" placeholder="Valeur">
-      <button data-action="attr-add" aria-label="Ajouter l'attribut"><i data-lucide="plus"></i></button>
-    </div>`;
-}
-
-// Révision aux cinq ans : ce que l'étude précédente disait de la composante,
-// et le suivi des travaux qu'elle prévoyait dans la période.
-function precedentHtml(c) {
-  const p = c.precedent;
-  if (!p) return '';
-  if (!p.actif) {
-    return `<div class="precedent-card"><div class="pc-hdr"><i data-lucide="history"></i>Étude précédente · ${esc(p.annee)}</div><div class="pc-texte">Composante absente de l'immeuble à l'étude précédente.</div></div>`;
-  }
-  const r = ratingInfo(p.rating);
-  const vignettes = (p.photos || []).map(ph => {
-    const url = state.photoBlobUrls[ph.id];
-    if (!url && state.photoIndispo[ph.id]) return `<div class="pc-photo indispo"><i data-lucide="image-off"></i></div>`;
-    return `<div class="pc-photo">${url ? `<img src="${url}" alt="">` : `<i data-lucide="loader-2"></i>`}</div>`;
-  }).join('');
-  let travaux = '';
-  if (p.travaux_a_verifier) {
-    const motif = p.remplacement_prevu
-      ? `L'étude ${esc(p.annee)} prévoyait le remplacement en ${esc(p.remplacement_prevu)}.`
-      : `L'étude ${esc(p.annee)} cotait cette composante « remplacement requis ».`;
-    const choix = [['fait', 'Réalisé'], ['reporte', 'Reporté'], ['abandonne', 'Abandonné']]
-      .map(([v, l]) => `<button class="quick-chip ${c.travaux_periode === v ? 'on' : ''}" data-action="set-travaux" data-val="${v}">${l}</button>`).join('');
-    travaux = `
-      <div class="pc-travaux">
-        <div class="pc-texte"><b>${motif}</b> Ces travaux ont-ils été faits ?</div>
-        <div class="quick-chips">${choix}</div>
-        ${c.travaux_periode === 'fait' ? `
-        <label class="pc-annee">Année des travaux
-          <input id="travauxAnnee" data-role="travaux-annee" inputmode="numeric" maxlength="4" value="${esc(c.travaux_annee || '')}" placeholder="AAAA">
-        </label>
-        <div class="pc-aide">L'année de construction ou de réparation de la fiche prend cette valeur.</div>` : ''}
-      </div>`;
-  }
-  return `
-  <div class="precedent-card">
-    <div class="pc-hdr"><i data-lucide="history"></i>Étude précédente · ${esc(p.annee)}</div>
-    <div class="pc-cote">${r ? `<span class="status-pill" style="background:${r.bg};color:${r.color}">${esc(r.label)}</span>` : '<span class="pc-texte">Non cotée</span>'}${p.r_flag ? '<span class="r-pill">R</span>' : ''}${p.delai_suggere ? `<span class="pc-texte">${esc(p.delai_suggere)}</span>` : ''}</div>
-    ${p.observation ? `<div class="pc-obs">${esc(p.observation)}</div>` : ''}
-    ${vignettes ? `<div class="pc-photos">${vignettes}</div>` : ''}
-    ${travaux}
-  </div>`;
-}
-
-// Réalisé : l'année des travaux devient l'année de construction ou de
-// réparation. Autre choix : on revient à celle de l'étude précédente.
-function onTravauxClick(val) {
-  const c = state.activeComponent;
-  if (!c || !c.precedent) return;
-  const suivant = c.travaux_periode === val ? null : val;
-  const patch = { travaux_periode: suivant };
-  if (suivant === 'fait') {
-    const annee = c.travaux_annee || (c.precedent.remplacement_prevu && c.precedent.remplacement_prevu <= new Date().getFullYear() ? c.precedent.remplacement_prevu : new Date().getFullYear());
-    patch.travaux_annee = annee;
-    patch.install_year = annee;
-  } else if (c.travaux_periode === 'fait') {
-    patch.travaux_annee = null;
-    patch.install_year = c.precedent.install_year;
-  }
-  applyComponentPatch(c.id, patch);
-  render();
-  setSaveStatus('ficheStatus', 'Enregistrement…');
-  patchComponent(c.id, patch)
-    .then((r) => setSaveStatus('ficheStatus', r && r.enAttente ? "Gardé sur l'appareil" : 'Enregistré'))
-    .catch(() => setSaveStatus('ficheStatus', ''));
-}
-function onTravauxAnneeBlur(e) {
-  const c = state.activeComponent;
-  if (!c) return;
-  const v = e.target.value.trim();
-  if (!/^\d{4}$/.test(v)) { if (v) showToast('Indiquez une année sur 4 chiffres.'); return; }
-  const annee = parseInt(v, 10);
-  if (annee === c.travaux_annee) return;
-  const patch = { travaux_annee: annee, install_year: annee };
-  applyComponentPatch(c.id, patch);
-  patchComponent(c.id, patch)
-    .then((r) => setSaveStatus('ficheStatus', r && r.enAttente ? "Gardé sur l'appareil" : 'Enregistré'))
-    .catch(() => setSaveStatus('ficheStatus', ''));
-  render();
-}
 
 function ficheHtml() {
   if (state.ficheLoading || !state.activeComponent) return `<div class="scr-fiche">${loadingHtml()}</div>`;
@@ -2305,27 +2070,16 @@ function ficheHtml() {
     return `<div class="photo-thumb ${url ? '' : 'loading'} ${p.local ? 'en-attente' : ''}">${url ? `<img src="${url}" alt="">` : `<i data-lucide="loader-2"></i>`}${url ? `<div class="tag">${esc(p.local ? "En attente d'envoi" : (p.tag || ''))}</div>` : ''}</div>`;
   }).join('');
 
-  const aiCardHtml = state.aiResult ? aiResultHtml(state.aiResult, c) : '';
-
   const micSection = state.speechSupported ? `
     <button class="mic-btn ${state.recording ? 'rec' : ''}" data-action="toggle-voice" ${!state.online ? 'disabled' : ''}>
       <i data-lucide="mic" class="${state.recording ? 'pulse' : ''}"></i>${state.recording ? 'Écoute… touchez pour arrêter' : 'Dicter une note'}
     </button>` : `
     <div class="note-fallback">
       <textarea id="noteFallbackText" data-role="note-fallback-text" placeholder="Reconnaissance vocale indisponible sur cet appareil. Écrivez votre note ici…">${esc(state.noteDraft)}</textarea>
-      <button class="send" data-action="note-fallback-send">Envoyer la note</button>
+      <button class="send" data-action="note-fallback-send">Enregistrer la note</button>
     </div>`;
 
-  const noteCard = c.note ? `<div class="note-card"><div class="note-card-hdr"><i data-lucide="sparkles"></i><span>Note structurée</span></div><div class="note-card-body">${esc(c.note)}</div></div>` : '';
-
-  const delaiChips = DELAIS.map(d => `<button class="quick-chip ${c.delai_suggere === d ? 'on' : ''}" data-action="set-facet" data-field="delai_suggere" data-val="${esc(d)}">${esc(d)}</button>`).join('');
-  const guide = c.guide || {};
-  const defautsChips = (guide.defauts || []).map(d => `<button class="quick-chip" data-action="add-constat" data-val="${esc(d)}">${esc(d)}</button>`).join('');
-
-  const rep = replacementYear(c);
-  const repSub = rep
-    ? (rep.delta > 1 ? `dans ${rep.delta} ans` : rep.delta === 1 ? "l'an prochain" : rep.delta === 0 ? 'cette année' : `échu depuis ${Math.abs(rep.delta)} an${Math.abs(rep.delta) > 1 ? 's' : ''}`)
-    : 'Renseignez l’année et la durée de vie utile';
+  const noteCard = c.note ? `<div class="note-card"><div class="note-card-hdr"><i data-lucide="mic"></i><span>Note</span></div><div class="note-card-body">${esc(c.note)}</div></div>` : '';
 
   return `
   <div class="scr-fiche">
@@ -2341,7 +2095,6 @@ function ficheHtml() {
       <h2 class="fiche-title">${esc(c.name)}</h2>
     </div>
     <div class="fiche-body">
-      ${precedentHtml(c)}
       <div class="section-lbl">Photos (${photos.length})</div>
       <div class="photo-strip scr">
         <button class="photo-add ${state.uploadingPhoto ? 'uploading' : ''}" data-action="add-photo">
@@ -2351,99 +2104,13 @@ function ficheHtml() {
       </div>
       <input type="file" accept="image/*" capture="environment" id="photoFileInput" data-role="photo-file-input" style="display:none">
 
-      <button class="btn-analyze" data-action="analyze" ${state.analyzing || !state.online ? 'disabled' : ''}>
-        <i data-lucide="${state.analyzing ? 'loader-2' : 'sparkles'}" class="${state.analyzing ? 'spin' : ''}"></i>${state.analyzing ? 'Analyse en cours…' : "Analyser les photos avec l'IA"}
-      </button>
-
-      ${aiCardHtml}
-
-      <div class="sec-head" style="margin-top:24px">
-        <span class="section-lbl" style="margin:0">Cote de l'élément</span>
-        <button class="r-toggle ${c.r_flag ? 'on' : ''}" data-action="toggle-rflag" title="Marqueur R">R</button>
-      </div>
+      <div class="section-lbl" style="margin-top:24px">Cote de l'élément</div>
       ${ratingListHtml(c)}
 
-      <div class="section-lbl" style="margin-top:26px">Relevé</div>
-      ${guide.points ? `<div class="guide-hint"><b>À décrire</b> ${esc(guide.points)}</div>` : ''}
+      <div class="section-lbl" style="margin-top:26px">Quantité nécessaire</div>
+      <input id="qtyInput" class="fld-input" data-role="comp-text" data-field="qty" value="${esc(c.qty != null ? c.qty : '')}" placeholder="ex. 12 unités, 40 m²">
 
-      <div class="obs-field">
-        <label for="observationInput">Constats — un par ligne</label>
-        <textarea id="observationInput" data-role="comp-textarea" data-field="observation" placeholder="Localisation – ce qui est observé&#10;ex. Façade arrière – joints de mortier effrités" rows="4">${esc(c.observation || '')}</textarea>
-        ${defautsChips ? `<div class="guide-lbl">À surveiller — touchez pour ajouter</div><div class="quick-chips">${defautsChips}</div>` : ''}
-      </div>
-
-      <div class="obs-field">
-        <label>Étendue</label>
-        ${choixHtml('etendue', ETENDUES, c.etendue)}
-        <input class="fld-input" style="margin-top:8px" data-role="comp-text" data-field="etendue_qte" value="${esc(c.etendue_qte || '')}" placeholder="Quantité touchée — ex. ≈ 4 m², 3 fenêtres, 20 %">
-      </div>
-
-      <div class="obs-field">
-        <label>Limite d'observation</label>
-        ${choixHtml('limite_observation', LIMITES_OBS, c.limite_observation)}
-        ${c.limite_observation && c.limite_observation !== 'de_pres' ? `<input class="fld-input" style="margin-top:8px" data-role="comp-text" data-field="limite_detail" value="${esc(c.limite_detail || '')}" placeholder="Raison ou méthode — ex. du sol à l'aide de jumelles, local verrouillé">` : ''}
-      </div>
-
-      ${obsFieldHtml('causeInput', 'comp-textarea', 'cause_possible', 'Cause possible', c.cause_possible, 'Origine probable, modalisée — ex. semble provenir de…')}
-
-      <div class="obs-field">
-        <label>Nature du risque</label>
-        ${choixHtml('nature_risque', RISQUES, c.nature_risque)}
-      </div>
-
-      <div class="obs-field">
-        <label>Délai suggéré</label>
-        <div class="quick-chips">${delaiChips}</div>
-        ${c.delai_suggere && !DELAIS.includes(c.delai_suggere) ? `<div class="guide-lbl">Valeur antérieure : ${esc(c.delai_suggere)}</div>` : ''}
-      </div>
-
-      ${obsFieldHtml('consequencesInput', 'comp-textarea', 'consequences', 'Conséquences additionnelles', c.consequences, 'Si rien n’est fait…')}
-      ${obsFieldHtml('projetCaInput', 'comp-textarea', 'projet_ca', 'Travaux planifiés par le conseil', c.projet_ca, 'ex. le remplacement des fenêtres pour 2027')}
-
-      <div class="sec-head" style="margin-top:26px">
-        <span class="section-lbl" style="margin:0">Précisions</span>
-        <button class="link-btn" data-action="toggle-facets">${state.facetsOpen ? 'Masquer' : 'Préciser'}</button>
-      </div>
-      ${state.facetsOpen ? `<div class="facets-wrap">${facetsHtml(c)}</div>` : `<div class="facets-summary">${esc(facetSuffix(c) || 'Position de façade, emplacement, variante — au besoin.')}</div>`}
-
-      <div class="section-lbl" style="margin-top:26px">Données techniques</div>
-      <div class="field-grid">
-        <div>
-          <label for="yearInput">Année de construction ou réparation</label>
-          <input id="yearInput" data-role="year-input" value="${esc(c.install_year != null ? c.install_year : '')}" inputmode="numeric" placeholder="AAAA">
-        </div>
-        <div>
-          <label for="lifeInput">Durée de vie utile (ans)</label>
-          <input id="lifeInput" data-role="comp-number" data-field="useful_life_years" value="${esc(c.useful_life_years != null ? c.useful_life_years : '')}" inputmode="numeric" placeholder="—">
-        </div>
-        <div>
-          <label for="qtyInput">Quantité</label>
-          <input id="qtyInput" data-role="comp-text" data-field="qty" value="${esc(c.qty != null ? c.qty : '')}" placeholder="—">
-        </div>
-        <div>
-          <label for="costInput">Coût de remplacement ($)</label>
-          <input id="costInput" data-role="comp-number" data-field="replacement_cost" value="${esc(c.replacement_cost != null ? c.replacement_cost : '')}" inputmode="numeric" placeholder="—">
-        </div>
-      </div>
-
-      <div class="obs-field" style="margin-top:14px">
-        <label>Source de l'année</label>
-        ${choixHtml('source_annee', SOURCES_ANNEE, c.source_annee)}
-      </div>
-
-      <div class="derived-card ${rep && rep.delta < 0 ? 'late' : ''}">
-        <div class="k">Année anticipée de remplacement</div>
-        <div class="v">${rep ? rep.year : '—'}</div>
-        <div class="s">${esc(repSub)}</div>
-      </div>
-
-      <div class="section-lbl" style="margin-top:26px">Carnet d'entretien (${(c.entretien || []).filter(t => !t.retiree).length})</div>
-      ${carnetHtml(c)}
-
-      <div class="section-lbl" style="margin-top:26px">Attributs</div>
-      ${attributsHtml(c)}
-
-      <div class="section-lbl" style="margin-top:26px">Note vocale</div>
+      <div class="section-lbl" style="margin-top:26px">Note</div>
       ${micSection}
       ${noteCard}
 
@@ -2455,31 +2122,24 @@ function ficheHtml() {
   </div>`;
 }
 
-function aiResultHtml(r, c) {
-  const rInfo = ratingInfo(r.rating);
-  const label = rInfo ? rInfo.label : (r.ratingLabel || 'Non déterminée');
-  const conf = r.confidence != null ? (typeof r.confidence === 'number' ? Math.round(r.confidence <= 1 ? r.confidence * 100 : r.confidence) + ' %' : r.confidence) : '';
-  const cost = r.cost != null && r.cost !== '' ? String(r.cost) : (typeof r.costEstimate === 'number' ? fmtCAD.format(Math.round(r.costEstimate)) : '—');
-  const line = (k, v) => v ? `<div class="ai-line"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>` : '';
-  return `<div class="ai-card">
-    <div class="ai-card-hdr"><i data-lucide="sparkles"></i><span class="lbl">Analyse IA</span>${conf ? `<span class="conf">confiance ${esc(conf)}</span>` : ''}</div>
-    <div class="ai-card-body">
-      <div class="ai-grid">
-        <div><div class="k">Composante</div><div class="v">${esc(c.name)}</div></div>
-        <div><div class="k">Cote proposée</div><div class="v" style="color:${rInfo ? rInfo.color : 'var(--ink-500)'}">${esc(label)}</div></div>
-      </div>
-      ${line('Constats', r.observation)}
-      ${line('Étendue', [libelleDe(ETENDUES, r.etendue), r.etendueQte].filter(Boolean).join(' · '))}
-      ${line("Limite d'observation", libelleDe(LIMITES_OBS, r.limiteObservation))}
-      ${line('Cause possible', r.causePossible)}
-      ${line('Nature du risque', libelleDe(RISQUES, r.natureRisque))}
-      ${line('Délai suggéré', r.delaiSuggere)}
-      ${line('Conséquences', r.consequences)}
-      ${line('Coût de remplacement', cost)}
-      ${r.source ? `<div class="ai-source">Source : ${esc(r.source)}</div>` : ''}
-      <button class="btn-apply" data-action="apply-ai">Appliquer ces valeurs</button>
+function analyseVisiteHtml() {
+  const pending = pendingAnalysisComponents().length;
+  const label = state.analyzingVisit
+    ? `Analyse ${state.analyzeProgress.done}/${state.analyzeProgress.total}…`
+    : (pending ? "Lancer l'analyse IA" : 'Visite analysée');
+  return `
+  <div class="ai-banner">
+    <div class="icon"><i data-lucide="sparkles"></i></div>
+    <div>
+      <div class="title">Analyse IA</div>
+      <div class="body">${pending
+        ? `${pending} composante${pending > 1 ? 's' : ''} documentée${pending > 1 ? 's' : ''} en attente. L'IA complète l'observation, la cause, le délai et le coût de remplacement à partir des photos.`
+        : "Toutes les composantes documentées ont été analysées."}</div>
     </div>
-  </div>`;
+  </div>
+  <button class="btn-cta" data-action="analyze-visit" ${state.analyzingVisit || !state.online || !pending ? 'disabled' : ''}>
+    <i data-lucide="${state.analyzingVisit ? 'loader-2' : 'sparkles'}" class="${state.analyzingVisit ? 'spin' : ''}"></i>${label}
+  </button>`;
 }
 
 function syntheseHtml() {
@@ -2519,6 +2179,8 @@ function syntheseHtml() {
         </div>
         ${missingHtml}
       </div>` : ''}
+
+      ${analyseVisiteHtml()}
 
       <div class="fund-card">
         <div class="lbl">Fonds de prévoyance requis · ${proj ? proj.params.projectionYears : 30} ans</div>
@@ -2568,6 +2230,7 @@ function onRootClick(e) {
   switch (action) {
     case 'select-dossier': selectDossier(t.dataset.id); break;
     case 'go-accueil': state.screen = 'accueil'; render(); break;
+    case 'go-dossiers': state.screen = 'dossiers'; render(); break;
     case 'go-immeuble': state.screen = 'immeuble'; render(); break;
     case 'go-liste': state.screen = 'liste'; render(); break;
     case 'go-synth': state.screen = 'synthese'; render(); break;
@@ -2582,14 +2245,8 @@ function onRootClick(e) {
     case 'ajout-cat': if (state.ajout) { state.ajout.cat = t.dataset.val; render(); } break;
     case 'ajout-libre': if (state.ajout && state.ajout.cat) creerComposante({ name: state.ajout.q, cat: state.ajout.cat, vu: state.ajout.vu }); break;
     case 'add-photo': triggerPhotoInput(); break;
-    case 'analyze': analyze(); break;
-    case 'apply-ai': applyAi(); break;
+    case 'analyze-visit': analyzeVisit(); break;
     case 'set-rating': onRatingClick(t.dataset.rating); break;
-    case 'toggle-rflag': onRflagClick(); break;
-    case 'set-facet': onFacetClick(t.dataset.field, t.dataset.val); break;
-    case 'set-travaux': onTravauxClick(t.dataset.val); break;
-    case 'toggle-facets': state.facetsOpen = !state.facetsOpen; render(); break;
-    case 'add-constat': ajouterConstat(t.dataset.val); break;
     case 'tache-retirer': retirerTache(t.dataset.id); break;
     case 'tache-retablir': retablirTache(t.dataset.id); break;
     case 'tache-form': state.tacheForm = { x: '', f: 'S', q: '', mois: [] }; render(); break;
@@ -2602,16 +2259,6 @@ function onRootClick(e) {
       state.tacheForm.mois = l.includes(m) ? l.filter(x => x !== m) : l.concat([m]);
       render();
     } break;
-    case 'attr-add': onAttrAdd(); break;
-    case 'attr-del': onAttrDelete(t.dataset.key); break;
-    case 'attr-suggest': {
-      state.attrKeyDraft = t.dataset.key;
-      const keyEl = document.getElementById('attrKeyInput');
-      if (keyEl) keyEl.value = state.attrKeyDraft;
-      const valEl = document.getElementById('attrValInput');
-      if (valEl) valEl.focus();
-      break;
-    }
     case 'imm-choice': onImmChoice(t.dataset.sec, t.dataset.key, t.dataset.val); break;
     case 'toggle-voice': toggleVoice(); break;
     case 'note-fallback-send': onNoteFallbackSend(); break;
@@ -2634,10 +2281,6 @@ function onRootInput(e) {
     render();
   } else if (t.matches('[data-role="note-fallback-text"]')) {
     state.noteDraft = t.value;
-  } else if (t.matches('[data-role="attr-key-draft"]')) {
-    state.attrKeyDraft = t.value;
-  } else if (t.matches('[data-role="attr-val-draft"]')) {
-    state.attrValDraft = t.value;
   } else if (t.matches('[data-role="ajout-q"]')) {
     if (state.ajout) { state.ajout.q = t.value; render(); }
   } else if (t.matches('[data-role="ajout-vu"]')) {
@@ -2659,15 +2302,11 @@ function onRootChange(e) {
 function onRootFocusout(e) {
   const t = e.target;
   if (!t || !t.matches) return;
-  if (t.matches('[data-role="year-input"]')) { onYearBlur(e); return; }
-  if (t.matches('[data-role="travaux-annee"]')) { onTravauxAnneeBlur(e); return; }
-  if (t.matches('[data-role="comp-number"]')) { onNumberBlur(t.dataset.field, e); return; }
   if (t.matches('[data-role="comp-text"]') || t.matches('[data-role="comp-textarea"]')) {
     const v = t.value.trim();
     saveCompField(t.dataset.field, v === '' ? null : v);
     return;
   }
-  if (t.matches('[data-role="attr-value"]')) { onAttrValueBlur(t.dataset.key, e); return; }
   if (t.matches('[data-role="imm-text"]')) { onImmTextBlur(t.dataset.sec, t.dataset.key, e); return; }
   if (t.matches('[data-role="dossier-number"]')) { onDossierNumberBlur(t.dataset.field, e); return; }
 }

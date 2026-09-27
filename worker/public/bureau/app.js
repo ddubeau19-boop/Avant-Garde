@@ -2845,6 +2845,71 @@ function coteRapportBlockHtml(redaction) {
   </div>`;
 }
 
+/* ---------- diff mot-à-mot : texte généré par l'IA vs texte courant ----------
+   LCS classique sur des tokens mot/espace (une section fait au plus
+   quelques centaines de tokens, donc le O(n·m) reste instantané), pour
+   que l'ingénieur voie précisément ce qu'il a changé par rapport à ce
+   que le serveur a proposé. */
+function tokenizeForDiff(s) {
+  return String(s || '').split(/(\s+)/).filter(t => t !== '');
+}
+function diffTokens(a, b) {
+  const n = a.length, m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const ops = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push({ type: 'same', v: a[i] }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push({ type: 'del', v: a[i] }); i++; }
+    else { ops.push({ type: 'add', v: b[j] }); j++; }
+  }
+  while (i < n) { ops.push({ type: 'del', v: a[i] }); i++; }
+  while (j < m) { ops.push({ type: 'add', v: b[j] }); j++; }
+  // fusionne les tokens consécutifs de même type pour limiter le nombre de balises
+  const merged = [];
+  for (const op of ops) {
+    const last = merged[merged.length - 1];
+    if (last && last.type === op.type) last.v += op.v;
+    else merged.push({ type: op.type, v: op.v });
+  }
+  return merged;
+}
+function diffHtml(oldText, newText) {
+  const a = tokenizeForDiff(oldText), b = tokenizeForDiff(newText);
+  if (a.join('') === b.join('')) return `<div class="rvia-diff-empty">Identique au texte généré.</div>`;
+  const ops = diffTokens(a, b);
+  const wordCount = v => (v.match(/\S+/g) || []).length;
+  const added = ops.filter(o => o.type === 'add').reduce((n, o) => n + wordCount(o.v), 0);
+  const removed = ops.filter(o => o.type === 'del').reduce((n, o) => n + wordCount(o.v), 0);
+  const body = ops.map(op => {
+    const text = escapeHtml(op.v);
+    if (op.type === 'del') return `<del>${text}</del>`;
+    if (op.type === 'add') return `<ins>${text}</ins>`;
+    return text;
+  }).join('');
+  return `<div class="rvia-diff-stats">${added ? `+${added}` : ''}${added && removed ? ' · ' : ''}${removed ? `-${removed}` : ''} vs le texte généré</div><div class="rvia-diff-text">${body}</div>`;
+}
+
+// Pendant que le panneau de diff d'une section est ouvert, on le recalcule à
+// chaque frappe — mais avec un léger anti-rebond pour ne pas relancer le LCS
+// à chaque caractère, et toujours par manipulation DOM directe (jamais via
+// state/render(), qui effacerait la saisie en cours).
+const secDiffTimers = {};
+function onSecTextInput(el) {
+  const panel = document.getElementById('secDiff_' + (el.id || '').replace('secText_', ''));
+  if (!panel || panel.style.display === 'none') return;
+  const id = el.id;
+  clearTimeout(secDiffTimers[id]);
+  secDiffTimers[id] = setTimeout(() => {
+    panel.innerHTML = diffHtml(el.getAttribute('data-sec-original') || '', el.textContent);
+  }, 200);
+}
+
 function redactionTableHtml(tbl) {
   if (!tbl || !Array.isArray(tbl.entetes) || !Array.isArray(tbl.lignes)) return '';
   return `<div class="rvia-table-wrap">
@@ -2862,14 +2927,17 @@ function redactionSectionHtml(sec, i) {
   const collapsed = inactive && !state.attentionOpen;
   const titre = (sec && sec.titre) || '';
   const color = inactive ? 'var(--ink-400)' : (cle === 'attention' ? 'var(--accent-press)' : 'var(--orange)');
+  const texte = (sec && sec.texte) || '';
   return `
   <div class="rvia-section ${inactive ? 'inactive' : ''} ${collapsed ? 'collapsed' : ''}">
     <div class="rvia-section-head" style="color:${color}">
       <i data-lucide="${icon}"></i><span>${escapeHtml(titre)}</span>
       ${inactive ? `<span class="rvia-inactive-tag">inactive</span>
       <button class="rvia-section-toggle" data-action="toggle-attention">${state.attentionOpen ? 'Masquer' : 'Afficher'}</button>` : ''}
+      <button class="rvia-diff-toggle" data-action="toggle-diff" data-idx="${i}" title="Comparer avec le texte généré par l'IA"><i data-lucide="eye" style="width:12px;height:12px"></i><span class="lbl">Modifications</span></button>
     </div>
-    <p class="rvia-section-text" id="secText_${i}" contenteditable="true" data-sec-text data-sec-cle="${escapeHtml(cle)}" data-sec-title="${escapeHtml(titre)}">${escapeHtml((sec && sec.texte) || '')}</p>
+    <p class="rvia-section-text" id="secText_${i}" contenteditable="true" data-sec-text data-sec-cle="${escapeHtml(cle)}" data-sec-title="${escapeHtml(titre)}" data-sec-original="${escapeHtml(texte)}">${escapeHtml(texte)}</p>
+    <div class="rvia-diff" id="secDiff_${i}" style="display:none"></div>
     ${redactionTableHtml(sec && sec.tableau)}
   </div>`;
 }
@@ -3031,6 +3099,7 @@ function initEvents() {
     if (!t || !t.matches) return;
     if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
+    else if (t.matches('[data-sec-text]')) onSecTextInput(t);
     else if (bib.input(t)) return;
     else if (state.screen === 'modeles' && modeles.input(t)) return;
     else if (t.matches('[data-role="equipe-name"]')) equipe.form.name = t.value;
@@ -3283,6 +3352,25 @@ function initEvents() {
         state.attentionOpen = !state.attentionOpen;
         render();
         break;
+      case 'toggle-diff': {
+        // Jamais via state/render() : un re-rendu régénère chaque paragraphe
+        // depuis sec.texte et effacerait une correction en cours de saisie.
+        const idx = btn.getAttribute('data-idx');
+        const panel = document.getElementById(`secDiff_${idx}`);
+        const textEl = document.getElementById(`secText_${idx}`);
+        if (!panel || !textEl) break;
+        const opening = panel.style.display === 'none';
+        if (opening) {
+          panel.innerHTML = diffHtml(textEl.getAttribute('data-sec-original') || '', textEl.textContent);
+          panel.style.display = 'block';
+        } else {
+          panel.style.display = 'none';
+        }
+        btn.classList.toggle('on', opening);
+        const lbl = btn.querySelector('.lbl');
+        if (lbl) lbl.textContent = opening ? 'Masquer' : 'Modifications';
+        break;
+      }
       case 'retry-redaction':
         loadRedactionForCurrent({ force: true });
         break;
