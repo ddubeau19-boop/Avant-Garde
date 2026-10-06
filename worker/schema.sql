@@ -146,7 +146,10 @@ CREATE TABLE dossiers (
   rappel_revision_le   TEXT,  -- dernier rappel de révision envoyé à la firme
   assigne_a            TEXT,  -- membre de la firme responsable du dossier
   echeance             TEXT,  -- date de livraison visée (AAAA-MM-JJ)
-  client_id            TEXT   -- syndicat client (clients.id)
+  client_id            TEXT,  -- syndicat client (clients.id)
+  date_visite          TEXT,  -- date de la visite des lieux (AAAA-MM-JJ)
+  rapport_publie_r2    TEXT,  -- clé R2 du .docx figé à la publication
+  publie_par           TEXT   -- utilisateur qui a publié (signataire de la version figée)
 );
 
 CREATE TABLE components (

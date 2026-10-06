@@ -831,3 +831,21 @@ details.ca-bloc summary { cursor: pointer; }
 .an-cta:disabled { opacity: .55; cursor: not-allowed; }
 .rt-ia { align-self: center; margin-left: 4px; font-family: var(--font-mono); font-size: 9.5px; font-weight: 700; letter-spacing: .04em;
   padding: 2px 5px; border-radius: 999px; background: var(--orange-wash); color: var(--orange); }
+
+/* Date de la visite */
+.solde-box.date { width: 165px; }
+.solde-box.manque { border-color: var(--orange); background: var(--orange-wash); }
+
+/* Publication : vérification avant envoi */
+.pv-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px; margin-bottom: 8px; font-size: 13.5px; line-height: 1.4; }
+.pv-row > i { width: 17px; height: 17px; flex-shrink: 0; }
+.pv-row > span { flex: 1; }
+.pv-row.bloquant { background: #FFE4DB; color: #9A2A12; }
+.pv-row.avert { background: #FFF4E5; color: var(--ink-700); }
+.pv-row.avert > i { color: var(--orange); }
+.pv-row.ok { background: #E6F2EB; color: #1F5F3A; }
+.pv-row .btn-pill-sm { flex-shrink: 0; text-decoration: none; }
+.pv-publie { display: flex; align-items: center; gap: 12px; padding: 14px; border: 1px solid #BFDCCB; background: #F3FAF6; border-radius: 12px; margin-bottom: 18px; font-size: 13.5px; color: var(--ink-700); }
+.pv-publie > i { width: 20px; height: 20px; color: var(--green); flex-shrink: 0; }
+.pv-publie .btn-pill-sm { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; }
+.sig-form { margin: 4px 0 10px; }
