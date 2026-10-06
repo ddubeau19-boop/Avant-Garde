@@ -12,6 +12,9 @@
 
 const COTE_MAX = 1600;
 const ENVOIS_SIMULTANES = 3;
+// Cartes affichées par section, puis « Afficher plus » : chaque carte porte la
+// liste de toutes les composantes, et des centaines alourdissent chaque rendu.
+const PAR_PAGE = 48;
 // Deux photos dont les empreintes diffèrent d'au plus 5 bits sur 64 sont la
 // même prise de vue (rafale, photo reprise, même fichier déposé deux fois).
 const SEUIL_DOUBLON = 5;
@@ -74,14 +77,25 @@ export function creerTriPhotos(opts) {
     file: [],               // photos à envoyer : { f, forcer, dossier }
     ouvriers: 0,            // envois en route
     pause: false,
+    limites: { sures: PAR_PAGE, aClasser: PAR_PAGE }, // cartes affichées par section
   };
+
+  // L'écran compte des centaines de cartes, chacune avec la liste des
+  // composantes : le redessiner à chaque photo traitée prenait plusieurs
+  // secondes. Pendant un envoi, on regroupe les rendus.
+  let minuterieRendu = null;
+  function renderBientot() {
+    if (minuterieRendu) return;
+    minuterieRendu = setTimeout(() => { minuterieRendu = null; render(); }, 900);
+  }
 
   function liberer(url) { try { URL.revokeObjectURL(url); } catch (e) { /* déjà libérée */ } }
 
   function reinitialiser(dossierId) {
     Object.values(t.vignettes).forEach(liberer);
     t.doublons.forEach((d) => liberer(d.url));
-    Object.assign(t, { dossierId, photos: [], charge: false, chargement: false, erreur: null, vignettes: {}, choix: {}, envoi: null, classement: false, survol: false, empreintes: [], doublons: [], file: [], pause: false });
+    vignettesManquees.clear();
+    Object.assign(t, { dossierId, photos: [], charge: false, chargement: false, erreur: null, vignettes: {}, choix: {}, envoi: null, classement: false, survol: false, empreintes: [], doublons: [], file: [], pause: false, limites: { sures: PAR_PAGE, aClasser: PAR_PAGE } });
   }
 
   // 'deja' : la même image est déjà au dossier (photo redéposée, reprise d'un
@@ -126,16 +140,29 @@ export function creerTriPhotos(opts) {
     chargerVignettes();
   }
 
+  // Vignettes des cartes à l'écran seulement. Rappelée à chaque rendu : une
+  // carte qui devient visible (afficher plus, seuil, classement) a la sienne.
+  let vignettesEnCours = false;
+  const vignettesManquees = new Set();
   async function chargerVignettes() {
+    if (vignettesEnCours || !t.charge) return;
+    vignettesEnCours = true;
     const id = t.dossierId;
-    for (const p of t.photos.slice()) {
-      if (t.vignettes[p.id] || t.dossierId !== id) continue;
-      try {
-        const res = await apiRaw(`/api/dossiers/${id}/photos-a-classer/${p.id}/fichier`);
-        if (!res.ok) continue;
-        t.vignettes[p.id] = URL.createObjectURL(await res.blob());
-        render();
-      } catch (e) { /* la carte reste sans vignette */ }
+    try {
+      let lot;
+      while (t.dossierId === id && (lot = visibles().filter((p) => !t.vignettes[p.id] && !vignettesManquees.has(p.id))).length) {
+        for (const p of lot) {
+          if (t.dossierId !== id) break;
+          try {
+            const res = await apiRaw(`/api/dossiers/${id}/photos-a-classer/${p.id}/fichier`);
+            if (res.ok) t.vignettes[p.id] = URL.createObjectURL(await res.blob());
+            else vignettesManquees.add(p.id);
+          } catch (e) { vignettesManquees.add(p.id); /* la carte reste sans vignette */ }
+          renderBientot();
+        }
+      }
+    } finally {
+      vignettesEnCours = false;
     }
   }
 
@@ -152,14 +179,20 @@ export function creerTriPhotos(opts) {
       canvas.height = Math.round(bmp.height * echelle);
       canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
       if (bmp.close) bmp.close();
-      const empreinte = empreinteDe(canvas);
-      const blob = await new Promise((ok) => canvas.toBlob(ok, 'image/jpeg', 0.85));
-      if (!blob) return { fichier: file, empreinte };
-      const nom = (file.name || 'photo').replace(/\.[^.]+$/, '') + '.jpg';
-      return { fichier: new File([blob], nom, { type: 'image/jpeg' }), empreinte };
+      return { canvas, empreinte: empreinteDe(canvas) };
     } catch (e) {
-      return { fichier: file, empreinte: null };
+      return { canvas: null, empreinte: null };
     }
+  }
+  // La compression JPEG n'est faite que pour une photo qui part vraiment : une
+  // photo déjà au dossier (reprise d'un envoi) s'arrête à l'empreinte.
+  async function encoder(file, canvas) {
+    if (!canvas) return file;
+    const blob = await new Promise((ok) => canvas.toBlob(ok, 'image/jpeg', 0.85));
+    canvas.width = 0; canvas.height = 0;
+    if (!blob) return file;
+    const nom = (file.name || 'photo').replace(/\.[^.]+$/, '') + '.jpg';
+    return new File([blob], nom, { type: 'image/jpeg' });
   }
 
   // forcer : l'ingénieur a demandé d'envoyer une photo écartée comme doublon.
@@ -183,7 +216,7 @@ export function creerTriPhotos(opts) {
   function lancer() {
     while (!t.pause && t.file.length && t.ouvriers < ENVOIS_SIMULTANES) {
       t.ouvriers += 1;
-      ouvrier().finally(() => { t.ouvriers -= 1; render(); });
+      ouvrier().finally(() => { t.ouvriers -= 1; if (t.ouvriers === 0) render(); else renderBientot(); });
     }
   }
 
@@ -192,19 +225,22 @@ export function creerTriPhotos(opts) {
       const { f, forcer, dossier: id } = t.file.shift();
       if (t.dossierId !== id) return;
       try {
-        const { fichier, empreinte } = await reduire(f);
+        const { canvas, empreinte } = await reduire(f);
         if (t.dossierId !== id) return;
         // Vérifier et retenir l'empreinte sans attendre entre les deux : les
         // envois parallèles d'une même rafale se voient ainsi l'un l'autre.
         const doublon = forcer ? null : doublonDe(empreinte);
         if (doublon === 'deja') {
           // Déjà au dossier : rien à montrer, seulement à compter.
+          if (canvas) { canvas.width = 0; canvas.height = 0; }
           if (t.envoi) t.envoi.deja += 1;
         } else if (doublon) {
+          const fichier = await encoder(f, canvas);
           t.doublons.push({ cle: `d${Date.now()}${Math.random().toString(16).slice(2, 8)}`, fichier, empreinte, url: URL.createObjectURL(fichier) });
           if (t.envoi) t.envoi.doublons += 1;
         } else {
           if (empreinte) t.empreintes.push(empreinte);
+          const fichier = await encoder(f, canvas);
           const fd = new FormData();
           fd.append('file', fichier);
           if (empreinte) fd.append('empreinte', empreinte);
@@ -218,7 +254,7 @@ export function creerTriPhotos(opts) {
       }
       if (t.dossierId !== id) return;
       if (t.envoi) t.envoi.faits += 1;
-      render();
+      renderBientot();
     }
   }
 
@@ -379,7 +415,20 @@ export function creerTriPhotos(opts) {
     </div>`;
   }
 
+  function plusHtml(k, total) {
+    const reste = total - t.limites[k];
+    if (reste <= 0) return '';
+    return `<div class="tp-plus"><button class="btn-secondary" data-action="tp-plus" data-k="${k}">Afficher ${Math.min(PAR_PAGE, reste)} de plus</button><span>${t.limites[k]} sur ${total} affichées</span></div>`;
+  }
+  // Les cartes à l'écran, pour ne charger que leurs vignettes.
+  function visibles() {
+    const sures = t.photos.filter(estSure).slice(0, t.limites.sures);
+    const autres = t.photos.filter((p) => !estSure(p)).slice(0, t.limites.aClasser);
+    return sures.concat(autres);
+  }
+
   function html() {
+    if (t.charge && !vignettesEnCours && visibles().some((p) => !t.vignettes[p.id] && !vignettesManquees.has(p.id))) setTimeout(chargerVignettes, 0);
     const sures = t.photos.filter(estSure);
     const aClasser = t.photos.filter((p) => !estSure(p));
     // Le lot ne prend que les choix faits par l'ingénieur : une proposition
@@ -444,7 +493,8 @@ export function creerTriPhotos(opts) {
         <span class="hint">Confiance de ${t.seuil} % et plus</span>
         <button class="btn-primary tp-bulk" data-action="tp-approuver-sures" ${t.classement ? 'disabled' : ''}>Approuver les ${sures.length}</button>
       </div>
-      <div class="tp-grid">${sures.map(carteHtml).join('')}</div>` : ''}
+      <div class="tp-grid">${sures.slice(0, t.limites.sures).map(carteHtml).join('')}</div>
+      ${plusHtml('sures', sures.length)}` : ''}
 
       ${aClasser.length ? `
       <div class="tp-section-head">
@@ -453,7 +503,8 @@ export function creerTriPhotos(opts) {
         <span class="hint">L'IA n'est pas sûre : choisissez la composante</span>
         ${choisies.length ? `<button class="btn-primary tp-bulk" data-action="tp-classer-choisies" ${t.classement ? 'disabled' : ''}>Classer vos ${choisies.length} choix</button>` : ''}
       </div>
-      <div class="tp-grid">${aClasser.map(carteHtml).join('')}</div>` : ''}
+      <div class="tp-grid">${aClasser.slice(0, t.limites.aClasser).map(carteHtml).join('')}</div>
+      ${plusHtml('aClasser', aClasser.length)}` : ''}
     </div>`;
   }
 
@@ -475,6 +526,11 @@ export function creerTriPhotos(opts) {
     switch (action) {
       case 'tp-choisir': choisirFichiers(); return true;
       case 'tp-pause': pause(); return true;
+      case 'tp-plus': {
+        const k = btn.getAttribute('data-k');
+        if (t.limites[k] != null) { t.limites[k] += PAR_PAGE; render(); }
+        return true;
+      }
       case 'tp-seuil': changerSeuil(Number(btn.getAttribute('data-val'))); return true;
       case 'tp-reprendre': reprendre(); return true;
       case 'tp-abandonner':
