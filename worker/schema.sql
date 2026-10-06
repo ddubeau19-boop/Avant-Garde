@@ -202,7 +202,8 @@ CREATE TABLE photos (
   component_id TEXT NOT NULL REFERENCES components(id) ON DELETE CASCADE,
   r2_key       TEXT NOT NULL,
   tag          TEXT,
-  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  empreinte    TEXT    -- dHash 64 bits (hex), quand la photo vient d'un dépôt en lot
 );
 
 -- Photos déposées en lot au bureau, en attente d'être rattachées à une
@@ -219,7 +220,8 @@ CREATE TABLE photos_a_classer (
   description   TEXT,     -- ce que l'IA voit sur la photo
   erreur        TEXT,     -- pourquoi l'IA n'a rien proposé
   created_by    TEXT,
-  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  empreinte     TEXT      -- dHash 64 bits (hex) calculé par le navigateur, contre les doublons
 );
 
 CREATE INDEX idx_components_dossier ON components(dossier_id);
