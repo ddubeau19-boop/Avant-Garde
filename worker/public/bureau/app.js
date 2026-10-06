@@ -87,26 +87,28 @@ const IMM_DOCS = [
   ['rapports_travaux',        'Rapports de travaux « grands projets »'],
   ['carnet_entretien',        "Carnet d'entretien"],
 ];
+// Mêmes clés et mêmes types qu'au terrain : la fiche se remplit d'un côté
+// ou de l'autre, et le serveur en tire les mêmes règles.
 const IMM_CARACS = [
-  { k: 'annee_construction',      q: 'Année de construction' },
-  { k: 'date_conversion',         q: 'Date de conversion (immeuble converti en copropriété)' },
-  { k: 'nb_stationnements_int',   q: "Espaces de stationnement intérieurs" },
-  { k: 'gicleurs',                q: "Présence d'un système de gicleurs" },
-  { k: 'gicleurs_ou',             q: 'Où ? (stationnement, RDC, étages)' },
-  { k: 'unites_gicleurs',         q: 'Unités protégées par un système de gicleurs' },
-  { k: 'nb_ascenseurs',           q: "Systèmes d'ascenseur" },
-  { k: 'generatrice',             q: 'Génératrice' },
-  { k: 'generatrice_carburant',   q: 'Carburant de la génératrice', vals: { mazout: 'Mazout', gaz_naturel: 'Gaz naturel' } },
-  { k: 'piscine_interieure',      q: 'Piscine intérieure' },
-  { k: 'piscine_exterieure',      q: 'Piscine extérieure' },
-  { k: 'nb_terrasses_toiture',    q: 'Terrasses au niveau toiture' },
-  { k: 'fenetres_privatives',     q: 'Fenêtres considérées privatives' },
-  { k: 'portes_privatives',       q: 'Portes considérées privatives' },
-  { k: 'portes_patio_privatives', q: 'Portes-patio considérées privatives' },
-  { k: 'balcons_privatifs',       q: 'Balcons considérés privatifs' },
-  { k: 'elements_pcur',           q: 'Éléments considérés PCUR' },
-  { k: 'cles_repartition_pcur',   q: 'Clés de répartition PCUR disponibles' },
-  { k: 'acces_toiture',           q: 'Accès sécuritaire à la toiture' },
+  { k: 'annee_construction',      q: 'Année de construction',                                type: 'year' },
+  { k: 'date_conversion',         q: 'Date de conversion (immeuble converti en copropriété)', type: 'year' },
+  { k: 'nb_stationnements_int',   q: "Espaces de stationnement intérieurs",                  type: 'number' },
+  { k: 'gicleurs',                q: "Présence d'un système de gicleurs",                    type: 'ouinon' },
+  { k: 'gicleurs_ou',             q: 'Où ? (stationnement, RDC, étages)',                    type: 'text', si: 'gicleurs' },
+  { k: 'unites_gicleurs',         q: 'Unités protégées par un système de gicleurs',          type: 'ouinon' },
+  { k: 'nb_ascenseurs',           q: "Systèmes d'ascenseur",                                 type: 'number' },
+  { k: 'generatrice',             q: 'Génératrice',                                          type: 'ouinon' },
+  { k: 'generatrice_carburant',   q: 'Carburant de la génératrice', type: 'choice', si: 'generatrice', vals: { mazout: 'Mazout', gaz_naturel: 'Gaz naturel' } },
+  { k: 'piscine_interieure',      q: 'Piscine intérieure',                                   type: 'ouinon' },
+  { k: 'piscine_exterieure',      q: 'Piscine extérieure',                                   type: 'ouinon' },
+  { k: 'nb_terrasses_toiture',    q: 'Terrasses au niveau toiture',                          type: 'number' },
+  { k: 'fenetres_privatives',     q: 'Fenêtres considérées privatives',                      type: 'ouinon' },
+  { k: 'portes_privatives',       q: 'Portes considérées privatives',                        type: 'ouinon' },
+  { k: 'portes_patio_privatives', q: 'Portes-patio considérées privatives',                  type: 'ouinon' },
+  { k: 'balcons_privatifs',       q: 'Balcons considérés privatifs',                         type: 'ouinon' },
+  { k: 'elements_pcur',           q: 'Éléments considérés PCUR',                             type: 'ouinon' },
+  { k: 'cles_repartition_pcur',   q: 'Clés de répartition PCUR disponibles',                 type: 'ouinon' },
+  { k: 'acces_toiture',           q: 'Accès sécuritaire à la toiture',                       type: 'ouinon' },
 ];
 const IMM_REMPLACEMENTS = [
   ['pavage',             'Pavage'],
@@ -209,6 +211,10 @@ const state = {
 
   publishing: false,
   publishError: null,
+  inactifs: [],               // composantes retirées de l'étude (actif = 0)
+  inactifsOuverts: false,
+  lot: { ouvert: false, choix: { bon: true, na: true, normal: false }, enCours: false, note: null },
+  couts: { ouvert: false, donnees: null, erreur: null, choix: {}, enCours: false },
   publication: null,          // GET /api/dossiers/:id/publication
   publicationErreur: null,
   publicationResultat: null,  // { avises, echecs } après une publication
@@ -827,6 +833,11 @@ async function openDossier(id) {
   state.addCompOpen = false;
   state.addCompError = null;
   tri.reinitialiser(id);
+  state.batimentNote = null;
+  state.inactifs = [];
+  state.inactifsOuverts = false;
+  state.lot = { ouvert: false, choix: { bon: true, na: true, normal: false }, enCours: false, note: null };
+  state.couts = { ouvert: false, donnees: null, erreur: null, choix: {}, enCours: false };
   state.analyse = { enCours: false, faits: 0, total: 0, note: null };
   await loadDossierDetail(id);
 }
@@ -844,6 +855,7 @@ async function loadDossierDetail(id) {
     state.dossier = dossier;
     // Les composantes retirées de la visite ne vont ni au rapport ni à la révision.
     state.components = Array.isArray(components) ? components.filter(c => c.actif !== 0) : [];
+    state.inactifs = Array.isArray(components) ? components.filter(c => c.actif === 0) : [];
     state.projection = projection;
     state.batiment = parseJsonObject(dossier && dossier.batiment_info);
     state.revisionLoading = false;
@@ -1091,6 +1103,179 @@ async function onSoldeBlur(value) {
   } catch (e) {
     state.saveStatus = 'error';
     state.revisionFlashError = e.message || "Échec de l'enregistrement.";
+  }
+  render();
+}
+
+// ---- Coûts suggérés par la banque de prix ----
+// Médiane du coût par porte des immeubles de même taille × portes du dossier.
+// Un échantillon mince (moins de 5 prix) n'est pas coché d'office.
+async function ouvrirCouts() {
+  state.couts = { ouvert: true, donnees: null, erreur: null, choix: {}, enCours: false };
+  render();
+  try {
+    const d = await apiJson(`/api/dossiers/${state.dossierId}/couts-suggeres`);
+    state.couts.donnees = d;
+    (d.suggestions || []).forEach(x => { state.couts.choix[x.component_id] = !x.mince; });
+  } catch (e) {
+    state.couts.erreur = e.message || 'Impossible de lire la banque de prix.';
+  }
+  render();
+}
+function coutsPanelHtml() {
+  const k = state.couts;
+  if (k.erreur) return `<div class="nf-card lot-panel">${errorBanner(k.erreur)}</div>`;
+  if (!k.donnees) return `<div class="nf-card lot-panel">${spinnerBlock('Lecture de la banque de prix…')}</div>`;
+  const d = k.donnees;
+  const sug = d.suggestions || [];
+  const n = sug.filter(x => k.choix[x.component_id]).length;
+  let corps;
+  if (!d.tranche) corps = `<div class="lot-sub">Saisissez le nombre d'unités du dossier : les prix de la banque se comparent par porte.</div>`;
+  else if (!sug.length) corps = `<div class="lot-sub">Aucune composante sans coût n'a de prix comparable dans la banque (même code Uniformat, immeubles de ${escapeHtml(d.tranche.label.toLowerCase())}).</div>`;
+  else corps = `
+    <div class="couts-table">
+      ${sug.map(x => `
+      <label class="couts-ligne">
+        <input type="checkbox" data-role="cout-choix" data-id="${x.component_id}" ${k.choix[x.component_id] ? 'checked' : ''}>
+        <span class="nom">${escapeHtml(x.name)}<small>${escapeHtml(x.uniformat_code)} · ${x.n} prix${x.mince ? ' · <b>échantillon mince</b>' : ''}</small></span>
+        <span class="val">${fmt(x.cout)} $<small>${fmt(x.bas)} – ${fmt(x.haut)} $</small></span>
+      </label>`).join('')}
+    </div>`;
+  return `
+  <div class="nf-card lot-panel">
+    <div class="lot-titre">Coûts de remplacement tirés de la banque de prix</div>
+    <div class="lot-sub">${d.tranche ? `Médiane du coût par porte des immeubles de ${escapeHtml(d.tranche.label.toLowerCase())}, indexée, × ${d.unites} unités. Seuls les coûts vides sont remplis ; à valider au regard de l'immeuble.` : ''}</div>
+    ${corps}
+    <div class="nf-actions">
+      <button type="button" class="btn-secondary" data-action="couts-fermer">Fermer</button>
+      ${sug.length ? `<button type="button" class="btn-primary" data-action="couts-appliquer" ${n && !k.enCours ? '' : 'disabled'}>${k.enCours ? 'Application…' : `Appliquer ${n} coût(s)`}</button>` : ''}
+    </div>
+  </div>`;
+}
+async function appliquerCouts() {
+  const k = state.couts;
+  const ids = Object.keys(k.choix).filter(id => k.choix[id]);
+  if (!ids.length || k.enCours) return;
+  k.enCours = true;
+  render();
+  try {
+    const r = await apiJson(`/api/dossiers/${state.dossierId}/couts-suggeres/appliquer`, { method: 'POST', body: JSON.stringify({ ids }) });
+    const parId = new Map((r.appliques || []).map(a => [a.component_id, a.replacement_cost]));
+    state.components = state.components.map(c => parId.has(c.id) ? Object.assign({}, c, { replacement_cost: parId.get(c.id) }) : c);
+    await refreshProjection();
+    state.couts = { ouvert: false, donnees: null, erreur: null, choix: {}, enCours: false };
+    state.lot.note = `${parId.size} coût(s) de remplacement repris de la banque de prix.`;
+  } catch (e) {
+    k.enCours = false;
+    state.revisionFlashError = e.message || "L'application des coûts a échoué.";
+  }
+  render();
+}
+
+// ---- Confirmation en lot et retrait de composantes ----
+// Les composantes sans enjeu (bon état, entretien normal, non applicable)
+// n'ont pas à être relues une à une ; celles qui demandent un entretien ou un
+// remplacement (cotes 3-4), si.
+const LOT_GROUPES = [
+  { k: 'bon',    label: 'Cotées « Bon état »',          test: (c) => c.done && c.rating === 1 },
+  { k: 'normal', label: 'Cotées « Entretien normal »',  test: (c) => c.done && c.rating === 2 },
+  { k: 'na',     label: 'Non applicables (na)',          test: (c) => c.done && c.rating == null },
+];
+function lotCandidats(k) {
+  const g = LOT_GROUPES.find(x => x.k === k);
+  return state.components.filter(c => c.confirmed !== 1 && g.test(c));
+}
+function lotPanelHtml() {
+  const l = state.lot;
+  const choisis = LOT_GROUPES.filter(g => l.choix[g.k]).reduce((n, g) => n + lotCandidats(g.k).length, 0);
+  const reste = state.components.filter(c => c.confirmed !== 1 && !LOT_GROUPES.some(g => g.test(c))).length;
+  return `
+  <div class="nf-card lot-panel">
+    <div class="lot-titre">Confirmer en lot</div>
+    <div class="lot-sub">Le texte de ces composantes sera rédigé à la génération du rapport, sans relecture une à une. Les composantes à entretien ou remplacement requis (cotes 3-4) et celles sans cote validée se révisent individuellement${reste ? ` (${reste} restante(s))` : ''}.</div>
+    ${LOT_GROUPES.map(g => {
+      const n = lotCandidats(g.k).length;
+      return `<label class="lot-ligne ${n ? '' : 'vide'}"><input type="checkbox" data-role="lot-choix" data-k="${g.k}" ${l.choix[g.k] && n ? 'checked' : ''} ${n ? '' : 'disabled'}><span>${g.label}</span><b>${n}</b></label>`;
+    }).join('')}
+    <div class="nf-actions">
+      <button type="button" class="btn-secondary" data-action="lot-fermer">Fermer</button>
+      <button type="button" class="btn-primary" data-action="lot-confirmer" ${choisis && !l.enCours ? '' : 'disabled'}>${l.enCours ? 'Confirmation…' : `Confirmer ${choisis} composante(s)`}</button>
+    </div>
+  </div>`;
+}
+async function lotConfirmer() {
+  const l = state.lot;
+  const ids = LOT_GROUPES.filter(g => l.choix[g.k]).flatMap(g => lotCandidats(g.k).map(c => c.id));
+  if (!ids.length || l.enCours) return;
+  l.enCours = true;
+  render();
+  try {
+    const r = await apiJson(`/api/dossiers/${state.dossierId}/components/lot`, { method: 'POST', body: JSON.stringify({ ids, confirmed: 1 }) });
+    const set = new Set(ids);
+    state.components = state.components.map(c => set.has(c.id) ? Object.assign({}, c, { confirmed: 1 }) : c);
+    state.lot = Object.assign({}, l, { ouvert: false, enCours: false, note: `${r.modifiees} composante(s) confirmée(s) en lot.` });
+  } catch (e) {
+    l.enCours = false;
+    state.revisionFlashError = e.message || 'La confirmation en lot a échoué.';
+  }
+  render();
+}
+async function changerActif(id, actif) {
+  const c = actif ? state.inactifs.find(x => x.id === id) : state.components.find(x => x.id === id);
+  if (!c) return;
+  if (!actif && !confirm(`Retirer « ${c.name} » de l'étude ? Elle ne figurera ni au rapport ni au calcul du fonds. Vous pourrez la réactiver.`)) return;
+  try {
+    await apiJson(`/api/dossiers/${state.dossierId}/components/lot`, { method: 'POST', body: JSON.stringify({ ids: [id], actif }) });
+    const maj = Object.assign({}, c, { actif });
+    if (actif) { state.inactifs = state.inactifs.filter(x => x.id !== id); state.components = state.components.concat([maj]); }
+    else { state.components = state.components.filter(x => x.id !== id); state.inactifs = state.inactifs.concat([maj]); delete state.expanded[id]; }
+    await refreshProjection();
+  } catch (e) {
+    state.revisionFlashError = e.message || "La modification n'a pas été enregistrée.";
+  }
+  render();
+}
+function inactifsHtml() {
+  const n = state.inactifs.length;
+  if (!n) return '';
+  return `
+  <div class="inactifs">
+    <button class="inactifs-head" data-action="inactifs-toggle"><i data-lucide="${state.inactifsOuverts ? 'chevron-up' : 'chevron-down'}" style="width:14px;height:14px"></i>Retirées de l'étude · ${n}</button>
+    ${state.inactifsOuverts ? `<div class="inactifs-liste">${state.inactifs.map(c => `
+      <div class="inactif"><span>${escapeHtml(c.name)}</span><button class="btn-pill-sm" data-action="reactiver-composante" data-id="${c.id}">Réactiver</button></div>`).join('')}</div>` : ''}
+  </div>`;
+}
+
+// Fiche d'immeuble : une réponse modifiée part tout de suite au serveur. Ses
+// règles peuvent activer ou retirer des composantes : on recharge alors la liste.
+async function immEnregistrer(sec, key, val) {
+  const b = state.batiment && typeof state.batiment === 'object' ? state.batiment : {};
+  const avant = b[sec] && b[sec][key] != null ? String(b[sec][key]) : '';
+  const v = String(val == null ? '' : val).trim();
+  if (avant === v) return;
+  if (!b[sec]) b[sec] = {};
+  if (v === '') delete b[sec][key]; else b[sec][key] = v;
+  if (!Object.keys(b[sec]).length) delete b[sec];
+  state.batiment = b;
+  state.saveStatus = 'saving';
+  if (!paintSaveIndicator()) render();
+  try {
+    const r = await apiJson(`/api/dossiers/${state.dossierId}`, { method: 'PATCH', body: JSON.stringify({ batiment_info: JSON.stringify(b) }) });
+    state.dossier = Object.assign({}, state.dossier, { batiment_info: r.batiment_info });
+    const n = r.composantes_mises_a_jour;
+    if (n) {
+      const comps = await apiJson(`/api/dossiers/${state.dossierId}/components`);
+      if (Array.isArray(comps)) {
+        state.components = comps.filter(c => c.actif !== 0);
+        state.inactifs = comps.filter(c => c.actif === 0);
+      }
+      await refreshProjection();
+      state.batimentNote = `${n} composante(s) ajustée(s) selon la fiche d'immeuble.`;
+    }
+    state.saveStatus = 'saved';
+  } catch (e) {
+    state.saveStatus = 'error';
+    state.revisionFlashError = e.message || "Échec de l'enregistrement de la fiche.";
   }
   render();
 }
@@ -2664,6 +2849,7 @@ function compDetailHtml(c) {
   const empHtml = EMPLACEMENTS.map(pp => `<button class="seg-btn ${c.emplacement === pp.v ? 'on' : ''}" data-action="set-facet" data-id="${c.id}" data-field="emplacement" data-val="${pp.v}">${escapeHtml(pp.label)}</button>`).join('');
   return `
   <div class="comp-detail">
+    <div class="comp-retirer"><button class="btn-pill-sm" data-action="retirer-composante" data-id="${c.id}"><i data-lucide="eye-off" style="width:13px;height:13px"></i>Retirer de l'étude (ne s'applique pas à cet immeuble)</button></div>
     <div class="comp-detail-col">
       <div class="detail-eyebrow">Relevé</div>
       ${obsFieldHtml(c, 'observation', 'Constats — un par ligne', 'Localisation – ce qui est observé')}
@@ -2767,8 +2953,18 @@ function compRowHtml(c, excluded) {
 
 /* ---------- Fiche d'immeuble (lecture seule) ---------- */
 
-function immRowHtml(label, value, muted) {
-  return `<div class="imm-row"><div class="imm-q">${escapeHtml(label)}</div><div class="imm-a ${value == null ? 'none' : ''}">${value == null ? '—' : escapeHtml(value)}</div></div>`;
+// Une rangée de la fiche : choix en boutons, ou champ libre enregistré au blur.
+function immSegHtml(sec, key, choix) {
+  const cur = immVal(sec, key);
+  return `<div class="seg imm-seg">${Object.entries(choix).map(([v, l]) =>
+    `<button class="seg-btn ${cur === v ? 'on' : ''}" data-action="imm-choix" data-sec="${sec}" data-key="${key}" data-val="${v}">${escapeHtml(l)}</button>`).join('')}</div>`;
+}
+function immInputHtml(sec, key, placeholder, mode) {
+  return `<input class="detail-input imm-input" id="imm_${sec}_${key}" data-role="imm-input" data-sec="${sec}" data-key="${key}"
+    value="${escapeHtml(immVal(sec, key) || '')}" placeholder="${escapeHtml(placeholder || '')}" ${mode ? `inputmode="${mode}"` : ''}>`;
+}
+function immLigneHtml(label, controle, sub) {
+  return `<div class="imm-row ${sub ? 'sub' : ''}"><div class="imm-q">${escapeHtml(label)}</div><div class="imm-a">${controle}</div></div>`;
 }
 
 function batimentPanelHtml(d) {
@@ -2778,35 +2974,30 @@ function batimentPanelHtml(d) {
       <div class="imm-head-icon"><i data-lucide="clipboard-list"></i></div>
       <div style="flex:1">
         <div class="imm-head-title">Fiche d'immeuble</div>
-        <div class="imm-head-sub">${count ? count + ' réponse' + (count > 1 ? 's' : '') + ' consignée' + (count > 1 ? 's' : '') + ' au terrain' : 'Aucune réponse consignée au terrain pour l’instant'} · lecture seule</div>
+        <div class="imm-head-sub">${count ? count + ' réponse' + (count > 1 ? 's' : '') + ' consignée' + (count > 1 ? 's' : '') : 'Aucune réponse consignée pour l’instant'} · description, historique et documents du rapport</div>
       </div>
       <i data-lucide="${state.batimentOpen ? 'chevron-up' : 'chevron-down'}" style="color:var(--ink-500)"></i>
     </button>`;
   if (!state.batimentOpen) return `<div class="imm-panel">${head}</div>`;
 
-  const docs = IMM_DOCS.map(([k, label]) => {
-    const v = immVal('documents', k);
-    return immRowHtml(label, v == null ? null : (IMM_DOC_VALS[v] || v));
-  }).join('');
-
+  const docs = IMM_DOCS.map(([k, label]) => immLigneHtml(label, immSegHtml('documents', k, IMM_DOC_VALS))).join('');
   const caracs = IMM_CARACS.map(cfg => {
-    const v = immVal('caracteristiques', cfg.k);
-    let disp = v;
-    if (v != null && cfg.vals && cfg.vals[v]) disp = cfg.vals[v];
-    else if (v != null && IMM_OUI_NON[v]) disp = IMM_OUI_NON[v];
-    return immRowHtml(cfg.q, disp);
+    if (cfg.si && immVal('caracteristiques', cfg.si) !== 'oui') return '';
+    const ctl = cfg.type === 'ouinon' ? immSegHtml('caracteristiques', cfg.k, IMM_OUI_NON)
+      : cfg.type === 'choice' ? immSegHtml('caracteristiques', cfg.k, cfg.vals)
+      : cfg.type === 'year' ? immInputHtml('caracteristiques', cfg.k, 'AAAA', 'numeric')
+      : cfg.type === 'number' ? immInputHtml('caracteristiques', cfg.k, '0', 'numeric')
+      : immInputHtml('caracteristiques', cfg.k, '');
+    return immLigneHtml(cfg.q, ctl, !!cfg.si);
   }).join('');
-
-  const rempl = IMM_REMPLACEMENTS.map(([k, label]) => immRowHtml(label, immVal('remplacements', k))).join('');
-  const entr = IMM_ENTRETIENS.map(([k, label]) => immRowHtml(label, immVal('entretiens', k))).join('');
-
-  const solde = d.current_fund_balance != null ? fmt(d.current_fund_balance) + ' $' : null;
-  const cotis = d.cotisation_annuelle != null ? fmt(d.cotisation_annuelle) + ' $' : null;
+  const rempl = IMM_REMPLACEMENTS.map(([k, label]) => immLigneHtml(label, immInputHtml('remplacements', k, 'AAAA', 'numeric'))).join('');
+  const entr = IMM_ENTRETIENS.map(([k, label]) => immLigneHtml(label, immInputHtml('entretiens', k, 'mm/aaaa'))).join('');
 
   return `
   <div class="imm-panel open">
     ${head}
     <div class="imm-body">
+      ${state.batimentNote ? `<div class="temp-pass-warn" style="margin:0 0 12px"><i data-lucide="info"></i><span>${escapeHtml(state.batimentNote)}</span></div>` : ''}
       <div class="imm-section">
         <div class="imm-section-head"><span class="n">1</span>Documents à fournir avant la visite</div>
         ${docs}
@@ -2823,12 +3014,7 @@ function batimentPanelHtml(d) {
         <div class="imm-section-head"><span class="n">4</span>Dates des derniers entretiens</div>
         ${entr}
       </div>
-      <div class="imm-section">
-        <div class="imm-section-head"><span class="n">5</span>Solde et cotisation annuelle — FP</div>
-        ${immRowHtml("Solde au fonds de prévoyance en début d'année", solde)}
-        ${immRowHtml('Cotisation annuelle à ce fonds', cotis)}
-      </div>
-      <div class="imm-foot">Relevé saisi par l'inspecteur sur le terrain. Pour le corriger, passez par l'app d'inspection.</div>
+      <div class="imm-foot">Enregistré à chaque réponse, au bureau comme au terrain. Certaines réponses (piscine, ascenseurs, génératrice…) activent ou retirent les composantes correspondantes. Le solde et la cotisation se saisissent dans la carte du fonds.</div>
     </div>
   </div>`;
 }
@@ -2973,8 +3159,13 @@ function renderRevision() {
         <span class="lbl">Composantes · ${docCount}/${total} documentées</span>
         <div class="rule"></div>
         <span class="hint">Édition directe des cellules</span>
+        <button class="btn-pill-sm" data-action="couts-ouvrir"><i data-lucide="receipt" style="width:14px;height:14px"></i>Coûts de la banque</button>
+        <button class="btn-pill-sm" data-action="lot-ouvrir"><i data-lucide="list-checks" style="width:14px;height:14px"></i>Confirmer en lot</button>
         <label class="btn-pill-sm">${state.composantesImportUploading ? 'Lecture du document…' : 'Importer un .docx'}<input type="file" accept=".docx" data-role="composantes-import-file" style="display:none" ${state.composantesImportUploading ? 'disabled' : ''}></label>
       </div>
+      ${state.couts.ouvert ? coutsPanelHtml() : ''}
+      ${state.lot.ouvert ? lotPanelHtml() : ''}
+      ${state.lot.note ? `<div class="temp-pass-warn" style="margin-bottom:14px"><i data-lucide="info"></i><span>${escapeHtml(state.lot.note)}</span></div>` : ''}
       ${state.composantesImportError ? errorBanner(state.composantesImportError) : ''}
       ${state.composantesImportNote ? `<div class="temp-pass-warn" style="margin-bottom:14px"><i data-lucide="info"></i><span>${escapeHtml(state.composantesImportNote)}</span></div>` : ''}
 
@@ -2998,6 +3189,7 @@ function renderRevision() {
           </div>`).join('')}
       </div>
       ${addCompFormHtml()}
+      ${inactifsHtml()}
       <div class="comp-legend">
         <span class="legend-scale">Cote : ${RATINGS.map(r => `<span class="legend-rt"><b style="background:${r.color}">${r.v}</b>${escapeHtml(r.label)}</span>`).join('')}<span class="legend-rt"><b style="background:${RATING_NA.color}">na</b>${escapeHtml(RATING_NA.label)}</span></span>
         <span><span class="legend-r">R</span>Marqueur R</span>
@@ -3454,6 +3646,8 @@ function initEvents() {
   app.addEventListener('change', (e) => {
     const t = e.target;
     if (t && t.matches && t.matches('[data-role="visite-input"]')) { onVisiteChange(t.value); return; }
+    if (t && t.matches && t.matches('[data-role="cout-choix"]')) { state.couts.choix[t.getAttribute('data-id')] = t.checked; render(); return; }
+    if (t && t.matches && t.matches('[data-role="lot-choix"]')) { state.lot.choix[t.getAttribute('data-k')] = t.checked; render(); return; }
     if (t && t.matches && state.screen === 'photos' && tri.change(t)) return;
     if (t && t.matches && bib.change(t)) return;
     if (t && t.matches && state.screen === 'modeles' && modeles.change(t)) return;
@@ -3708,8 +3902,46 @@ function initEvents() {
         break;
       case 'toggle-batiment':
         state.batimentOpen = !state.batimentOpen;
+        state.batimentNote = null;
         render();
         break;
+      case 'couts-ouvrir':
+        if (state.couts.ouvert) { state.couts.ouvert = false; render(); } else ouvrirCouts();
+        break;
+      case 'couts-fermer':
+        state.couts.ouvert = false;
+        render();
+        break;
+      case 'couts-appliquer':
+        appliquerCouts();
+        break;
+      case 'lot-ouvrir':
+        state.lot.ouvert = !state.lot.ouvert;
+        state.lot.note = null;
+        render();
+        break;
+      case 'lot-fermer':
+        state.lot.ouvert = false;
+        render();
+        break;
+      case 'lot-confirmer':
+        lotConfirmer();
+        break;
+      case 'retirer-composante':
+        changerActif(btn.getAttribute('data-id'), 0);
+        break;
+      case 'reactiver-composante':
+        changerActif(btn.getAttribute('data-id'), 1);
+        break;
+      case 'inactifs-toggle':
+        state.inactifsOuverts = !state.inactifsOuverts;
+        render();
+        break;
+      case 'imm-choix': {
+        const sec = btn.getAttribute('data-sec'), key = btn.getAttribute('data-key'), val = btn.getAttribute('data-val');
+        immEnregistrer(sec, key, immVal(sec, key) === val ? '' : val);
+        break;
+      }
       case 'set-rating':
         onRatingClick(btn.getAttribute('data-id'), btn.getAttribute('data-rating'));
         break;
@@ -3777,6 +4009,7 @@ function initEvents() {
     if (t.matches('[data-role="solde-input"]')) { onSoldeBlur(t.value); return; }
     if (t.matches('[data-role="cotisation-input"]')) { onCotisationBlur(t.value); return; }
     if (t.matches('[data-role="visite-input"]')) { onVisiteChange(t.value); return; }
+    if (t.matches('[data-role="imm-input"]')) { immEnregistrer(t.getAttribute('data-sec'), t.getAttribute('data-key'), t.value); return; }
     if (t.matches('[data-role="cost-cell"]')) { patchComponent(t.getAttribute('data-id'), { replacement_cost: parseNum(t.textContent) }, { refetchProjection: true }); return; }
     if (t.matches('[data-role="life-cell"]')) { patchComponent(t.getAttribute('data-id'), { useful_life_years: parseNum(t.textContent) }, { refetchProjection: true }); return; }
     if (t.matches('[data-role="year-cell"]')) { patchComponent(t.getAttribute('data-id'), { install_year: parseYear(t.textContent) }, { refetchProjection: true }); return; }
