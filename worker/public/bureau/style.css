@@ -888,3 +888,6 @@ details.ca-bloc summary { cursor: pointer; }
 .couts-ligne small { display: block; font-size: 11px; color: var(--ink-500); margin-top: 2px; font-family: var(--font-mono); }
 .couts-ligne .nom { flex: 1; min-width: 0; }
 .couts-ligne .val { text-align: right; font-family: var(--font-mono); font-weight: 600; white-space: nowrap; }
+.tp-progress-actions { margin-left: auto; display: inline-flex; gap: 6px; }
+.tp-progress-actions .btn-pill-sm { display: inline-flex; align-items: center; gap: 5px; padding: 6px 12px; font-size: 12px; }
+.tp-progress-aide { font-size: 11.5px; color: var(--ink-500); }
