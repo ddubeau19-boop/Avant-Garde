@@ -207,6 +207,7 @@ const state = {
   redactionMissing: false, // l'endpoint n'existe pas encore (404)
   redactionCache: {},      // id de composante -> rédaction déjà servie
   attentionOpen: false,    // section « attention spéciale » inactive dépliée
+  attn: { compId: null, liste: [], redige: {}, erreur: null, sauve: '[]' }, // attentions spéciales de la composante révisée
   banqueDirty: false,      // un texte vient d'être versé à la banque
 
   publishing: false,
@@ -1483,13 +1484,16 @@ async function onCotisationBlur(value) {
 // choix, le rapport prend les 4 premières classées.
 const PHOTOS_PAR_FICHE = 4;
 function photosRapportNoteHtml(photos) {
+  const enAttention = new Set(state.attn.liste.flatMap(a => a.photos || []));
+  if (enAttention.size) photos = photos.filter(p => p.au_rapport || !enAttention.has(p.id));
   const n = photos.filter(p => p.au_rapport).length;
   const texte = n
     ? `${n}/${PHOTOS_PAR_FICHE} photo(s) choisie(s) pour le rapport.`
     : photos.length > PHOTOS_PAR_FICHE
       ? `Le rapport montre ${PHOTOS_PAR_FICHE} photos : sans choix, les ${PHOTOS_PAR_FICHE} premières. Cliquez l'étoile pour choisir.`
       : 'Toutes ces photos iront au rapport. Cliquez l\'étoile pour n\'en garder que certaines.';
-  return `<div class="rvia-photos-note">${escapeHtml(texte)}</div>${state.photoRapportErreur ? `<div class="rvia-photos-note err">${escapeHtml(state.photoRapportErreur)}</div>` : ''}`;
+  const attn = enAttention.size ? ` ${enAttention.size} photo(s) jointe(s) aux attentions spéciales y figurent, pas à l'état de l'actif.` : '';
+  return `<div class="rvia-photos-note">${escapeHtml(texte + attn)}</div>${state.photoRapportErreur ? `<div class="rvia-photos-note err">${escapeHtml(state.photoRapportErreur)}</div>` : ''}`;
 }
 async function basculerPhotoRapport(id) {
   const p = state.reviewPhotos.find(x => x.id === id);
@@ -1546,6 +1550,8 @@ async function loadReviewPhotosForCurrent() {
   const loaded = [];
   try {
     const full = await apiJson(`/api/components/${comp.id}`);
+    state.attn = { compId: comp.id, liste: lireAttentions(full.attentions), redige: {}, erreur: null };
+    state.attn.sauve = JSON.stringify(state.attn.liste);
     const photos = Array.isArray(full.photos) ? full.photos : [];
     for (let i = 0; i < photos.length; i++) {
       try {
@@ -1640,6 +1646,134 @@ function collectEtatText() {
   const el = document.querySelector('.rvia-card [data-sec-cle="etat"]');
   const txt = el ? el.textContent.trim() : '';
   return txt.length >= 40 ? txt : null;
+}
+
+// ---- Attentions spéciales ----
+// Une situation par attention : titre, notes de l'ingénieur, au plus deux
+// photos de la composante, et le texte du rapport (rédigé par l'IA à partir
+// des notes et des photos, puis relu). Présentes, elles remplacent l'attention
+// générée. La liste entière est enregistrée à chaque modification.
+const PHOTOS_PAR_ATTENTION = 2;
+function lireAttentions(brut) {
+  try {
+    const l = typeof brut === 'string' ? JSON.parse(brut) : brut;
+    return Array.isArray(l) ? l.map(a => Object.assign({ titre: '', notes: '', texte: '', photos: [] }, a)) : [];
+  } catch (e) { return []; }
+}
+function attentionById(id) { return state.attn.liste.find(a => a.id === id) || null; }
+function attentionsSectionHtml(sec, i) {
+  const k = state.attn;
+  const liste = k.liste;
+  const comp = orderedComponents()[state.reviewIdx];
+  const nom = comp ? comp.name : '';
+  const photos = state.reviewPhotos;
+  const entete = `
+    <div class="rvia-section-head" style="color:var(--accent-press)">
+      <i data-lucide="alert-triangle"></i><span>${escapeHtml(`ATTENTION SPÉCIALE - ${nom}`)}</span>
+      <button class="btn-pill-sm attn-ajouter" data-action="attn-ajouter"><i data-lucide="plus" style="width:13px;height:13px"></i>Ajouter une attention spéciale</button>
+    </div>`;
+  if (!liste.length) {
+    return `<div class="rvia-section attn-section">${entete}
+      <div class="attn-vide">Ajoutez une attention spéciale pour chaque situation à signaler (ex. « Solin décollé – façade nord »), avec vos notes et jusqu'à ${PHOTOS_PAR_ATTENTION} photos. L'IA rédige le texte, vous le relisez.${sec && sec.actif ? ' Sans attention ajoutée, le rapport garde le texte ci-dessous, produit à partir de la cote et des constats.' : ''}</div>
+      ${sec && sec.actif ? redactionSectionHtml(Object.assign({}, sec, { _brut: true }), i) : ''}
+    </div>`;
+  }
+  return `<div class="rvia-section attn-section">${entete}
+    ${k.erreur ? `<div class="rvia-photos-note err">${escapeHtml(k.erreur)}</div>` : ''}
+    ${liste.map((a, n) => {
+      const enCours = !!k.redige[a.id];
+      return `
+      <div class="attn-carte">
+        <div class="attn-carte-tete"><span class="attn-num">${n + 1}</span>
+          <input class="detail-input attn-titre" id="attn_titre_${a.id}" data-role="attn" data-id="${a.id}" data-f="titre" placeholder="Situation – ex. Solin décollé, façade nord" value="${escapeHtml(a.titre)}">
+          <button class="icon-btn" data-action="attn-supprimer" data-id="${a.id}" title="Supprimer cette attention"><i data-lucide="trash-2"></i></button>
+        </div>
+        <label class="attn-lbl">Vos notes <small>ce qui est vu, où, la cause probable, quoi faire et quand</small></label>
+        <textarea class="detail-input attn-notes" id="attn_notes_${a.id}" data-role="attn" data-id="${a.id}" data-f="notes" rows="3" placeholder="ex. Solin de toit décollé sur ~2 m au-dessus de l'unité 4, traces d'eau au plafond. Refixer au printemps.">${escapeHtml(a.notes)}</textarea>
+        <label class="attn-lbl">Photos <small>${a.photos.length}/${PHOTOS_PAR_ATTENTION} — elles iront dans cette attention, pas à l'état de l'actif</small></label>
+        ${photos.length ? `<div class="attn-photos">${photos.map(p => {
+          const on = a.photos.includes(p.id);
+          return `<button class="attn-photo ${on ? 'on' : ''}" data-action="attn-photo" data-id="${a.id}" data-photo="${p.id}" title="${on ? 'Retirer de cette attention' : 'Joindre à cette attention'}"><img src="${p.url}" alt="">${on ? '<i data-lucide="check"></i>' : ''}</button>`;
+        }).join('')}</div>` : `<div class="attn-sans-photo">${state.reviewPhotosLoading ? 'Chargement des photos…' : 'Aucune photo classée sur cette composante.'}</div>`}
+        <div class="attn-texte-tete">
+          <label class="attn-lbl">Texte au rapport</label>
+          <button class="btn-secondary attn-rediger" data-action="attn-rediger" data-id="${a.id}" ${enCours ? 'disabled' : ''}><i data-lucide="${enCours ? 'loader-2' : 'sparkles'}" style="width:14px;height:14px"></i>${enCours ? 'Rédaction…' : (a.texte ? 'Réécrire avec l\'IA' : 'Rédiger avec l\'IA')}</button>
+        </div>
+        <textarea class="detail-input attn-texte" id="attn_texte_${a.id}" data-role="attn" data-id="${a.id}" data-f="texte" rows="5" placeholder="Rédigé par l'IA à partir de vos notes et des photos, ou écrit ici. Sans texte, vos notes vont au rapport telles quelles.">${escapeHtml(a.texte)}</textarea>
+      </div>`;
+    }).join('')}
+    <div class="attn-cloture">À la fin de la section, le rapport ajoute une seule fois la recommandation commune (visite de service, suivi au tableur, section 9.0).</div>
+  </div>`;
+}
+async function enregistrerAttentions() {
+  const k = state.attn;
+  const compId = k.compId;
+  if (!compId) return;
+  // Un re-rendu fait perdre le focus (focusout) : on n'enregistre que ce qui a changé.
+  const instantane = JSON.stringify(k.liste);
+  if (instantane === k.sauve) return;
+  k.sauve = instantane;
+  state.saveStatus = 'saving';
+  paintSaveIndicator();
+  try {
+    const r = await apiJson(`/api/components/${compId}/attentions`, { method: 'PUT', body: JSON.stringify({ attentions: k.liste }) });
+    // Les identifiants créés par le serveur remplacent les provisoires.
+    if (state.attn.compId === compId && Array.isArray(r.attentions) && r.attentions.length === k.liste.length) {
+      r.attentions.forEach((a, n) => { k.liste[n].id = a.id; k.liste[n].photos = a.photos; });
+      k.sauve = JSON.stringify(k.liste);
+    }
+    state.components = state.components.map(c => c.id === compId ? Object.assign({}, c, { attentions: JSON.stringify(k.liste) }) : c);
+    state.saveStatus = 'saved';
+    k.erreur = null;
+  } catch (e) {
+    state.saveStatus = 'error';
+    k.sauve = null;
+    k.erreur = e.message || "Les attentions n'ont pas été enregistrées.";
+  }
+  render();
+}
+function nouvelIdAttention() { return 'att_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); }
+function ajouterAttention() {
+  if (state.attn.liste.length >= 8) { state.attn.erreur = 'Au plus 8 attentions spéciales par composante.'; render(); return; }
+  const a = { id: nouvelIdAttention(), titre: '', notes: '', texte: '', photos: [] };
+  state.attn.liste.push(a);
+  render();
+  const champ = document.getElementById(`attn_titre_${a.id}`);
+  if (champ) champ.focus();
+}
+function supprimerAttention(id) {
+  const a = attentionById(id);
+  if (!a) return;
+  if ((a.titre || a.notes || a.texte) && !confirm(`Supprimer l'attention « ${a.titre || 'sans titre'} » ?`)) return;
+  state.attn.liste = state.attn.liste.filter(x => x.id !== id);
+  enregistrerAttentions();
+}
+function basculerPhotoAttention(id, photoId) {
+  const a = attentionById(id);
+  if (!a) return;
+  if (a.photos.includes(photoId)) a.photos = a.photos.filter(x => x !== photoId);
+  else if (a.photos.length >= PHOTOS_PAR_ATTENTION) { state.attn.erreur = `Au plus ${PHOTOS_PAR_ATTENTION} photos par attention : retirez-en une d'abord.`; render(); return; }
+  else a.photos = a.photos.concat([photoId]);
+  state.attn.erreur = null;
+  enregistrerAttentions();
+}
+async function redigerAttention(id) {
+  const a = attentionById(id);
+  const compId = state.attn.compId;
+  if (!a || !compId || state.attn.redige[id]) return;
+  if (!a.titre && !a.notes && !a.photos.length) { state.attn.erreur = "Écrivez quelques notes ou joignez une photo : l'IA rédige à partir de ce que vous avez vu."; render(); return; }
+  if (a.texte && !confirm("Remplacer le texte actuel par une nouvelle rédaction de l'IA ?")) return;
+  state.attn.redige[id] = true;
+  state.attn.erreur = null;
+  render();
+  try {
+    const r = await apiJson(`/api/components/${compId}/attentions/rediger`, { method: 'POST', body: JSON.stringify({ titre: a.titre, notes: a.notes, photos: a.photos }) });
+    if (state.attn.compId === compId && r.texte) { a.texte = r.texte; await enregistrerAttentions(); }
+  } catch (e) {
+    state.attn.erreur = e.message || "La rédaction par l'IA a échoué.";
+  }
+  delete state.attn.redige[id];
+  render();
 }
 
 async function rvConfirm() {
@@ -3641,6 +3775,7 @@ function redactionTableHtml(tbl) {
 
 function redactionSectionHtml(sec, i) {
   const cle = sec && sec.cle ? sec.cle : '';
+  if (cle === 'attention' && !(sec && sec._brut)) return attentionsSectionHtml(sec, i);
   const icon = SECTION_ICONS[cle] || 'file-text';
   const inactive = sec && sec.actif === false;
   const collapsed = inactive && !state.attentionOpen;
@@ -3825,7 +3960,8 @@ function initEvents() {
   app.addEventListener('input', (e) => {
     const t = e.target;
     if (!t || !t.matches) return;
-    if (t.matches('[data-role="saisie"]')) state.saisie.brouillon[t.getAttribute('data-id') + '|' + t.getAttribute('data-field')] = t.value;
+    if (t.matches('[data-role="attn"]')) { const a = attentionById(t.getAttribute('data-id')); if (a) a[t.getAttribute('data-f')] = t.value; }
+    else if (t.matches('[data-role="saisie"]')) state.saisie.brouillon[t.getAttribute('data-id') + '|' + t.getAttribute('data-field')] = t.value;
     else if (t.matches('#add-comp-form [data-draft]')) state.addComp[t.getAttribute('data-draft')] = t.value;
     else if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
@@ -4213,6 +4349,18 @@ function initEvents() {
       case 'rv-skip':
         rvSkip();
         break;
+      case 'attn-ajouter':
+        ajouterAttention();
+        break;
+      case 'attn-supprimer':
+        supprimerAttention(btn.getAttribute('data-id'));
+        break;
+      case 'attn-photo':
+        basculerPhotoAttention(btn.getAttribute('data-id'), btn.getAttribute('data-photo'));
+        break;
+      case 'attn-rediger':
+        redigerAttention(btn.getAttribute('data-id'));
+        break;
       case 'photo-rapport':
         basculerPhotoRapport(btn.getAttribute('data-id'));
         break;
@@ -4242,6 +4390,7 @@ function initEvents() {
     if (t.matches('[data-role="cotisation-input"]')) { onCotisationBlur(t.value); return; }
     if (t.matches('[data-role="visite-input"]')) { onVisiteChange(t.value); return; }
     if (t.matches('[data-role="imm-input"]')) { immEnregistrer(t.getAttribute('data-sec'), t.getAttribute('data-key'), t.value); return; }
+    if (t.matches('[data-role="attn"]')) { enregistrerAttentions(); return; }
     if (t.matches('[data-role="saisie"]')) { enregistrerSaisie(t.getAttribute('data-id'), t.getAttribute('data-field'), t.value); return; }
     if (t.matches('[data-role="cost-cell"]')) { patchComponent(t.getAttribute('data-id'), { replacement_cost: parseNum(t.textContent) }, { refetchProjection: true }); return; }
     if (t.matches('[data-role="life-cell"]')) { patchComponent(t.getAttribute('data-id'), { useful_life_years: parseNum(t.textContent) }, { refetchProjection: true }); return; }

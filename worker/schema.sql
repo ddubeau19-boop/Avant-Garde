@@ -201,7 +201,8 @@ CREATE TABLE components (
   -- Révision aux cinq ans
   origine_id         TEXT,    -- composante de l'étude précédente
   travaux_periode    TEXT,    -- fait | reporte | abandonne : travaux prévus à l'étude précédente
-  travaux_annee      INTEGER  -- année des travaux réalisés
+  travaux_annee      INTEGER, -- année des travaux réalisés
+  attentions         TEXT     -- JSON : attentions spéciales saisies au bureau [{id, titre, notes, texte, photos}]
 );
 
 CREATE TABLE photos (
