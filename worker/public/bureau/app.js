@@ -826,6 +826,28 @@ function quitterEnvoiPhotos() {
   return confirm("Des photos sont encore en cours d'envoi. Si vous quittez ce dossier, l'envoi s'arrête (vous pourrez redéposer les mêmes photos : celles déjà envoyées seront écartées). Quitter quand même ?");
 }
 
+// Copie complète du dossier pour faire des essais. Le serveur copie
+// composantes et photos (fichiers partagés) ; ni portail, ni client, ni
+// publication. On ouvre la copie aussitôt.
+async function dupliquerDossier() {
+  const d = state.dossier;
+  if (!d || state.copieEnCours) return;
+  if (!confirm(`Créer une copie de « ${d.name} » pour faire des essais ?\n\nComposantes, photos et données sont copiées. L'original n'est pas touché, et le syndicat ne voit pas la copie.`)) return;
+  state.copieEnCours = true;
+  render();
+  try {
+    const copie = await apiJson(`/api/dossiers/${d.id}/copie`, { method: 'POST', body: JSON.stringify({}) });
+    state.copieEnCours = false;
+    loadDossiers();
+    await openDossier(copie.id);
+    state.lot.note = `Copie créée : ${copie.dossier_no} — ${copie.copie.composantes} composante(s), ${copie.copie.photos} photo(s) classée(s), ${copie.copie.a_classer} à classer. Vous travaillez maintenant dans la copie.`;
+  } catch (e) {
+    state.copieEnCours = false;
+    state.revisionFlashError = e.message || 'La copie a échoué.';
+  }
+  render();
+}
+
 async function openDossier(id) {
   if (String(id) !== String(state.dossierId) && !quitterEnvoiPhotos()) return;
   journal.ouvert = false; journal.entrees = null;
@@ -3469,6 +3491,7 @@ function renderRevision() {
         </div>
         <div class="rev-actions">
           ${saveIndicatorHtml()}
+          <button class="btn-pill-sm" data-action="dupliquer-dossier" title="Copie complète pour faire des essais : l'original n'est pas touché"><i data-lucide="copy" style="width:14px;height:14px"></i>${state.copieEnCours ? 'Copie…' : 'Dupliquer'}</button>
           <button class="btn-cta-pub" data-action="go-publier"><i data-lucide="send"></i>Publier au client</button>
         </div>
       </div>
@@ -4372,6 +4395,9 @@ function initEvents() {
         break;
       case 'rv-skip':
         rvSkip();
+        break;
+      case 'dupliquer-dossier':
+        dupliquerDossier();
         break;
       case 'attn-ajouter':
         ajouterAttention();
