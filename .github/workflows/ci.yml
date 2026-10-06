@@ -42,11 +42,19 @@ jobs:
           fi
           echo "Aucun marqueur de conflit."
 
+      # Les scripts du site sont des modules (import/export) : sur un fichier
+      # .js, « node --check » ne les analyse pas et laisse passer une erreur de
+      # syntaxe. Lus en module sur l'entrée standard, ils le sont vraiment.
+      # Et un échec dans la boucle doit faire échouer l'étape, pas seulement
+      # le dernier fichier.
       - name: Syntaxe JavaScript
         run: |
-          for f in worker/src/index.js worker/public/*/app.js; do
-            node --check "$f" && echo "ok  $f"
+          echec=0
+          node --check worker/src/index.js && echo "ok  worker/src/index.js" || echec=1
+          for f in worker/public/*/*.js; do
+            node --input-type=module --check < "$f" && echo "ok  $f" || { echo "::error file=$f::erreur de syntaxe"; echec=1; }
           done
+          exit $echec
 
       # Le vrai portail : wrangler assemble le worker exactement comme au
       # déploiement. Aucun identifiant Cloudflare requis pour --dry-run, donc

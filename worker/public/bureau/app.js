@@ -210,6 +210,9 @@ const state = {
   publishing: false,
   publishError: null,
 
+  // Analyse des photos par l'IA, depuis le bureau : { enCours, faits, total, note }.
+  analyse: { enCours: false, faits: 0, total: 0, note: null },
+
   // Ajout d'une composante depuis le bureau.
   addCompOpen: false,
   addComp: { name: '', cat: 'enveloppe', uniformat_code: '' },
@@ -820,6 +823,7 @@ async function openDossier(id) {
   state.addCompOpen = false;
   state.addCompError = null;
   tri.reinitialiser(id);
+  state.analyse = { enCours: false, faits: 0, total: 0, note: null };
   await loadDossierDetail(id);
 }
 
@@ -874,6 +878,101 @@ async function uploadComposantesImport(file) {
   }
   state.composantesImportUploading = false;
   render();
+}
+
+// Composantes dont les photos n'ont pas encore été analysées. Même marqueur
+// qu'au terrain : toute analyse réussie remplit le délai suggéré. Un texte déjà
+// confirmé par l'ingénieur n'est pas rouvert.
+function composantesAAnalyser() {
+  return state.components.filter(c => c.photos > 0 && !c.delai_suggere && c.confirmed !== 1);
+}
+
+// Ne remplit que ce qui est vide : ce que l'ingénieur a saisi fait foi. La
+// cote proposée n'est pas validée (done reste à 0) : il la confirme d'un clic.
+function patchDepuisAnalyse(c, r) {
+  const vide = (v) => v == null || String(v).trim() === '';
+  const texte = (v) => (typeof v === 'string' && v.trim()) ? v.trim() : null;
+  const patch = {};
+  const champs = [
+    ['observation', texte(r.observation)], ['cause_possible', texte(r.causePossible)],
+    ['delai_suggere', texte(r.delaiSuggere)], ['consequences', texte(r.consequences)],
+    ['etendue', r.etendue || null], ['etendue_qte', texte(r.etendueQte)],
+    ['limite_observation', r.limiteObservation || null], ['nature_risque', r.natureRisque || null],
+  ];
+  champs.forEach(([k, v]) => { if (v != null && vide(c[k])) patch[k] = v; });
+  if (c.replacement_cost == null && typeof r.costEstimate === 'number' && !isNaN(r.costEstimate)) patch.replacement_cost = Math.round(r.costEstimate);
+  if (c.rating == null && !c.done && [1, 2, 3, 4].includes(r.rating)) patch.rating = r.rating;
+  return patch;
+}
+
+async function analyserPhotos() {
+  if (state.analyse.enCours) return;
+  const todo = composantesAAnalyser();
+  if (!todo.length) return;
+  const dossierId = state.dossierId;
+  state.analyse = { enCours: true, faits: 0, total: todo.length, note: null };
+  render();
+  let remplies = 0, cotes = 0, echecs = 0;
+  const attente = todo.slice();
+  // Deux à la fois : chaque analyse lit jusqu'à quatre photos de la composante.
+  async function suivant() {
+    while (attente.length) {
+      const comp = attente.shift();
+      try {
+        const r = await apiJson(`/api/components/${comp.id}/analyze`, { method: 'POST' });
+        if (state.dossierId !== dossierId) return;
+        // Sans clé API ou en cas d'erreur, le serveur renvoie une estimation
+        // par l'âge : ce n'est pas une lecture des photos, on ne l'écrit pas.
+        if (!r || r.source !== 'ia') { echecs++; }
+        else {
+          const courant = state.components.find(x => x.id === comp.id) || comp;
+          const patch = patchDepuisAnalyse(courant, r);
+          if (Object.keys(patch).length) {
+            await apiJson(`/api/components/${comp.id}`, { method: 'PATCH', body: JSON.stringify(patch) });
+            state.components = state.components.map(x => x.id === comp.id ? Object.assign({}, x, patch) : x);
+            remplies++;
+            if (patch.rating != null) cotes++;
+          }
+        }
+      } catch (e) {
+        echecs++;
+      }
+      if (state.dossierId !== dossierId) return;
+      state.analyse.faits += 1;
+      render();
+    }
+  }
+  await Promise.all([suivant(), suivant()]);
+  if (state.dossierId !== dossierId) return;
+  await refreshProjection();
+  const morceaux = [`Analyse terminée : ${remplies} composante(s) complétée(s) à partir des photos.`];
+  if (cotes) morceaux.push(`${cotes} cote(s) proposée(s) par l'IA, marquées « IA » : cliquez la cote pour la valider ou choisissez-en une autre. Une composante n'entre au calcul du fonds qu'une fois sa cote validée.`);
+  if (echecs) morceaux.push(`${echecs} analyse(s) n'ont pas abouti ; relancez le bouton pour réessayer.`);
+  morceaux.push('Vérifiez ensuite le texte avec « Réviser le texte du rapport ».');
+  state.analyse = { enCours: false, faits: 0, total: 0, note: morceaux.join(' ') };
+  render();
+}
+
+function analyseCtaHtml() {
+  const a = state.analyse;
+  const reste = composantesAAnalyser().length;
+  const pct = a.total ? Math.round(a.faits / a.total * 100) : 0;
+  const sub = a.enCours
+    ? `Analyse ${a.faits}/${a.total}… Gardez cet onglet ouvert.`
+    : reste
+      ? `${reste} composante(s) avec photos à analyser : observations, cause, délai, conséquences, coût et une cote proposée. Seuls les champs vides sont remplis.`
+      : `Aucune composante en attente : classez d'abord des photos, ou elles sont déjà analysées.`;
+  return `
+      <button class="reviewia-cta an-cta" data-action="analyser-photos" ${a.enCours || !reste ? 'disabled' : ''}>
+        <div class="reviewia-cta-icon"><i data-lucide="${a.enCours ? 'loader-2' : 'scan-search'}" class="${a.enCours ? 'spin' : ''}"></i></div>
+        <div style="flex:1">
+          <div class="reviewia-cta-title">Analyser les photos par l'IA</div>
+          <div class="reviewia-cta-sub">${sub}</div>
+        </div>
+        <div class="reviewia-cta-right">
+          ${a.enCours ? `<div class="reviewia-cta-track"><div class="reviewia-cta-fill" style="width:${pct}%"></div></div>` : '<i data-lucide="arrow-right"></i>'}
+        </div>
+      </button>`;
 }
 
 async function refreshProjection() {
@@ -2490,7 +2589,9 @@ function ratingControlHtml(c) {
   const na = `<button class="rt-opt na ${naOn ? 'on' : ''}" data-action="set-rating" data-id="${c.id}" data-rating="na"
       title="${escapeHtml(RATING_NA.label)}" aria-label="${escapeHtml(RATING_NA.label)}"
       style="${naOn ? `background:${RATING_NA.color};border-color:${RATING_NA.color};color:#fff` : ''}">na</button>`;
-  return `<div class="rt-ctrl">${opts}${na}</div>`;
+  const proposee = c.rating != null && !c.done
+    ? `<span class="rt-ia" title="Cote proposée par l'IA à partir des photos : cliquez-la pour la valider">IA</span>` : '';
+  return `<div class="rt-ctrl">${opts}${na}${proposee}</div>`;
 }
 
 function ratingPillHtml(c) {
@@ -2802,6 +2903,19 @@ function renderRevision() {
       ${scenarioCardsHtml(proj, state.selectedScenarioCode || (proj && proj.recommendedCode) || (proj && proj.scenarios && proj.scenarios[0] && proj.scenarios[0].code))}
       ${executiveSummaryHtml(proj, state.selectedScenarioCode || (proj && proj.recommendedCode) || (proj && proj.scenarios && proj.scenarios[0] && proj.scenarios[0].code))}
 
+
+      <button class="reviewia-cta tp-cta" data-action="go-photos">
+        <div class="reviewia-cta-icon"><i data-lucide="images"></i></div>
+        <div style="flex:1">
+          <div class="reviewia-cta-title">Déposer les photos du dossier</div>
+          <div class="reviewia-cta-sub">Toutes d'un coup : l'IA propose une composante pour chaque photo, vous approuvez.${tri.nombreAClasser() ? ` <b>${tri.nombreAClasser()} photo(s) à classer.</b>` : ''}</div>
+        </div>
+        <div class="reviewia-cta-right"><i data-lucide="arrow-right"></i></div>
+      </button>
+
+      ${analyseCtaHtml()}
+      ${state.analyse.note ? `<div class="temp-pass-warn" style="margin-bottom:14px"><i data-lucide="info"></i><span>${escapeHtml(state.analyse.note)}</span></div>` : ''}
+
       <button class="reviewia-cta" data-action="go-reviewia">
         <div class="reviewia-cta-icon"><i data-lucide="sparkles"></i></div>
         <div style="flex:1">
@@ -2812,15 +2926,6 @@ function renderRevision() {
           <div class="reviewia-cta-track"><div class="reviewia-cta-fill" style="width:${total ? Math.round(cCount / total * 100) : 0}%"></div></div>
           <i data-lucide="arrow-right"></i>
         </div>
-      </button>
-
-      <button class="reviewia-cta tp-cta" data-action="go-photos">
-        <div class="reviewia-cta-icon"><i data-lucide="images"></i></div>
-        <div style="flex:1">
-          <div class="reviewia-cta-title">Déposer les photos du dossier</div>
-          <div class="reviewia-cta-sub">Toutes d'un coup : l'IA propose une composante pour chaque photo, vous approuvez.${tri.nombreAClasser() ? ` <b>${tri.nombreAClasser()} photo(s) à classer.</b>` : ''}</div>
-        </div>
-        <div class="reviewia-cta-right"><i data-lucide="arrow-right"></i></div>
       </button>
 
       ${batimentPanelHtml(d)}
@@ -3262,6 +3367,9 @@ function initEvents() {
     if (state.screen === 'modeles' && modeles.click(action, btn)) return;
     if (state.screen === 'photos' && tri.click(action, btn)) return;
     switch (action) {
+      case 'analyser-photos':
+        analyserPhotos();
+        break;
       case 'go-photos':
         state.screen = 'photos';
         render();

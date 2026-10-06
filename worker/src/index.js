@@ -5235,7 +5235,11 @@ pas de statuer, mets "rating": null et explique-le dans "observation".`
     }
   ];
   try {
-    const text = await callClaude(apiKey, { content, maxTokens: 700 });
+    // Juger un état sur photos gagne à réfléchir : on garde la réflexion
+    // adaptative, mais avec la place d'écrire ensuite la fiche. À 700 jetons,
+    // la réflexion pouvait tout prendre, le JSON n'arrivait pas, et la fiche
+    // retombait sans le dire sur l'estimation par l'âge.
+    const text = await callClaude(apiKey, { content, maxTokens: 4000 });
     const parsed = extractJson(text);
     // Les valeurs hors vocabulaire sont écartées plutôt que stockées : le
     // gabarit de rédaction ne sait rien faire d'une étendue « moyenne ».
