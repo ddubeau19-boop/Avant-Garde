@@ -59,7 +59,8 @@ export async function courrielsApres(marque, { attendus = 1, delai = 10000, cont
   const fin = Date.now() + delai;
   const lire = () => fichiersCourriels().filter((f) => f.moment >= marque)
     .map((f) => readFileSync(f.chemin, 'utf8'))
-    .filter((t) => !contient || t.includes(contient));
+    // Un fichier encore vide est un courriel en cours d'écriture : pas encore arrivé.
+    .filter((t) => t.length > 0 && (!contient || t.includes(contient)));
   let liste = lire();
   while (liste.length < attendus && Date.now() < fin) {
     await pause(150);

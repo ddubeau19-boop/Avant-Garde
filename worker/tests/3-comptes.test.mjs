@@ -36,9 +36,9 @@ test('invitation par l\'administrateur : lien unique, activation, signature', as
   assert.equal(r.statut, 201);
   assert.equal(r.json.envoye, true);
   assert.equal(r.json.membre.invitation_en_attente, true);
-  const [courriel] = await courrielsApres(marque);
+  const [courriel] = await courrielsApres(marque, { contient: 'Bienvenue, Nouvelle Ing' });
   assert.match(courriel, /Activer mon compte/);
-  const lien = await lienApres(marque);
+  const lien = await lienApres(marque, 'Bienvenue, Nouvelle Ing');
   // Avant activation, pas de connexion possible.
   assert.equal((await connexion(email, 'nimporte quoi')).statut, 401);
   const info = await api(`/api/auth/jeton/${lien}`);
@@ -61,15 +61,15 @@ test('mot de passe oublié : même réponse pour tous, lien d\'une heure, ancien
   const email = `oubli${Date.now()}@test.ca`;
   let marque = nombreCourriels();
   await api(`/api/companies/${IDS.firmeA}/equipe`, { methode: 'POST', session: adminA, corps: { name: 'Distrait', email } });
-  const premier = await api(`/api/auth/jeton/${await lienApres(marque)}`, { methode: 'POST', corps: { password: 'premier mot de passe' } });
+  const premier = await api(`/api/auth/jeton/${await lienApres(marque, 'Bienvenue, Distrait')}`, { methode: 'POST', corps: { password: 'premier mot de passe' } });
   const ancienne = premier.json.token;
   marque = nombreCourriels();
   const existe = await api('/api/auth/oubli', { methode: 'POST', corps: { email } });
   const inconnu = await api('/api/auth/oubli', { methode: 'POST', corps: { email: 'inconnu@nulle.part' } });
   assert.deepEqual(existe.json, inconnu.json);
-  const lien = await lienApres(marque);
-  // L'adresse inconnue n'a rien reçu : un seul courriel est parti.
-  assert.equal((await courrielsApres(marque, { attendus: 2, delai: 1500 })).length, 1);
+  const lien = await lienApres(marque, 'valable une heure');
+  // L'adresse inconnue n'a rien reçu : un seul courriel de réinitialisation est parti.
+  assert.equal((await courrielsApres(marque, { attendus: 2, delai: 1500, contient: 'valable une heure' })).length, 1);
   assert.equal((await api(`/api/auth/jeton/${lien}`)).json.type, 'reinitialisation');
   assert.equal((await api(`/api/auth/jeton/${lien}`, { methode: 'POST', corps: { password: 'deuxième mot de passe' } })).statut, 200);
   assert.equal((await api('/api/auth/me', { session: ancienne })).statut, 401);
