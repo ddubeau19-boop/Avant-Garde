@@ -2929,6 +2929,23 @@ auth.post("/login", async (c) => {
   const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
   return c.json({ token, user: await publicUser(c.env.DB, user) });
 });
+// Bloc de signature de l'utilisateur connecté : titre, ordre, n° de membre.
+// Repris à la déclaration de chaque rapport qu'il publie.
+auth.patch("/signature", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "non authentifié" }, 401);
+  if (user.role === "portail") return c.json({ error: "réservé aux comptes de firme" }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const champ = (v, max) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null);
+  const ordre = champ(body2.ordre_professionnel, 10)?.toUpperCase() ?? null;
+  if (ordre && !ORDRES_PROFESSIONNELS.some((o) => o.sigle === ordre)) {
+    return c.json({ error: `ordre professionnel inconnu (${ORDRES_PROFESSIONNELS.map((o) => o.sigle).join(", ")})` }, 400);
+  }
+  await c.env.DB.prepare("UPDATE users SET title = ?1, ordre_professionnel = ?2, no_membre = ?3 WHERE id = ?4")
+    .bind(champ(body2.title, 60), ordre, champ(body2.no_membre, 30), user.id).run();
+  const maj = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(user.id).first();
+  return c.json(await publicUser(c.env.DB, maj));
+});
 auth.get("/me", async (c) => {
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
@@ -2955,6 +2972,7 @@ async function getCurrentUser(c) {
 const JOURNAL_REGROUPEMENT_MS = 10 * 60 * 1e3;
 const JOURNAL_VALEUR_MAX = 300;
 const LIBELLES_CHAMPS = {
+  date_visite: "Date de la visite",
   name: "Nom", done: "Documentée", etat: "État", residual: "Vie résiduelle (%)", install_year: "Année d'installation",
   qty: "Quantité", note: "Note", replacement_cost: "Coût de remplacement", useful_life_years: "Vie utile",
   confirmed: "Confirmée au bureau", rating: "Cote", r_flag: "Remplacement (R)", observation: "Constats",
@@ -3833,7 +3851,12 @@ const COLONNES_AJOUTEES = [
   // Suivi des dossiers : qui s'en occupe, et pour quand.
   ["dossiers", "assigne_a", "TEXT"],
   ["dossiers", "echeance", "TEXT"],
-  ["dossiers", "client_id", "TEXT"]
+  ["dossiers", "client_id", "TEXT"],
+  // Date de la visite des lieux (AAAA-MM-JJ) : au rapport, section 1.6 et déclaration.
+  ["dossiers", "date_visite", "TEXT"],
+  // Version publiée, figée : le .docx produit à la publication (R2) et son signataire.
+  ["dossiers", "rapport_publie_r2", "TEXT"],
+  ["dossiers", "publie_par", "TEXT"]
 ];
 // Tables ajoutées après la mise en production, créées au premier appel.
 const TABLES_AJOUTEES = [
@@ -24660,6 +24683,10 @@ const ORDRES_PROFESSIONNELS = [
   { sigle: "OAQ", nom: "Ordre des architectes du Québec", re: /(^|[\s,.(])arch\.?($|[\s,.)])|architecte/i }
 ];
 function ordreDuSignataire(signataire) {
+  // Le sigle saisi au profil fait foi ; à défaut, on le déduit du titre.
+  const sigle = String(signataire?.ordre_professionnel ?? "").trim().toUpperCase();
+  const parSigle = ORDRES_PROFESSIONNELS.find((o) => o.sigle === sigle);
+  if (parSigle) return parSigle;
   const source = [signataire?.name, signataire?.title, signataire?.ordre_professionnel, signataire?.role].filter(Boolean).join(" ");
   if (!source.trim()) return null;
   for (const ordre of ORDRES_PROFESSIONNELS) {
@@ -25832,6 +25859,7 @@ const CHAMPS_GABARIT = [
   ["etages", "Nombre d'étages"],
   ["annee_construction", "Année de construction"],
   ["date_rapport", "Date du rapport (ex. 25 septembre 2026)"],
+  ["date_visite", "Date de la visite des lieux (ex. 12 septembre 2026)"],
   ["annee", "Année courante"],
   ["signataire", "Nom du signataire"],
   ["signataire_titre", "Titre du signataire (ex. ing.)"],
@@ -25852,6 +25880,19 @@ const BLOCS_GABARIT_LIBELLES = [
   ["sommaire_executif", "Sommaire exécutif — scénario de financement sur 5 ans"],
   ["table_des_matieres", "Table des matières Word, mise à jour à l'ouverture"]
 ];
+// Une date de visite « AAAA-MM-JJ » réelle, et pas dans le futur.
+function dateVisiteValide(v) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v ?? ""));
+  if (!m) return false;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 12));
+  return d.getUTCMonth() === +m[2] - 1 && d.getUTCDate() === +m[3] && d.getTime() <= Date.now() + 864e5;
+}
+// « 12 septembre 2026 » à partir d'AAAA-MM-JJ, sans glisser d'un jour selon le fuseau.
+function dateVisiteLongue(v) {
+  if (!dateVisiteValide(v)) return null;
+  const [a, m, j] = String(v).split("-").map(Number);
+  return new Date(Date.UTC(a, m - 1, j, 12)).toLocaleDateString("fr-CA", { day: "numeric", month: "long", year: "numeric", timeZone: "UTC" });
+}
 function dateLongue(date) {
   return date.toLocaleDateString("fr-CA", { day: "numeric", month: "long", year: "numeric" });
 }
@@ -25989,6 +26030,7 @@ async function generateReportDocx(ctx, opts = {}) {
     body(`Solde du fonds de prévoyance : ${montantMaison(dossier.current_fund_balance) ?? "non disponible"}`),
     body(`Cotisation annuelle : ${montantMaison(dossier.cotisation_annuelle) ?? "non disponible"}`),
     titre2("1.6 Visite"),
+    body(`Date de la visite : ${dateVisiteLongue(dossier.date_visite) ?? A_COMPLETER}`),
     body(`Inspecteur : ${nomSignataire}`),
     body(`Préparé le : ${today}`),
     ...sectionEvolution(ctx, outils, anneeCourante)
@@ -26181,7 +26223,7 @@ async function generateReportDocx(ctx, opts = {}) {
     puce(ordre
       ? `J'ai rédigé mes analyses, opinions et conclusions de même que le présent rapport en conformité avec les règlements et normes de pratique de l'${ordre.nom} (${ordre.sigle});`
       : `J'ai rédigé mes analyses, opinions et conclusions de même que le présent rapport en conformité avec les règlements et normes de pratique de ${A_COMPLETER} — ordre professionnel du signataire;`),
-    puce(`La visite des lieux a été effectuée par ${nomSignataire.replace(/\.$/, "")}. Les espaces communs ont été visités.`),
+    puce(`La visite des lieux a été effectuée le ${dateVisiteLongue(dossier.date_visite) ?? A_COMPLETER} par ${nomSignataire.replace(/\.$/, "")}. Les espaces communs ont été visités.`),
     body(`Fait le ${today}.`),
     body("Je déclare avoir procédé avec diligence dans l'exercice de la profession en ce qui concerne les opinions de valeur reliées au remplacement des éléments du bâtiment en cause."),
     body("________________________"),
@@ -48055,6 +48097,10 @@ portail.get("/immeubles/:id/rapport.docx", async (c) => {
   const { refus, dossier } = await immeublePortail(c);
   if (refus) return refus;
   if (!dossier.published_at) return c.json({ error: "le rapport n'est pas encore publié par la firme" }, 404);
+  // La version figée à la publication ; à défaut (publié avant qu'elle
+  // existe), le rapport regénéré comme auparavant.
+  const fige = dossier.rapport_publie_r2 ? await c.env.PHOTOS.get(dossier.rapport_publie_r2) : null;
+  if (fige) return new Response(fige.body, { headers: { "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "content-disposition": `attachment; filename="${dossier.dossier_no}-etude-fonds-prevoyance.docx"` } });
   const bytes = await produireRapportDocx(c, await contexteRapportPortail(c, dossier, { word: true }));
   return new Response(new Blob([new Uint8Array(bytes)]), { headers: { "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "content-disposition": `attachment; filename="${dossier.dossier_no}-etude-fonds-prevoyance.docx"` } });
 });
@@ -48728,6 +48774,7 @@ function valeursChamps(ctx) {
     etages: valeur(dossier.floors),
     annee_construction: valeur(anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier.built_year)),
     date_rapport: dateLongue(new Date()),
+    date_visite: valeur(dateVisiteLongue(dossier.date_visite)),
     annee: String(new Date().getFullYear()),
     signataire: valeur(signataire?.name ?? ctx.engineerName),
     signataire_titre: valeur(signataire?.title),
@@ -48841,9 +48888,22 @@ dossiers.patch("/:id", async (c) => {
     "current_fund_balance",
     "published_at",
     "batiment_info",
-    "cotisation_annuelle"
+    "cotisation_annuelle",
+    "date_visite"
   ]) {
     if (key in body2) {
+      // Publier maintenant passe par POST /publier, qui vérifie et fige le
+      // rapport. Une date passée reste permise : c'est l'historique d'une
+      // étude livrée hors de la plateforme (révision aux cinq ans).
+      if (key === "published_at" && body2[key] != null) {
+        const t = Date.parse(body2[key]);
+        if (isNaN(t) || t > Date.now() - 864e5) {
+          return c.json({ error: "pour publier, utilisez POST /api/dossiers/:id/publier : il vérifie le rapport et le fige" }, 400);
+        }
+      }
+      if (key === "date_visite" && body2[key] != null && !dateVisiteValide(body2[key])) {
+        return c.json({ error: "date de visite invalide (AAAA-MM-JJ, pas dans le futur)" }, 400);
+      }
       fields.push(`${key} = ?${fields.length + 1}`);
       values.push(body2[key]);
     }
@@ -48864,6 +48924,105 @@ dossiers.patch("/:id", async (c) => {
   const gabarit = biblio ? [...biblio.composantes, ...GABARIT_STRATEGIS.filter((item) => !biblio.noms.has(cleTexte(item.name)))] : GABARIT_STRATEGIS;
   const composantesMisesAJour = await appliquerReglesModifiees(c.env.DB, owned, dossier, gabarit);
   return c.json({ ...dossier, stats: await dossierStats(c.env.DB, id), composantes_mises_a_jour: composantesMisesAJour });
+});
+// ── Publication ─────────────────────────────────────────────────────────────
+// Avant de livrer au syndicat : ce qui empêche de signer (bloquant) et ce qui
+// laissera une mention « à confirmer » ou « non disponible » (avertissement).
+async function verificationPublication(db, dossier, signataire) {
+  const bloquants = [];
+  const avertissements = [];
+  if (!dateVisiteValide(dossier.date_visite)) {
+    bloquants.push({ cle: "date_visite", message: "La date de la visite n'est pas saisie : elle figure en section 1.6 et dans la déclaration." });
+  }
+  const ordre = ordreDuSignataire(signataire);
+  if (!ordre || !String(signataire?.ordre_professionnel ?? "").trim() || !String(signataire?.no_membre ?? "").trim()) {
+    bloquants.push({ cle: "signataire", message: "Votre bloc de signature est incomplet (ordre professionnel et n° de membre) : la déclaration porterait « à compléter avant signature »." });
+  }
+  const comp = await db.prepare(
+    `SELECT
+       SUM(CASE WHEN confirmed = 1 THEN 0 ELSE 1 END) AS non_confirmees,
+       SUM(CASE WHEN done = 1 THEN 0 ELSE 1 END) AS non_documentees,
+       SUM(CASE WHEN done = 1 AND replacement_cost IS NULL THEN 1 ELSE 0 END) AS sans_cout,
+       COUNT(*) AS total
+     FROM components WHERE dossier_id = ?1 AND actif = 1`
+  ).bind(dossier.id).first();
+  if (!comp?.total) bloquants.push({ cle: "composantes", message: "Aucune composante active au dossier." });
+  else if (comp.non_confirmees) bloquants.push({ cle: "confirmation", message: `${comp.non_confirmees} composante(s) dont le texte n'est pas confirmé.` });
+  if (comp?.non_documentees) avertissements.push({ cle: "documentation", message: `${comp.non_documentees} composante(s) sans cote validée : exclues du calcul du fonds.` });
+  if (comp?.sans_cout) avertissements.push({ cle: "couts", message: `${comp.sans_cout} composante(s) sans coût de remplacement : exclues du calcul du fonds.` });
+  if (dossier.current_fund_balance == null) avertissements.push({ cle: "solde", message: "Solde du fonds non saisi : « non disponible » au rapport." });
+  if (dossier.cotisation_annuelle == null) avertissements.push({ cle: "cotisation", message: "Cotisation annuelle non saisie : « non disponible » au rapport." });
+  if (!(Number(dossier.units) > 0)) avertissements.push({ cle: "unites", message: "Nombre d'unités non saisi : « à confirmer » au rapport." });
+  const membres = (await membresPortail(db, dossier.id)).filter((m) => m.actif);
+  if (!membres.length) avertissements.push({ cle: "membres", message: "Aucun membre du syndicat invité au portail : personne ne sera avisé. Invitez-les depuis « Carnet d'entretien »." });
+  return { bloquants, avertissements, destinataires: membres.map((m) => ({ name: m.name, email: m.email, en_attente: m.invitation_en_attente })) };
+}
+dossiers.get("/:id/publication", async (c) => {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const publiePar = dossier.publie_par ? await c.env.DB.prepare("SELECT name FROM users WHERE id = ?1").bind(dossier.publie_par).first() : null;
+  return c.json({
+    ...await verificationPublication(c.env.DB, dossier, user),
+    signataire: { name: user.name, title: user.title ?? null, ordre_professionnel: user.ordre_professionnel ?? null, no_membre: user.no_membre ?? null },
+    publication: dossier.published_at ? { published_at: dossier.published_at, par: publiePar?.name ?? null, figee: !!dossier.rapport_publie_r2 } : null
+  });
+});
+// Publier : vérifier, produire le rapport une fois, le garder tel quel, aviser
+// le syndicat. Ce que le syndicat télécharge ensuite est ce fichier, pas un
+// rapport regénéré à chaque clic à partir de données qui ont pu changer.
+dossiers.post("/:id/publier", async (c) => {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const verification = await verificationPublication(c.env.DB, dossier, user);
+  if (verification.bloquants.length) return c.json({ error: "le rapport n'est pas prêt à être publié", verification }, 409);
+  const ctx = await buildReportContext(c, { word: true });
+  const octets = await produireRapportDocx(c, ctx);
+  const maintenant = (/* @__PURE__ */ new Date()).toISOString();
+  const r2Key = `rapports/${dossier.id}/${maintenant.replace(/[:.]/g, "-")}.docx`;
+  await c.env.PHOTOS.put(r2Key, octets, { httpMetadata: { contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" } });
+  await c.env.DB.prepare(
+    "UPDATE dossiers SET published_at = ?1, rapport_publie_r2 = ?2, publie_par = ?3, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?4"
+  ).bind(maintenant, r2Key, user.id, dossier.id).run();
+  await noterJournal(c.env.DB, { dossierId: dossier.id, userId: user.id, action: "publication", champs: [{ champ: "published_at", avant: dossier.published_at ?? null, apres: maintenant }] });
+  // Les membres déjà actifs reçoivent l'avis ; une invitation en attente mène
+  // déjà au portail, où le rapport les attendra.
+  const origine = origineDe(c);
+  const firme = await companyBrief(c.env.DB, dossier.company_id);
+  let avises = 0;
+  const echecs = [];
+  for (const m of (await membresPortail(c.env.DB, dossier.id)).filter((x) => x.actif && !x.invitation_en_attente)) {
+    try {
+      await envoyerCourriel(c.env, {
+        to: m.email,
+        subject: `${dossier.published_at ? "Nouvelle version de l'étude" : "Étude de fonds de prévoyance"} — ${dossier.name}`,
+        titre: `Bonjour ${m.name}`,
+        paragraphes: [
+          `${firme?.name ?? "Votre firme d'ingénierie"} a publié ${dossier.published_at ? "une nouvelle version de " : ""}l'étude du fonds de prévoyance de ${dossier.name}.`,
+          "Vous pouvez la télécharger dès maintenant depuis votre portail, avec le carnet d'entretien de l'immeuble."
+        ],
+        bouton: { texte: "Ouvrir le portail", url: `${origine}/portail/` },
+        replyTo: user.email ? { email: user.email, name: user.name ?? undefined } : void 0
+      });
+      avises++;
+    } catch (e) {
+      echecs.push(m.email);
+    }
+  }
+  const publie = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(dossier.id).first();
+  return c.json({ dossier: { ...publie, stats: await dossierStats(c.env.DB, dossier.id) }, avises, echecs });
+});
+// La version publiée, telle que le syndicat la reçoit.
+dossiers.get("/:id/rapport-publie.docx", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const obj = dossier.published_at && dossier.rapport_publie_r2 ? await c.env.PHOTOS.get(dossier.rapport_publie_r2) : null;
+  if (!obj) return c.json({ error: "aucune version publiée figée" }, 404);
+  return new Response(obj.body, {
+    headers: {
+      "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "content-disposition": `attachment; filename="${dossier.dossier_no}-etude-fonds-prevoyance.docx"`
+    }
+  });
 });
 const photos = new Hono();
 photos.get("/:id/file", async (c) => {

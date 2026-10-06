@@ -209,6 +209,9 @@ const state = {
 
   publishing: false,
   publishError: null,
+  publication: null,          // GET /api/dossiers/:id/publication
+  publicationErreur: null,
+  publicationResultat: null,  // { avises, echecs } après une publication
 
   // Analyse des photos par l'IA, depuis le bureau : { enCours, faits, total, note }.
   analyse: { enCours: false, faits: 0, total: 0, note: null },
@@ -1091,6 +1094,23 @@ async function onSoldeBlur(value) {
   render();
 }
 
+// Date de la visite des lieux : au rapport (1.6 et déclaration).
+async function onVisiteChange(value) {
+  const v = String(value || '').trim() || null;
+  if (state.dossier && (state.dossier.date_visite || null) === v) return;
+  state.saveStatus = 'saving';
+  paintSaveIndicator();
+  try {
+    await apiJson(`/api/dossiers/${state.dossierId}`, { method: 'PATCH', body: JSON.stringify({ date_visite: v }) });
+    state.dossier = Object.assign({}, state.dossier, { date_visite: v });
+    state.saveStatus = 'saved';
+  } catch (e) {
+    state.saveStatus = 'error';
+    state.revisionFlashError = e.message || "Échec de l'enregistrement.";
+  }
+  render();
+}
+
 async function onCotisationBlur(value) {
   const n = parseNum(value);
   if (n === null) { render(); return; }
@@ -1273,22 +1293,36 @@ async function rvConfirm() {
   rvGoTo(state.reviewIdx + 1);
 }
 
+// État de la publication : vérification serveur, destinataires, version publiée.
+async function chargerPublication() {
+  state.publication = null;
+  state.publicationErreur = null;
+  render();
+  try {
+    state.publication = await apiJson(`/api/dossiers/${state.dossierId}/publication`);
+  } catch (e) {
+    state.publicationErreur = e.message || 'Impossible de vérifier le dossier.';
+  }
+  render();
+}
+
+// Publier : le serveur vérifie, produit le rapport une fois et le fige, puis
+// avise les membres du syndicat. Un refus (409) renvoie ce qui bloque.
 async function doPublish() {
   if (state.publishing) return;
   state.publishing = true;
   state.publishError = null;
+  state.publicationResultat = null;
   render();
   try {
-    const iso = new Date().toISOString();
-    await apiJson(`/api/dossiers/${state.dossierId}`, { method: 'PATCH', body: JSON.stringify({ published_at: iso }) });
-    state.dossier = Object.assign({}, state.dossier, { published_at: iso });
-    state.publishing = false;
-    render();
+    const r = await apiJson(`/api/dossiers/${state.dossierId}/publier`, { method: 'POST' });
+    state.dossier = Object.assign({}, state.dossier, r.dossier);
+    state.publicationResultat = { avises: r.avises, echecs: r.echecs || [] };
   } catch (e) {
-    state.publishing = false;
     state.publishError = e.message || 'Erreur lors de la publication.';
-    render();
   }
+  state.publishing = false;
+  await chargerPublication();
 }
 
 async function downloadReport(kind) {
@@ -2469,6 +2503,9 @@ function fundCardHtml(d, proj, params, excluded) {
         <div><div class="fund-stat-label">Cotisation annuelle actuelle</div>
           <div class="solde-box"><input type="text" inputmode="numeric" data-role="cotisation-input" value="${cotisationVal}"><span>$</span></div>
         </div>
+        <div><div class="fund-stat-label"><label for="visiteInput">Date de la visite</label></div>
+          <div class="solde-box date ${d.date_visite ? '' : 'manque'}"><input id="visiteInput" type="date" data-role="visite-input" max="${new Date().toISOString().slice(0, 10)}" value="${escapeHtml(d.date_visite || '')}"></div>
+        </div>
       </div>
       ${excluded.length > 0 ? `
       <div class="excluded-banner">
@@ -2971,55 +3008,88 @@ function renderRevision() {
   </div>`;
 }
 
+// Compléter son bloc de signature sans quitter la publication.
+function signatureFormHtml(sig) {
+  const ordres = ['OIQ', 'OTPQ', 'OAQ'];
+  return `
+  <form class="nf-card sig-form" id="signature-form">
+    <div class="nf-grid">
+      <div class="nf-field"><label class="field-label" for="sig_title">Titre</label>
+        <input id="sig_title" class="detail-input" value="${escapeHtml(sig.title || '')}" placeholder="ex. ing., M.Sc.A."></div>
+      <div class="nf-field"><label class="field-label" for="sig_ordre">Ordre professionnel *</label>
+        <select id="sig_ordre" class="detail-input" required><option value="">—</option>${ordres.map(o => `<option ${sig.ordre_professionnel === o ? 'selected' : ''}>${o}</option>`).join('')}</select></div>
+      <div class="nf-field"><label class="field-label" for="sig_no">N° de membre *</label>
+        <input id="sig_no" class="detail-input" value="${escapeHtml(sig.no_membre || '')}" required></div>
+    </div>
+    <div class="nf-actions"><button type="submit" class="btn-primary">Enregistrer ma signature</button></div>
+  </form>`;
+}
+
+async function enregistrerSignature() {
+  const v = (id) => (document.getElementById(id) || {}).value || '';
+  try {
+    await apiJson('/api/auth/signature', { method: 'PATCH', body: JSON.stringify({ title: v('sig_title'), ordre_professionnel: v('sig_ordre'), no_membre: v('sig_no') }) });
+  } catch (e) {
+    state.publishError = e.message;
+  }
+  await chargerPublication();
+}
+
 function renderPublier() {
   const d = state.dossier;
   if (!d) return `<div class="rev-shell"><div class="page-pad"><div class="empty-state">Dossier introuvable.</div></div></div>`;
-  const allConf = allConfirmed();
-  const remaining = state.components.length - confirmedCount();
-  const published = !!d.published_at;
+  const pub = state.publication;
+  const res = state.publicationResultat;
   let body;
-  if (published) {
-    body = `
-    <div class="pub-published">
-      <div class="pub-icon-circle green"><i data-lucide="party-popper" style="width:30px;height:30px"></i></div>
-      <h2>Étude publiée</h2>
-      <p>Le syndicat ${escapeHtml(d.name || '')} a reçu l'avis par courriel. Sa plateforme est active : consultation de l'étude et suivi du carnet d'entretien.</p>
-      <div style="display:flex;gap:11px;justify-content:center"><button class="btn-secondary" data-action="go-dossiers">Retour aux dossiers</button></div>
-    </div>`;
-  } else if (!allConf) {
-    body = `
-    <div class="pub-locked">
-      <div class="pub-icon-circle"><i data-lucide="lock" style="width:28px;height:28px"></i></div>
-      <h2>Révision à compléter</h2>
-      <p>Les rapports Word et Excel ne sont pas générés tant que le texte de toutes les composantes n'est pas confirmé. Il reste <b>${remaining}</b> composante(s) à réviser.</p>
-      <button class="btn-primary" data-action="go-reviewia"><i data-lucide="sparkles"></i>Poursuivre la révision</button>
-    </div>`;
-  } else {
-    const deliverables = [
-      { name: 'Étude de fonds de prévoyance', sub: 'Word · vérifié', icon: 'file-text', bg: 'var(--ink)', color: '#fff' },
-      { name: 'Tableur durées de vie', sub: 'Excel · ' + state.components.length + ' composantes', icon: 'table-2', bg: 'var(--green)', color: '#fff' },
-      { name: 'Accès plateforme client', sub: 'Espace syndicat en ligne', icon: 'monitor', bg: 'var(--ink-100)', color: 'var(--ink-700)' },
-    ];
+  if (state.publicationErreur) body = errorBanner(state.publicationErreur, 'go-publier');
+  else if (!pub) body = spinnerBlock('Vérification du dossier…');
+  else {
+    const bloquants = pub.bloquants || [];
+    const avert = pub.avertissements || [];
+    const dest = pub.destinataires || [];
+    const sig = pub.signataire || {};
+    const publie = pub.publication;
+    const actionPour = (cle) => cle === 'date_visite' ? `<button class="btn-pill-sm" data-action="go-revision">Saisir la date</button>`
+      : cle === 'signataire' ? ''
+      : cle === 'confirmation' ? `<button class="btn-pill-sm" data-action="go-reviewia">Réviser le texte</button>` : '';
+    const ligne = (x, niveau) => `<div class="pv-row ${niveau}"><i data-lucide="${niveau === 'bloquant' ? 'x-circle' : 'alert-triangle'}"></i><span>${escapeHtml(x.message)}</span>${niveau === 'bloquant' ? actionPour(x.cle) : ''}</div>`;
     body = `
     <div class="pub-ready">
       <div class="pub-ready-top">
-        <div class="pub-section-eyebrow">Ce qui sera livré</div>
-        ${deliverables.map(dl => `
-        <div class="deliverable-row">
-          <div class="deliverable-icon" style="background:${dl.bg};color:${dl.color}"><i data-lucide="${dl.icon}"></i></div>
-          <div style="flex:1"><div class="deliverable-name">${dl.name}</div><div class="deliverable-sub">${dl.sub}</div></div>
-          <i data-lucide="check-circle-2" style="color:var(--green)"></i>
-        </div>`).join('')}
-        <div class="pub-section-eyebrow" style="margin-top:22px">Destinataire</div>
+        ${publie ? `
+        <div class="pv-publie">
+          <i data-lucide="check-circle-2"></i>
+          <div style="flex:1"><b>Publiée le ${escapeHtml(new Date(publie.published_at).toLocaleDateString('fr-CA', { day: 'numeric', month: 'long', year: 'numeric' }))}</b>${publie.par ? ` par ${escapeHtml(publie.par)}` : ''}.
+            ${publie.figee ? 'Le syndicat télécharge la version figée à ce moment.' : 'Publiée avant les versions figées : le portail regénère le rapport ; republiez pour figer la version.'}</div>
+          ${publie.figee ? `<button class="btn-pill-sm" data-action="telecharger-publie"><i data-lucide="download" style="width:14px;height:14px"></i>Version publiée</button>` : ''}
+        </div>` : ''}
+        ${res ? `<div class="pv-row ok"><i data-lucide="mail-check"></i><span>${res.avises ? `${res.avises} membre(s) du syndicat avisé(s) par courriel.` : 'Aucun membre actif à aviser.'}${res.echecs.length ? ` Échec d'envoi : ${escapeHtml(res.echecs.join(', '))}.` : ''}</span></div>` : ''}
+
+        <div class="pub-section-eyebrow">Vérification avant publication</div>
+        ${bloquants.length || avert.length ? '' : `<div class="pv-row ok"><i data-lucide="check-circle-2"></i><span>Rien à signaler : le rapport est complet.</span></div>`}
+        ${bloquants.map((x) => ligne(x, 'bloquant')).join('')}
+        ${avert.map((x) => ligne(x, 'avert')).join('')}
+
+        <div class="pub-section-eyebrow" style="margin-top:22px">Signataire</div>
         <div class="recipient-card">
-          <div class="recipient-avatar">${initialsOf(d.name)}</div>
-          <div style="flex:1"><div class="recipient-name">Syndicat ${escapeHtml(d.name || '')}</div><div class="recipient-sub">${d.units ? d.units + ' unités · ' : ''}${escapeHtml(d.address || '')}</div></div>
+          <div class="recipient-avatar">${initialsOf(sig.name)}</div>
+          <div style="flex:1"><div class="recipient-name">${escapeHtml(sig.name || '')}${sig.title ? ', ' + escapeHtml(sig.title) : ''}</div>
+            <div class="recipient-sub">${sig.ordre_professionnel && sig.no_membre ? `${escapeHtml(sig.ordre_professionnel)} · n° ${escapeHtml(sig.no_membre)}` : 'Ordre professionnel ou n° de membre manquant'} · visite du ${d.date_visite ? escapeHtml(d.date_visite) : '—'}</div></div>
         </div>
+
+        ${bloquants.some((x) => x.cle === 'signataire') ? signatureFormHtml(sig) : ''}
+
+        <div class="pub-section-eyebrow" style="margin-top:22px">Destinataires (membres du portail)</div>
+        ${dest.length ? dest.map((m) => `
+        <div class="recipient-card">
+          <div class="recipient-avatar">${initialsOf(m.name)}</div>
+          <div style="flex:1"><div class="recipient-name">${escapeHtml(m.name)}</div><div class="recipient-sub">${escapeHtml(m.email)}${m.en_attente ? ' · invitation en attente : verra le rapport en activant son accès' : ''}</div></div>
+        </div>`).join('') : `<div class="recipient-sub">Aucun membre : invitez le syndicat depuis « Carnet d'entretien » pour qu'il soit avisé et puisse télécharger l'étude.</div>`}
       </div>
       ${state.publishError ? `<div style="padding:0 30px 16px">${errorBanner(state.publishError)}</div>` : ''}
       <div class="pub-footer">
-        <div class="pub-footer-note">En publiant, les rapports passent en lecture seule et le client reçoit ses accès.</div>
-        <button class="btn-primary" data-action="publish" ${state.publishing ? 'disabled' : ''}><i data-lucide="${state.publishing ? 'loader-2' : 'send'}" class="${state.publishing ? 'spin' : ''}"></i>${state.publishing ? 'Publication…' : 'Publier & activer le client'}</button>
+        <div class="pub-footer-note">En publiant, le rapport Word est produit une fois et figé : c'est cette version que le syndicat télécharge, même si le dossier change ensuite. Les membres actifs reçoivent un courriel.</div>
+        <button class="btn-primary" data-action="publish" ${state.publishing || bloquants.length ? 'disabled' : ''}><i data-lucide="${state.publishing ? 'loader-2' : 'send'}" class="${state.publishing ? 'spin' : ''}"></i>${state.publishing ? 'Production du rapport…' : publie ? 'Publier une nouvelle version' : 'Publier au syndicat'}</button>
       </div>
     </div>`;
   }
@@ -3283,6 +3353,9 @@ function initEvents() {
       const email = document.getElementById('login-email').value.trim();
       const password = document.getElementById('login-password').value;
       doLogin(email, password);
+    } else if (e.target && e.target.id === 'signature-form') {
+      e.preventDefault();
+      enregistrerSignature();
     } else if (e.target && e.target.id === 'add-comp-form') {
       e.preventDefault();
       addComponent();
@@ -3328,6 +3401,7 @@ function initEvents() {
 
   app.addEventListener('change', (e) => {
     const t = e.target;
+    if (t && t.matches && t.matches('[data-role="visite-input"]')) { onVisiteChange(t.value); return; }
     if (t && t.matches && state.screen === 'photos' && tri.change(t)) return;
     if (t && t.matches && bib.change(t)) return;
     if (t && t.matches && state.screen === 'modeles' && modeles.change(t)) return;
@@ -3509,8 +3583,13 @@ function initEvents() {
         break;
       case 'go-publier':
         state.publishError = null;
+        state.publicationResultat = null;
         state.screen = 'publier';
-        render();
+        chargerPublication();
+        break;
+      case 'telecharger-publie':
+        telecharger(`/api/dossiers/${state.dossierId}/rapport-publie.docx`, `${(state.dossier && state.dossier.dossier_no) || 'dossier'}-etude-fonds-prevoyance.docx`)
+          .catch((e) => { state.publishError = e.message; render(); });
         break;
       case 'select-scenario':
         state.selectedScenarioCode = btn.getAttribute('data-code');
@@ -3631,6 +3710,7 @@ function initEvents() {
     if (!t || !t.matches) return;
     if (t.matches('[data-role="solde-input"]')) { onSoldeBlur(t.value); return; }
     if (t.matches('[data-role="cotisation-input"]')) { onCotisationBlur(t.value); return; }
+    if (t.matches('[data-role="visite-input"]')) { onVisiteChange(t.value); return; }
     if (t.matches('[data-role="cost-cell"]')) { patchComponent(t.getAttribute('data-id'), { replacement_cost: parseNum(t.textContent) }, { refetchProjection: true }); return; }
     if (t.matches('[data-role="life-cell"]')) { patchComponent(t.getAttribute('data-id'), { useful_life_years: parseNum(t.textContent) }, { refetchProjection: true }); return; }
     if (t.matches('[data-role="year-cell"]')) { patchComponent(t.getAttribute('data-id'), { install_year: parseYear(t.textContent) }, { refetchProjection: true }); return; }
