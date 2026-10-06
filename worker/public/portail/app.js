@@ -143,7 +143,8 @@ async function ouvrirOnglet(onglet) {
 }
 
 async function telecharger(quoi) {
-  const chemin = quoi === 'rapport' ? 'rapport.docx' : 'suivi-entretien.xlsx';
+  const pdf = state.donnees && state.donnees.immeuble && state.donnees.immeuble.rapport === 'pdf';
+  const chemin = quoi === 'rapport' ? (pdf ? 'rapport.pdf' : 'rapport.docx') : 'suivi-entretien.xlsx';
   state.occupe = quoi;
   rendre();
   try {
@@ -278,7 +279,7 @@ function documentsHtml() {
   const d = state.donnees;
   return `<div class="docs">
     <button class="doc" data-action="telecharger" data-val="suivi"><i data-lucide="${state.occupe === 'suivi' ? 'loader-2' : 'calendar-check'}" class="${state.occupe === 'suivi' ? 'spin' : ''}"></i><span>Tableur de suivi d'entretien<small>Excel · toutes les tâches, saison par saison</small></span><i data-lucide="download"></i></button>
-    ${d.immeuble.rapport ? `<button class="doc" data-action="telecharger" data-val="rapport"><i data-lucide="${state.occupe === 'rapport' ? 'loader-2' : 'file-text'}" class="${state.occupe === 'rapport' ? 'spin' : ''}"></i><span>Étude du fonds de prévoyance<small>Word · dossier ${esc(d.immeuble.dossier_no || '')}</small></span><i data-lucide="download"></i></button>`
+    ${d.immeuble.rapport ? `<button class="doc" data-action="telecharger" data-val="rapport"><i data-lucide="${state.occupe === 'rapport' ? 'loader-2' : 'file-text'}" class="${state.occupe === 'rapport' ? 'spin' : ''}"></i><span>Étude du fonds de prévoyance<small>${d.immeuble.rapport === 'pdf' ? 'PDF signé' : 'Word'} · dossier ${esc(d.immeuble.dossier_no || '')}</small></span><i data-lucide="download"></i></button>`
       : `<div class="vide">L'étude du fonds de prévoyance sera disponible ici une fois publiée par ${esc(d.firme.name || 'votre firme')}.</div>`}
   </div>`;
 }
