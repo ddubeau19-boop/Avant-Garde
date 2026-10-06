@@ -3833,6 +3833,20 @@ const COLONNES_AJOUTEES = [
 ];
 // Tables ajoutées après la mise en production, créées au premier appel.
 const TABLES_AJOUTEES = [
+  // Photos déposées en lot au bureau, en attente d'être rattachées à une
+  // composante : l'IA propose, l'ingénieur approuve ou classe lui-même.
+  `CREATE TABLE IF NOT EXISTS photos_a_classer (
+     id            TEXT PRIMARY KEY,
+     dossier_id    TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+     r2_key        TEXT NOT NULL,
+     nom_fichier   TEXT,
+     suggestion_id TEXT,
+     confiance     INTEGER,
+     autres        TEXT,
+     description   TEXT,
+     erreur        TEXT,
+     created_by    TEXT,
+     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
   `CREATE TABLE IF NOT EXISTS jetons_compte (
      id         TEXT PRIMARY KEY,
      user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -46614,7 +46628,7 @@ function generateReportXlsx(ctx) {
         CATEGORIES[c.cat]?.label ?? c.cat,
         c.uniformat_code ?? "",
         c.name,
-        c.done ? RATING_LABELS[c.rating] ?? "na" : "non documentée",
+        c.done || c.rating != null ? RATING_LABELS[c.rating] ?? "na" : "non documentée",
         coteRapportLongue(c.rating) ?? "",
         ligne.allocation ? "Allocation" : "Remplacement",
         c.observation ?? "",
@@ -48262,6 +48276,151 @@ dossiers.get("/:id/components", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
+});
+// ── Photos déposées en lot ───────────────────────────────────────────────────
+// Au bureau, l'ingénieur dépose toutes les photos d'une visite d'un coup.
+// Chacune est montrée à l'IA avec la liste des composantes du dossier ; elle
+// propose la composante la plus probable et une confiance. Rien n'est rattaché
+// sans l'approbation de l'ingénieur : une photo mal classée finirait au rapport
+// sous la mauvaise composante.
+const SEUIL_CONFIANCE_PHOTO = 80;
+const TYPES_IMAGE_ANALYSABLES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+const TAILLE_MAX_ANALYSE = 4.5 * 1024 * 1024;
+async function classerPhoto(apiKey, { base64, mediaType, nomFichier, composantes }) {
+  if (!apiKey) return { erreur: "aucune clé API configurée" };
+  if (composantes.length === 0) return { erreur: "aucune composante au dossier" };
+  const liste = composantes.map((cmp, i) => {
+    const facettes = [cmp.variante, POSITIONS[cmp.position], EMPLACEMENTS[cmp.emplacement]].filter(Boolean).join(", ");
+    return `${i + 1}. ${cmp.name}${facettes ? ` (${facettes})` : ""} — ${CATEGORIES[cmp.cat]?.label ?? cmp.cat}${cmp.uniformat_code ? ` — ${cmp.uniformat_code}` : ""}`;
+  }).join("\n");
+  const content = [
+    { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
+    {
+      type: "text",
+      text: `Cette photo a été prise lors de la visite d'un immeuble en copropriété, pour une étude de fonds de prévoyance.${nomFichier ? ` Nom du fichier : « ${nomFichier} ».` : ""}
+Voici les composantes inventoriées pour cet immeuble :
+${liste}
+
+À quelle composante cette photo se rattache-t-elle ? Réponds UNIQUEMENT avec un objet JSON :
+{"n": numéro de la composante la plus probable, ou null si aucune ne convient, "confiance": entier de 0 à 100, "autres": [jusqu'à deux autres numéros plausibles], "description": "ce que montre la photo, en dix mots au plus"}
+
+Sois prudent : une confiance de 80 ou plus veut dire que tu es sûr. Une vue d'ensemble de la façade,
+une photo floue ou un élément qui pourrait relever de plusieurs composantes mérite une confiance faible.`
+    }
+  ];
+  try {
+    const texte = await callClaude(apiKey, { content, maxTokens: 300 });
+    const r = extractJson(texte);
+    const parIndex = (n) => Number.isInteger(Number(n)) && Number(n) >= 1 && Number(n) <= composantes.length ? composantes[Number(n) - 1].id : null;
+    const suggestion = parIndex(r.n);
+    const confiance = Math.max(0, Math.min(100, Math.round(Number(r.confiance) || 0)));
+    const autres = (Array.isArray(r.autres) ? r.autres : []).map(parIndex).filter((id) => id && id !== suggestion).slice(0, 2);
+    return { suggestion, confiance: suggestion ? confiance : 0, autres, description: String(r.description ?? "").slice(0, 200) || null };
+  } catch (e) {
+    return { erreur: String(e && e.message || e).slice(0, 300) };
+  }
+}
+function photoAClasserVue(row) {
+  let autres = [];
+  try { autres = JSON.parse(row.autres || "[]"); } catch { autres = []; }
+  return {
+    id: row.id,
+    nom_fichier: row.nom_fichier,
+    suggestion_id: row.suggestion_id,
+    confiance: row.confiance,
+    sure: !!row.suggestion_id && (row.confiance ?? 0) >= SEUIL_CONFIANCE_PHOTO,
+    autres,
+    description: row.description,
+    erreur: row.erreur,
+    created_at: row.created_at
+  };
+}
+dossiers.get("/:id/photos-a-classer", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const rows = await c.env.DB.prepare("SELECT * FROM photos_a_classer WHERE dossier_id = ?1 ORDER BY created_at ASC").bind(dossier.id).all();
+  return c.json({ seuil: SEUIL_CONFIANCE_PHOTO, photos: rows.results.map(photoAClasserVue) });
+});
+dossiers.post("/:id/photos-a-classer", async (c) => {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  if (file.type && !file.type.startsWith("image/")) return c.json({ error: "seules les images sont acceptées" }, 400);
+  const id = `pac_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
+  const type = file.type || "image/jpeg";
+  const ext = type === "image/png" ? "png" : type === "image/webp" ? "webp" : "jpg";
+  const r2Key = `photos/${dossier.id}/a-classer/${id}.${ext}`;
+  const octets = await file.arrayBuffer();
+  await c.env.PHOTOS.put(r2Key, octets, { httpMetadata: { contentType: type } });
+  const nomFichier = String(file.name || "").slice(0, 200) || null;
+  const composantes = (await c.env.DB.prepare(
+    "SELECT id, name, cat, uniformat_code, variante, position, emplacement FROM components WHERE dossier_id = ?1 AND actif = 1 ORDER BY sort_order ASC, created_at ASC"
+  ).bind(dossier.id).all()).results;
+  const analysable = TYPES_IMAGE_ANALYSABLES.includes(type) && octets.byteLength <= TAILLE_MAX_ANALYSE;
+  const r = analysable
+    ? await classerPhoto(c.env.ANTHROPIC_API_KEY, { base64: arrayBufferToBase64(octets), mediaType: type, nomFichier, composantes })
+    : { erreur: "format ou taille non analysable : à classer à la main" };
+  await c.env.DB.prepare(
+    `INSERT INTO photos_a_classer (id, dossier_id, r2_key, nom_fichier, suggestion_id, confiance, autres, description, erreur, created_by)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+  ).bind(id, dossier.id, r2Key, nomFichier, r.suggestion ?? null, r.confiance ?? null, JSON.stringify(r.autres ?? []), r.description ?? null, r.erreur ?? null, user?.id ?? null).run();
+  const row = await c.env.DB.prepare("SELECT * FROM photos_a_classer WHERE id = ?1").bind(id).first();
+  return c.json(photoAClasserVue(row), 201);
+});
+dossiers.get("/:id/photos-a-classer/:pid/fichier", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.notFound();
+  const row = await c.env.DB.prepare("SELECT * FROM photos_a_classer WHERE id = ?1 AND dossier_id = ?2").bind(c.req.param("pid"), dossier.id).first();
+  if (!row) return c.notFound();
+  const obj = await c.env.PHOTOS.get(row.r2_key);
+  if (!obj) return c.notFound();
+  return new Response(obj.body, {
+    headers: { "content-type": obj.httpMetadata?.contentType ?? "image/jpeg", "cache-control": "private, max-age=86400" }
+  });
+});
+// Rattache des photos à leur composante : { affectations: [{ id, component_id }] }.
+// La photo garde son fichier en R2 ; seule sa fiche passe dans la table photos.
+dossiers.post("/:id/photos-a-classer/classer", async (c) => {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const affectations = Array.isArray(body2.affectations) ? body2.affectations.slice(0, 500) : [];
+  if (!affectations.length) return c.json({ error: "aucune affectation" }, 400);
+  const composantes = new Set((await c.env.DB.prepare("SELECT id FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossier.id).all()).results.map((r) => r.id));
+  const classees = [];
+  const refusees = [];
+  const parComposante = new Map();
+  for (const a of affectations) {
+    const row = await c.env.DB.prepare("SELECT * FROM photos_a_classer WHERE id = ?1 AND dossier_id = ?2").bind(String(a?.id ?? ""), dossier.id).first();
+    if (!row || !composantes.has(a.component_id)) {
+      refusees.push({ id: a?.id ?? null, raison: !row ? "photo introuvable" : "composante introuvable" });
+      continue;
+    }
+    const n = (await c.env.DB.prepare("SELECT COUNT(*) AS n FROM photos WHERE component_id = ?1").bind(a.component_id).first())?.n ?? 0;
+    const tag = TAG_ORDER[n] ?? `Photo ${n + 1}`;
+    const photoId = `pho_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
+    await c.env.DB.batch([
+      c.env.DB.prepare("INSERT INTO photos (id, component_id, r2_key, tag) VALUES (?1, ?2, ?3, ?4)").bind(photoId, a.component_id, row.r2_key, tag),
+      c.env.DB.prepare("DELETE FROM photos_a_classer WHERE id = ?1").bind(row.id)
+    ]);
+    classees.push({ id: row.id, photo_id: photoId, component_id: a.component_id });
+    parComposante.set(a.component_id, (parComposante.get(a.component_id) ?? 0) + 1);
+  }
+  for (const [componentId, nombre] of parComposante) {
+    await noterJournal(c.env.DB, { dossierId: dossier.id, componentId, userId: user?.id, action: "photo", champs: [{ champ: "photos", avant: null, apres: String(nombre) }] });
+  }
+  return c.json({ classees, refusees });
+});
+dossiers.delete("/:id/photos-a-classer/:pid", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const row = await c.env.DB.prepare("SELECT * FROM photos_a_classer WHERE id = ?1 AND dossier_id = ?2").bind(c.req.param("pid"), dossier.id).first();
+  if (!row) return c.json({ error: "photo introuvable" }, 404);
+  await c.env.DB.prepare("DELETE FROM photos_a_classer WHERE id = ?1").bind(row.id).run();
+  await c.env.PHOTOS.delete(row.r2_key);
+  return c.json({ ok: true });
 });
 // Historique du dossier, du plus récent au plus ancien ; ?composante= pour
 // une seule fiche.

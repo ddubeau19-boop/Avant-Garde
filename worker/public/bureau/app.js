@@ -5,6 +5,7 @@
 
 import { creerBibliotheque } from '../shared/bibliotheque.js';
 import { creerModeles } from '../shared/modeles.js';
+import { creerTriPhotos } from './tri-photos.js';
 
 const TOKEN_KEY = 'cs_bureau_token';
 
@@ -208,6 +209,12 @@ const state = {
 
   publishing: false,
   publishError: null,
+
+  // Ajout d'une composante depuis le bureau.
+  addCompOpen: false,
+  addComp: { name: '', cat: 'enveloppe', uniformat_code: '' },
+  addCompSaving: false,
+  addCompError: null,
 
   prixRows: [],
   prixResume: null,
@@ -810,6 +817,9 @@ async function openDossier(id) {
   state.batiment = {};
   state.batimentOpen = false;
   state.redactionCache = {};
+  state.addCompOpen = false;
+  state.addCompError = null;
+  tri.reinitialiser(id);
   await loadDossierDetail(id);
 }
 
@@ -830,6 +840,7 @@ async function loadDossierDetail(id) {
     state.batiment = parseJsonObject(dossier && dossier.batiment_info);
     state.revisionLoading = false;
     render();
+    tri.charger(id);
   } catch (e) {
     state.revisionLoading = false;
     state.revisionError = e.message || 'Impossible de charger ce dossier.';
@@ -908,8 +919,10 @@ function onRatingClick(id, raw) {
   if (!c) return;
   const value = raw === 'na' ? null : parseNum(raw);
   const cur = c.rating == null ? null : c.rating;
-  if (cur === value) return;
-  patchComponent(id, { rating: value });
+  // Coter au bureau documente la composante (done = 1), comme « Enregistrer »
+  // au terrain : sans visite, c'est ici que l'évaluation se fait.
+  if (cur === value && c.done) return;
+  patchComponent(id, { rating: value, done: 1 });
 }
 
 function onRflagClick(id) {
@@ -1298,7 +1311,7 @@ function renderLogin() {
 }
 
 function railHtml() {
-  const dossiersActive = ['dossiers', 'revision', 'publier', 'reviewIA'].includes(state.screen);
+  const dossiersActive = ['dossiers', 'revision', 'publier', 'reviewIA', 'photos'].includes(state.screen);
   const items = [
     { key: 'dossiers', label: 'Dossiers', icon: 'folder', action: 'go-dossiers', active: dossiersActive },
     { key: 'prix', label: 'Banque de prix', icon: 'receipt', action: 'go-prix', active: state.screen === 'prix' },
@@ -1330,11 +1343,68 @@ function railHtml() {
   </div>`;
 }
 
+function addCompFormHtml() {
+  if (!state.addCompOpen) {
+    return `<button class="btn-pill-sm add-comp-btn" data-action="open-add-comp"><i data-lucide="plus" style="width:14px;height:14px"></i>Ajouter une composante</button>`;
+  }
+  const f = state.addComp;
+  const saving = state.addCompSaving;
+  const opts = CAT_ORDER.map(k => `<option value="${k}" ${f.cat === k ? 'selected' : ''}>${escapeHtml(CATS[k].label)}</option>`).join('');
+  return `
+  <form class="nf-card add-comp" id="add-comp-form">
+    ${state.addCompError ? errorBanner(state.addCompError) : ''}
+    <div class="nf-grid">
+      <div class="nf-field wide">
+        <label class="field-label" for="nf_addComp_name">Composante *</label>
+        <input id="nf_addComp_name" class="detail-input" data-draft="name" value="${escapeHtml(f.name)}" placeholder="ex. Revêtement de brique — façade avant" required>
+      </div>
+      <div class="nf-field wide">
+        <label class="field-label" for="nf_addComp_cat">Catégorie</label>
+        <select id="nf_addComp_cat" class="detail-input" data-draft="cat">${opts}</select>
+      </div>
+      <div class="nf-field">
+        <label class="field-label" for="nf_addComp_code">Code Uniformat II</label>
+        <input id="nf_addComp_code" class="detail-input" data-draft="uniformat_code" value="${escapeHtml(f.uniformat_code)}" placeholder="ex. B2010">
+      </div>
+    </div>
+    <div class="nf-actions">
+      <button type="button" class="btn-secondary" data-action="cancel-add-comp" ${saving ? 'disabled' : ''}>Annuler</button>
+      <button type="submit" class="btn-primary" ${saving ? 'disabled' : ''}>${saving ? 'Ajout…' : 'Ajouter'}</button>
+    </div>
+  </form>`;
+}
+
+async function addComponent() {
+  if (state.addCompSaving || !state.dossierId) return;
+  const f = state.addComp;
+  const name = String(f.name || '').trim();
+  if (!name) { state.addCompError = 'Le nom de la composante est requis.'; render(); return; }
+  state.addCompSaving = true;
+  state.addCompError = null;
+  render();
+  try {
+    const comp = await apiJson(`/api/dossiers/${state.dossierId}/components`, {
+      method: 'POST',
+      body: JSON.stringify({ name, cat: f.cat, uniformat_code: String(f.uniformat_code || '').trim() || null }),
+    });
+    state.components = state.components.concat([Object.assign({ photos: 0 }, comp)]);
+    state.addComp = { name: '', cat: f.cat, uniformat_code: '' };
+    state.addCompSaving = false;
+    await refreshProjection();
+    render();
+  } catch (e) {
+    state.addCompSaving = false;
+    state.addCompError = e.message || "Impossible d'ajouter la composante.";
+    render();
+  }
+}
+
 function renderShell() {
   let main = '';
   if (state.screen === 'dossiers') main = renderDossiers();
   else if (state.screen === 'prix') main = renderPrix();
   else if (state.screen === 'revision') main = renderRevision();
+  else if (state.screen === 'photos') main = tri.html();
   else if (state.screen === 'publier') main = renderPublier();
   else if (state.screen === 'reviewIA') main = renderReviewIA();
   else if (state.screen === 'equipe') main = renderEquipe();
@@ -1375,6 +1445,24 @@ const modeles = creerModeles({
   spinnerBlock: (x) => spinnerBlock(x),
   companyId: () => idFirme(),
 });
+// Photos déposées en lot : l'IA propose une composante, l'ingénieur approuve.
+const tri = creerTriPhotos({
+  apiJson: (path, opts) => apiJson(path, opts),
+  apiRaw: (path, opts) => apiRaw(path, opts),
+  render: () => render(),
+  escapeHtml: (x) => escapeHtml(x),
+  spinnerBlock: (x) => spinnerBlock(x),
+  errorBanner: (msg) => errorBanner(msg),
+  composantes: () => state.components,
+  categories: CATS,
+  ordreCategories: CAT_ORDER,
+  apresClassement: (classees) => {
+    const parComposante = {};
+    classees.forEach((x) => { parComposante[x.component_id] = (parComposante[x.component_id] || 0) + 1; });
+    state.components = state.components.map((c) => parComposante[c.id] ? Object.assign({}, c, { photos: (c.photos || 0) + parComposante[c.id] }) : c);
+  },
+});
+
 const logoFirme = { envoi: false, erreur: null };
 
 async function envoyerLogo(file) {
@@ -2398,7 +2486,7 @@ function ratingControlHtml(c) {
       title="${escapeHtml(r.v + ' · ' + r.label)}" aria-label="${escapeHtml(r.label)}"
       style="${on ? `background:${r.color};border-color:${r.color};color:#fff` : ''}">${r.v}</button>`;
   }).join('');
-  const naOn = c.rating == null;
+  const naOn = c.rating == null && !!c.done;
   const na = `<button class="rt-opt na ${naOn ? 'on' : ''}" data-action="set-rating" data-id="${c.id}" data-rating="na"
       title="${escapeHtml(RATING_NA.label)}" aria-label="${escapeHtml(RATING_NA.label)}"
       style="${naOn ? `background:${RATING_NA.color};border-color:${RATING_NA.color};color:#fff` : ''}">na</button>`;
@@ -2726,6 +2814,15 @@ function renderRevision() {
         </div>
       </button>
 
+      <button class="reviewia-cta tp-cta" data-action="go-photos">
+        <div class="reviewia-cta-icon"><i data-lucide="images"></i></div>
+        <div style="flex:1">
+          <div class="reviewia-cta-title">Déposer les photos du dossier</div>
+          <div class="reviewia-cta-sub">Toutes d'un coup : l'IA propose une composante pour chaque photo, vous approuvez.${tri.nombreAClasser() ? ` <b>${tri.nombreAClasser()} photo(s) à classer.</b>` : ''}</div>
+        </div>
+        <div class="reviewia-cta-right"><i data-lucide="arrow-right"></i></div>
+      </button>
+
       ${batimentPanelHtml(d)}
       ${journalPanelHtml(d)}
 
@@ -2757,6 +2854,7 @@ function renderRevision() {
             ${g.rows.map(c => compRowHtml(c, excluded)).join('')}
           </div>`).join('')}
       </div>
+      ${addCompFormHtml()}
       <div class="comp-legend">
         <span class="legend-scale">Cote : ${RATINGS.map(r => `<span class="legend-rt"><b style="background:${r.color}">${r.v}</b>${escapeHtml(r.label)}</span>`).join('')}<span class="legend-rt"><b style="background:${RATING_NA.color}">na</b>${escapeHtml(RATING_NA.label)}</span></span>
         <span><span class="legend-r">R</span>Marqueur R</span>
@@ -3072,6 +3170,7 @@ function renderReviewIA() {
 // ---------------------------------------------------------------
 function initEvents() {
   const app = document.getElementById('app');
+  tri.brancher(app, () => state.screen === 'photos');
 
   app.addEventListener('submit', (e) => {
     if (e.target && e.target.id === 'login-form') {
@@ -3079,6 +3178,9 @@ function initEvents() {
       const email = document.getElementById('login-email').value.trim();
       const password = document.getElementById('login-password').value;
       doLogin(email, password);
+    } else if (e.target && e.target.id === 'add-comp-form') {
+      e.preventDefault();
+      addComponent();
     } else if (e.target && e.target.id === 'prix-form') {
       e.preventDefault();
       submitPrix();
@@ -3097,7 +3199,8 @@ function initEvents() {
   app.addEventListener('input', (e) => {
     const t = e.target;
     if (!t || !t.matches) return;
-    if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
+    if (t.matches('#add-comp-form [data-draft]')) state.addComp[t.getAttribute('data-draft')] = t.value;
+    else if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
     else if (t.matches('[data-sec-text]')) onSecTextInput(t);
     else if (bib.input(t)) return;
@@ -3120,6 +3223,7 @@ function initEvents() {
 
   app.addEventListener('change', (e) => {
     const t = e.target;
+    if (t && t.matches && state.screen === 'photos' && tri.change(t)) return;
     if (t && t.matches && bib.change(t)) return;
     if (t && t.matches && state.screen === 'modeles' && modeles.change(t)) return;
     if (t && t.matches && t.matches('[data-role="logo-firme"]')) { const f = t.files && t.files[0]; t.value = ''; if (f) envoyerLogo(f); return; }
@@ -3156,7 +3260,24 @@ function initEvents() {
     const action = btn.getAttribute('data-action');
     if (bib.click(action, btn)) return;
     if (state.screen === 'modeles' && modeles.click(action, btn)) return;
+    if (state.screen === 'photos' && tri.click(action, btn)) return;
     switch (action) {
+      case 'go-photos':
+        state.screen = 'photos';
+        render();
+        tri.ouvrir(state.dossierId);
+        break;
+      case 'open-add-comp':
+        state.addCompOpen = true;
+        state.addCompError = null;
+        render();
+        { const el = document.getElementById('nf_addComp_name'); if (el) el.focus(); }
+        break;
+      case 'cancel-add-comp':
+        state.addCompOpen = false;
+        state.addCompError = null;
+        render();
+        break;
       case 'go-carnet':
         leaveReviewIA();
         state.screen = 'carnet';
