@@ -43736,7 +43736,7 @@ function generateReportXlsx(ctx) {
         CATEGORIES[c.cat]?.label ?? c.cat,
         c.uniformat_code ?? "",
         c.name,
-        c.done ? RATING_LABELS[c.rating] ?? "na" : "non documentée",
+        c.done || c.rating != null ? RATING_LABELS[c.rating] ?? "na" : "non documentée",
         coteRapportLongue(c.rating) ?? "",
         ligne.allocation ? "Allocation" : "Remplacement",
         c.observation ?? "",
@@ -44053,7 +44053,7 @@ async function dossierStats(db, dossierId) {
     `SELECT
          COUNT(*) AS total,
          SUM(done) AS done,
-         SUM(CASE WHEN done = 1 AND rating >= 3 THEN 1 ELSE 0 END) AS critical,
+         SUM(CASE WHEN rating >= 3 THEN 1 ELSE 0 END) AS critical,
          (SELECT COUNT(*) FROM photos p JOIN components c2 ON c2.id = p.component_id WHERE c2.dossier_id = ?1) AS photos_total
        FROM components WHERE dossier_id = ?1`
   ).bind(dossierId).first();
@@ -44083,6 +44083,8 @@ dossiers.post("/", async (c) => {
   if (!user.company_id) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
   const body2 = await c.req.json();
   if (!body2.dossier_no || !body2.name) return c.json({ error: "dossier_no et name requis" }, 400);
+  const dejaPris = await c.env.DB.prepare("SELECT 1 FROM dossiers WHERE dossier_no = ?1").bind(body2.dossier_no).first();
+  if (dejaPris) return c.json({ error: `le numéro de dossier ${body2.dossier_no} est déjà utilisé` }, 409);
   const id = newId("dos");
   await c.env.DB.prepare(
     `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id)
@@ -44147,6 +44149,33 @@ dossiers.get("/:id/components", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
+});
+// Ajout manuel d'une composante, depuis le bureau : sans visite, l'inventaire
+// généré à la création est le seul point de départ, et il faut pouvoir le compléter.
+dossiers.post("/:id/components", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json();
+  const name = String(body2.name ?? "").trim();
+  if (!name) return c.json({ error: "name requis" }, 400);
+  const cat = CATEGORIES[body2.cat] ? body2.cat : "equipements";
+  const last = await c.env.DB.prepare("SELECT MAX(sort_order) AS m FROM components WHERE dossier_id = ?1").bind(dossier.id).first();
+  const id = newId("cmp");
+  await c.env.DB.prepare(
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code)
+     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)`
+  ).bind(
+    id,
+    dossier.id,
+    cat,
+    name,
+    body2.qty ?? "—",
+    (last?.m ?? -1) + 1,
+    body2.useful_life_years ?? DEFAULT_USEFUL_LIFE_YEARS[cat] ?? ALLOCATION_USEFUL_LIFE,
+    body2.uniformat_code ? String(body2.uniformat_code).trim() : null
+  ).run();
+  const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
+  return c.json({ ...component, photos: 0 }, 201);
 });
 async function buildReportContext(c) {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));

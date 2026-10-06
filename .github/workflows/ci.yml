@@ -15,7 +15,7 @@ on:
 # dans le désordre et qu'un vieux « vert » vienne valider un état dépassé.
 concurrency:
   group: ci-${{ github.ref }}
-    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read

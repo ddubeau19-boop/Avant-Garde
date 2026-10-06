@@ -599,3 +599,35 @@ button { font-family: inherit; }
 .exec-cell.right { text-align: right; }
 .exec-cell.mono { font-family: var(--font-mono); }
 .exec-row.negative .exec-cell.mono.right:last-child { color: var(--accent-press); font-weight: 700; }
+
+/* ============================================================
+   CRÉATION SANS VISITE — nouveau dossier, ajout de composante
+   ============================================================ */
+.page-title-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.btn-new { padding: 10px 18px; font-size: 13.5px; }
+.btn-new i { width: 16px; height: 16px; }
+.nf-card { border: 1px solid var(--ink-200); border-radius: 14px; background: #fff; padding: 20px 22px; margin-bottom: 22px; }
+.nf-head { margin-bottom: 14px; }
+.nf-title { font-weight: 700; font-size: 16px; color: var(--ink); }
+.nf-sub { color: var(--ink-500); font-size: 13px; margin-top: 4px; max-width: 70ch; }
+.nf-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 14px; }
+.nf-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.nf-field.wide { grid-column: span 2; }
+.nf-field .detail-input { width: 100%; box-sizing: border-box; }
+.nf-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+.nf-actions .btn-primary { padding: 11px 20px; }
+.add-comp-btn { display: inline-flex; align-items: center; gap: 6px; margin-top: 12px; }
+.nf-card.add-comp { margin-top: 12px; margin-bottom: 0; }
+.inv-notice { display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px; border-radius: 12px; margin-bottom: 16px;
+  background: var(--orange-wash); color: var(--ink-700); font-size: 13px; line-height: 1.45; }
+.inv-notice.warn { background: #FFF4E5; }
+.inv-notice > i { color: var(--orange); margin-top: 1px; }
+.inv-notice span { flex: 1; }
+.inv-close { border: none; background: transparent; color: var(--ink-500); cursor: pointer; padding: 2px; }
+@media (max-width: 900px) {
+  .nf-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+  .nf-grid { grid-template-columns: 1fr; }
+  .nf-field.wide { grid-column: auto; }
+}

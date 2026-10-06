@@ -176,6 +176,19 @@ const state = {
 
   publishing: false,
   publishError: null,
+
+  // Création d'un dossier depuis le bureau, sans passer par la visite.
+  newDossierOpen: false,
+  newDossier: { dossier_no: '', name: '', address: '', city: '', units: '', floors: '', built_year: '' },
+  newDossierSaving: false,
+  newDossierError: null,
+  newDossierInventaire: null, // { source, erreur, total } renvoyé par POST /api/dossiers
+
+  // Ajout d'une composante depuis le bureau.
+  addCompOpen: false,
+  addComp: { name: '', cat: 'enveloppe', uniformat_code: '' },
+  addCompSaving: false,
+  addCompError: null,
 };
 
 // ---------------------------------------------------------------
@@ -465,6 +478,86 @@ async function loadDossiers() {
   }
 }
 
+function intOrNull(v) {
+  const n = parseInt(String(v == null ? '' : v).replace(/[^0-9]/g, ''), 10);
+  return isNaN(n) ? null : n;
+}
+
+function resetNewDossier() {
+  state.newDossier = { dossier_no: '', name: '', address: '', city: '', units: '', floors: '', built_year: '' };
+  state.newDossierError = null;
+}
+
+// Crée le dossier directement au bureau. Le serveur génère l'inventaire des
+// composantes à partir du nombre d'unités, d'étages et de l'année : c'est le
+// point de départ quand il n'y a pas (encore) de visite.
+async function createDossier() {
+  if (state.newDossierSaving) return;
+  const f = state.newDossier;
+  const dossierNo = String(f.dossier_no || '').trim();
+  const name = String(f.name || '').trim();
+  if (!dossierNo || !name) {
+    state.newDossierError = 'Le numéro de dossier et le nom du syndicat sont requis.';
+    render();
+    return;
+  }
+  state.newDossierSaving = true;
+  state.newDossierError = null;
+  render();
+  try {
+    const created = await apiJson('/api/dossiers', {
+      method: 'POST',
+      body: JSON.stringify({
+        dossier_no: dossierNo,
+        name,
+        address: String(f.address || '').trim() || null,
+        city: String(f.city || '').trim() || null,
+        units: intOrNull(f.units) || 0,
+        floors: intOrNull(f.floors),
+        built_year: intOrNull(f.built_year),
+      }),
+    });
+    state.newDossierSaving = false;
+    state.newDossierOpen = false;
+    state.newDossierInventaire = created && created.inventaire ? created.inventaire : null;
+    resetNewDossier();
+    await openDossier(created.id);
+  } catch (e) {
+    state.newDossierSaving = false;
+    state.newDossierError = e.message || 'Impossible de créer le dossier.';
+    render();
+  }
+}
+
+async function addComponent() {
+  if (state.addCompSaving || !state.dossierId) return;
+  const f = state.addComp;
+  const name = String(f.name || '').trim();
+  if (!name) {
+    state.addCompError = 'Le nom de la composante est requis.';
+    render();
+    return;
+  }
+  state.addCompSaving = true;
+  state.addCompError = null;
+  render();
+  try {
+    const comp = await apiJson(`/api/dossiers/${state.dossierId}/components`, {
+      method: 'POST',
+      body: JSON.stringify({ name, cat: f.cat, uniformat_code: String(f.uniformat_code || '').trim() || null }),
+    });
+    state.components = state.components.concat([comp]);
+    state.addCompSaving = false;
+    state.addComp = { name: '', cat: f.cat, uniformat_code: '' };
+    await refreshProjection();
+    render();
+  } catch (e) {
+    state.addCompSaving = false;
+    state.addCompError = e.message || "Impossible d'ajouter la composante.";
+    render();
+  }
+}
+
 async function openDossier(id) {
   revokeReviewPhotos();
   state.dossierId = id;
@@ -478,6 +571,8 @@ async function openDossier(id) {
   state.batiment = {};
   state.batimentOpen = false;
   state.redactionCache = {};
+  state.addCompOpen = false;
+  state.addCompError = null;
   await loadDossierDetail(id);
 }
 
@@ -541,14 +636,16 @@ function componentById(id) {
   return state.components.find(c => String(c.id) === String(id)) || null;
 }
 
-// Cote 1-4 + na : « na » enregistre rating = null.
+// Cote 1-4 + na : « na » enregistre rating = null. Coter au bureau documente
+// la composante (done = 1), comme « Enregistrer » au terrain : sans visite,
+// c'est ici que l'évaluation se fait, et le rapport doit la reconnaître.
 function onRatingClick(id, raw) {
   const c = componentById(id);
   if (!c) return;
   const value = raw === 'na' ? null : parseNum(raw);
   const cur = c.rating == null ? null : c.rating;
-  if (cur === value) return;
-  patchComponent(id, { rating: value });
+  if (cur === value && c.done) return;
+  patchComponent(id, { rating: value, done: 1 });
 }
 
 function onRflagClick(id) {
@@ -962,9 +1059,13 @@ function renderDossiers() {
   return `
   <div class="page-pad">
     <div class="eyebrow-orange">Tableau de bord</div>
-    <h1 class="page-title">Dossiers</h1>
+    <div class="page-title-row">
+      <h1 class="page-title">Dossiers</h1>
+      ${state.newDossierOpen ? '' : `<button class="btn-primary btn-new" data-action="new-dossier"><i data-lucide="plus"></i>Nouveau dossier</button>`}
+    </div>
     <p class="page-lead">Révisez les données du terrain, ajustez le fonds de prévoyance et générez les rapports.</p>
     ${state.dossiersError ? errorBanner(state.dossiersError, 'retry-dossiers') : ''}
+    ${state.newDossierOpen ? newDossierFormHtml() : ''}
     <div class="filters-row">
       <button class="chip ${state.filter === 'review' ? 'active' : ''}" data-action="filter" data-filter="review">Prêts pour révision · ${reviewCount}</button>
       <button class="chip ${state.filter === 'field' ? 'active' : ''}" data-action="filter" data-filter="field">En cours sur le terrain · ${fieldCount}</button>
@@ -984,6 +1085,80 @@ function renderDossiers() {
         <div><button class="btn-row-action ${d._reviewReady ? 'primary' : ''}" data-action="open-dossier" data-id="${d.id}">${d._reviewReady ? 'Réviser' : 'Ouvrir'}</button></div>
       </div>`).join('')}
     </div>
+  </div>`;
+}
+
+function draftInput(obj, key, label, opts) {
+  opts = opts || {};
+  const id = `nf_${obj}_${key}`;
+  return `<div class="nf-field ${opts.wide ? 'wide' : ''}">
+    <label class="field-label" for="${id}">${escapeHtml(label)}${opts.required ? ' *' : ''}</label>
+    <input id="${id}" class="detail-input" data-draft="${obj}.${key}" value="${escapeHtml(state[obj][key] || '')}"
+      ${opts.numeric ? 'inputmode="numeric"' : ''} placeholder="${escapeHtml(opts.placeholder || '')}" ${opts.required ? 'required' : ''}>
+  </div>`;
+}
+
+function newDossierFormHtml() {
+  const saving = state.newDossierSaving;
+  return `
+  <form class="nf-card" id="new-dossier-form">
+    <div class="nf-head">
+      <div>
+        <div class="nf-title">Nouveau dossier</div>
+        <div class="nf-sub">Sans visite : l'inventaire des composantes est généré à partir du nombre d'unités, d'étages et de l'année de construction. Vous le complétez ensuite au bureau.</div>
+      </div>
+    </div>
+    ${state.newDossierError ? errorBanner(state.newDossierError) : ''}
+    <div class="nf-grid">
+      ${draftInput('newDossier', 'dossier_no', 'Numéro de dossier', { required: true, placeholder: 'ex. 2026-041' })}
+      ${draftInput('newDossier', 'name', 'Syndicat', { required: true, wide: true, placeholder: 'ex. Syndicat de copropriété Le Riverain' })}
+      ${draftInput('newDossier', 'address', 'Adresse', { wide: true, placeholder: 'ex. 1200, rue Principale' })}
+      ${draftInput('newDossier', 'city', 'Ville', { placeholder: 'ex. Montréal' })}
+      ${draftInput('newDossier', 'units', 'Unités', { numeric: true, placeholder: 'ex. 24' })}
+      ${draftInput('newDossier', 'floors', 'Étages', { numeric: true, placeholder: 'ex. 4' })}
+      ${draftInput('newDossier', 'built_year', 'Année de construction', { numeric: true, placeholder: 'ex. 1998' })}
+    </div>
+    <div class="nf-actions">
+      <button type="button" class="btn-secondary" data-action="cancel-new-dossier" ${saving ? 'disabled' : ''}>Annuler</button>
+      <button type="submit" class="btn-primary" ${saving ? 'disabled' : ''}>${saving ? 'Création et inventaire…' : 'Créer le dossier'}<i data-lucide="${saving ? 'loader-2' : 'arrow-right'}" class="${saving ? 'spin' : ''}"></i></button>
+    </div>
+  </form>`;
+}
+
+function addCompFormHtml() {
+  if (!state.addCompOpen) {
+    return `<button class="btn-pill-sm add-comp-btn" data-action="open-add-comp"><i data-lucide="plus" style="width:14px;height:14px"></i>Ajouter une composante</button>`;
+  }
+  const saving = state.addCompSaving;
+  const opts = CAT_ORDER.map(k => `<option value="${k}" ${state.addComp.cat === k ? 'selected' : ''}>${escapeHtml(CATS[k].label)}</option>`).join('');
+  return `
+  <form class="nf-card add-comp" id="add-comp-form">
+    ${state.addCompError ? errorBanner(state.addCompError) : ''}
+    <div class="nf-grid">
+      ${draftInput('addComp', 'name', 'Composante', { required: true, wide: true, placeholder: 'ex. Revêtement de brique — façade avant' })}
+      <div class="nf-field wide">
+        <label class="field-label" for="nf_addComp_cat">Catégorie</label>
+        <select id="nf_addComp_cat" class="detail-input" data-draft="addComp.cat">${opts}</select>
+      </div>
+      ${draftInput('addComp', 'uniformat_code', 'Code Uniformat II', { placeholder: 'ex. B2010' })}
+    </div>
+    <div class="nf-actions">
+      <button type="button" class="btn-secondary" data-action="cancel-add-comp" ${saving ? 'disabled' : ''}>Annuler</button>
+      <button type="submit" class="btn-primary" ${saving ? 'disabled' : ''}>${saving ? 'Ajout…' : 'Ajouter'}</button>
+    </div>
+  </form>`;
+}
+
+function inventaireNoticeHtml() {
+  const inv = state.newDossierInventaire;
+  if (!inv) return '';
+  const generique = inv.source && inv.source !== 'ia';
+  return `<div class="inv-notice ${generique ? 'warn' : ''}">
+    <i data-lucide="${generique ? 'alert-circle' : 'sparkles'}" style="width:16px;height:16px;flex-shrink:0"></i>
+    <span>${generique
+      ? `Inventaire générique de ${inv.total} composantes (l'IA n'a pas pu l'adapter à l'immeuble). Retirez ce qui ne s'applique pas avec la cote « na » et ajoutez ce qui manque.`
+      : `Inventaire de ${inv.total} composantes généré pour cet immeuble. Cotez chaque composante, complétez coûts et durées, puis confirmez le texte pour générer les rapports.`}</span>
+    <button class="inv-close" data-action="dismiss-inventaire" aria-label="Fermer"><i data-lucide="x" style="width:14px;height:14px"></i></button>
   </div>`;
 }
 
@@ -1137,7 +1312,7 @@ function ratingControlHtml(c) {
       title="${escapeHtml(r.v + ' · ' + r.label)}" aria-label="${escapeHtml(r.label)}"
       style="${on ? `background:${r.color};border-color:${r.color};color:#fff` : ''}">${r.v}</button>`;
   }).join('');
-  const naOn = c.rating == null;
+  const naOn = c.rating == null && !!c.done;
   const na = `<button class="rt-opt na ${naOn ? 'on' : ''}" data-action="set-rating" data-id="${c.id}" data-rating="na"
       title="${escapeHtml(RATING_NA.label)}" aria-label="${escapeHtml(RATING_NA.label)}"
       style="${naOn ? `background:${RATING_NA.color};border-color:${RATING_NA.color};color:#fff` : ''}">na</button>`;
@@ -1330,7 +1505,7 @@ function renderRevision() {
   const proj = state.projection;
   const excluded = (proj && proj.excludedComponents) || [];
   const params = (proj && proj.params) || {};
-  const docCount = state.components.filter(c => c.photos > 0).length;
+  const docCount = state.components.filter(c => c.done).length;
 
   return `
   <div class="rev-shell">
@@ -1353,6 +1528,7 @@ function renderRevision() {
     </div>
     <div class="rev-body cscr">
       ${state.revisionFlashError ? errorBanner(state.revisionFlashError) : ''}
+      ${inventaireNoticeHtml()}
       <div class="cards-grid">
         ${fundCardHtml(d, proj, params, excluded)}
         ${reportsCardHtml(allConf, remaining)}
@@ -1400,6 +1576,7 @@ function renderRevision() {
             ${g.rows.map(c => compRowHtml(c, excluded)).join('')}
           </div>`).join('')}
       </div>
+      ${addCompFormHtml()}
       <div class="comp-legend">
         <span class="legend-scale">Cote : ${RATINGS.map(r => `<span class="legend-rt"><b style="background:${r.color}">${r.v}</b>${escapeHtml(r.label)}</span>`).join('')}<span class="legend-rt"><b style="background:${RATING_NA.color}">na</b>${escapeHtml(RATING_NA.label)}</span></span>
         <span><span class="legend-r">R</span>Marqueur R</span>
@@ -1649,6 +1826,8 @@ function initEvents() {
   const app = document.getElementById('app');
 
   app.addEventListener('submit', (e) => {
+    if (e.target && e.target.id === 'new-dossier-form') { e.preventDefault(); createDossier(); return; }
+    if (e.target && e.target.id === 'add-comp-form') { e.preventDefault(); addComponent(); return; }
     if (e.target && e.target.id === 'login-form') {
       e.preventDefault();
       const email = document.getElementById('login-email').value.trim();
@@ -1663,6 +1842,11 @@ function initEvents() {
   app.addEventListener('input', (e) => {
     const t = e.target;
     if (!t || !t.matches) return;
+    if (t.matches('[data-draft]')) {
+      const parts = t.getAttribute('data-draft').split('.');
+      if (state[parts[0]]) state[parts[0]][parts[1]] = t.value;
+      return;
+    }
     if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
   });
@@ -1697,7 +1881,34 @@ function initEvents() {
         goReviewIA();
         break;
       case 'open-dossier':
+        state.newDossierInventaire = null;
         openDossier(btn.getAttribute('data-id'));
+        break;
+      case 'new-dossier':
+        state.newDossierOpen = true;
+        state.newDossierError = null;
+        render();
+        { const el = document.getElementById('nf_newDossier_dossier_no'); if (el) el.focus(); }
+        break;
+      case 'cancel-new-dossier':
+        state.newDossierOpen = false;
+        resetNewDossier();
+        render();
+        break;
+      case 'dismiss-inventaire':
+        state.newDossierInventaire = null;
+        render();
+        break;
+      case 'open-add-comp':
+        state.addCompOpen = true;
+        state.addCompError = null;
+        render();
+        { const el = document.getElementById('nf_addComp_name'); if (el) el.focus(); }
+        break;
+      case 'cancel-add-comp':
+        state.addCompOpen = false;
+        state.addCompError = null;
+        render();
         break;
       case 'filter':
         state.filter = btn.getAttribute('data-filter');
