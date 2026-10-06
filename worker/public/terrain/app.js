@@ -1114,12 +1114,30 @@ async function reduirePhoto(file) {
 }
 
 async function onPhotoFileChange(e) {
-  const file = e.target.files && e.target.files[0];
+  const files = Array.from((e.target.files) || []);
   e.target.value = '';
-  if (!file || !state.activeId) return;
+  ajouterPhotos(files);
+}
+
+// Plusieurs photos (caméra continue, galerie) : envoyées une à une, dans
+// l'ordre, sur la composante ouverte au moment du dépôt.
+async function ajouterPhotos(files) {
+  if (!files.length || !state.activeId) return;
   const compId = state.activeId;
   const dossierId = state.dossier && state.dossier.id;
-  state.uploadingPhoto = true; state.error = null; render();
+  state.error = null;
+  for (let i = 0; i < files.length; i++) {
+    state.uploadingPhoto = files.length > 1 ? `${i + 1}/${files.length}` : true;
+    render();
+    const ok = await ajouterPhoto(files[i], compId, dossierId);
+    if (!ok) break;
+  }
+  state.uploadingPhoto = false;
+  render();
+  synchroniser();
+}
+
+async function ajouterPhoto(file, compId, dossierId) {
   const photo = await reduirePhoto(file);
   // Choisi par l'appareil : l'envoi peut être rejoué sans créer de doublon.
   const photoId = nouvelIdPhoto();
@@ -1132,10 +1150,9 @@ async function onPhotoFileChange(e) {
       state.reseauInstable = false;
     } catch (e2) {
       if (!sansReseau(e2)) {
-        state.uploadingPhoto = false;
         HL.photoEffacer(photoId);
-        if (e2.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e2); render(); }
-        return;
+        if (e2.message !== 'SESSION_EXPIRED') state.error = friendlyError(e2);
+        return false;
       }
       state.reseauInstable = true;
     }
@@ -1146,9 +1163,169 @@ async function onPhotoFileChange(e) {
     state.activeComponent = Object.assign({}, state.activeComponent, { photos: (state.activeComponent.photos || []).concat([affichee]) });
   }
   state.components = state.components.map(c => (c.id === compId ? Object.assign({}, c, { photos: (c.photos || 0) + 1 }) : c));
-  state.uploadingPhoto = false;
-  render();
-  if (!envoyee) synchroniser();
+  return true;
+}
+
+/* ---------- Caméra continue ---------- */
+
+// La caméra reste ouverte dans l'app : on appuie autant de fois qu'il faut,
+// les photos s'empilent en vignettes, « Terminer » les joint toutes à la
+// composante. L'écran vit hors du rendu de l'app (un <video> recréé à chaque
+// rendu couperait l'image) et se gère lui-même.
+const camera = { el: null, flux: null, prises: [], torche: false, compId: null };
+
+function cameraDisponible() {
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.isSecureContext);
+}
+
+async function ouvrirCamera() {
+  if (!state.activeId || camera.el) return;
+  if (!cameraDisponible()) { triggerPhotoInput(); return; }
+  camera.compId = state.activeId;
+  camera.prises = [];
+  camera.torche = false;
+  const el = document.createElement('div');
+  el.className = 'cam';
+  el.innerHTML = `
+    <video class="cam-video" playsinline autoplay muted></video>
+    <div class="cam-flash"></div>
+    <div class="cam-haut">
+      <button class="cam-btn" data-cam="fermer" aria-label="Fermer la caméra"><i data-lucide="x"></i></button>
+      <div class="cam-titre">${esc(state.activeComponent ? state.activeComponent.name : '')}</div>
+      <button class="cam-btn cam-torche" data-cam="torche" aria-label="Lampe" hidden><i data-lucide="flashlight"></i></button>
+    </div>
+    <div class="cam-msg" hidden></div>
+    <div class="cam-bas">
+      <div class="cam-vignettes"></div>
+      <div class="cam-commandes">
+        <button class="cam-btn cam-galerie" data-cam="systeme" aria-label="Appareil photo du téléphone"><i data-lucide="smartphone"></i></button>
+        <button class="cam-declencheur" data-cam="prendre" aria-label="Prendre une photo"><span></span></button>
+        <button class="cam-terminer" data-cam="terminer" disabled>Terminer</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  camera.el = el;
+  el.addEventListener('click', onCameraClick);
+  if (window.lucide) window.lucide.createIcons();
+  document.addEventListener('visibilitychange', onCameraVisibilite);
+  await demarrerFlux();
+}
+
+async function demarrerFlux() {
+  if (!camera.el) return;
+  arreterFlux();
+  try {
+    camera.flux = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 4032 }, height: { ideal: 3024 } },
+    });
+  } catch (e) {
+    const refus = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+    cameraMessage(refus
+      ? "L'accès à la caméra est refusé. Autorisez-le dans les réglages du navigateur, ou utilisez l'appareil photo du téléphone (bouton à gauche)."
+      : "La caméra n'a pas pu démarrer. Utilisez l'appareil photo du téléphone (bouton à gauche).");
+    return;
+  }
+  if (!camera.el) { arreterFlux(); return; }
+  const video = camera.el.querySelector('.cam-video');
+  video.srcObject = camera.flux;
+  try { await video.play(); } catch (e) { /* lecture auto refusée : l'image démarre au premier toucher */ }
+  cameraMessage('');
+  const piste = camera.flux.getVideoTracks()[0];
+  const capacites = piste && piste.getCapabilities ? piste.getCapabilities() : {};
+  camera.el.querySelector('.cam-torche').hidden = !capacites.torch;
+}
+
+function arreterFlux() {
+  if (camera.flux) camera.flux.getTracks().forEach(t => t.stop());
+  camera.flux = null;
+}
+
+function cameraMessage(texte) {
+  if (!camera.el) return;
+  const m = camera.el.querySelector('.cam-msg');
+  m.textContent = texte;
+  m.hidden = !texte;
+}
+
+// Au retour dans l'app (appel, autre app), le téléphone a souvent coupé le flux.
+function onCameraVisibilite() {
+  if (!camera.el || document.visibilityState !== 'visible') return;
+  const piste = camera.flux && camera.flux.getVideoTracks()[0];
+  if (!piste || piste.readyState === 'ended') demarrerFlux();
+}
+
+async function prendrePhoto() {
+  const video = camera.el && camera.el.querySelector('.cam-video');
+  if (!video || !video.videoWidth) return;
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.getContext('2d').drawImage(video, 0, 0);
+  const flash = camera.el.querySelector('.cam-flash');
+  flash.classList.remove('on'); void flash.offsetWidth; flash.classList.add('on');
+  if (navigator.vibrate) navigator.vibrate(30);
+  const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.92));
+  if (!blob || !camera.el) return;
+  const n = camera.prises.length + 1;
+  const fichier = new File([blob], `photo-${Date.now()}-${n}.jpg`, { type: 'image/jpeg' });
+  camera.prises.push({ fichier, url: URL.createObjectURL(blob) });
+  dessinerPrises();
+}
+
+function dessinerPrises() {
+  const zone = camera.el.querySelector('.cam-vignettes');
+  zone.innerHTML = camera.prises.map((p, i) => `<button class="cam-vignette" data-cam="retirer" data-i="${i}" aria-label="Retirer cette photo"><img src="${p.url}" alt=""><span>×</span></button>`).join('');
+  zone.scrollLeft = zone.scrollWidth;
+  const fin = camera.el.querySelector('.cam-terminer');
+  fin.disabled = !camera.prises.length;
+  fin.textContent = camera.prises.length ? `Terminer (${camera.prises.length})` : 'Terminer';
+}
+
+function fermerCamera() {
+  arreterFlux();
+  camera.prises.forEach(p => URL.revokeObjectURL(p.url));
+  camera.prises = [];
+  document.removeEventListener('visibilitychange', onCameraVisibilite);
+  if (camera.el) camera.el.remove();
+  camera.el = null;
+}
+
+async function basculerTorche() {
+  const piste = camera.flux && camera.flux.getVideoTracks()[0];
+  if (!piste) return;
+  camera.torche = !camera.torche;
+  try { await piste.applyConstraints({ advanced: [{ torch: camera.torche }] }); } catch (e) { camera.torche = false; }
+  camera.el.querySelector('.cam-torche').classList.toggle('on', camera.torche);
+}
+
+function onCameraClick(e) {
+  const b = e.target.closest('[data-cam]');
+  if (!b) return;
+  const action = b.getAttribute('data-cam');
+  if (action === 'prendre') prendrePhoto();
+  else if (action === 'torche') basculerTorche();
+  else if (action === 'retirer') {
+    const i = Number(b.getAttribute('data-i'));
+    const p = camera.prises[i];
+    if (p) { URL.revokeObjectURL(p.url); camera.prises.splice(i, 1); dessinerPrises(); }
+  } else if (action === 'fermer') {
+    if (camera.prises.length && !confirm(`Abandonner les ${camera.prises.length} photo(s) prises ?`)) return;
+    fermerCamera();
+  } else if (action === 'systeme') {
+    // L'app photo du téléphone : plus de réglages, une photo à la fois. Les
+    // photos déjà prises ici sont gardées et jointes d'abord.
+    const fichiers = camera.prises.map(p => p.fichier);
+    const compId = camera.compId;
+    fermerCamera();
+    if (fichiers.length && state.activeId === compId) ajouterPhotos(fichiers);
+    triggerPhotoInput();
+  } else if (action === 'terminer') {
+    const fichiers = camera.prises.map(p => p.fichier);
+    const compId = camera.compId;
+    fermerCamera();
+    if (state.activeId === compId) ajouterPhotos(fichiers);
+  }
 }
 
 /* ---------- Analyse IA groupée (déclenchée une fois la visite terminée) ---------- */
@@ -2097,12 +2274,16 @@ function ficheHtml() {
     <div class="fiche-body">
       <div class="section-lbl">Photos (${photos.length})</div>
       <div class="photo-strip scr">
-        <button class="photo-add ${state.uploadingPhoto ? 'uploading' : ''}" data-action="add-photo">
-          <i data-lucide="${state.uploadingPhoto ? 'loader-2' : 'camera'}"></i><span>${state.uploadingPhoto ? 'Envoi…' : 'Photo'}</span>
+        <button class="photo-add ${state.uploadingPhoto ? 'uploading' : ''}" data-action="add-photo" ${state.uploadingPhoto ? 'disabled' : ''}>
+          <i data-lucide="${state.uploadingPhoto ? 'loader-2' : 'camera'}"></i><span>${state.uploadingPhoto ? (state.uploadingPhoto === true ? 'Envoi…' : `Envoi ${state.uploadingPhoto}`) : 'Photos'}</span>
+        </button>
+        <button class="photo-add photo-galerie" data-action="add-galerie" ${state.uploadingPhoto ? 'disabled' : ''}>
+          <i data-lucide="images"></i><span>Galerie</span>
         </button>
         ${photoThumbsHtml}
       </div>
       <input type="file" accept="image/*" capture="environment" id="photoFileInput" data-role="photo-file-input" style="display:none">
+      <input type="file" accept="image/*" multiple id="photoGalerieInput" data-role="photo-file-input" style="display:none">
 
       <div class="section-lbl" style="margin-top:24px">Cote de l'élément</div>
       ${ratingListHtml(c)}
@@ -2244,7 +2425,8 @@ function onRootClick(e) {
     case 'ajout-ouvrir-libre': if (state.ajout) { state.ajout.libre = true; render(); } break;
     case 'ajout-cat': if (state.ajout) { state.ajout.cat = t.dataset.val; render(); } break;
     case 'ajout-libre': if (state.ajout && state.ajout.cat) creerComposante({ name: state.ajout.q, cat: state.ajout.cat, vu: state.ajout.vu }); break;
-    case 'add-photo': triggerPhotoInput(); break;
+    case 'add-photo': ouvrirCamera(); break;
+    case 'add-galerie': { const g = document.getElementById('photoGalerieInput'); if (g) g.click(); break; }
     case 'analyze-visit': analyzeVisit(); break;
     case 'set-rating': onRatingClick(t.dataset.rating); break;
     case 'tache-retirer': retirerTache(t.dataset.id); break;
