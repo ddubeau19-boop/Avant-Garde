@@ -825,3 +825,9 @@ details.ca-bloc summary { cursor: pointer; }
 .tp-doublon img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; display: block; opacity: .75; }
 .tp-doublon-nom { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-500); padding: 6px 8px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tp-doublon .btn-pill-sm { margin: 6px 8px 8px; padding: 5px 10px; font-size: 11.5px; }
+
+/* Analyse des photos par l'IA */
+.an-cta { margin-top: -12px; }
+.an-cta:disabled { opacity: .55; cursor: not-allowed; }
+.rt-ia { align-self: center; margin-left: 4px; font-family: var(--font-mono); font-size: 9.5px; font-weight: 700; letter-spacing: .04em;
+  padding: 2px 5px; border-radius: 999px; background: var(--orange-wash); color: var(--orange); }
