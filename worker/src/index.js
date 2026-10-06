@@ -3825,6 +3825,9 @@ const COLONNES_AJOUTEES = [
   // sert à écarter les doublons d'un dépôt de photos en lot.
   ["photos", "empreinte", "TEXT"],
   ["photos_a_classer", "empreinte", "TEXT"],
+  // Photo choisie par l'ingénieur pour la fiche du rapport (au plus 4 par
+  // composante) ; aucune choisie : les 4 premières, comme avant.
+  ["photos", "au_rapport", "INTEGER"],
   ["companies", "theme", "TEXT"],
   ["companies", "mise_en_page", "TEXT"],
   ["companies", "bibliotheque", "TEXT"],
@@ -48768,8 +48771,8 @@ dossiers.post("/:id/components/import", async (c) => {
     stats: await dossierStats(c.env.DB, dossier.id)
   });
 });
-// Photos d'un rapport : au plus 4 par fiche, dans l'ordre des étiquettes du
-// terrain, sous un budget total — un Worker n'a que 128 Mo, et un rapport de
+// Photos d'un rapport : au plus 4 par fiche — celles que l'ingénieur a
+// choisies, sinon les premières —, dans l'ordre des étiquettes du terrain, sous un budget total — un Worker n'a que 128 Mo, et un rapport de
 // 150 fiches en photos de téléphone pleine résolution ne tiendrait pas.
 const PHOTOS_PAR_FICHE = 4;
 const PHOTO_MAX_OCTETS = 4 * 1024 * 1024;
@@ -48782,7 +48785,7 @@ async function photosDuRapport(env, components2) {
   for (let i = 0; i < ids.length; i += 90) {
     const lot = ids.slice(i, i + 90);
     const r = await env.DB.prepare(
-      `SELECT id, component_id, r2_key, tag, created_at FROM photos WHERE component_id IN (${lot.map((_, k) => `?${k + 1}`).join(", ")}) ORDER BY created_at ASC`
+      `SELECT id, component_id, r2_key, tag, created_at, au_rapport FROM photos WHERE component_id IN (${lot.map((_, k) => `?${k + 1}`).join(", ")}) ORDER BY created_at ASC`
     ).bind(...lot).all();
     lignes.push(...r.results);
   }
@@ -48792,7 +48795,9 @@ async function photosDuRapport(env, components2) {
   };
   const choisies = [];
   for (const id of ids) {
-    const siennes = lignes.filter((l) => l.component_id === id).sort((a, b) => rang(a.tag) - rang(b.tag)).slice(0, PHOTOS_PAR_FICHE);
+    const toutes = lignes.filter((l) => l.component_id === id);
+    const elues = toutes.filter((l) => l.au_rapport === 1);
+    const siennes = (elues.length ? elues : toutes).sort((a, b) => rang(a.tag) - rang(b.tag)).slice(0, PHOTOS_PAR_FICHE);
     choisies.push(...siennes);
   }
   let budget = PHOTOS_BUDGET_OCTETS;
@@ -49209,6 +49214,28 @@ photos.get("/:id/file", async (c) => {
       "cache-control": "private, max-age=86400"
     }
   });
+});
+// Choisir les photos d'une fiche du rapport : au plus PHOTOS_PAR_FICHE par
+// composante. Après un dépôt en lot, les premières classées ne sont pas
+// forcément les meilleures.
+photos.patch("/:id", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "non authentifié" }, 401);
+  const photo = await c.env.DB.prepare(
+    `SELECT p.* FROM photos p
+       JOIN components cmp ON cmp.id = p.component_id
+       JOIN dossiers d ON d.id = cmp.dossier_id
+       WHERE p.id = ?1 AND d.company_id = ?2`
+  ).bind(c.req.param("id"), user.company_id).first();
+  if (!photo) return c.json({ error: "photo introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  if (body2.au_rapport !== 0 && body2.au_rapport !== 1) return c.json({ error: "au_rapport (0 ou 1) requis" }, 400);
+  if (body2.au_rapport === 1 && photo.au_rapport !== 1) {
+    const n = (await c.env.DB.prepare("SELECT COUNT(*) AS n FROM photos WHERE component_id = ?1 AND au_rapport = 1").bind(photo.component_id).first())?.n ?? 0;
+    if (n >= PHOTOS_PAR_FICHE) return c.json({ error: `au plus ${PHOTOS_PAR_FICHE} photos par fiche du rapport` }, 409);
+  }
+  await c.env.DB.prepare("UPDATE photos SET au_rapport = ?1 WHERE id = ?2").bind(body2.au_rapport, photo.id).run();
+  return c.json({ id: photo.id, component_id: photo.component_id, au_rapport: body2.au_rapport });
 });
 // ── Banque de prix ───────────────────────────────────────────────────────────
 // Ce que la firme a réellement payé, ramené à un prix unitaire indexé. La

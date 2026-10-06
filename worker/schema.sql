@@ -210,7 +210,8 @@ CREATE TABLE photos (
   r2_key       TEXT NOT NULL,
   tag          TEXT,
   created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  empreinte    TEXT    -- dHash 64 bits (hex), quand la photo vient d'un dépôt en lot
+  empreinte    TEXT,   -- dHash 64 bits (hex), quand la photo vient d'un dépôt en lot
+  au_rapport   INTEGER -- 1 : choisie pour la fiche du rapport (au plus 4 par composante)
 );
 
 -- Photos déposées en lot au bureau, en attente d'être rattachées à une

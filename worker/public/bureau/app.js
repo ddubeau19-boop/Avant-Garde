@@ -214,6 +214,8 @@ const state = {
   inactifs: [],               // composantes retirées de l'étude (actif = 0)
   inactifsOuverts: false,
   lot: { ouvert: false, choix: { bon: true, na: true, normal: false }, enCours: false, note: null },
+  saisie: { ouvert: false, tous: false, ids: [], brouillon: {} },
+  sansPhoto: { ouvert: false, chargement: false, choix: {}, enCours: false },
   couts: { ouvert: false, donnees: null, erreur: null, choix: {}, enCours: false },
   publication: null,          // GET /api/dossiers/:id/publication
   publicationErreur: null,
@@ -846,6 +848,8 @@ async function openDossier(id) {
   state.inactifsOuverts = false;
   state.lot = { ouvert: false, choix: { bon: true, na: true, normal: false }, enCours: false, note: null };
   state.couts = { ouvert: false, donnees: null, erreur: null, choix: {}, enCours: false };
+  state.saisie = { ouvert: false, tous: false, ids: [], brouillon: {} };
+  state.sansPhoto = { ouvert: false, chargement: false, choix: {}, enCours: false };
   state.analyse = { enCours: false, faits: 0, total: 0, note: null };
   await loadDossierDetail(id);
 }
@@ -1254,6 +1258,158 @@ function inactifsHtml() {
   </div>`;
 }
 
+// ---- Saisie rapide : année, vie utile et coût, une ligne par composante ----
+// Des champs ordinaires plutôt que les cellules du tableau : Entrée passe à la
+// ligne suivante, et ce qui est tapé survit aux re-rendus (brouillon). La
+// liste est figée à l'ouverture pour qu'une ligne complétée ne saute pas.
+const SAISIE_CHAMPS = [
+  { f: 'install_year',      label: 'Année constr./rép.', ph: 'ex. 2008', lire: parseYear },
+  { f: 'useful_life_years', label: 'Vie utile (ans)',    ph: 'ans',      lire: parseNum },
+  { f: 'replacement_cost',  label: 'Coût de remplacement ($)', ph: '$',  lire: parseNum },
+];
+function saisieAFaire(c) { return c.replacement_cost == null || c.useful_life_years == null; }
+function saisieListe() {
+  return groupedComponents().flatMap(g => g.rows).filter(c => state.saisie.tous || saisieAFaire(c)).map(c => c.id);
+}
+function ouvrirSaisie() {
+  state.saisie = { ouvert: !state.saisie.ouvert, tous: false, ids: [], brouillon: {} };
+  if (state.saisie.ouvert) state.saisie.ids = saisieListe();
+  render();
+  if (state.saisie.ouvert) {
+    const premier = document.querySelector('[data-role="saisie"]');
+    if (premier) premier.focus();
+  }
+}
+function saisieValeur(c, f) {
+  const cle = c.id + '|' + f;
+  if (cle in state.saisie.brouillon) return state.saisie.brouillon[cle];
+  return c[f] == null ? '' : String(c[f]);
+}
+function saisiePanelHtml() {
+  const k = state.saisie;
+  const lignes = k.ids.map(id => componentById(id)).filter(Boolean);
+  const restantes = state.components.filter(saisieAFaire).length;
+  return `
+  <div class="nf-card lot-panel">
+    <div class="lot-titre">Saisie rapide</div>
+    <div class="lot-sub">Chaque valeur s'enregistre en quittant le champ. <b>Entrée</b> passe à la ligne suivante, <b>Tab</b> au champ suivant. Une composante sans coût ni vie utile ne compte pas dans le fonds. ${restantes ? `<b>${restantes} composante(s) à compléter.</b>` : 'Toutes les composantes ont un coût et une vie utile.'}</div>
+    <label class="saisie-tous"><input type="checkbox" data-role="saisie-tous" ${k.tous ? 'checked' : ''}> Afficher aussi les composantes déjà complètes</label>
+    ${lignes.length ? `
+    <div class="saisie-table">
+      <div class="saisie-ligne saisie-tete"><span>Composante</span>${SAISIE_CHAMPS.map(x => `<span>${escapeHtml(x.label)}</span>`).join('')}</div>
+      ${lignes.map(c => `
+      <div class="saisie-ligne ${saisieAFaire(c) ? '' : 'complete'}">
+        <span class="nom">${escapeHtml(c.name || '—')}<small>${escapeHtml(c.uniformat_code || '')}${c.photos ? ` · ${c.photos} photo(s)` : ''}${c.rating != null ? ` · cote ${c.rating}` : ''}</small></span>
+        ${SAISIE_CHAMPS.map(x => `<input class="detail-input" id="sr_${x.f}_${c.id}" data-role="saisie" data-id="${c.id}" data-field="${x.f}" inputmode="numeric" autocomplete="off" placeholder="${x.ph}" value="${escapeHtml(saisieValeur(c, x.f))}">`).join('')}
+      </div>`).join('')}
+    </div>` : `<div class="lot-sub">Rien à compléter.</div>`}
+    <div class="nf-actions"><button type="button" class="btn-secondary" data-action="saisie-fermer">Fermer</button></div>
+  </div>`;
+}
+let saisieProjection = null;
+async function enregistrerSaisie(id, f, brut) {
+  const c = componentById(id);
+  const champ = SAISIE_CHAMPS.find(x => x.f === f);
+  if (!c || !champ) return;
+  const cle = id + '|' + f;
+  const v = champ.lire(brut);
+  if ((v == null ? null : v) === (c[f] == null ? null : c[f])) { delete state.saisie.brouillon[cle]; return; }
+  state.saveStatus = 'saving';
+  paintSaveIndicator();
+  try {
+    await apiJson(`/api/components/${id}`, { method: 'PATCH', body: JSON.stringify({ [f]: v }) });
+    state.components = state.components.map(x => x.id === id ? Object.assign({}, x, { [f]: v }) : x);
+    if (state.saisie.brouillon[cle] === brut) delete state.saisie.brouillon[cle];
+    state.saveStatus = 'saved';
+    // Le fonds se recalcule une fois la saisie calmée, pas à chaque champ.
+    clearTimeout(saisieProjection);
+    saisieProjection = setTimeout(async () => { await refreshProjection(); render(); }, 1500);
+  } catch (e) {
+    state.saveStatus = 'error';
+    state.revisionFlashError = e.message || "Échec de l'enregistrement.";
+  }
+  render();
+}
+function saisieSuivante(t) {
+  const ids = state.saisie.ids;
+  const i = ids.indexOf(t.getAttribute('data-id'));
+  const suivant = i >= 0 && i + 1 < ids.length ? document.getElementById(`sr_${t.getAttribute('data-field')}_${ids[i + 1]}`) : null;
+  if (suivant) { suivant.focus(); suivant.select(); } else t.blur();
+}
+
+// ---- Retirer les composantes sans photo ----
+// L'inventaire de départ est générique : après le classement des photos,
+// ce qui n'a ni photo ni cote n'a sans doute pas été vu sur place. Les
+// composantes retirées restent réactivables.
+function sansPhotoCandidats() {
+  const parentsPhotographies = new Set(state.components.filter(c => c.photos > 0 && c.parent_id).map(c => String(c.parent_id)));
+  return state.components.filter(c => !(c.photos > 0) && c.rating == null && !c.done && c.confirmed !== 1 && !parentsPhotographies.has(String(c.id)));
+}
+async function ouvrirSansPhoto() {
+  if (state.sansPhoto.ouvert) { state.sansPhoto.ouvert = false; render(); return; }
+  state.sansPhoto = { ouvert: true, chargement: true, choix: {}, enCours: false };
+  render();
+  // Compteurs de photos à jour avant de proposer quoi que ce soit.
+  try {
+    const comps = await apiJson(`/api/dossiers/${state.dossierId}/components`);
+    if (Array.isArray(comps)) {
+      state.components = comps.filter(c => c.actif !== 0);
+      state.inactifs = comps.filter(c => c.actif === 0);
+    }
+  } catch (e) { /* on garde la liste en mémoire */ }
+  sansPhotoCandidats().forEach(c => { state.sansPhoto.choix[c.id] = true; });
+  state.sansPhoto.chargement = false;
+  render();
+}
+function sansPhotoPanelHtml() {
+  const k = state.sansPhoto;
+  if (k.chargement) return `<div class="nf-card lot-panel">${spinnerBlock('Lecture des composantes…')}</div>`;
+  const cands = sansPhotoCandidats();
+  const n = cands.filter(c => k.choix[c.id]).length;
+  const aClasser = tri.nombreAClasser();
+  return `
+  <div class="nf-card lot-panel">
+    <div class="lot-titre">Retirer les composantes sans photo</div>
+    <div class="lot-sub">Composantes sans aucune photo et sans cote : probablement absentes de l'immeuble. Décochez celles à garder. Elles ne figureront ni au rapport ni au fonds, et restent réactivables sous « Retirées de l'étude ».</div>
+    ${aClasser ? `<div class="temp-pass-warn" style="margin-bottom:10px"><i data-lucide="alert-triangle"></i><span><b>${aClasser} photo(s) encore à classer.</b> Classez-les d'abord : une composante photographiée mais pas encore classée serait proposée ici.</span></div>` : ''}
+    ${cands.length ? `
+    <div class="couts-table">
+      ${cands.map(c => `
+      <label class="couts-ligne">
+        <input type="checkbox" data-role="sansphoto-choix" data-id="${c.id}" ${k.choix[c.id] ? 'checked' : ''}>
+        <span class="nom">${escapeHtml(c.name || '—')}<small>${escapeHtml(catInfo(c.cat).label)}${c.uniformat_code ? ' · ' + escapeHtml(c.uniformat_code) : ''}</small></span>
+      </label>`).join('')}
+    </div>` : `<div class="lot-sub">Aucune composante sans photo ni cote.</div>`}
+    <div class="nf-actions">
+      <button type="button" class="btn-secondary" data-action="sansphoto-fermer">Fermer</button>
+      ${cands.length ? `<button type="button" class="btn-primary" data-action="sansphoto-retirer" ${n && !k.enCours ? '' : 'disabled'}>${k.enCours ? 'Retrait…' : `Retirer ${n} composante(s)`}</button>` : ''}
+    </div>
+  </div>`;
+}
+async function retirerSansPhoto() {
+  const k = state.sansPhoto;
+  const ids = sansPhotoCandidats().filter(c => k.choix[c.id]).map(c => c.id);
+  if (!ids.length || k.enCours) return;
+  if (!confirm(`Retirer ${ids.length} composante(s) de l'étude ? Vous pourrez les réactiver une à une.`)) return;
+  k.enCours = true;
+  render();
+  try {
+    const r = await apiJson(`/api/dossiers/${state.dossierId}/components/lot`, { method: 'POST', body: JSON.stringify({ ids, actif: 0 }) });
+    const set = new Set(ids);
+    const retirees = state.components.filter(c => set.has(c.id)).map(c => Object.assign({}, c, { actif: 0 }));
+    state.components = state.components.filter(c => !set.has(c.id));
+    state.inactifs = state.inactifs.concat(retirees);
+    ids.forEach(id => { delete state.expanded[id]; });
+    state.sansPhoto = { ouvert: false, chargement: false, choix: {}, enCours: false };
+    state.lot.note = `${r.modifiees} composante(s) retirée(s) de l'étude. Elles restent réactivables sous « Retirées de l'étude ».`;
+    await refreshProjection();
+  } catch (e) {
+    k.enCours = false;
+    state.revisionFlashError = e.message || 'Le retrait a échoué.';
+  }
+  render();
+}
+
 // Fiche d'immeuble : une réponse modifiée part tout de suite au serveur. Ses
 // règles peuvent activer ou retirer des composantes : on recharge alors la liste.
 async function immEnregistrer(sec, key, val) {
@@ -1323,7 +1479,41 @@ async function onCotisationBlur(value) {
   render();
 }
 
+// Photos de la fiche du rapport : au plus 4, choisies d'une étoile. Sans
+// choix, le rapport prend les 4 premières classées.
+const PHOTOS_PAR_FICHE = 4;
+function photosRapportNoteHtml(photos) {
+  const n = photos.filter(p => p.au_rapport).length;
+  const texte = n
+    ? `${n}/${PHOTOS_PAR_FICHE} photo(s) choisie(s) pour le rapport.`
+    : photos.length > PHOTOS_PAR_FICHE
+      ? `Le rapport montre ${PHOTOS_PAR_FICHE} photos : sans choix, les ${PHOTOS_PAR_FICHE} premières. Cliquez l'étoile pour choisir.`
+      : 'Toutes ces photos iront au rapport. Cliquez l\'étoile pour n\'en garder que certaines.';
+  return `<div class="rvia-photos-note">${escapeHtml(texte)}</div>${state.photoRapportErreur ? `<div class="rvia-photos-note err">${escapeHtml(state.photoRapportErreur)}</div>` : ''}`;
+}
+async function basculerPhotoRapport(id) {
+  const p = state.reviewPhotos.find(x => x.id === id);
+  if (!p) return;
+  const voulu = p.au_rapport ? 0 : 1;
+  if (voulu && state.reviewPhotos.filter(x => x.au_rapport).length >= PHOTOS_PAR_FICHE) {
+    state.photoRapportErreur = `Au plus ${PHOTOS_PAR_FICHE} photos par fiche : retirez-en une d'abord.`;
+    render();
+    return;
+  }
+  p.au_rapport = voulu;
+  state.photoRapportErreur = null;
+  render();
+  try {
+    await apiJson(`/api/photos/${id}`, { method: 'PATCH', body: JSON.stringify({ au_rapport: voulu }) });
+  } catch (e) {
+    p.au_rapport = voulu ? 0 : 1;
+    state.photoRapportErreur = e.message || "Le choix de la photo n'a pas été enregistré.";
+    render();
+  }
+}
+
 function revokeReviewPhotos() {
+  state.photoRapportErreur = null;
   state.reviewObjectUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch (e) {} });
   state.reviewObjectUrls = [];
   state.reviewPhotos = [];
@@ -1364,7 +1554,7 @@ async function loadReviewPhotosForCurrent() {
           const blob = await res.blob();
           const url = URL.createObjectURL(blob);
           state.reviewObjectUrls.push(url);
-          loaded.push({ id: photos[i].id, tag: photos[i].tag || tags[i] || ('Photo ' + (i + 1)), url });
+          loaded.push({ id: photos[i].id, tag: photos[i].tag || tags[i] || ('Photo ' + (i + 1)), url, au_rapport: photos[i].au_rapport === 1 ? 1 : 0 });
         }
       } catch (e) { /* skip this photo */ }
     }
@@ -3167,10 +3357,14 @@ function renderRevision() {
         <span class="lbl">Composantes · ${docCount}/${total} documentées</span>
         <div class="rule"></div>
         <span class="hint">Édition directe des cellules</span>
+        <button class="btn-pill-sm" data-action="saisie-ouvrir"><i data-lucide="table" style="width:14px;height:14px"></i>Saisie rapide</button>
+        <button class="btn-pill-sm" data-action="sansphoto-ouvrir"><i data-lucide="camera-off" style="width:14px;height:14px"></i>Retirer sans photo</button>
         <button class="btn-pill-sm" data-action="couts-ouvrir"><i data-lucide="receipt" style="width:14px;height:14px"></i>Coûts de la banque</button>
         <button class="btn-pill-sm" data-action="lot-ouvrir"><i data-lucide="list-checks" style="width:14px;height:14px"></i>Confirmer en lot</button>
         <label class="btn-pill-sm">${state.composantesImportUploading ? 'Lecture du document…' : 'Importer un .docx'}<input type="file" accept=".docx" data-role="composantes-import-file" style="display:none" ${state.composantesImportUploading ? 'disabled' : ''}></label>
       </div>
+      ${state.saisie.ouvert ? saisiePanelHtml() : ''}
+      ${state.sansPhoto.ouvert ? sansPhotoPanelHtml() : ''}
       ${state.couts.ouvert ? coutsPanelHtml() : ''}
       ${state.lot.ouvert ? lotPanelHtml() : ''}
       ${state.lot.note ? `<div class="temp-pass-warn" style="margin-bottom:14px"><i data-lucide="info"></i><span>${escapeHtml(state.lot.note)}</span></div>` : ''}
@@ -3551,8 +3745,10 @@ function renderReviewIA() {
           <div class="rvia-photos-col cscr">
             <div class="rvia-photos-eyebrow">Photos (${photosLoading ? '…' : photos.length})</div>
             ${photosLoading ? spinnerBlock('Chargement des photos…') : (photos.length > 0 ? `
+            ${photosRapportNoteHtml(photos)}
             <div class="rvia-photos-grid">
-              ${photos.map(p => `<div class="rvia-photo"><img src="${p.url}" alt=""><div class="rvia-photo-tag">${escapeHtml(p.tag)}</div></div>`).join('')}
+              ${photos.map(p => `<div class="rvia-photo ${p.au_rapport ? 'au-rapport' : ''}"><img src="${p.url}" alt=""><div class="rvia-photo-tag">${escapeHtml(p.tag)}</div>
+                <button class="rvia-photo-star" data-action="photo-rapport" data-id="${p.id}" title="${p.au_rapport ? 'Retirer du rapport' : 'Mettre au rapport'}" aria-pressed="${p.au_rapport ? 'true' : 'false'}"><i data-lucide="star" style="width:14px;height:14px"></i></button></div>`).join('')}
             </div>` : `
             <div class="rvia-no-photos"><i data-lucide="camera-off" style="width:22px;height:22px"></i><div>Aucune photo au dossier</div></div>`)}
             ${r ? coteRapportBlockHtml(r) : ''}
@@ -3629,7 +3825,8 @@ function initEvents() {
   app.addEventListener('input', (e) => {
     const t = e.target;
     if (!t || !t.matches) return;
-    if (t.matches('#add-comp-form [data-draft]')) state.addComp[t.getAttribute('data-draft')] = t.value;
+    if (t.matches('[data-role="saisie"]')) state.saisie.brouillon[t.getAttribute('data-id') + '|' + t.getAttribute('data-field')] = t.value;
+    else if (t.matches('#add-comp-form [data-draft]')) state.addComp[t.getAttribute('data-draft')] = t.value;
     else if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
     else if (t.matches('[data-sec-text]')) onSecTextInput(t);
@@ -3655,6 +3852,8 @@ function initEvents() {
     const t = e.target;
     if (t && t.matches && t.matches('[data-role="visite-input"]')) { onVisiteChange(t.value); return; }
     if (t && t.matches && t.matches('[data-role="cout-choix"]')) { state.couts.choix[t.getAttribute('data-id')] = t.checked; render(); return; }
+    if (t && t.matches && t.matches('[data-role="sansphoto-choix"]')) { state.sansPhoto.choix[t.getAttribute('data-id')] = t.checked; render(); return; }
+    if (t && t.matches && t.matches('[data-role="saisie-tous"]')) { state.saisie.tous = t.checked; state.saisie.ids = saisieListe(); render(); return; }
     if (t && t.matches && t.matches('[data-role="lot-choix"]')) { state.lot.choix[t.getAttribute('data-k')] = t.checked; render(); return; }
     if (t && t.matches && state.screen === 'photos' && tri.change(t)) return;
     if (t && t.matches && bib.change(t)) return;
@@ -3923,6 +4122,23 @@ function initEvents() {
       case 'couts-appliquer':
         appliquerCouts();
         break;
+      case 'saisie-ouvrir':
+        ouvrirSaisie();
+        break;
+      case 'saisie-fermer':
+        state.saisie.ouvert = false;
+        render();
+        break;
+      case 'sansphoto-ouvrir':
+        ouvrirSansPhoto();
+        break;
+      case 'sansphoto-fermer':
+        state.sansPhoto.ouvert = false;
+        render();
+        break;
+      case 'sansphoto-retirer':
+        retirerSansPhoto();
+        break;
       case 'lot-ouvrir':
         state.lot.ouvert = !state.lot.ouvert;
         state.lot.note = null;
@@ -3997,6 +4213,9 @@ function initEvents() {
       case 'rv-skip':
         rvSkip();
         break;
+      case 'photo-rapport':
+        basculerPhotoRapport(btn.getAttribute('data-id'));
+        break;
       case 'rv-confirm':
         rvConfirm();
         break;
@@ -4009,6 +4228,11 @@ function initEvents() {
   });
 
 
+  app.addEventListener('keydown', (e) => {
+    const t = e.target;
+    if (e.key === 'Enter' && t && t.matches && t.matches('[data-role="saisie"]')) { e.preventDefault(); saisieSuivante(t); }
+  });
+
   // focusout bubbles (unlike blur), so a single delegated listener works for
   // the solde input and the contenteditable table cells.
   app.addEventListener('focusout', (e) => {
@@ -4018,6 +4242,7 @@ function initEvents() {
     if (t.matches('[data-role="cotisation-input"]')) { onCotisationBlur(t.value); return; }
     if (t.matches('[data-role="visite-input"]')) { onVisiteChange(t.value); return; }
     if (t.matches('[data-role="imm-input"]')) { immEnregistrer(t.getAttribute('data-sec'), t.getAttribute('data-key'), t.value); return; }
+    if (t.matches('[data-role="saisie"]')) { enregistrerSaisie(t.getAttribute('data-id'), t.getAttribute('data-field'), t.value); return; }
     if (t.matches('[data-role="cost-cell"]')) { patchComponent(t.getAttribute('data-id'), { replacement_cost: parseNum(t.textContent) }, { refetchProjection: true }); return; }
     if (t.matches('[data-role="life-cell"]')) { patchComponent(t.getAttribute('data-id'), { useful_life_years: parseNum(t.textContent) }, { refetchProjection: true }); return; }
     if (t.matches('[data-role="year-cell"]')) { patchComponent(t.getAttribute('data-id'), { install_year: parseYear(t.textContent) }, { refetchProjection: true }); return; }

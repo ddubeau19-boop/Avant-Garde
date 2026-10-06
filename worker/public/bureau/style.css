@@ -481,6 +481,13 @@ button { font-family: inherit; }
 .rvia-photo { aspect-ratio: 4/3; border-radius: 10px; background: var(--ink-100); position: relative; display: flex; align-items: flex-end; overflow: hidden; }
 .rvia-photo img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .rvia-photo-tag { font-family: var(--font-mono); font-size: 9px; color: #fff; background: rgba(0,0,0,.45); padding: 2px 6px; margin: 6px; border-radius: 5px; position: relative; z-index: 1; }
+.rvia-photo-star { position: absolute; top: 6px; right: 6px; z-index: 2; width: 28px; height: 28px; border-radius: 50%; border: 0; background: rgba(0,0,0,.45); color: #fff; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+.rvia-photo-star:hover { background: rgba(0,0,0,.65); }
+.rvia-photo.au-rapport { box-shadow: 0 0 0 3px var(--orange); }
+.rvia-photo.au-rapport .rvia-photo-star { background: var(--orange); }
+.rvia-photo.au-rapport .rvia-photo-star svg { fill: currentColor; }
+.rvia-photos-note { font-size: 12px; color: var(--ink-600); margin: 0 0 8px; line-height: 1.4; }
+.rvia-photos-note.err { color: var(--accent-press); }
 .rvia-no-photos { border: 1.5px dashed var(--ink-300); border-radius: 10px; padding: 22px; text-align: center; color: var(--ink-400); }
 .rvia-no-photos div { font-size: 12px; margin-top: 6px; }
 .rvia-meta { margin-top: 18px; display: flex; flex-direction: column; gap: 10px; }
@@ -898,3 +905,19 @@ details.ca-bloc summary { cursor: pointer; }
 .tp-seuil .seg-btn { display: inline-flex; align-items: baseline; gap: 5px; }
 .tp-seuil .seg-btn small { font-size: 10.5px; opacity: .7; font-family: var(--font-mono); }
 .tp-seuil-aide { font-size: 12px; color: var(--ink-500); flex-basis: 100%; }
+
+/* Saisie rapide : année, vie utile, coût */
+.saisie-tous { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink-600); margin: 4px 0 10px; }
+.saisie-table { border: 1px solid var(--ink-200); border-radius: 12px; max-height: 480px; overflow-y: auto; }
+.saisie-ligne { display: grid; grid-template-columns: minmax(0, 1fr) 120px 110px 150px; gap: 8px; align-items: center; padding: 7px 12px; border-bottom: 1px solid var(--line-soft); font-size: 13px; }
+.saisie-ligne:last-child { border-bottom: none; }
+.saisie-ligne.complete { background: var(--ink-050); }
+.saisie-ligne .nom { min-width: 0; }
+.saisie-ligne .nom small { display: block; font-size: 11px; color: var(--ink-500); margin-top: 2px; font-family: var(--font-mono); }
+.saisie-ligne input { width: 100%; text-align: right; font-family: var(--font-mono); padding: 6px 8px; }
+.saisie-tete { position: sticky; top: 0; background: var(--white, #fff); z-index: 1; font-size: 11px; font-weight: 600; color: var(--ink-500); text-transform: uppercase; letter-spacing: .03em; }
+.saisie-tete span:not(:first-child) { text-align: right; }
+@media (max-width: 700px) {
+  .saisie-ligne { grid-template-columns: 1fr 1fr 1fr; }
+  .saisie-ligne .nom, .saisie-tete span:first-child { grid-column: 1 / -1; }
+}
