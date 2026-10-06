@@ -93,3 +93,22 @@ test('retirer une photo la supprime de la file', async () => {
   assert.equal((await api(`/api/dossiers/${id}/photos-a-classer/${p.id}/fichier`, { session: ingA, brut: true })).status, 404);
   assert.equal((await api(`/api/dossiers/${id}/photos-a-classer/${p.id}`, { methode: 'DELETE', session: ingA })).statut, 404);
 });
+
+test("l'empreinte visuelle est gardée, renvoyée, et suit la photo classée", async () => {
+  const id = await nouveauDossier();
+  const [c1] = (await api(`/api/dossiers/${id}/components`, { session: ingA })).json;
+  const f = new FormData();
+  f.append('file', new Blob([JPEG], { type: 'image/jpeg' }), 'a.jpg');
+  f.append('empreinte', '0f0f0f0f0f0f0f0f');
+  const p = (await api(`/api/dossiers/${id}/photos-a-classer`, { methode: 'POST', session: ingA, formulaire: f })).json;
+  assert.equal(p.empreinte, '0f0f0f0f0f0f0f0f');
+  const g = new FormData();
+  g.append('file', new Blob([JPEG], { type: 'image/jpeg' }), 'b.jpg');
+  g.append('empreinte', 'pas-une-empreinte');
+  assert.equal((await api(`/api/dossiers/${id}/photos-a-classer`, { methode: 'POST', session: ingA, formulaire: g })).json.empreinte, null, 'une empreinte invalide est ignorée');
+
+  assert.deepEqual((await api(`/api/dossiers/${id}/photos-a-classer`, { session: ingA })).json.empreintes, ['0f0f0f0f0f0f0f0f']);
+  await api(`/api/dossiers/${id}/photos-a-classer/classer`, { methode: 'POST', session: ingA, corps: { affectations: [{ id: p.id, component_id: c1.id }] } });
+  // Classée, la photo continue d'écarter ses doublons.
+  assert.deepEqual((await api(`/api/dossiers/${id}/photos-a-classer`, { session: ingA })).json.empreintes, ['0f0f0f0f0f0f0f0f']);
+});

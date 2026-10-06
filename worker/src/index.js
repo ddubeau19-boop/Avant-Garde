@@ -3803,6 +3803,10 @@ Réponds UNIQUEMENT par les numéros séparés par des virgules, ou par le mot A
 // créées au premier appel de chaque isolat plutôt que par une migration
 // manuelle : un déploiement ne peut pas précéder la base qu'il suppose.
 const COLONNES_AJOUTEES = [
+  // Empreinte visuelle (dHash 64 bits, hexadécimal) calculée par le navigateur :
+  // sert à écarter les doublons d'un dépôt de photos en lot.
+  ["photos", "empreinte", "TEXT"],
+  ["photos_a_classer", "empreinte", "TEXT"],
   ["companies", "theme", "TEXT"],
   ["companies", "mise_en_page", "TEXT"],
   ["companies", "bibliotheque", "TEXT"],
@@ -3846,7 +3850,8 @@ const TABLES_AJOUTEES = [
      description   TEXT,
      erreur        TEXT,
      created_by    TEXT,
-     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
+     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+     empreinte     TEXT)`,
   `CREATE TABLE IF NOT EXISTS jetons_compte (
      id         TEXT PRIMARY KEY,
      user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -48309,7 +48314,11 @@ une photo floue ou un élément qui pourrait relever de plusieurs composantes m�
     }
   ];
   try {
-    const texte = await callClaude(apiKey, { content, maxTokens: 300 });
+    // Un tri, pas un raisonnement : sans réflexion, la réponse tient dans son
+    // budget et coûte moins. Avec la réflexion adaptative par défaut, 300 jetons
+    // pouvaient partir en « thinking » avant le JSON, et la photo restait sans
+    // proposition.
+    const texte = await callClaude(apiKey, { content, maxTokens: 600, thinking: { type: "disabled" } });
     const r = extractJson(texte);
     const parIndex = (n) => Number.isInteger(Number(n)) && Number(n) >= 1 && Number(n) <= composantes.length ? composantes[Number(n) - 1].id : null;
     const suggestion = parIndex(r.n);
@@ -48332,6 +48341,7 @@ function photoAClasserVue(row) {
     autres,
     description: row.description,
     erreur: row.erreur,
+    empreinte: row.empreinte ?? null,
     created_at: row.created_at
   };
 }
@@ -48339,7 +48349,14 @@ dossiers.get("/:id/photos-a-classer", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   const rows = await c.env.DB.prepare("SELECT * FROM photos_a_classer WHERE dossier_id = ?1 ORDER BY created_at ASC").bind(dossier.id).all();
-  return c.json({ seuil: SEUIL_CONFIANCE_PHOTO, photos: rows.results.map(photoAClasserVue) });
+  // Empreintes de toutes les photos du dossier, classées ou non : le navigateur
+  // écarte un doublon même d'une photo déposée lors d'un lot précédent.
+  const classees = await c.env.DB.prepare(
+    `SELECT p.empreinte FROM photos p JOIN components cmp ON cmp.id = p.component_id
+      WHERE cmp.dossier_id = ?1 AND p.empreinte IS NOT NULL`
+  ).bind(dossier.id).all();
+  const empreintes = [...rows.results.map((r) => r.empreinte), ...classees.results.map((r) => r.empreinte)].filter(Boolean);
+  return c.json({ seuil: SEUIL_CONFIANCE_PHOTO, photos: rows.results.map(photoAClasserVue), empreintes });
 });
 dossiers.post("/:id/photos-a-classer", async (c) => {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
@@ -48355,6 +48372,7 @@ dossiers.post("/:id/photos-a-classer", async (c) => {
   const octets = await file.arrayBuffer();
   await c.env.PHOTOS.put(r2Key, octets, { httpMetadata: { contentType: type } });
   const nomFichier = String(file.name || "").slice(0, 200) || null;
+  const empreinte = /^[0-9a-f]{16}$/.test(String(form.get("empreinte") ?? "")) ? String(form.get("empreinte")) : null;
   const composantes = (await c.env.DB.prepare(
     "SELECT id, name, cat, uniformat_code, variante, position, emplacement FROM components WHERE dossier_id = ?1 AND actif = 1 ORDER BY sort_order ASC, created_at ASC"
   ).bind(dossier.id).all()).results;
@@ -48363,9 +48381,9 @@ dossiers.post("/:id/photos-a-classer", async (c) => {
     ? await classerPhoto(c.env.ANTHROPIC_API_KEY, { base64: arrayBufferToBase64(octets), mediaType: type, nomFichier, composantes })
     : { erreur: "format ou taille non analysable : à classer à la main" };
   await c.env.DB.prepare(
-    `INSERT INTO photos_a_classer (id, dossier_id, r2_key, nom_fichier, suggestion_id, confiance, autres, description, erreur, created_by)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
-  ).bind(id, dossier.id, r2Key, nomFichier, r.suggestion ?? null, r.confiance ?? null, JSON.stringify(r.autres ?? []), r.description ?? null, r.erreur ?? null, user?.id ?? null).run();
+    `INSERT INTO photos_a_classer (id, dossier_id, r2_key, nom_fichier, suggestion_id, confiance, autres, description, erreur, created_by, empreinte)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`
+  ).bind(id, dossier.id, r2Key, nomFichier, r.suggestion ?? null, r.confiance ?? null, JSON.stringify(r.autres ?? []), r.description ?? null, r.erreur ?? null, user?.id ?? null, empreinte).run();
   const row = await c.env.DB.prepare("SELECT * FROM photos_a_classer WHERE id = ?1").bind(id).first();
   return c.json(photoAClasserVue(row), 201);
 });
@@ -48402,7 +48420,7 @@ dossiers.post("/:id/photos-a-classer/classer", async (c) => {
     const tag = TAG_ORDER[n] ?? `Photo ${n + 1}`;
     const photoId = `pho_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
     await c.env.DB.batch([
-      c.env.DB.prepare("INSERT INTO photos (id, component_id, r2_key, tag) VALUES (?1, ?2, ?3, ?4)").bind(photoId, a.component_id, row.r2_key, tag),
+      c.env.DB.prepare("INSERT INTO photos (id, component_id, r2_key, tag, empreinte) VALUES (?1, ?2, ?3, ?4, ?5)").bind(photoId, a.component_id, row.r2_key, tag, row.empreinte ?? null),
       c.env.DB.prepare("DELETE FROM photos_a_classer WHERE id = ?1").bind(row.id)
     ]);
     classees.push({ id: row.id, photo_id: photoId, component_id: a.component_id });

@@ -6,10 +6,44 @@
 // avec la liste des composantes : elle propose une composante et une
 // confiance. Les propositions sûres s'approuvent en lot ; les autres se
 // classent une à une. Rien n'est rattaché sans l'approbation de l'ingénieur.
+// Les doublons (rafales, photos reprises) sont écartés avant l'envoi, sur
+// leur empreinte visuelle : ils ne coûtent ni stockage ni analyse.
 // ============================================================
 
 const COTE_MAX = 1600;
 const ENVOIS_SIMULTANES = 3;
+// Deux photos dont les empreintes diffèrent d'au plus 5 bits sur 64 sont la
+// même prise de vue (rafale, photo reprise, même fichier déposé deux fois).
+const SEUIL_DOUBLON = 5;
+
+// Empreinte visuelle (dHash) : l'image réduite à 9 × 8 en niveaux de gris,
+// chaque bit dit si un pixel est plus clair que son voisin de droite. Robuste
+// à la compression, à la taille et aux petits écarts d'exposition ; deux
+// cadrages différents donnent des empreintes éloignées.
+function empreinteDe(source) {
+  const c = document.createElement('canvas');
+  c.width = 9; c.height = 8;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(source, 0, 0, 9, 8);
+  const px = ctx.getImageData(0, 0, 9, 8).data;
+  const gris = (x, y) => { const i = (y * 9 + x) * 4; return px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114; };
+  let hex = '';
+  for (let y = 0; y < 8; y++) {
+    let octet = 0;
+    for (let x = 0; x < 8; x++) octet = (octet << 1) | (gris(x, y) > gris(x + 1, y) ? 1 : 0);
+    hex += octet.toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+function distance(a, b) {
+  let d = 0;
+  for (let i = 0; i < 16; i += 2) {
+    let x = parseInt(a.slice(i, i + 2), 16) ^ parseInt(b.slice(i, i + 2), 16);
+    while (x) { d += x & 1; x >>= 1; }
+  }
+  return d;
+}
 
 // opts : { apiJson, apiRaw, render, escapeHtml, spinnerBlock, errorBanner,
 //          dossierId: () => id, composantes: () => [...], categories: { cle: { label } },
@@ -25,14 +59,23 @@ export function creerTriPhotos(opts) {
     erreur: null,
     vignettes: {},          // id -> URL d'objet
     choix: {},              // id -> composante choisie par l'ingénieur
-    envoi: null,            // { total, faits, echecs: [noms] }
+    envoi: null,            // { total, faits, echecs: [noms], doublons }
     classement: false,
     survol: false,
+    empreintes: [],         // empreintes des photos du dossier (classées ou non)
+    doublons: [],           // photos écartées : { cle, fichier, empreinte, url }
   };
 
+  function liberer(url) { try { URL.revokeObjectURL(url); } catch (e) { /* déjà libérée */ } }
+
   function reinitialiser(dossierId) {
-    Object.values(t.vignettes).forEach((u) => { try { URL.revokeObjectURL(u); } catch (e) { /* déjà libérée */ } });
-    Object.assign(t, { dossierId, photos: [], charge: false, chargement: false, erreur: null, vignettes: {}, choix: {}, envoi: null, classement: false, survol: false });
+    Object.values(t.vignettes).forEach(liberer);
+    t.doublons.forEach((d) => liberer(d.url));
+    Object.assign(t, { dossierId, photos: [], charge: false, chargement: false, erreur: null, vignettes: {}, choix: {}, envoi: null, classement: false, survol: false, empreintes: [], doublons: [] });
+  }
+
+  function estDoublon(empreinte) {
+    return !!empreinte && t.empreintes.some((e) => distance(e, empreinte) <= SEUIL_DOUBLON);
   }
 
   function nombreAClasser() { return t.photos.length; }
@@ -47,6 +90,10 @@ export function creerTriPhotos(opts) {
       if (t.dossierId !== dossierId) return;
       t.photos = Array.isArray(r && r.photos) ? r.photos : [];
       if (r && r.seuil) t.seuil = r.seuil;
+      // Les empreintes déjà connues du serveur, plus celles d'envois encore en
+      // route dans cet onglet.
+      const serveur = Array.isArray(r && r.empreintes) ? r.empreintes : [];
+      t.empreintes = Array.from(new Set(serveur.concat(t.empreintes)));
       t.charge = true;
     } catch (e) {
       if (t.dossierId === dossierId) t.erreur = e.message || 'Impossible de charger les photos à classer.';
@@ -75,7 +122,8 @@ export function creerTriPhotos(opts) {
 
   // Les photos de téléphone font 3 à 8 Mo : on les ramène à 1600 px, assez
   // pour le rapport et pour l'analyse, et on gagne l'envoi. Un format que le
-  // navigateur ne sait pas décoder (HEIC hors Safari) part tel quel.
+  // navigateur ne sait pas décoder (HEIC hors Safari) part tel quel, sans
+  // empreinte : il ne sera pas comparé aux autres.
   async function reduire(file) {
     try {
       const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
@@ -85,23 +133,25 @@ export function creerTriPhotos(opts) {
       canvas.height = Math.round(bmp.height * echelle);
       canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
       if (bmp.close) bmp.close();
+      const empreinte = empreinteDe(canvas);
       const blob = await new Promise((ok) => canvas.toBlob(ok, 'image/jpeg', 0.85));
-      if (!blob) return file;
+      if (!blob) return { fichier: file, empreinte };
       const nom = (file.name || 'photo').replace(/\.[^.]+$/, '') + '.jpg';
-      return new File([blob], nom, { type: 'image/jpeg' });
+      return { fichier: new File([blob], nom, { type: 'image/jpeg' }), empreinte };
     } catch (e) {
-      return file;
+      return { fichier: file, empreinte: null };
     }
   }
 
-  async function deposer(fichiers) {
+  // forcer : l'ingénieur a demandé d'envoyer une photo écartée comme doublon.
+  async function deposer(fichiers, { forcer = false } = {}) {
     const id = t.dossierId;
     const images = Array.from(fichiers || []).filter((f) => !f.type || f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name || ''));
     if (!id || images.length === 0) return;
     if (t.envoi && t.envoi.faits < t.envoi.total) {
       t.envoi.total += images.length;
     } else {
-      t.envoi = { total: images.length, faits: 0, echecs: [] };
+      t.envoi = { total: images.length, faits: 0, echecs: [], doublons: 0 };
     }
     render();
     const attente = images.slice();
@@ -109,13 +159,23 @@ export function creerTriPhotos(opts) {
       while (attente.length) {
         const f = attente.shift();
         try {
-          const reduite = await reduire(f);
-          const fd = new FormData();
-          fd.append('file', reduite);
-          const p = await apiJson(`/api/dossiers/${id}/photos-a-classer`, { method: 'POST', body: fd });
+          const { fichier, empreinte } = await reduire(f);
           if (t.dossierId !== id) return;
-          t.photos.push(p);
-          t.vignettes[p.id] = URL.createObjectURL(reduite);
+          // Vérifier et retenir l'empreinte sans attendre entre les deux : les
+          // envois parallèles d'une même rafale se voient ainsi l'un l'autre.
+          if (!forcer && estDoublon(empreinte)) {
+            t.doublons.push({ cle: `d${Date.now()}${Math.random().toString(16).slice(2, 8)}`, fichier, empreinte, url: URL.createObjectURL(fichier) });
+            if (t.envoi) t.envoi.doublons += 1;
+          } else {
+            if (empreinte) t.empreintes.push(empreinte);
+            const fd = new FormData();
+            fd.append('file', fichier);
+            if (empreinte) fd.append('empreinte', empreinte);
+            const p = await apiJson(`/api/dossiers/${id}/photos-a-classer`, { method: 'POST', body: fd });
+            if (t.dossierId !== id) return;
+            t.photos.push(p);
+            t.vignettes[p.id] = URL.createObjectURL(fichier);
+          }
         } catch (e) {
           if (t.envoi) t.envoi.echecs.push(f.name || 'photo');
         }
@@ -125,6 +185,20 @@ export function creerTriPhotos(opts) {
       }
     }
     await Promise.all(Array.from({ length: Math.min(ENVOIS_SIMULTANES, images.length) }, suivant));
+  }
+
+  function envoyerDoublons(cles) {
+    const choisis = t.doublons.filter((d) => cles.includes(d.cle));
+    if (!choisis.length) return;
+    t.doublons = t.doublons.filter((d) => !cles.includes(d.cle));
+    choisis.forEach((d) => liberer(d.url));
+    deposer(choisis.map((d) => d.fichier), { forcer: true });
+  }
+
+  function oublierDoublons() {
+    t.doublons.forEach((d) => liberer(d.url));
+    t.doublons = [];
+    render();
   }
 
   function choixDe(p) {
@@ -167,6 +241,11 @@ export function creerTriPhotos(opts) {
     if (!confirm('Retirer cette photo ? Elle ne sera rattachée à aucune composante.')) return;
     try {
       await apiJson(`/api/dossiers/${t.dossierId}/photos-a-classer/${id}`, { method: 'DELETE' });
+      const retiree = t.photos.find((p) => p.id === id);
+      if (retiree && retiree.empreinte) {
+        const i = t.empreintes.indexOf(retiree.empreinte);
+        if (i >= 0) t.empreintes.splice(i, 1);
+      }
       t.photos = t.photos.filter((p) => p.id !== id);
       if (t.vignettes[id]) { try { URL.revokeObjectURL(t.vignettes[id]); } catch (e) { /* rien */ } delete t.vignettes[id]; }
       delete t.choix[id];
@@ -249,23 +328,37 @@ export function creerTriPhotos(opts) {
       <h1 class="page-title">Déposer et classer</h1>
       <p class="page-lead">Déposez toutes les photos de la visite d'un coup. L'IA propose une composante pour chacune ; vous approuvez les propositions sûres et classez les autres.</p>
 
-      <label class="tp-drop ${t.survol ? 'survol' : ''}" data-role="tp-drop">
-        <input type="file" accept="image/*,.heic,.heif" multiple data-role="tp-fichiers" style="display:none">
+      <button type="button" class="tp-drop ${t.survol ? 'survol' : ''}" data-role="tp-drop" data-action="tp-choisir">
         <i data-lucide="upload-cloud"></i>
         <div class="tp-drop-titre">Glissez les photos ici, ou cliquez pour les choisir</div>
-        <div class="tp-drop-sub">JPEG, PNG ou HEIC · autant que vous voulez · réduites à ${COTE_MAX} px avant l'envoi</div>
-      </label>
+        <div class="tp-drop-sub">JPEG, PNG ou HEIC · autant que vous voulez · réduites à ${COTE_MAX} px avant l'envoi · doublons écartés</div>
+      </button>
 
       ${envoi ? `
       <div class="tp-progress">
-        <div class="tp-progress-txt">${enCours ? `<i data-lucide="loader-2" class="spin" style="width:14px;height:14px"></i>Envoi et analyse : ${envoi.faits}/${envoi.total}` : `<i data-lucide="check-circle-2" style="width:14px;height:14px"></i>${envoi.total - envoi.echecs.length} photo(s) analysée(s)`}${envoi.echecs.length ? ` · <span class="err">${envoi.echecs.length} échec(s) : ${escapeHtml(envoi.echecs.slice(0, 3).join(', '))}${envoi.echecs.length > 3 ? '…' : ''}</span>` : ''}</div>
+        <div class="tp-progress-txt">${enCours ? `<i data-lucide="loader-2" class="spin" style="width:14px;height:14px"></i>Envoi et analyse : ${envoi.faits}/${envoi.total}` : `<i data-lucide="check-circle-2" style="width:14px;height:14px"></i>${envoi.total - envoi.echecs.length - (envoi.doublons || 0)} photo(s) analysée(s)`}${envoi.doublons ? ` · ${envoi.doublons} doublon(s) écarté(s)` : ''}${envoi.echecs.length ? ` · <span class="err">${envoi.echecs.length} échec(s) : ${escapeHtml(envoi.echecs.slice(0, 3).join(', '))}${envoi.echecs.length > 3 ? '…' : ''}</span>` : ''}</div>
         <div class="prog-track"><div class="prog-fill" style="width:${pct}%;background:var(--orange)"></div></div>
       </div>` : ''}
 
       ${t.erreur ? errorBanner(t.erreur) : ''}
       ${t.chargement && !t.charge ? spinnerBlock('Chargement des photos…') : ''}
 
-      ${t.charge && t.photos.length === 0 && !enCours ? `<div class="empty-state">Aucune photo en attente de classement.</div>` : ''}
+      ${t.charge && t.photos.length === 0 && !enCours && !t.doublons.length ? `<div class="empty-state">Aucune photo en attente de classement.</div>` : ''}
+
+      ${t.doublons.length ? `
+      <div class="tp-section-head">
+        <span class="lbl"><i data-lucide="copy" style="width:14px;height:14px"></i>Doublons écartés · ${t.doublons.length}</span>
+        <div class="rule"></div>
+        <span class="hint">Pas envoyés ni analysés : presque identiques à une photo déjà au dossier</span>
+        <button class="btn-pill-sm" data-action="tp-oublier-doublons">Les ignorer</button>
+        <button class="btn-pill-sm" data-action="tp-envoyer-doublons">Tout envoyer quand même</button>
+      </div>
+      <div class="tp-doublons">${t.doublons.map((d) => `
+        <div class="tp-doublon">
+          <img src="${d.url}" alt="${escapeHtml(d.fichier.name || '')}" loading="lazy">
+          <div class="tp-doublon-nom" title="${escapeHtml(d.fichier.name || '')}">${escapeHtml(d.fichier.name || 'Photo')}</div>
+          <button class="btn-pill-sm" data-action="tp-envoyer-doublon" data-cle="${d.cle}">Envoyer</button>
+        </div>`).join('')}</div>` : ''}
 
       ${sures.length ? `
       <div class="tp-section-head">
@@ -289,10 +382,26 @@ export function creerTriPhotos(opts) {
 
   // ---------------- Événements ----------------
 
+  // Le sélecteur vit hors de l'écran redessiné : un rendu pendant que la
+  // fenêtre de choix est ouverte (vignettes qui arrivent, envoi en cours)
+  // remplaçait l'ancien <input>, et la sélection se perdait.
+  function choisirFichiers() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.accept = 'image/*,.heic,.heif';
+    input.addEventListener('change', () => deposer(Array.from(input.files || [])));
+    input.click();
+  }
+
   function click(action, btn) {
     switch (action) {
+      case 'tp-choisir': choisirFichiers(); return true;
       case 'tp-classer': classer([btn.getAttribute('data-id')]); return true;
       case 'tp-supprimer': supprimer(btn.getAttribute('data-id')); return true;
+      case 'tp-envoyer-doublon': envoyerDoublons([btn.getAttribute('data-cle')]); return true;
+      case 'tp-envoyer-doublons': envoyerDoublons(t.doublons.map((d) => d.cle)); return true;
+      case 'tp-oublier-doublons': oublierDoublons(); return true;
       case 'tp-approuver-sures': classer(t.photos.filter(estSure).map((p) => p.id)); return true;
       case 'tp-classer-choisies': classer(t.photos.filter((p) => !estSure(p) && choixPropre(p)).map((p) => p.id)); return true;
       default: return false;
@@ -300,12 +409,6 @@ export function creerTriPhotos(opts) {
   }
 
   function change(el) {
-    if (el.matches('[data-role="tp-fichiers"]')) {
-      const files = el.files ? Array.from(el.files) : [];
-      el.value = '';
-      deposer(files);
-      return true;
-    }
     if (el.matches('[data-role="tp-choix"]')) {
       const id = el.getAttribute('data-id');
       const p = t.photos.find((x) => x.id === id);
