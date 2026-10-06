@@ -423,6 +423,14 @@ export function creerTriPhotos(opts) {
 
   // Glisser-déposer : écouteurs posés une fois sur le conteneur de l'app.
   function brancher(app, actif) {
+    // L'envoi vit dans l'onglet : le fermer ou le recharger l'arrête. Le
+    // navigateur demande confirmation tant qu'il reste des photos à envoyer
+    // (il affiche son propre message, pas le nôtre).
+    window.addEventListener('beforeunload', (e) => {
+      if (!envoiEnCours()) return;
+      e.preventDefault();
+      e.returnValue = '';
+    });
     const zone = (e) => actif() && e.target && e.target.closest && e.target.closest('[data-role="tp-drop"]');
     app.addEventListener('dragover', (e) => {
       if (!zone(e)) return;
@@ -445,5 +453,10 @@ export function creerTriPhotos(opts) {
     window.addEventListener('drop', (e) => { if (actif()) e.preventDefault(); });
   }
 
-  return { charger, ouvrir, reinitialiser, nombreAClasser, html, click, change, brancher, nomComposante };
+  // Photos encore à envoyer : fermer l'onglet ou changer de dossier les perdrait.
+  function envoiEnCours() {
+    return !!(t.envoi && t.envoi.faits < t.envoi.total);
+  }
+
+  return { charger, ouvrir, reinitialiser, nombreAClasser, html, click, change, brancher, nomComposante, envoiEnCours };
 }

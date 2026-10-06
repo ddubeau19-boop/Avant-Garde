@@ -523,6 +523,7 @@ async function doLogin(email, password) {
 }
 
 function doLogout() {
+  if (!quitterEnvoiPhotos()) return;
   revokeReviewPhotos();
   if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
   state.token = null;
@@ -816,7 +817,14 @@ async function deletePrix(id) {
   }
 }
 
+// Changer de dossier arrête l'envoi de photos en cours : on le dit avant.
+function quitterEnvoiPhotos() {
+  if (!tri.envoiEnCours()) return true;
+  return confirm("Des photos sont encore en cours d'envoi. Si vous quittez ce dossier, l'envoi s'arrête (vous pourrez redéposer les mêmes photos : celles déjà envoyées seront écartées). Quitter quand même ?");
+}
+
 async function openDossier(id) {
+  if (String(id) !== String(state.dossierId) && !quitterEnvoiPhotos()) return;
   journal.ouvert = false; journal.entrees = null;
   revokeReviewPhotos();
   state.dossierId = id;
