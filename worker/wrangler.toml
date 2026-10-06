@@ -15,6 +15,32 @@ binding = "DB"
 database_name = "stratege-fp"
 database_id = "a409a728-53d2-4344-b438-6adb9f8b5a46"
 
+# La base du CRM Stratégis, où les factures des syndicats gérés sont déjà
+# rattachées à un code de composante. Lue, jamais écrite : le worker n'émet que
+# des SELECT dessus. L'accès est réservé à l'entreprise nommée par
+# CRM_COMPANY_ID — une firme locataire ne doit pas atteindre les factures d'une
+# autre, binding ou pas.
+[[d1_databases]]
+binding = "CRM"
+database_name = "stratege-crm"
+database_id = "9bcbc6e3-574a-44f5-8d30-273906128282"
+
+[vars]
+CRM_COMPANY_ID = "com_980c47a26e91493593a8"
+# Inscription autonome des firmes (/compte/?nouvelle-firme=1) : « non » la ferme.
+INSCRIPTION_OUVERTE = "oui"
+# Adresse d'expédition des courriels (invitations, mots de passe). Tout
+# alias du domaine intégré à Email Service convient, sans boîte à créer.
+COURRIEL_EXPEDITEUR = "no-reply@stratege.io"
+# Adresse publique de la plateforme, pour les liens des rappels mensuels
+# (envoyés sans requête entrante, donc sans adresse à reprendre).
+URL_PLATEFORME = "https://pga.stratege.io"
+
+# Cloudflare Email Service : envoi des invitations et des liens de
+# réinitialisation. Le domaine stratege.io y est intégré (Email Sending).
+[[send_email]]
+name = "EMAIL"
+
 [[r2_buckets]]
 binding = "PHOTOS"
 bucket_name = "stratege-fp-photos"
@@ -22,6 +48,14 @@ bucket_name = "stratege-fp-photos"
 [[routes]]
 pattern = "pga.stratege.io"
 custom_domain = true
+
+# Tâches planifiées (heures UTC ; 11 h UTC = 7 h à Montréal l'été, 6 h l'hiver).
+[triggers]
+# Le 1er du mois à 11 h UTC : rappels du carnet et des révisions. Le dimanche
+# à 7 h UTC : sauvegarde complète de la base dans R2 (sauvegardes/).
+# Cloudflare numérote les jours de semaine 1-7 (dimanche = 1 ou SUN), pas 0-6
+# comme le cron Unix habituel — "0" y est invalide (code 10100), d'où SUN.
+crons = ["0 11 1 * *", "0 7 * * SUN"]
 
 [observability]
 enabled = true

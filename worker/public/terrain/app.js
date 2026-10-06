@@ -8,9 +8,11 @@
 //   attributs typés libres, et l'année anticipée de remplacement dérivée de
 //   « année de construction ou réparation + durée de vie utile ».
 
+import * as HL from './hors-ligne.js';
+
 const TOKEN_KEY = 'cs_terrain_token';
 
-/* ---------- Taxonomie maison : 10 catégories ---------- */
+/* ---------- Taxonomie maison : 11 catégories ---------- */
 
 const CATS = {
   terrain:     { label: 'Terrain et aménagement',                                  pill: 'Terrain',        icon: 'trees' },
@@ -23,6 +25,7 @@ const CATS = {
   cvac:        { label: 'Systèmes de chauffage et ventilation',                    pill: 'CVAC',           icon: 'fan' },
   electrique:  { label: 'Installations électriques',                               pill: 'Électricité',    icon: 'zap' },
   plomberie:   { label: "Installations de plomberie, d'eau et d'égout",            pill: 'Plomberie',      icon: 'droplets' },
+  piscines:    { label: 'Piscines et centre aquatique',                            pill: 'Piscines',       icon: 'waves' },
 };
 
 const CAT_AUTRES = { label: 'Autres', pill: 'Autres', icon: 'box' };
@@ -46,24 +49,14 @@ function ratingInfo(v) {
   return RATINGS.find(r => r.v === v) || null;
 }
 
-/* ---------- Facettes ---------- */
-
-const POSITIONS = [
-  { v: 'AV',  label: 'Avant' },
-  { v: 'GA',  label: 'Gauche' },
-  { v: 'ARR', label: 'Arrière' },
-  { v: 'DR',  label: 'Droite' },
-];
-
+/* ---------- Facettes ----------
+   Conservé pour l'affichage en lecture seule (liste, étude précédente) —
+   la saisie terrain ne les propose plus (voir ficheHtml). */
 const EMPLACEMENTS = [
   { v: 'corridors',    label: 'Corridors' },
   { v: 'escaliers',    label: 'Escaliers' },
   { v: 'stationnement',label: 'Stationnement' },
 ];
-
-const DELAIS = ['à court terme', 'dans les 5 ans', 'à planifier', 'aucun suivi particulier'];
-
-const ATTR_SUGGESTIONS = ['Année', 'Marque', 'Modèle', 'Capacité', 'Nombre', "D'origine"];
 
 /* ---------- Fiche d'immeuble ---------- */
 
@@ -129,7 +122,7 @@ const IMM_ENTRETIENS = [
 const fmtCAD = new Intl.NumberFormat('fr-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
 
 const state = {
-  screen: 'loading', // loading | login | dossiers | accueil | immeuble | liste | fiche | synthese
+  screen: 'loading', // loading | login | dossiers | accueil | immeuble | liste | ajout | fiche | synthese
   token: null,
   user: null,
   online: navigator.onLine,
@@ -144,7 +137,11 @@ const state = {
 
   dossiers: [],
   dossier: null,
-  components: [],
+  tacheForm: null,       // { x, f, q, mois: [] } — ajout d'une tâche au carnet
+  components: [],        // composantes actives de la visite
+  inactifs: [],          // composantes retirées de la visite, réactivables
+  catalogue: null,       // bibliothèque de la firme : [{ cat, name, vu, code }]
+  ajout: null,           // { q, cat, vu } — ajout d'une composante trouvée sur place
   filter: 'all',
   search: '',
 
@@ -153,13 +150,7 @@ const state = {
   ficheLoading: false,
   photoBlobUrls: {},
   uploadingPhoto: false,
-  facetsOpen: false,
   naChosen: {},          // id -> true : « na » choisi dans la session courante
-  attrKeyDraft: '',
-  attrValDraft: '',
-
-  analyzing: false,
-  aiResult: null,
 
   recording: false,
   speechSupported: !!(window.SpeechRecognition || window.webkitSpeechRecognition),
@@ -171,6 +162,17 @@ const state = {
   projectionLoading: false,
   downloadingDocx: false,
   downloadingXlsx: false,
+
+  analyzingVisit: false, // analyse groupée par l'IA, lancée une fois la visite terminée
+  analyzeProgress: { done: 0, total: 0 },
+
+  // Hors connexion
+  envois: [],            // modifications en attente d'envoi (copie de la file IndexedDB)
+  synchro: false,        // envoi de la file en cours
+  reseauInstable: false, // le navigateur se dit en ligne, mais les requêtes échouent
+  rejets: [],            // modifications refusées par le serveur à la synchronisation
+  prepa: null,           // { dossierId, etat, faites, total, … } — visite préparée hors connexion
+  photoIndispo: {},      // id -> true : photo absente de l'appareil et pas de réseau
 };
 
 try { state.token = localStorage.getItem(TOKEN_KEY) || null; } catch (e) { state.token = null; }
@@ -215,6 +217,7 @@ function friendlyError(e) {
   if (!e) return 'Une erreur est survenue.';
   if (e.message === 'OFFLINE') return 'Vous êtes hors connexion.';
   if (e.message === 'SESSION_EXPIRED') return 'Votre session a expiré.';
+  if (e.message === 'PAS_EN_CACHE') return "Ces données n'ont pas encore été téléchargées sur l'appareil. Ouvrez-les une fois avec du réseau pour les avoir hors connexion.";
   return e.message || 'Une erreur est survenue.';
 }
 
@@ -240,14 +243,22 @@ async function apiFetch(path, opts, config) {
   const headers = Object.assign({}, opts.headers || {});
   if (auth && state.token) headers['Authorization'] = 'Bearer ' + state.token;
   let res;
+  // Un sous-sol ou un garage laisse souvent une connexion qui ne répond plus :
+  // passé le délai, la requête compte comme hors connexion.
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  const minuterie = ctrl ? setTimeout(() => ctrl.abort(), config.timeout || 20000) : null;
   try {
-    res = await fetch(path, Object.assign({}, opts, { headers }));
+    res = await fetch(path, Object.assign({}, opts, { headers }, ctrl ? { signal: ctrl.signal } : {}));
   } catch (e) {
-    throw new Error('Erreur réseau. Vérifiez votre connexion.');
+    const err = new Error('Erreur réseau. Vérifiez votre connexion.');
+    err.reseau = true;
+    throw err;
+  } finally {
+    if (minuterie) clearTimeout(minuterie);
   }
   if (auth && res.status === 401) {
     try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
-    state.token = null; state.user = null; state.dossier = null; state.dossiers = []; state.components = [];
+    state.token = null; state.user = null; state.dossier = null; state.dossiers = []; state.components = []; state.inactifs = [];
     state.screen = 'login';
     state.loginError = 'Votre session a expiré. Reconnectez-vous.';
     render();
@@ -260,22 +271,391 @@ async function apiJson(path, opts, config) {
   const res = await apiFetch(path, opts, config);
   let data = null;
   try { data = await res.json(); } catch (e) {}
-  if (!res.ok) throw new Error((data && data.error) || `Erreur (${res.status})`);
+  if (!res.ok) {
+    const err = new Error((data && data.error) || `Erreur (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
+}
+
+/* ============================================================
+   Hors connexion : copies locales, file d'envois, synchronisation
+   ------------------------------------------------------------
+   Chaque lecture passe par le serveur quand c'est possible et garde une
+   copie sur l'appareil ; sans réseau, la copie répond. Chaque
+   modification faite sans réseau entre dans une file, rejouée dans
+   l'ordre au retour de la connexion. Tant que la file n'est pas vide,
+   les nouvelles modifications s'y ajoutent aussi, pour qu'une ancienne
+   valeur ne passe jamais après une plus récente.
+   ============================================================ */
+
+function sansReseau(e) {
+  return !!e && (e.message === 'OFFLINE' || e.reseau === true);
+}
+
+async function lireApi(cle, path, config) {
+  try {
+    const data = await apiJson(path, null, config);
+    HL.ecrire(cle, data);
+    state.reseauInstable = false;
+    return data;
+  } catch (e) {
+    if (!sansReseau(e)) throw e;
+    if (state.online) state.reseauInstable = true;
+    const copie = await HL.lire(cle);
+    if (copie == null) throw new Error('PAS_EN_CACHE');
+    return copie;
+  }
+}
+
+let envoiEnCours = null;
+
+async function chargerEnvois() {
+  state.envois = await HL.envoisTous();
+}
+
+async function enfiler(op) {
+  op.userId = state.user && state.user.id;
+  if (!op.dossierId && state.dossier) op.dossierId = state.dossier.id;
+  op.cree_le = new Date().toISOString();
+  // Une modification du même objet encore en attente absorbe la nouvelle :
+  // une seule requête partira au retour du réseau.
+  if (op.kind === 'patch-component' || op.kind === 'patch-dossier') {
+    for (let i = state.envois.length - 1; i >= 0; i--) {
+      const a = state.envois[i];
+      if (a.kind === op.kind && a.id === op.id && a.n !== envoiEnCours) {
+        a.body = Object.assign({}, a.body, op.body);
+        await HL.envoiRemplacer(a);
+        paintNetBar();
+        return a;
+      }
+    }
+  }
+  const enregistre = await HL.envoiAjouter(op);
+  // Sans IndexedDB, la file vit en mémoire : elle tient jusqu'au rechargement.
+  state.envois.push(enregistre || Object.assign(op, { n: Date.now() + Math.random() }));
+  paintNetBar();
+  return enregistre || op;
+}
+
+async function retirerEnvoi(n) {
+  state.envois = state.envois.filter(o => o.n !== n);
+  await HL.envoiRetirer(n);
+}
+
+// Les modifications en attente, appliquées par-dessus la copie du serveur.
+function avecEnAttente(comp) {
+  let c = Object.assign({}, comp);
+  for (const op of state.envois) {
+    if (op.kind === 'patch-component' && op.id === c.id) {
+      const entretien = op.body.taches_entretien != null && Array.isArray(c.entretien)
+        ? { entretien: entretienLocal(c.entretien, op.body.taches_entretien) } : {};
+      c = Object.assign(c, op.body, entretien);
+    } else if (op.kind === 'photo' && op.componentId === c.id) {
+      if (Array.isArray(c.photos)) {
+        if (!c.photos.some(p => p.id === op.photoId)) c.photos = c.photos.concat([{ id: op.photoId, component_id: c.id, tag: "En attente d'envoi", local: true }]);
+      } else {
+        c.photos = (c.photos || 0) + 1;
+      }
+    }
+  }
+  return c;
+}
+
+function dossierAvecEnAttente(d) {
+  const r = Object.assign({}, d);
+  for (const op of state.envois) if (op.kind === 'patch-dossier' && op.id === d.id) Object.assign(r, op.body);
+  return r;
+}
+
+// Tâches du carnet recalculées sur l'appareil après un retrait, un
+// rétablissement ou un ajout fait hors connexion. Le serveur refait le
+// calcul exact à la synchronisation.
+function entretienLocal(entretien, persoBrut) {
+  const p = parseJsonObject(persoBrut);
+  const retirees = new Set(Array.isArray(p.retirees) ? p.retirees : []);
+  const ajoutees = Array.isArray(p.ajoutees) ? p.ajoutees : [];
+  const idsAjoutees = new Set(ajoutees.map(t => t.id));
+  const liste = entretien
+    .filter(t => !t.perso || idsAjoutees.has(t.id))
+    .map(t => (t.perso ? t : Object.assign({}, t, { retiree: retirees.has(t.id) })));
+  for (const t of ajoutees) if (!liste.some(x => x.id === t.id)) liste.push(tacheLocale(t));
+  return liste;
+}
+function tacheLocale(t) {
+  const mois = (t.mois || []).map(Number).sort((a, b) => a - b);
+  const freq = FREQ_TACHE.find(f => f[0] === t.f);
+  const qui = QUI_TACHE.find(q => q[0] === (t.q || ''));
+  return {
+    id: t.id, texte: t.x, element: '', code: t.f, mois,
+    frequence: freq ? freq[1] : 'Aux mois indiqués',
+    quand: mois.map(m => MOIS_COURTS[m - 1]).join(', '),
+    responsable: qui ? qui[1] : 'Syndicat / gestionnaire',
+    perso: true, retiree: false, aPreciser: false,
+  };
+}
+
+function idAleatoire(prefixe, n, alphabet) {
+  const octets = new Uint8Array(n);
+  crypto.getRandomValues(octets);
+  return prefixe + Array.from(octets, b => alphabet[b % alphabet.length]).join('');
+}
+const nouvelIdPhoto = () => idAleatoire('pho_', 20, '0123456789abcdef');
+const nouvelIdTache = () => idAleatoire('p_', 10, 'abcdefghijklmnopqrstuvwxyz0123456789');
+const nouvelIdComposante = () => idAleatoire('cmp_', 20, '0123456789abcdef');
+
+// Composantes créées sur l'appareil et pas encore reçues par le serveur.
+function creationEnAttente(id) {
+  return state.envois.find(o => o.kind === 'create-component' && o.id === id) || null;
+}
+function avecCreations(liste, dossierId) {
+  const connus = new Set(liste.map(c => c.id));
+  const nouvelles = state.envois
+    .filter(o => o.kind === 'create-component' && o.dossierId === dossierId && !connus.has(o.id))
+    .map(o => o.local);
+  return liste.concat(nouvelles);
+}
+
+// Copie locale d'une composante et de sa ligne dans la liste du dossier,
+// mises à jour avec ce que le serveur vient de confirmer.
+async function fusionnerCacheComposante(id, champs, dossierId) {
+  if (!champs || typeof champs !== 'object') return;
+  const cle = `component:${id}`;
+  const actuelle = await HL.lire(cle);
+  if (actuelle) await HL.ecrire(cle, Object.assign({}, actuelle, champs, { photos: actuelle.photos, guide: actuelle.guide }));
+  const cleListe = `components:${dossierId || champs.dossier_id || (state.dossier && state.dossier.id)}`;
+  const liste = await HL.lire(cleListe);
+  if (Array.isArray(liste)) {
+    const i = liste.findIndex(x => x.id === id);
+    if (i >= 0) {
+      const { photos, guide, entretien, ...ligne } = champs;
+      liste[i] = Object.assign({}, liste[i], ligne, typeof photos === 'number' ? { photos } : {});
+      await HL.ecrire(cleListe, liste);
+    }
+  }
+}
+
+async function ajouterPhotoAuCache(compId, photo, dossierId) {
+  const cle = `component:${compId}`;
+  const comp = await HL.lire(cle);
+  if (comp && Array.isArray(comp.photos) && !comp.photos.some(p => p.id === photo.id)) {
+    comp.photos.push(photo);
+    await HL.ecrire(cle, comp);
+  }
+  const cleListe = `components:${dossierId}`;
+  const liste = await HL.lire(cleListe);
+  if (Array.isArray(liste)) {
+    const ligne = liste.find(x => x.id === compId);
+    if (ligne) { ligne.photos = (ligne.photos || 0) + 1; await HL.ecrire(cleListe, liste); }
+  }
+}
+
+async function envoyerPhoto(compId, photoId, blob, dossierId) {
+  const fd = new FormData();
+  fd.append('id', photoId);
+  fd.append('file', blob, (blob && blob.name) || 'photo.jpg');
+  const res = await apiFetch(`/api/components/${compId}/photos`, { method: 'POST', body: fd }, { timeout: 90000 });
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    const err = new Error((data && data.error) || 'Le téléversement de la photo a échoué.');
+    err.status = res.status;
+    throw err;
+  }
+  await ajouterPhotoAuCache(compId, data, dossierId);
+  return data;
+}
+
+function descriptionEnvoi(op) {
+  if (op.kind === 'photo') return 'Photo';
+  if (op.kind === 'create-component') return `Nouvelle composante « ${op.body.name} »`;
+  if (op.kind === 'patch-dossier') return "Fiche d'immeuble";
+  const c = state.components.concat(state.inactifs).find(x => x.id === op.id);
+  return c ? c.name : 'Composante';
+}
+
+async function executerEnvoi(op) {
+  if (op.kind === 'create-component') {
+    const data = await apiJson(`/api/dossiers/${op.dossierId}/components`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(op.body),
+    }, { timeout: 20000 });
+    if (data) {
+      await HL.ecrire(`component:${op.id}`, data);
+      const c = state.activeComponent;
+      if (c && c.id === op.id) state.activeComponent = avecEnAttente(Object.assign({}, data, { photos: c.photos }));
+    }
+    return;
+  }
+  if (op.kind === 'patch-component') {
+    const data = await apiJson(`/api/components/${op.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(op.body),
+    }, { timeout: 20000 });
+    await fusionnerCacheComposante(op.id, data, op.dossierId);
+    // Les tâches du carnet recalculées par le serveur remplacent le calcul
+    // local, sauf si une autre modification du carnet attend encore.
+    const autre = state.envois.some(o => o.n !== op.n && o.kind === 'patch-component' && o.id === op.id && o.body.taches_entretien != null);
+    if (data && data.entretien && !autre && state.activeComponent && state.activeComponent.id === op.id) {
+      state.activeComponent = Object.assign({}, state.activeComponent, { entretien: data.entretien });
+    }
+    return;
+  }
+  if (op.kind === 'patch-dossier') {
+    const data = await apiJson(`/api/dossiers/${op.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(op.body),
+    }, { timeout: 20000 });
+    if (data) await HL.ecrire(`dossier:${op.id}`, data);
+    return;
+  }
+  if (op.kind === 'photo') {
+    const blob = await HL.photoLire(op.photoId);
+    if (!blob) return; // fichier disparu de l'appareil : rien à envoyer
+    const photo = await envoyerPhoto(op.componentId, op.photoId, blob, op.dossierId);
+    const c = state.activeComponent;
+    if (c && c.id === op.componentId && Array.isArray(c.photos)) {
+      state.activeComponent = Object.assign({}, c, { photos: c.photos.map(p => (p.id === photo.id ? photo : p)) });
+    }
+  }
+}
+
+let synchroEnCours = false;
+async function synchroniser() {
+  if (synchroEnCours || !state.online || !state.token || !state.envois.length) return;
+  synchroEnCours = true;
+  state.synchro = true;
+  paintNetBar();
+  const touches = new Set();
+  let envoyes = 0;
+  try {
+    while (state.envois.length && state.online) {
+      const op = state.envois[0];
+      if (op.userId && state.user && op.userId !== state.user.id) { await retirerEnvoi(op.n); continue; }
+      envoiEnCours = op.n;
+      try {
+        await executerEnvoi(op);
+      } catch (e) {
+        envoiEnCours = null;
+        if (sansReseau(e)) { state.reseauInstable = true; break; }
+        if (e.message === 'SESSION_EXPIRED') break;
+        // Refus définitif (composante supprimée, valeur invalide…) : on le
+        // signale et on passe à la suite plutôt que de bloquer toute la file.
+        if (e.status >= 400 && e.status < 500 && ![408, 425, 429].includes(e.status)) {
+          state.rejets.push(`${descriptionEnvoi(op)} : ${e.message}`);
+          await retirerEnvoi(op.n);
+          continue;
+        }
+        break; // erreur du serveur : on réessaiera plus tard
+      }
+      envoiEnCours = null;
+      await retirerEnvoi(op.n);
+      envoyes += 1;
+      if (op.dossierId) touches.add(op.dossierId);
+      state.reseauInstable = false;
+      paintNetBar();
+    }
+  } finally {
+    envoiEnCours = null;
+    synchroEnCours = false;
+    state.synchro = false;
+  }
+  if (envoyes && state.dossier && touches.has(state.dossier.id)) await rafraichirDossier();
+  if (envoyes && !state.envois.length) state.toast = 'Modifications hors connexion envoyées';
+  renderSiPossible();
+  if (state.toast === 'Modifications hors connexion envoyées') {
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { state.toast = null; renderSiPossible(); }, 2600);
+  }
+}
+
+// Après une synchronisation : la liste et le dossier tels que le serveur les
+// voit maintenant (règles de la fiche d'immeuble, tâches recalculées…).
+async function rafraichirDossier() {
+  const id = state.dossier && state.dossier.id;
+  if (!id) return;
+  try {
+    const [dossier, components] = await Promise.all([
+      apiJson(`/api/dossiers/${id}`),
+      apiJson(`/api/dossiers/${id}/components`),
+    ]);
+    HL.ecrire(`dossier:${id}`, dossier);
+    HL.ecrire(`components:${id}`, components);
+    if (!state.dossier || state.dossier.id !== id) return;
+    state.dossier = dossierAvecEnAttente(dossier);
+    state.batiment = parseJsonObject(state.dossier.batiment_info);
+    const tous = avecCreations(components, id).map(avecEnAttente);
+    state.components = tous.filter(c => c.actif !== 0);
+    state.inactifs = tous.filter(c => c.actif === 0);
+  } catch (e) { /* on garde l'affichage actuel */ }
+}
+
+// Toute la visite sur l'appareil : fiches complètes et photos, en arrière-plan.
+let prepaEnCours = null;
+async function preparerHorsLigne(id) {
+  if (prepaEnCours === id || !state.online) return;
+  prepaEnCours = id;
+  const maj = (p) => {
+    if (state.dossier && state.dossier.id === id) { state.prepa = p; paintPrepa(); }
+  };
+  try {
+    maj({ dossierId: id, etat: 'fiches' });
+    const lot = await apiJson(`/api/dossiers/${id}/hors-ligne`, null, { timeout: 60000 });
+    await HL.ecrireLot(lot.composantes.map(c => [`component:${c.id}`, c]));
+    // Les photos de l'étude précédente aussi, pour comparer sur place.
+    const photos = lot.composantes.flatMap(c => (c.photos || []).concat(c.precedent ? c.precedent.photos || [] : []));
+    const presentes = await HL.photosPresentes();
+    const manquantes = photos.filter(p => !presentes.has(p.id));
+    let faites = photos.length - manquantes.length;
+    maj({ dossierId: id, etat: 'photos', faites, total: photos.length });
+    let i = 0;
+    const travailleur = async () => {
+      while (i < manquantes.length && state.online) {
+        const p = manquantes[i++];
+        try {
+          const res = await apiFetch(`/api/photos/${p.id}/file`, null, { timeout: 45000 });
+          if (res.ok) { await HL.photoEcrire(p.id, await res.blob()); faites += 1; }
+        } catch (e) { /* photo réessayée à la prochaine préparation */ }
+        maj({ dossierId: id, etat: 'photos', faites, total: photos.length });
+      }
+    };
+    await Promise.all([travailleur(), travailleur(), travailleur()]);
+    const fin = {
+      dossierId: id, etat: faites >= photos.length ? 'pret' : 'partiel',
+      faites, total: photos.length, fiches: lot.composantes.length, le: new Date().toISOString(),
+    };
+    await HL.ecrire(`prepa:${id}`, fin);
+    maj(fin);
+  } catch (e) {
+    maj(Object.assign({}, state.prepa && state.prepa.le ? state.prepa : {}, { dossierId: id, etat: 'erreur' }));
+  } finally {
+    prepaEnCours = null;
+  }
+}
+
+function enregistrerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.register('./sw.js').catch(() => { /* l'application reste utilisable en ligne */ });
 }
 
 async function loadCompanyLogo() {
   if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
   const co = state.user && state.user.company;
   if (!co || !co.hasLogo) { render(); return; }
+  let blob = null;
   try {
     const res = await apiFetch(`/api/companies/${co.id}/logo`);
     if (!res.ok) throw new Error('logo indisponible');
-    const blob = await res.blob();
-    state.companyLogoUrl = URL.createObjectURL(blob);
+    blob = await res.blob();
+    HL.photoEcrire(`logo:${co.id}`, blob);
   } catch (e) {
-    state.companyLogoUrl = null;
+    blob = await HL.photoLire(`logo:${co.id}`);
   }
+  state.companyLogoUrl = blob ? URL.createObjectURL(blob) : null;
   render();
 }
 
@@ -284,15 +664,22 @@ async function loadCompanyLogo() {
    ============================================================ */
 
 async function boot() {
+  enregistrerServiceWorker();
+  await chargerEnvois();
   if (state.token) {
     state.screen = 'loading';
     render();
     try {
-      state.user = await apiJson('/api/auth/me');
+      state.user = await lireApi('me', '/api/auth/me');
       loadCompanyLogo();
       await loadDossiers();
+      synchroniser();
     } catch (e) {
-      if (e.message !== 'SESSION_EXPIRED') { state.screen = 'login'; render(); }
+      if (e.message !== 'SESSION_EXPIRED') {
+        state.screen = 'login';
+        if (e.message === 'PAS_EN_CACHE') state.loginError = "Connectez-vous une première fois avec du réseau pour utiliser l'application hors connexion.";
+        render();
+      }
     }
   } else {
     state.screen = 'login';
@@ -311,8 +698,15 @@ async function doLogin(email, password) {
     }, { auth: false });
     state.token = data.token; state.user = data.user;
     try { localStorage.setItem(TOKEN_KEY, data.token); } catch (e) {}
+    const precedent = await HL.lire('me');
+    if (precedent && data.user && precedent.id !== data.user.id) {
+      await HL.toutEffacer();
+      state.envois = [];
+    }
+    if (data.user) HL.ecrire('me', data.user);
     loadCompanyLogo();
     await loadDossiers();
+    synchroniser();
   } catch (e) {
     state.loginError = friendlyError(e);
     state.loginPassword = '';
@@ -321,7 +715,13 @@ async function doLogin(email, password) {
   }
 }
 
-function logout() {
+async function logout() {
+  const n = state.envois.length;
+  if (n && !confirm(`${n} modification${n > 1 ? 's' : ''} faite${n > 1 ? 's' : ''} hors connexion ${n > 1 ? "n'ont" : "n'a"} pas encore été envoyée${n > 1 ? 's' : ''}. Vous déconnecter l${n > 1 ? 'es' : 'a'} effacera de cet appareil. Continuer ?`)) return;
+  // Les données de visite ne restent pas sur l'appareil après la déconnexion.
+  await HL.toutEffacer();
+  state.envois = [];
+  state.prepa = null;
   try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
   if (state.companyLogoUrl) { URL.revokeObjectURL(state.companyLogoUrl); state.companyLogoUrl = null; }
   Object.assign(state, {
@@ -335,7 +735,7 @@ function logout() {
 async function loadDossiers() {
   state.screen = 'loading'; state.error = null; render();
   try {
-    const dossiers = await apiJson('/api/dossiers');
+    const dossiers = await lireApi('dossiers', '/api/dossiers');
     state.dossiers = dossiers;
     if (dossiers.length === 1) {
       await selectDossier(dossiers[0].id);
@@ -344,6 +744,10 @@ async function loadDossiers() {
     state.screen = 'dossiers';
     render();
   } catch (e) {
+    if (e.message === 'PAS_EN_CACHE') {
+      state.dossiers = []; state.error = friendlyError(e); state.screen = 'dossiers'; render();
+      return;
+    }
     if (e.message !== 'SESSION_EXPIRED') {
       state.screen = 'login';
       state.loginError = friendlyError(e);
@@ -364,18 +768,24 @@ function parseJsonObject(raw) {
 async function selectDossier(id) {
   state.screen = 'loading'; render();
   try {
-    const [dossier, components] = await Promise.all([
-      apiJson(`/api/dossiers/${id}`),
-      apiJson(`/api/dossiers/${id}/components`),
+    const [dossierBrut, componentsBruts] = await Promise.all([
+      lireApi(`dossier:${id}`, `/api/dossiers/${id}`),
+      lireApi(`components:${id}`, `/api/dossiers/${id}/components`),
     ]);
+    const dossier = dossierAvecEnAttente(dossierBrut);
+    const components = avecCreations(componentsBruts, id).map(avecEnAttente);
     state.dossier = dossier;
-    state.components = components;
+    state.components = components.filter(c => c.actif !== 0);
+    state.inactifs = components.filter(c => c.actif === 0);
     state.batiment = parseJsonObject(dossier.batiment_info);
     state.naChosen = {};
-    state.filter = 'all'; state.search = '';
+    state.filter = 'all'; state.search = ''; state.ajout = null;
+    chargerCatalogue(id);
+    state.prepa = (await HL.lire(`prepa:${id}`)) || null;
     state.screen = 'accueil';
     render();
     loadProjection(id);
+    if (state.online) preparerHorsLigne(id);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') {
       state.error = friendlyError(e);
@@ -388,7 +798,7 @@ async function selectDossier(id) {
 async function loadProjection(id) {
   state.projectionLoading = true; render();
   try {
-    state.projection = await apiJson(`/api/dossiers/${id}/projection`);
+    state.projection = await lireApi(`projection:${id}`, `/api/dossiers/${id}/projection`);
   } catch (e) {
     state.projection = null;
   } finally {
@@ -401,15 +811,16 @@ async function loadProjection(id) {
    ============================================================ */
 
 async function openFiche(id) {
-  state.activeId = id; state.screen = 'fiche'; state.aiResult = null;
-  state.analyzing = false; state.recording = false; state.noteDraft = '';
+  state.activeId = id; state.screen = 'fiche';
+  state.recording = false; state.noteDraft = ''; state.tacheForm = null;
   state.ficheLoading = true; state.activeComponent = null; state.error = null;
-  state.attrKeyDraft = ''; state.attrValDraft = ''; state.facetsOpen = false;
   render();
   try {
-    const comp = await apiJson(`/api/components/${id}`);
+    const enAttente = creationEnAttente(id);
+    const comp = avecEnAttente(enAttente
+      ? ((await HL.lire(`component:${id}`)) || enAttente.local)
+      : await lireApi(`component:${id}`, `/api/components/${id}`));
     state.activeComponent = comp;
-    state.facetsOpen = !!(comp.position || comp.emplacement || comp.variante);
     state.ficheLoading = false;
     render();
     loadPhotoBlobs(comp.photos || []);
@@ -422,40 +833,224 @@ async function openFiche(id) {
 async function loadPhotoBlobs(photos) {
   for (const p of photos) {
     if (state.photoBlobUrls[p.id]) continue;
-    try {
-      const res = await apiFetch(`/api/photos/${p.id}/file`);
-      if (!res.ok) continue;
-      const blob = await res.blob();
+    // La copie de l'appareil d'abord : elle s'affiche sans réseau.
+    let blob = await HL.photoLire(p.id);
+    if (!blob && !p.local && state.online) {
+      try {
+        const res = await apiFetch(`/api/photos/${p.id}/file`);
+        if (res.ok) { blob = await res.blob(); HL.photoEcrire(p.id, blob); }
+      } catch (e) { /* ignore individual photo failures */ }
+    }
+    if (blob) {
       state.photoBlobUrls[p.id] = URL.createObjectURL(blob);
-      render();
-    } catch (e) { /* ignore individual photo failures */ }
+      delete state.photoIndispo[p.id];
+    } else if (!state.online || state.reseauInstable) {
+      state.photoIndispo[p.id] = true;
+    }
+    renderSiPossible();
   }
 }
 
 function applyComponentPatch(id, patch) {
+  const appliquer = (c) => {
+    const suivant = Object.assign({}, c, patch);
+    if (patch.taches_entretien != null && !patch.entretien && Array.isArray(c.entretien)) {
+      suivant.entretien = entretienLocal(c.entretien, patch.taches_entretien);
+    }
+    return suivant;
+  };
   if (state.activeComponent && state.activeComponent.id === id) {
-    state.activeComponent = Object.assign({}, state.activeComponent, patch);
+    state.activeComponent = appliquer(state.activeComponent);
   }
-  state.components = state.components.map(c => (c.id === id ? Object.assign({}, c, patch) : c));
+  state.components = state.components.map(c => (c.id === id ? appliquer(c) : c));
 }
 
+// Rend la réponse du serveur, ou { enAttente: true } quand la modification
+// est gardée sur l'appareil pour être envoyée plus tard.
 async function patchComponent(id, patch) {
+  const garder = async () => {
+    await enfiler({ kind: 'patch-component', id, body: patch });
+    applyComponentPatch(id, patch);
+    synchroniser();
+    return { enAttente: true };
+  };
+  if (!state.online || state.envois.length) return garder();
   try {
-    const res = await apiFetch(`/api/components/${id}`, {
+    const data = await apiJson(`/api/components/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
-    });
-    let data = null;
-    try { data = await res.json(); } catch (e) {}
-    if (!res.ok) throw new Error((data && data.error) || `Erreur (${res.status})`);
+    }, { timeout: 15000 });
     const merged = Object.assign({}, patch, (data && typeof data === 'object') ? data : {});
     applyComponentPatch(id, merged);
+    state.reseauInstable = false;
+    fusionnerCacheComposante(id, data);
     return merged;
   } catch (e) {
+    if (sansReseau(e)) { state.reseauInstable = true; return garder(); }
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     throw e;
   }
+}
+
+// Retire une composante de la visite (elle n'existe pas dans l'immeuble) ou l'y
+// remet. Elle n'est jamais supprimée : ses données restent si on la réactive.
+async function setActif(id, actif) {
+  try {
+    await patchComponent(id, { actif: actif ? 1 : 0 });
+  } catch (e) { return; }
+  const tous = state.components.concat(state.inactifs).map(c => (c.id === id ? Object.assign({}, c, { actif: actif ? 1 : 0 }) : c));
+  const ordre = (a, b) => (a.sort_order || 0) - (b.sort_order || 0);
+  state.components = tous.filter(c => c.actif !== 0).sort(ordre);
+  state.inactifs = tous.filter(c => c.actif === 0).sort(ordre);
+  if (actif) {
+    showToast('Composante réactivée');
+    if (!state.inactifs.length && state.filter === 'inactifs') state.filter = 'all';
+  } else {
+    showToast('Composante retirée de la visite');
+    state.screen = 'liste';
+  }
+  render();
+}
+
+/* ---------- Ajout d'une composante trouvée sur place ---------- */
+
+async function chargerCatalogue(id) {
+  try {
+    const liste = await lireApi(`catalogue:${id}`, `/api/dossiers/${id}/catalogue`);
+    if (state.dossier && state.dossier.id === id) { state.catalogue = liste; if (state.screen === 'ajout') renderSiPossible(); }
+  } catch (e) { /* l'ajout libre reste possible */ }
+}
+
+const sansAccents = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+function ouvrirAjout() {
+  state.ajout = { q: state.search || '', cat: '', vu: '', libre: false };
+  state.screen = 'ajout';
+  render();
+  const el = document.getElementById('ajoutSearch');
+  if (el) el.focus();
+}
+
+// Crée la composante et ouvre sa fiche. Sans réseau, elle existe tout de
+// suite sur l'appareil et part au serveur avec le reste de la file.
+async function creerComposante(modele) {
+  const d = state.dossier;
+  if (!d) return;
+  const name = String(modele.name || '').replace(/\s+/g, ' ').trim();
+  if (!name) { showToast('Donnez un nom à la composante.'); return; }
+  const cat = CATS[modele.cat] ? modele.cat : 'equipements';
+  const vu = toInt(modele.vu);
+  const id = nouvelIdComposante();
+  const body = { id, name, cat };
+  if (vu && vu > 0) body.useful_life_years = vu;
+  const ordre = state.components.concat(state.inactifs).reduce((m, c) => Math.max(m, c.sort_order || 0), -1) + 1;
+  const local = {
+    id, dossier_id: d.id, cat, name, qty: '—', done: 0, actif: 1, ai_suggested: 0, sort_order: ordre,
+    useful_life_years: vu || null, uniformat_code: modele.code || null, photos: [], entretien: [],
+    guide: { element: '', points: [], defauts: [], constats: [] },
+  };
+  let comp = null;
+  if (state.online && !state.envois.length) {
+    try {
+      comp = await apiJson(`/api/dossiers/${d.id}/components`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }, { timeout: 15000 });
+      HL.ecrire(`component:${id}`, comp);
+      const cle = `components:${d.id}`;
+      const liste = await HL.lire(cle);
+      if (Array.isArray(liste) && !liste.some(x => x.id === id)) {
+        const { guide, entretien, precedent, ...ligne } = comp;
+        HL.ecrire(cle, liste.concat([Object.assign(ligne, { photos: 0 })]));
+      }
+    } catch (e) {
+      if (!sansReseau(e)) {
+        if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
+        return;
+      }
+      state.reseauInstable = true;
+    }
+  }
+  if (!comp) {
+    await enfiler({ kind: 'create-component', id, dossierId: d.id, body, local });
+    await HL.ecrire(`component:${id}`, local);
+    comp = local;
+    synchroniser();
+  }
+  const { guide, entretien, precedent, ...ligne } = comp;
+  state.components = state.components.concat([Object.assign(ligne, { photos: Array.isArray(comp.photos) ? comp.photos.length : 0 })]);
+  state.ajout = null;
+  state.filter = 'all'; state.search = '';
+  showToast('Composante ajoutée à la visite');
+  openFiche(id);
+}
+
+async function reactiverEtOuvrir(id) {
+  await setActif(id, true);
+  if (state.inactifs.some(c => c.id === id)) return;
+  state.ajout = null;
+  openFiche(id);
+}
+
+function ajoutHtml() {
+  const a = state.ajout || { q: '', cat: '', vu: '' };
+  const q = sansAccents(a.q);
+  const trouve = (nom) => q.length >= 2 && q.split(' ').every(mot => sansAccents(nom).includes(mot));
+  const presents = new Set(state.components.concat(state.inactifs).map(c => sansAccents(c.name)));
+  const actives = state.components.filter(c => trouve(c.name)).slice(0, 5);
+  const inactives = state.inactifs.filter(c => trouve(c.name)).slice(0, 5);
+  const catalogue = (state.catalogue || [])
+    .map((item, i) => Object.assign({ i }, item))
+    .filter(item => trouve(item.name) && !presents.has(sansAccents(item.name)))
+    .slice(0, 12);
+  const ligne = (icone, nom, sous, bouton) => `
+    <div class="comp-row ajout-row">
+      <div class="comp-thumb" style="background:var(--ink-050);color:var(--ink-500)"><i data-lucide="${icone}"></i></div>
+      <div class="comp-mid"><div class="name">${esc(nom)}</div><div class="sub">${esc(sous)}</div></div>
+      <div class="comp-end">${bouton}</div>
+    </div>`;
+  const resultats = [
+    ...actives.map(c => ligne(catInfo(c.cat).icon, c.name, 'Déjà dans la visite',
+      `<button class="reactiver" data-action="open-fiche" data-id="${esc(c.id)}"><i data-lucide="chevron-right"></i>Ouvrir</button>`)),
+    ...inactives.map(c => ligne(catInfo(c.cat).icon, c.name, 'Désactivée pour cet immeuble',
+      `<button class="reactiver" data-action="ajout-reactiver" data-id="${esc(c.id)}"><i data-lucide="rotate-ccw"></i>Réactiver</button>`)),
+    ...catalogue.map(item => ligne(catInfo(item.cat).icon, item.name, `${catInfo(item.cat).pill}${item.vu ? ` · vie utile ${item.vu} ans` : ''}`,
+      `<button class="reactiver" data-action="ajout-catalogue" data-i="${item.i}"><i data-lucide="plus"></i>Ajouter</button>`)),
+  ].join('');
+  const nomLibre = a.q.replace(/\s+/g, ' ').trim();
+  const catChoisie = a.cat || '';
+  const replie = resultats && !a.libre;
+  const libre = nomLibre.length < 2 ? '' : replie
+    ? `<button class="btn-outline ajout-btn" data-action="ajout-ouvrir-libre"><i data-lucide="pencil"></i>Autre chose : créer « ${esc(nomLibre)} »</button>`
+    : `
+    <div class="card ajout-libre">
+      <div class="guide-lbl">Composante hors bibliothèque</div>
+      <div class="ajout-nom">« ${esc(nomLibre)} »</div>
+      <div class="guide-lbl">Catégorie</div>
+      <div class="quick-chips">${Object.keys(CATS).map(k => `<button class="quick-chip ${catChoisie === k ? 'on' : ''}" data-action="ajout-cat" data-val="${k}">${esc(CATS[k].pill)}</button>`).join('')}</div>
+      <div class="guide-lbl">Vie utile (années, facultatif)</div>
+      <input class="fld-input" id="ajoutVu" data-role="ajout-vu" inputmode="numeric" value="${esc(a.vu)}" placeholder="ex. 25">
+      <button class="btn-cta" data-action="ajout-libre" ${catChoisie ? '' : 'disabled'}><i data-lucide="plus"></i>Créer cette composante</button>
+      ${catChoisie ? '' : '<div class="attr-empty">Choisissez une catégorie.</div>'}
+    </div>`;
+  return `
+  <div class="scr-liste">
+    <div class="hdr">
+      <div class="hdr-row">
+        <button class="hdr-back" data-action="go-liste"><i data-lucide="chevron-left"></i>Composantes</button>
+      </div>
+      <h2>Ajouter une composante</h2>
+      <div class="search-box"><i data-lucide="search"></i><input id="ajoutSearch" data-role="ajout-q" placeholder="Ce que vous voyez — ex. génératrice" value="${esc(a.q)}" autocomplete="off"></div>
+    </div>
+    <div class="list-body">
+      ${q.length < 2
+        ? `<div class="empty-state">Tapez le nom de la composante trouvée sur place. La bibliothèque de votre firme est proposée d'abord${state.catalogue ? '' : ' (non disponible sur cet appareil pour l\'instant)'}.</div>`
+        : (resultats ? `<div class="grp"><div class="grp-hdr"><i data-lucide="library"></i><span class="lbl">Bibliothèque et visite</span><div class="rule"></div></div>${resultats}</div>` : `<div class="empty-state">Rien de semblable dans la bibliothèque.</div>`)}
+      ${libre}
+    </div>
+  </div>`;
 }
 
 // Enregistrement d'un champ de composante. Applique la valeur localement de façon
@@ -468,12 +1063,11 @@ function saveCompField(field, value, opts) {
   const cur = state.activeComponent[field];
   const same = (cur == null ? '' : String(cur)) === (value == null ? '' : String(value));
   if (same && !force) return false;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return false; }
   const patch = {}; patch[field] = value;
   applyComponentPatch(id, patch);
   setSaveStatus('ficheStatus', 'Enregistrement…');
   patchComponent(id, patch)
-    .then(() => setSaveStatus('ficheStatus', 'Enregistré'))
+    .then((r) => setSaveStatus('ficheStatus', r && r.enAttente ? "Gardé sur l'appareil" : 'Enregistré'))
     .catch(() => setSaveStatus('ficheStatus', ''));
   return true;
 }
@@ -488,150 +1082,131 @@ function onRatingClick(raw) {
   render();
 }
 
-function onRflagClick() {
-  const c = state.activeComponent;
-  if (!c) return;
-  if (saveCompField('r_flag', c.r_flag ? 0 : 1, { force: true })) render();
-}
-
-function onFacetClick(field, value) {
-  const c = state.activeComponent;
-  if (!c) return;
-  const next = (c[field] === value) ? null : value;
-  if (saveCompField(field, next, { force: true })) render();
-}
-
-function onYearBlur(e) {
-  if (!state.activeComponent) return;
-  const v = e.target.value.trim();
-  let payload;
-  if (v === '') payload = null;
-  else if (/^\d{4}$/.test(v)) payload = parseInt(v, 10);
-  else payload = v;
-  if (saveCompField('install_year', payload)) render();
-}
-
-function onNumberBlur(field, e) {
-  if (!state.activeComponent) return;
-  const v = toInt(e.target.value);
-  if (saveCompField(field, v)) render();
-}
-
-/* ---------- attributs ---------- */
-
-function componentAttrs(c) {
-  return parseJsonObject(c && c.attributs);
-}
-
-function saveAttrs(obj) {
-  const keys = Object.keys(obj);
-  const payload = keys.length ? JSON.stringify(obj) : null;
-  return saveCompField('attributs', payload, { force: true });
-}
-
-function onAttrAdd() {
-  const c = state.activeComponent;
-  if (!c) return;
-  const k = (state.attrKeyDraft || '').trim();
-  const v = (state.attrValDraft || '').trim();
-  if (!k) { showToast('Nommez le champ à ajouter.'); return; }
-  const attrs = componentAttrs(c);
-  attrs[k] = v;
-  if (saveAttrs(attrs)) { state.attrKeyDraft = ''; state.attrValDraft = ''; render(); }
-}
-
-function onAttrDelete(key) {
-  const c = state.activeComponent;
-  if (!c) return;
-  const attrs = componentAttrs(c);
-  delete attrs[key];
-  if (saveAttrs(attrs)) render();
-}
-
-function onAttrValueBlur(key, e) {
-  const c = state.activeComponent;
-  if (!c) return;
-  const attrs = componentAttrs(c);
-  const v = e.target.value;
-  if ((attrs[key] == null ? '' : String(attrs[key])) === v) return;
-  attrs[key] = v;
-  saveAttrs(attrs);
-}
 
 /* ---------- photos ---------- */
 
 function triggerPhotoInput() {
-  if (!state.online) { showToast('Hors connexion : ajout de photo indisponible.'); return; }
   const input = document.getElementById('photoFileInput');
   if (input) input.click();
+}
+
+// Réduit une photo de téléphone (souvent 3 à 5 Mo) à 1600 px de côté en JPEG
+// avant l'envoi : le rapport Word les intègre toutes, et un Worker n'a que
+// 128 Mo de mémoire. En cas d'échec (format non décodable), l'original part.
+async function reduirePhoto(file) {
+  const COTE_MAX = 1600;
+  try {
+    if (!window.createImageBitmap || !file.type.startsWith('image/')) return file;
+    const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    const echelle = Math.min(1, COTE_MAX / Math.max(bitmap.width, bitmap.height));
+    if (echelle === 1 && file.size < 700 * 1024 && file.type === 'image/jpeg') { bitmap.close && bitmap.close(); return file; }
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bitmap.width * echelle);
+    canvas.height = Math.round(bitmap.height * echelle);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close && bitmap.close();
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.82));
+    if (!blob) return file;
+    return new File([blob], (file.name || 'photo').replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' });
+  } catch (err) {
+    return file;
+  }
 }
 
 async function onPhotoFileChange(e) {
   const file = e.target.files && e.target.files[0];
   e.target.value = '';
   if (!file || !state.activeId) return;
+  const compId = state.activeId;
+  const dossierId = state.dossier && state.dossier.id;
   state.uploadingPhoto = true; state.error = null; render();
-  try {
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await apiFetch(`/api/components/${state.activeId}/photos`, { method: 'POST', body: fd });
-    let data = null;
-    try { data = await res.json(); } catch (e2) {}
-    if (!res.ok) throw new Error((data && data.error) || 'Le téléversement de la photo a échoué.');
-    if (state.activeComponent) {
-      state.activeComponent = Object.assign({}, state.activeComponent, { photos: (state.activeComponent.photos || []).concat([data]) });
+  const photo = await reduirePhoto(file);
+  // Choisi par l'appareil : l'envoi peut être rejoué sans créer de doublon.
+  const photoId = nouvelIdPhoto();
+  await HL.photoEcrire(photoId, photo);
+  state.photoBlobUrls[photoId] = URL.createObjectURL(photo);
+  let envoyee = null;
+  if (state.online && !state.envois.length) {
+    try {
+      envoyee = await envoyerPhoto(compId, photoId, photo, dossierId);
+      state.reseauInstable = false;
+    } catch (e2) {
+      if (!sansReseau(e2)) {
+        state.uploadingPhoto = false;
+        HL.photoEffacer(photoId);
+        if (e2.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e2); render(); }
+        return;
+      }
+      state.reseauInstable = true;
     }
-    state.components = state.components.map(c => (c.id === state.activeId ? Object.assign({}, c, { photos: (c.photos || 0) + 1 }) : c));
-    state.uploadingPhoto = false;
-    render();
-    loadPhotoBlobs([data]);
-  } catch (e2) {
-    state.uploadingPhoto = false;
-    if (e2.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e2); render(); }
   }
-}
-
-/* ---------- AI analyze ---------- */
-
-async function analyze() {
-  if (state.analyzing || !state.activeId) return;
-  if (!state.online) { showToast('Analyse indisponible hors connexion.'); return; }
-  state.analyzing = true; state.error = null; render();
-  try {
-    const result = await apiJson(`/api/components/${state.activeId}/analyze`, { method: 'POST' });
-    state.aiResult = result;
-  } catch (e) {
-    if (e.message !== 'SESSION_EXPIRED') state.error = friendlyError(e);
-  } finally {
-    state.analyzing = false; render();
+  if (!envoyee) await enfiler({ kind: 'photo', componentId: compId, photoId, dossierId });
+  const affichee = envoyee || { id: photoId, component_id: compId, tag: "En attente d'envoi", local: true };
+  if (state.activeComponent && state.activeComponent.id === compId) {
+    state.activeComponent = Object.assign({}, state.activeComponent, { photos: (state.activeComponent.photos || []).concat([affichee]) });
   }
-}
-
-function parseCostEstimate(v) {
-  if (v == null) return null;
-  if (typeof v === 'number') return isNaN(v) ? null : Math.round(v);
-  const cleaned = String(v).replace(/[^\d.,]/g, '');
-  if (!cleaned) return null;
-  const n = parseFloat(cleaned.replace(/\s/g, '').replace(/,(\d{3})/g, '$1').replace(',', '.'));
-  return isNaN(n) ? null : Math.round(n);
-}
-
-async function applyAi() {
-  if (!state.aiResult || !state.activeId) return;
-  if (!state.online) { showToast('Hors connexion : impossible d’appliquer les valeurs.'); return; }
-  const r = state.aiResult;
-  const patch = {};
-  if (typeof r.rating === 'number' && r.rating >= 1 && r.rating <= 4) patch.rating = r.rating;
-  if (typeof r.observation === 'string' && r.observation.trim()) patch.observation = r.observation.trim();
-  if (typeof r.causePossible === 'string' && r.causePossible.trim()) patch.cause_possible = r.causePossible.trim();
-  if (typeof r.delaiSuggere === 'string' && r.delaiSuggere.trim()) patch.delai_suggere = r.delaiSuggere.trim();
-  if (typeof r.consequences === 'string' && r.consequences.trim()) patch.consequences = r.consequences.trim();
-  if (typeof r.costEstimate === 'number' && !isNaN(r.costEstimate)) patch.replacement_cost = Math.round(r.costEstimate);
-  if (!Object.keys(patch).length) { state.aiResult = null; showToast('Rien à appliquer.'); return; }
-  applyComponentPatch(state.activeId, patch);
-  state.aiResult = null;
+  state.components = state.components.map(c => (c.id === compId ? Object.assign({}, c, { photos: (c.photos || 0) + 1 }) : c));
+  state.uploadingPhoto = false;
   render();
-  try { await patchComponent(state.activeId, patch); } catch (e) { /* error already surfaced */ }
+  if (!envoyee) synchroniser();
+}
+
+/* ---------- Analyse IA groupée (déclenchée une fois la visite terminée) ---------- */
+
+// La visite terrain ne capture que photos, cote, quantité et note. L'IA
+// remplit ensuite constats, étendue, cause, limite d'observation, nature du
+// risque, délai, conséquences et coût de remplacement à partir des photos —
+// une seule passe, pour toutes les composantes documentées, plutôt qu'une
+// analyse par fiche sur le terrain. Le serveur valide déjà chaque valeur
+// contre son propre vocabulaire fermé (etendue, limiteObservation, etc.),
+// donc le client applique la réponse telle quelle plutôt que de la
+// revalider avec les listes qui servaient à afficher les choix.
+function pendingAnalysisComponents() {
+  // delai_suggere est renseigné par toute analyse (IA ou repli heuristique),
+  // contrairement à observation qui peut rester vide sans photo — c'est
+  // donc le marqueur fiable d'une composante déjà passée par l'IA.
+  return state.components.filter(c => c.done && !c.delai_suggere);
+}
+
+async function analyzeVisit() {
+  if (state.analyzingVisit) return;
+  if (!state.online) { showToast('Analyse indisponible hors connexion.'); return; }
+  const todo = pendingAnalysisComponents();
+  if (!todo.length) return;
+  state.analyzingVisit = true; state.error = null;
+  state.analyzeProgress = { done: 0, total: todo.length };
+  render();
+  for (const comp of todo) {
+    try {
+      const result = await apiJson(`/api/components/${comp.id}/analyze`, { method: 'POST' });
+      const patch = {};
+      if (typeof result.observation === 'string' && result.observation.trim()) patch.observation = result.observation.trim();
+      if (typeof result.causePossible === 'string' && result.causePossible.trim()) patch.cause_possible = result.causePossible.trim();
+      if (typeof result.delaiSuggere === 'string' && result.delaiSuggere.trim()) patch.delai_suggere = result.delaiSuggere.trim();
+      if (result.etendue) patch.etendue = result.etendue;
+      if (typeof result.etendueQte === 'string' && result.etendueQte.trim()) patch.etendue_qte = result.etendueQte.trim();
+      if (result.limiteObservation) patch.limite_observation = result.limiteObservation;
+      if (result.natureRisque) patch.nature_risque = result.natureRisque;
+      if (typeof result.consequences === 'string' && result.consequences.trim()) patch.consequences = result.consequences.trim();
+      if (typeof result.costEstimate === 'number' && !isNaN(result.costEstimate)) patch.replacement_cost = Math.round(result.costEstimate);
+      if (comp.note && comp.note.trim()) {
+        try {
+          const noteData = await apiJson(`/api/components/${comp.id}/structure-note`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transcript: comp.note }),
+          });
+          if (noteData && typeof noteData.note === 'string') patch.note = noteData.note;
+        } catch (e) { /* la note reste telle quelle si la reformulation échoue */ }
+      }
+      if (Object.keys(patch).length) await patchComponent(comp.id, patch);
+    } catch (e) { /* on continue avec les composantes suivantes */ }
+    state.analyzeProgress = { done: state.analyzeProgress.done + 1, total: todo.length };
+    render();
+  }
+  state.analyzingVisit = false;
+  render();
+  showToast('Analyse de la visite terminée.');
 }
 
 /* ---------- voice note ---------- */
@@ -668,24 +1243,19 @@ function toggleVoice() {
   try { recognition.start(); } catch (e) { state.recording = false; render(); }
 }
 
-async function submitTranscript(transcript) {
-  try {
-    const data = await apiJson(`/api/components/${state.activeId}/structure-note`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcript }),
-    });
-    applyComponentPatch(state.activeId, { note: data.note });
-  } catch (e) {
-    if (e.message !== 'SESSION_EXPIRED') state.error = friendlyError(e);
-  }
-  render();
+// La note est enregistrée telle quelle (ajoutée à la suite d'une note
+// existante), sans reformulation IA — celle-ci a lieu en une seule passe
+// pour toute la visite (voir analyzeVisit). Fonctionne donc identiquement
+// en ligne ou hors connexion : c'est patchComponent qui gère la file d'attente.
+function submitTranscript(transcript) {
+  const c = state.activeComponent;
+  const val = (c && c.note ? c.note + '\n' : '') + transcript;
+  if (saveCompField('note', val, { force: true })) render();
 }
 
 function onNoteFallbackSend() {
   const val = (state.noteDraft || '').trim();
   if (!val) return;
-  if (!state.online) { showToast('Hors connexion : impossible d’envoyer la note.'); return; }
   state.noteDraft = '';
   render();
   submitTranscript(val);
@@ -693,7 +1263,6 @@ function onNoteFallbackSend() {
 
 async function saveFiche() {
   if (!state.activeId) return;
-  if (!state.online) { showToast('Hors connexion : impossible d’enregistrer.'); return; }
   const id = state.activeId;
   applyComponentPatch(id, { done: 1 });
   state.screen = 'liste';
@@ -719,19 +1288,57 @@ function immSetLocal(sec, key, val) {
   if (!Object.keys(state.batiment[sec]).length) delete state.batiment[sec];
 }
 
-async function saveBatiment() {
-  if (!state.dossier) return;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
-  setSaveStatus('immStatus', 'Enregistrement…');
+// Une réponse de la fiche d'immeuble (« piscine extérieure : non », nombre
+// d'ascenseurs…) peut activer ou désactiver des composantes côté serveur :
+// on recharge alors la liste pour que l'écran suive.
+async function suivreRegles(data) {
+  const n = data && data.composantes_mises_a_jour;
+  if (!n || !state.dossier) return;
   try {
-    const payload = JSON.stringify(state.batiment || {});
-    const data = await apiJson(`/api/dossiers/${state.dossier.id}`, {
+    const components = await apiJson(`/api/dossiers/${state.dossier.id}/components`);
+    state.components = components.filter(c => c.actif !== 0);
+    state.inactifs = components.filter(c => c.actif === 0);
+    showToast(`${n} composante${n > 1 ? 's' : ''} ajustée${n > 1 ? 's' : ''} selon la fiche d'immeuble`);
+    render();
+  } catch (e) {
+    if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
+  }
+}
+
+// Rend la réponse du serveur, ou { enAttente: true } si la modification est
+// gardée sur l'appareil.
+async function patchDossier(body) {
+  const id = state.dossier.id;
+  const garder = async () => {
+    await enfiler({ kind: 'patch-dossier', id, body, dossierId: id });
+    state.dossier = Object.assign({}, state.dossier, body);
+    synchroniser();
+    return { enAttente: true };
+  };
+  if (!state.online || state.envois.length) return garder();
+  try {
+    const data = await apiJson(`/api/dossiers/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ batiment_info: payload }),
-    });
-    if (data && typeof data === 'object') state.dossier = Object.assign({}, state.dossier, data);
-    setSaveStatus('immStatus', 'Enregistré');
+      body: JSON.stringify(body),
+    }, { timeout: 15000 });
+    state.dossier = Object.assign({}, state.dossier, body, (data && typeof data === 'object') ? data : {});
+    if (data) HL.ecrire(`dossier:${id}`, data);
+    state.reseauInstable = false;
+    return data || {};
+  } catch (e) {
+    if (sansReseau(e)) { state.reseauInstable = true; return garder(); }
+    throw e;
+  }
+}
+
+async function saveBatiment() {
+  if (!state.dossier) return;
+  setSaveStatus('immStatus', 'Enregistrement…');
+  try {
+    const data = await patchDossier({ batiment_info: JSON.stringify(state.batiment || {}) });
+    setSaveStatus('immStatus', data.enAttente ? "Gardé sur l'appareil" : 'Enregistré');
+    if (!data.enAttente) await suivreRegles(data);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     setSaveStatus('immStatus', '');
@@ -754,17 +1361,12 @@ function onImmTextBlur(sec, key, e) {
 
 async function saveDossierField(field, value) {
   if (!state.dossier) return;
-  if (!state.online) { showToast('Hors connexion : modification non enregistrée.'); return; }
   setSaveStatus('immStatus', 'Enregistrement…');
   try {
     const patch = {}; patch[field] = value;
-    const data = await apiJson(`/api/dossiers/${state.dossier.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    });
-    state.dossier = Object.assign({}, state.dossier, patch, (data && typeof data === 'object') ? data : {});
-    setSaveStatus('immStatus', 'Enregistré');
+    const data = await patchDossier(patch);
+    setSaveStatus('immStatus', data.enAttente ? "Gardé sur l'appareil" : 'Enregistré');
+    if (!data.enAttente) await suivreRegles(data);
   } catch (e) {
     if (e.message !== 'SESSION_EXPIRED') { state.error = friendlyError(e); render(); }
     setSaveStatus('immStatus', '');
@@ -782,14 +1384,6 @@ function onDossierNumberBlur(field, e) {
 /* ============================================================
    Derived view data
    ============================================================ */
-
-function replacementYear(c) {
-  const yr = toInt(c && c.install_year);
-  const vu = toInt(c && c.useful_life_years);
-  if (!yr || !vu) return null;
-  const year = yr + vu;
-  return { year, delta: year - new Date().getFullYear() };
-}
 
 function computeStats() {
   const comps = state.components;
@@ -851,6 +1445,7 @@ function rowVals(c) {
     sub, statusLabel, statusColor, statusBg, thumbBg, thumbColor, thumbIcon: info.icon,
     rflag: !!c.r_flag,
     aiTag: !!(c.ai_suggested && !c.done),
+    travauxTag: !!(c.precedent && c.precedent.travaux_a_verifier && !c.travaux_periode),
   };
 }
 
@@ -906,16 +1501,20 @@ function computeDecades(projection) {
 async function downloadReport(kind) {
   if (!state.dossier) return;
   if (!state.online) { showToast('Téléchargement indisponible hors connexion.'); return; }
-  const key = kind === 'docx' ? 'downloadingDocx' : 'downloadingXlsx';
+  // Le rapport se génère sur le serveur : ce qui attend encore sur l'appareil n'y serait pas.
+  if (state.envois.length) await synchroniser();
+  if (state.envois.length) showToast("Des modifications attendent encore l'envoi : le rapport ne les contient pas.");
+  const key = kind === 'docx' ? 'downloadingDocx' : kind === 'suivi' ? 'downloadingSuivi' : 'downloadingXlsx';
   state[key] = true; state.error = null; render();
   try {
-    const res = await apiFetch(`/api/dossiers/${state.dossier.id}/report.${kind}`);
+    const chemin = kind === 'suivi' ? 'suivi-entretien.xlsx' : `report.${kind}`;
+    const res = await apiFetch(`/api/dossiers/${state.dossier.id}/${chemin}`, null, { timeout: 180000 });
     if (!res.ok) throw new Error("Le rapport n'est pas disponible pour le moment.");
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${slug(state.dossier.name)}-rapport.${kind}`;
+    a.download = kind === 'suivi' ? `${slug(state.dossier.name)}-suivi-entretien.xlsx` : `${slug(state.dossier.name)}-rapport.${kind}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -958,9 +1557,19 @@ function render() {
   }
 }
 
+// Un rendu complet pendant la saisie effacerait le texte pas encore
+// enregistré (il l'est à la sortie du champ) : il attend la sortie du champ.
+let renduDiffere = false;
+function renderSiPossible() {
+  const a = document.activeElement;
+  const saisie = a && (a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'file', 'submit'].includes(a.type)));
+  if (saisie) { renduDiffere = true; paintNetBar(); paintPrepa(); return; }
+  render();
+}
+
 function screenHtml() {
   if (state.screen === 'login') return loginHtml() + toastHtml();
-  return `<div class="app-shell">${offlineBarHtml()}${errorBannerHtml()}${bodyForScreen()}</div>${toastHtml()}`;
+  return `<div class="app-shell">${offlineBarHtml()}${errorBannerHtml()}${rejetsHtml()}${bodyForScreen()}</div>${toastHtml()}`;
 }
 
 function bodyForScreen() {
@@ -969,6 +1578,7 @@ function bodyForScreen() {
     case 'accueil': return accueilHtml();
     case 'immeuble': return immeubleHtml();
     case 'liste': return listeHtml();
+    case 'ajout': return ajoutHtml();
     case 'fiche': return ficheHtml();
     case 'synthese': return syntheseHtml();
     case 'loading':
@@ -977,8 +1587,52 @@ function bodyForScreen() {
 }
 
 function offlineBarHtml() {
-  if (state.online) return '';
-  return `<div class="offline-bar"><i data-lucide="wifi-off"></i>Hors connexion — certaines actions sont indisponibles</div>`;
+  const n = state.envois.length;
+  const attente = n ? ` · ${n} en attente d'envoi` : '';
+  if (!state.online || state.reseauInstable) {
+    return `<div class="offline-bar" id="barreReseau"><i data-lucide="wifi-off"></i>${state.online ? 'Connexion instable' : 'Hors connexion'} — vos modifications sont gardées sur l'appareil${attente}</div>`;
+  }
+  if (n) {
+    return `<div class="offline-bar sync-bar" id="barreReseau"><i data-lucide="refresh-cw" class="${state.synchro ? 'spin' : ''}"></i>${state.synchro ? 'Envoi de' : 'En attente :'} ${n} modification${n > 1 ? 's' : ''} faite${n > 1 ? 's' : ''} hors connexion</div>`;
+  }
+  return '<div id="barreReseau" hidden></div>';
+}
+// Met la barre à jour sans redessiner l'écran (saisie en cours préservée).
+function paintNetBar() {
+  const el = document.getElementById('barreReseau');
+  if (!el) return;
+  el.outerHTML = offlineBarHtml();
+  if (window.lucide) window.lucide.createIcons();
+}
+
+function rejetsHtml() {
+  if (!state.rejets.length) return '';
+  const n = state.rejets.length;
+  return `<div class="error-banner"><i data-lucide="alert-triangle"></i><div class="msg">${n} modification${n > 1 ? 's' : ''} faite${n > 1 ? 's' : ''} hors connexion ${n > 1 ? 'ont été refusées' : 'a été refusée'} par le serveur :<br>${state.rejets.slice(0, 5).map(esc).join('<br>')}</div><button data-action="dismiss-rejets" aria-label="Fermer"><i data-lucide="x" style="width:15px;height:15px"></i></button></div>`;
+}
+
+function prepaTexte() {
+  const p = state.prepa;
+  if (!p) {
+    return state.online
+      ? { icone: 'loader-2', classe: 'spin', texte: 'Préparation de la visite hors connexion…' }
+      : { icone: 'cloud-off', classe: '', texte: 'Visite non préparée : seules les fiches déjà ouvertes sont disponibles hors connexion.' };
+  }
+  if (p.etat === 'fiches') return { icone: 'loader-2', classe: 'spin', texte: 'Préparation hors connexion : téléchargement des fiches…' };
+  if (p.etat === 'photos') return { icone: 'loader-2', classe: 'spin', texte: `Préparation hors connexion : photos ${p.faites}/${p.total}` };
+  if (p.etat === 'pret') return { icone: 'check-circle-2', classe: 'ok', texte: `Visite disponible hors connexion · ${p.fiches} fiches, ${p.total} photo${p.total > 1 ? 's' : ''}` };
+  if (p.etat === 'partiel') return { icone: 'check-circle-2', classe: 'ok', texte: `Visite disponible hors connexion, sauf ${p.total - p.faites} photo${p.total - p.faites > 1 ? 's' : ''} (reprise avec le réseau)` };
+  return { icone: 'alert-triangle', classe: '', texte: p.le ? 'Mise à jour hors connexion interrompue : la dernière préparation reste disponible.' : 'Préparation hors connexion interrompue : elle reprendra avec le réseau.' };
+}
+function prepaHtml() {
+  const t = prepaTexte();
+  return `<div class="prepa-ligne" id="prepaLigne"><i data-lucide="${t.icone}" class="${t.classe}"></i><span>${esc(t.texte)}</span></div>`;
+}
+function paintPrepa() {
+  const el = document.getElementById('prepaLigne');
+  if (!el) return;
+  el.outerHTML = prepaHtml();
+  if (window.lucide) window.lucide.createIcons();
 }
 
 function errorBannerHtml() {
@@ -1010,6 +1664,7 @@ function loginHtml() {
         <button class="btn-primary" type="submit" ${state.loginLoading || !state.online ? 'disabled' : ''}>
           ${state.loginLoading ? `<i data-lucide="loader-2" class="spin" style="width:17px;height:17px"></i>Connexion…` : `<i data-lucide="log-in" style="width:17px;height:17px"></i>Se connecter`}
         </button>
+        <a href="/compte/?retour=/terrain/" style="display:block;text-align:center;margin-top:14px;font-size:12.5px;color:var(--ink-500)">Mot de passe oublié ?</a>
       </form>
     </div>
   </div>`;
@@ -1020,15 +1675,20 @@ function dossiersHtml() {
     const pct = d.stats ? d.stats.pct : 0;
     return `<div class="picker-card" data-action="select-dossier" data-id="${esc(d.id)}">
       <h3>${esc(d.name)}</h3>
+      ${d.revision_source ? `<div class="addr" style="color:var(--orange)">Révision de l'étude ${esc(d.revision_source.dossier_no)} (${esc(d.revision_source.annee)})</div>` : ''}
       <div class="addr">${esc(d.address || '')}${d.city ? ' · ' + esc(d.city) : ''}</div>
       <div class="picker-bar"><div style="width:${pct}%"></div></div>
       <div class="picker-pct">${pct}% complété · ${d.stats ? d.stats.done : 0}/${d.stats ? d.stats.total : 0}</div>
     </div>`;
   }).join('');
   return `<div class="picker-screen">
+    ${state.dossier ? `<button class="hdr-back" data-action="go-accueil"><i data-lucide="chevron-left"></i>${esc(state.dossier.name)}</button>` : ''}
     <div class="top-row" style="margin-bottom:20px">
       <div class="brand"><img src="${state.companyLogoUrl || '../assets/logo-mark.png'}" alt=""><span>${esc((state.user && state.user.company && state.user.company.name) || 'Condo Stratégis')}</span></div>
-      <button data-action="logout" style="border:none;background:none;color:var(--ink-500);font-size:12px;cursor:pointer">Déconnexion</button>
+      <div style="display:flex;gap:14px;align-items:center">
+        <a href="/compte/?changer=1&retour=/terrain/" style="color:var(--ink-500);font-size:12px;text-decoration:none">Mot de passe</a>
+        <button data-action="logout" style="border:none;background:none;color:var(--ink-500);font-size:12px;cursor:pointer">Déconnexion</button>
+      </div>
     </div>
     <div class="eyebrow">Étude de fonds de prévoyance</div>
     <h1 class="page-title">Choisir un<br>dossier</h1>
@@ -1054,7 +1714,10 @@ function accueilHtml() {
   <div class="scr-accueil">
     <div class="top-row">
       <div class="brand"><img src="${state.companyLogoUrl || '../assets/logo-mark.png'}" alt=""><span>${esc((state.user && state.user.company && state.user.company.name) || 'Condo Stratégis')}</span></div>
-      <div class="net-badge ${state.online ? 'online' : 'offline'}"><i data-lucide="${state.online ? 'wifi' : 'wifi-off'}"></i>${state.online ? 'En ligne' : 'Hors connexion'}</div>
+      <div class="top-actions">
+        ${state.dossiers.length > 1 ? `<button class="switch-btn" data-action="go-dossiers" title="Changer de dossier"><i data-lucide="building-2"></i></button>` : ''}
+        <div class="net-badge ${state.online ? 'online' : 'offline'}"><i data-lucide="${state.online ? 'wifi' : 'wifi-off'}"></i>${state.online ? 'En ligne' : 'Hors connexion'}</div>
+      </div>
     </div>
     <div class="eyebrow">Étude de fonds de prévoyance</div>
     <h1 class="page-title">Visite<br>terrain</h1>
@@ -1077,6 +1740,7 @@ function accueilHtml() {
         <div class="progress-track"><div class="progress-fill" style="width:${st.pct}%"></div></div>
       </div>
     </div>
+    ${prepaHtml()}
     <div class="stats-grid">
       <div class="stat-tile"><div class="num">${st.photosTotal}</div><div class="lbl">Photos</div></div>
       <div class="stat-tile"><div class="num accent">${st.critical}</div><div class="lbl">À traiter</div></div>
@@ -1091,10 +1755,10 @@ function accueilHtml() {
       <i data-lucide="chevron-right" class="go"></i>
     </button>
     <div class="ai-banner">
-      <div class="icon"><i data-lucide="sparkles"></i></div>
+      <div class="icon"><i data-lucide="clipboard-list"></i></div>
       <div>
-        <div class="title">Checklist générée par l'IA</div>
-        <div class="body">${st.total} composante${st.total > 1 ? 's' : ''} identifiée${st.total > 1 ? 's' : ''} pour ce dossier. Ajustez sur le terrain au fil de la visite.</div>
+        <div class="title">Liste des composantes</div>
+        <div class="body">${st.total} composante${st.total > 1 ? 's' : ''} pour ce dossier${state.inactifs.length ? `, ${state.inactifs.length} autre${state.inactifs.length > 1 ? 's' : ''} désactivée${state.inactifs.length > 1 ? 's' : ''} selon la taille de l'immeuble et réactivable${state.inactifs.length > 1 ? 's' : ''} depuis la liste` : ''}. Retirez sur le terrain celles qui ne s'appliquent pas.</div>
       </div>
     </div>
     <button class="btn-cta" data-action="go-liste"><i data-lucide="play"></i>Reprendre la visite</button>
@@ -1209,6 +1873,30 @@ function immeubleHtml() {
 
 /* ---------- Liste des composantes ---------- */
 
+function inactifsGroups() {
+  const q = state.search.trim().toLowerCase();
+  const fl = state.inactifs.filter(c => !q || `${c.name || ''} ${c.uniformat_code || ''}`.toLowerCase().includes(q));
+  const cles = Object.keys(CATS);
+  const groups = cles.map(k => ({ key: k, label: CATS[k].label, icon: CATS[k].icon, items: fl.filter(c => c.cat === k) }));
+  groups.push({ key: 'autres', label: CAT_AUTRES.label, icon: CAT_AUTRES.icon, items: fl.filter(c => !CATS[c.cat]) });
+  return groups
+    .filter(g => g.items.length > 0)
+    .map(g => Object.assign(g, { inactifs: true, done: 0, total: g.items.length }));
+}
+
+function inactifRowHtml(c) {
+  return `<div class="comp-row inactif">
+    <div class="comp-thumb" style="background:var(--ink-050);color:var(--ink-300)"><i data-lucide="${catInfo(c.cat).icon}"></i></div>
+    <div class="comp-mid">
+      <div class="name">${esc(c.name)}</div>
+      <div class="sub">Désactivée</div>
+    </div>
+    <div class="comp-end">
+      <button class="reactiver" data-action="reactiver" data-id="${esc(c.id)}"><i data-lucide="rotate-ccw"></i>Réactiver</button>
+    </div>
+  </div>`;
+}
+
 function listeHtml() {
   const st = computeStats();
   const chips = [
@@ -1217,14 +1905,18 @@ function listeHtml() {
     { key: 'done', label: 'Fait', count: st.done },
     { key: 'action', label: 'Action requise', count: st.critical },
   ];
+  if (state.inactifs.length) chips.push({ key: 'inactifs', label: 'Désactivées', count: state.inactifs.length });
   const chipsHtml = chips.map(c => `<button class="chip ${state.filter === c.key ? 'on' : ''}" data-action="filter" data-filter="${c.key}">${c.label} · ${c.count}</button>`).join('');
-  const groups = computeGroups();
+  const groups = state.filter === 'inactifs' ? inactifsGroups() : computeGroups();
   const missingAI = state.components.filter(c => c.ai_suggested && !c.done).length;
   const groupsHtml = groups.map(g => `
     <div class="grp">
       <div class="grp-hdr"><i data-lucide="${g.icon}"></i><span class="lbl">${esc(g.label)}</span><span class="cnt">${g.done}/${g.total}</span><div class="rule"></div></div>
-      ${g.items.map(rowHtml).join('')}
+      ${g.items.map(g.inactifs ? inactifRowHtml : rowHtml).join('')}
     </div>`).join('');
+  const inactifsNote = state.filter === 'inactifs'
+    ? `<div class="missing-banner"><i data-lucide="eye-off"></i><div class="txt">Composantes jugées peu probables pour cet immeuble. <b>Réactivez</b> celles que vous trouvez sur place.</div></div>`
+    : '';
   return `
   <div class="scr-liste">
     <div class="hdr">
@@ -1236,9 +1928,11 @@ function listeHtml() {
       <div class="search-box"><i data-lucide="search"></i><input id="searchInput" data-role="search-input" placeholder="Rechercher une composante…" value="${esc(state.search)}"></div>
       <div class="chip-row scr">${chipsHtml}</div>
     </div>
+    ${inactifsNote}
     ${missingAI > 0 ? `<div class="missing-banner"><i data-lucide="scan-search"></i><div class="txt"><b>${missingAI} composante${missingAI > 1 ? 's' : ''} suggérée${missingAI > 1 ? 's' : ''}</b> par l'IA, non visitée${missingAI > 1 ? 's' : ''}</div></div>` : ''}
     <div class="list-body">
       ${groupsHtml || `<div class="empty-state">Aucune composante ne correspond à ce filtre.</div>`}
+      <button class="btn-outline ajout-btn" data-action="go-ajout"><i data-lucide="plus"></i>Ajouter une composante trouvée sur place</button>
     </div>
     <div class="bottom-bar"><button class="btn-dark" data-action="go-synth"><i data-lucide="flag"></i>Terminer la visite</button></div>
   </div>`;
@@ -1252,6 +1946,7 @@ function rowHtml(r) {
       ${r.facets ? `<div class="facets">${esc(r.facets)}</div>` : ''}
       <div class="sub">${esc(r.sub)}</div>
       ${r.aiTag ? `<div class="ai-tag">Suggéré IA</div>` : ''}
+      ${r.travauxTag ? `<div class="ai-tag">Travaux à vérifier</div>` : ''}
     </div>
     <div class="comp-end">
       <span class="status-pill" style="background:${r.statusBg};color:${r.statusColor}">${esc(r.statusLabel)}</span>
@@ -1282,50 +1977,86 @@ function ratingListHtml(c) {
   return `<div class="rating-list">${opts}${na}</div>`;
 }
 
-function obsFieldHtml(id, role, field, label, value, placeholder) {
-  return `<div class="obs-field">
-    <label for="${id}">${esc(label)}</label>
-    <textarea id="${id}" data-role="${role}" data-field="${esc(field)}" placeholder="${esc(placeholder)}" rows="3">${esc(value || '')}</textarea>
-  </div>`;
+
+/* ---------- Carnet d'entretien de la composante ---------- */
+
+const FREQ_TACHE = [['H', 'Chaque semaine'], ['M', 'Chaque mois'], ['S', 'Une fois dans la saison'], ['A', 'Annuelle'], ['AS', 'Annuelle, par un entrepreneur'], ['A5', 'Aux 5 ans']];
+const QUI_TACHE = [['', 'Syndicat / gestionnaire'], ['Ménagers', 'Entretien ménager'], ['Contrat', 'Entrepreneur (contrat)']];
+const MOIS_COURTS = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
+
+function persoEntretien(c) {
+  const p = parseJsonObject(c && c.taches_entretien);
+  return { retirees: Array.isArray(p.retirees) ? p.retirees.slice() : [], ajoutees: Array.isArray(p.ajoutees) ? p.ajoutees.slice() : [] };
+}
+// Retirer, rétablir ou ajouter : on renvoie tout le réglage de la composante ;
+// le serveur le valide et répond avec la liste de tâches recalculée.
+async function enregistrerEntretien(perso) {
+  const c = state.activeComponent;
+  if (!c) return;
+  try {
+    await patchComponent(c.id, { taches_entretien: JSON.stringify(perso) });
+    render();
+  } catch (e) { /* erreur déjà affichée */ }
+}
+function retirerTache(id) {
+  const c = state.activeComponent; if (!c) return;
+  const p = persoEntretien(c);
+  if (id.startsWith('p_')) p.ajoutees = p.ajoutees.filter(t => t.id !== id);
+  else if (!p.retirees.includes(id)) p.retirees.push(id);
+  enregistrerEntretien(p);
+}
+function retablirTache(id) {
+  const c = state.activeComponent; if (!c) return;
+  const p = persoEntretien(c);
+  p.retirees = p.retirees.filter(x => x !== id);
+  enregistrerEntretien(p);
+}
+function ajouterTache() {
+  const c = state.activeComponent; const f = state.tacheForm;
+  if (!c || !f) return;
+  if (!f.x.trim()) { showToast('Décrivez la tâche.'); return; }
+  if (!f.mois.length) { showToast('Choisissez au moins un mois.'); return; }
+  const p = persoEntretien(c);
+  p.ajoutees.push({ id: nouvelIdTache(), x: f.x.trim(), f: f.f, q: f.q, mois: f.mois.slice().sort((a, b) => a - b) });
+  state.tacheForm = null;
+  enregistrerEntretien(p);
 }
 
-function facetsHtml(c) {
-  const posHtml = POSITIONS.map(p => `<button class="seg-btn ${c.position === p.v ? 'on' : ''}" data-action="set-facet" data-field="position" data-val="${p.v}"><b>${p.v}</b><span>${esc(p.label)}</span></button>`).join('');
-  const empHtml = EMPLACEMENTS.map(p => `<button class="seg-btn ${c.emplacement === p.v ? 'on' : ''}" data-action="set-facet" data-field="emplacement" data-val="${p.v}">${esc(p.label)}</button>`).join('');
-  return `
-  <div class="facet-block">
-    <div class="facet-lbl">Position de façade</div>
-    <div class="seg seg-4">${posHtml}</div>
-  </div>
-  <div class="facet-block">
-    <div class="facet-lbl">Emplacement</div>
-    <div class="seg">${empHtml}</div>
-  </div>
-  <div class="facet-block">
-    <div class="facet-lbl">Variante de matériau ou de type</div>
-    <input id="varianteInput" class="fld-input" data-role="comp-text" data-field="variante" value="${esc(c.variante || '')}" placeholder="ex. Modules de béton, Bois traité">
-  </div>`;
-}
-
-function attributsHtml(c) {
-  const attrs = componentAttrs(c);
-  const keys = Object.keys(attrs);
-  const rows = keys.map((k, i) => `
-    <div class="attr-row">
-      <span class="k">${esc(k)}</span>
-      <input id="attrVal_${i}" class="v" data-role="attr-value" data-key="${esc(k)}" value="${esc(attrs[k])}" placeholder="—">
-      <button class="del" data-action="attr-del" data-key="${esc(k)}" aria-label="Retirer ${esc(k)}"><i data-lucide="x"></i></button>
-    </div>`).join('');
-  const sugg = ATTR_SUGGESTIONS.map(s => `<button class="quick-chip" data-action="attr-suggest" data-key="${esc(s)}">${esc(s)}</button>`).join('');
-  return `
-    ${keys.length ? `<div class="attr-list">${rows}</div>` : '<div class="attr-empty">Aucun attribut consigné.</div>'}
-    <div class="quick-chips">${sugg}</div>
-    <div class="attr-add">
-      <input id="attrKeyInput" data-role="attr-key-draft" value="${esc(state.attrKeyDraft)}" placeholder="Champ (ex. Marque)">
-      <input id="attrValInput" data-role="attr-val-draft" value="${esc(state.attrValDraft)}" placeholder="Valeur">
-      <button data-action="attr-add" aria-label="Ajouter l'attribut"><i data-lucide="plus"></i></button>
+function carnetHtml(c) {
+  const toutes = Array.isArray(c.entretien) ? c.entretien : [];
+  const actives = toutes.filter(t => !t.retiree);
+  const retirees = toutes.filter(t => t.retiree);
+  const ligne = (t) => `
+    <div class="tache-row">
+      <div class="tache-mid">
+        <div class="tache-texte">${esc(t.texte)}${t.perso ? '<span class="tache-perso">ajoutée</span>' : ''}</div>
+        <div class="tache-sub">${esc(t.frequence)} · ${esc(t.quand)} · ${esc(t.responsable)}${t.aPreciser ? ' · <b>mois à préciser</b>' : ''}</div>
+      </div>
+      <button class="tache-x" data-action="tache-retirer" data-id="${esc(t.id)}" aria-label="Retirer cette tâche"><i data-lucide="x"></i></button>
     </div>`;
+  const f = state.tacheForm;
+  const formulaire = f ? `
+    <div class="tache-form">
+      <input class="fld-input" data-role="tache-texte" value="${esc(f.x)}" placeholder="Tâche — ex. Vérifier l'étanchéité des joints de la margelle">
+      <div class="guide-lbl">Fréquence</div>
+      <div class="quick-chips">${FREQ_TACHE.map(([k, l]) => `<button class="quick-chip ${f.f === k ? 'on' : ''}" data-action="tache-freq" data-val="${k}">${esc(l)}</button>`).join('')}</div>
+      <div class="guide-lbl">Mois</div>
+      <div class="quick-chips">${MOIS_COURTS.map((m, i) => `<button class="quick-chip ${f.mois.includes(i + 1) ? 'on' : ''}" data-action="tache-mois" data-val="${i + 1}">${m}</button>`).join('')}</div>
+      <div class="guide-lbl">Responsable</div>
+      <div class="quick-chips">${QUI_TACHE.map(([k, l]) => `<button class="quick-chip ${f.q === k ? 'on' : ''}" data-action="tache-qui" data-val="${esc(k)}">${esc(l)}</button>`).join('')}</div>
+      <div class="tache-actions">
+        <button class="btn-outline" style="margin-top:0" data-action="tache-annuler">Annuler</button>
+        <button class="btn-cta" data-action="tache-ajouter"><i data-lucide="plus"></i>Ajouter</button>
+      </div>
+    </div>` : `<button class="btn-outline" data-action="tache-form"><i data-lucide="plus"></i>Ajouter une tâche</button>`;
+  return `
+    ${actives.length ? actives.map(ligne).join('') : '<div class="attr-empty">Aucune tâche du carnet pour cette composante.</div>'}
+    ${retirees.length ? `<details class="tache-retirees"><summary>Tâches retirées (${retirees.length})</summary>${retirees.map(t => `
+      <div class="tache-row retiree"><div class="tache-mid"><div class="tache-texte">${esc(t.texte)}</div><div class="tache-sub">${esc(t.frequence)} · ${esc(t.quand)}</div></div>
+      <button class="reactiver" data-action="tache-retablir" data-id="${esc(t.id)}"><i data-lucide="rotate-ccw"></i>Rétablir</button></div>`).join('')}</details>` : ''}
+    ${formulaire}`;
 }
+
 
 function ficheHtml() {
   if (state.ficheLoading || !state.activeComponent) return `<div class="scr-fiche">${loadingHtml()}</div>`;
@@ -1335,10 +2066,9 @@ function ficheHtml() {
 
   const photoThumbsHtml = photos.map(p => {
     const url = state.photoBlobUrls[p.id];
-    return `<div class="photo-thumb ${url ? '' : 'loading'}">${url ? `<img src="${url}" alt="">` : `<i data-lucide="loader-2"></i>`}${url ? `<div class="tag">${esc(p.tag || '')}</div>` : ''}</div>`;
+    if (!url && state.photoIndispo[p.id]) return `<div class="photo-thumb indispo" title="Photo pas encore téléchargée sur l'appareil"><i data-lucide="image-off"></i></div>`;
+    return `<div class="photo-thumb ${url ? '' : 'loading'} ${p.local ? 'en-attente' : ''}">${url ? `<img src="${url}" alt="">` : `<i data-lucide="loader-2"></i>`}${url ? `<div class="tag">${esc(p.local ? "En attente d'envoi" : (p.tag || ''))}</div>` : ''}</div>`;
   }).join('');
-
-  const aiCardHtml = state.aiResult ? aiResultHtml(state.aiResult, c) : '';
 
   const micSection = state.speechSupported ? `
     <button class="mic-btn ${state.recording ? 'rec' : ''}" data-action="toggle-voice" ${!state.online ? 'disabled' : ''}>
@@ -1346,17 +2076,10 @@ function ficheHtml() {
     </button>` : `
     <div class="note-fallback">
       <textarea id="noteFallbackText" data-role="note-fallback-text" placeholder="Reconnaissance vocale indisponible sur cet appareil. Écrivez votre note ici…">${esc(state.noteDraft)}</textarea>
-      <button class="send" data-action="note-fallback-send" ${!state.online ? 'disabled' : ''}>Envoyer la note</button>
+      <button class="send" data-action="note-fallback-send">Enregistrer la note</button>
     </div>`;
 
-  const noteCard = c.note ? `<div class="note-card"><div class="note-card-hdr"><i data-lucide="sparkles"></i><span>Note structurée</span></div><div class="note-card-body">${esc(c.note)}</div></div>` : '';
-
-  const delaiChips = DELAIS.map(d => `<button class="quick-chip ${c.delai_suggere === d ? 'on' : ''}" data-action="pick-delai" data-val="${esc(d)}">${esc(d)}</button>`).join('');
-
-  const rep = replacementYear(c);
-  const repSub = rep
-    ? (rep.delta > 1 ? `dans ${rep.delta} ans` : rep.delta === 1 ? "l'an prochain" : rep.delta === 0 ? 'cette année' : `échu depuis ${Math.abs(rep.delta)} an${Math.abs(rep.delta) > 1 ? 's' : ''}`)
-    : 'Renseignez l’année et la durée de vie utile';
+  const noteCard = c.note ? `<div class="note-card"><div class="note-card-hdr"><i data-lucide="mic"></i><span>Note</span></div><div class="note-card-body">${esc(c.note)}</div></div>` : '';
 
   return `
   <div class="scr-fiche">
@@ -1374,104 +2097,49 @@ function ficheHtml() {
     <div class="fiche-body">
       <div class="section-lbl">Photos (${photos.length})</div>
       <div class="photo-strip scr">
-        <button class="photo-add ${state.uploadingPhoto ? 'uploading' : ''}" data-action="add-photo" ${!state.online ? 'disabled' : ''}>
+        <button class="photo-add ${state.uploadingPhoto ? 'uploading' : ''}" data-action="add-photo">
           <i data-lucide="${state.uploadingPhoto ? 'loader-2' : 'camera'}"></i><span>${state.uploadingPhoto ? 'Envoi…' : 'Photo'}</span>
         </button>
         ${photoThumbsHtml}
       </div>
       <input type="file" accept="image/*" capture="environment" id="photoFileInput" data-role="photo-file-input" style="display:none">
 
-      <button class="btn-analyze" data-action="analyze" ${state.analyzing || !state.online ? 'disabled' : ''}>
-        <i data-lucide="${state.analyzing ? 'loader-2' : 'sparkles'}" class="${state.analyzing ? 'spin' : ''}"></i>${state.analyzing ? 'Analyse en cours…' : "Analyser les photos avec l'IA"}
-      </button>
-
-      ${aiCardHtml}
-
-      <div class="sec-head" style="margin-top:24px">
-        <span class="section-lbl" style="margin:0">Cote de l'élément</span>
-        <button class="r-toggle ${c.r_flag ? 'on' : ''}" data-action="toggle-rflag" title="Marqueur R">R</button>
-      </div>
+      <div class="section-lbl" style="margin-top:24px">Cote de l'élément</div>
       ${ratingListHtml(c)}
 
-      <div class="section-lbl" style="margin-top:26px">Observations</div>
-      ${obsFieldHtml('observationInput', 'comp-textarea', 'observation', 'Observation', c.observation, 'Ce qui est constaté sur place…')}
-      ${obsFieldHtml('causeInput', 'comp-textarea', 'cause_possible', 'Cause possible', c.cause_possible, 'Origine probable du constat…')}
+      <div class="section-lbl" style="margin-top:26px">Quantité nécessaire</div>
+      <input id="qtyInput" class="fld-input" data-role="comp-text" data-field="qty" value="${esc(c.qty != null ? c.qty : '')}" placeholder="ex. 12 unités, 40 m²">
 
-      <div class="obs-field">
-        <label for="delaiInput">Délai suggéré</label>
-        <input id="delaiInput" class="fld-input" data-role="comp-text" data-field="delai_suggere" value="${esc(c.delai_suggere || '')}" placeholder="ex. à court terme">
-        <div class="quick-chips">${delaiChips}</div>
-      </div>
-
-      ${obsFieldHtml('consequencesInput', 'comp-textarea', 'consequences', 'Conséquences additionnelles', c.consequences, 'Si rien n’est fait…')}
-
-      <div class="sec-head" style="margin-top:26px">
-        <span class="section-lbl" style="margin:0">Précisions</span>
-        <button class="link-btn" data-action="toggle-facets">${state.facetsOpen ? 'Masquer' : 'Préciser'}</button>
-      </div>
-      ${state.facetsOpen ? `<div class="facets-wrap">${facetsHtml(c)}</div>` : `<div class="facets-summary">${esc(facetSuffix(c) || 'Position de façade, emplacement, variante — au besoin.')}</div>`}
-
-      <div class="section-lbl" style="margin-top:26px">Données techniques</div>
-      <div class="field-grid">
-        <div>
-          <label for="yearInput">Année de construction ou réparation</label>
-          <input id="yearInput" data-role="year-input" value="${esc(c.install_year != null ? c.install_year : '')}" inputmode="numeric" placeholder="AAAA">
-        </div>
-        <div>
-          <label for="lifeInput">Durée de vie utile (ans)</label>
-          <input id="lifeInput" data-role="comp-number" data-field="useful_life_years" value="${esc(c.useful_life_years != null ? c.useful_life_years : '')}" inputmode="numeric" placeholder="—">
-        </div>
-        <div>
-          <label for="qtyInput">Quantité</label>
-          <input id="qtyInput" data-role="comp-text" data-field="qty" value="${esc(c.qty != null ? c.qty : '')}" placeholder="—">
-        </div>
-        <div>
-          <label for="costInput">Coût de remplacement ($)</label>
-          <input id="costInput" data-role="comp-number" data-field="replacement_cost" value="${esc(c.replacement_cost != null ? c.replacement_cost : '')}" inputmode="numeric" placeholder="—">
-        </div>
-      </div>
-
-      <div class="derived-card ${rep && rep.delta < 0 ? 'late' : ''}">
-        <div class="k">Année anticipée de remplacement</div>
-        <div class="v">${rep ? rep.year : '—'}</div>
-        <div class="s">${esc(repSub)}</div>
-      </div>
-
-      <div class="section-lbl" style="margin-top:26px">Attributs</div>
-      ${attributsHtml(c)}
-
-      <div class="section-lbl" style="margin-top:26px">Note vocale</div>
+      <div class="section-lbl" style="margin-top:26px">Note</div>
       ${micSection}
       ${noteCard}
+
+      <button class="btn-outline btn-retirer" data-action="desactiver" data-id="${esc(c.id)}"><i data-lucide="eye-off"></i>Retirer de la visite (absente de l'immeuble)</button>
     </div>
     <div class="fiche-bottom">
-      <button class="btn-cta" data-action="save-fiche" ${!state.online ? 'disabled' : ''}><i data-lucide="check"></i>Enregistrer &amp; suivante</button>
+      <button class="btn-cta" data-action="save-fiche"><i data-lucide="check"></i>Enregistrer &amp; suivante</button>
     </div>
   </div>`;
 }
 
-function aiResultHtml(r, c) {
-  const rInfo = ratingInfo(r.rating);
-  const label = rInfo ? rInfo.label : (r.ratingLabel || 'Non déterminée');
-  const conf = r.confidence != null ? (typeof r.confidence === 'number' ? Math.round(r.confidence <= 1 ? r.confidence * 100 : r.confidence) + ' %' : r.confidence) : '';
-  const cost = r.cost != null && r.cost !== '' ? String(r.cost) : (typeof r.costEstimate === 'number' ? fmtCAD.format(Math.round(r.costEstimate)) : '—');
-  const line = (k, v) => v ? `<div class="ai-line"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>` : '';
-  return `<div class="ai-card">
-    <div class="ai-card-hdr"><i data-lucide="sparkles"></i><span class="lbl">Analyse IA</span>${conf ? `<span class="conf">confiance ${esc(conf)}</span>` : ''}</div>
-    <div class="ai-card-body">
-      <div class="ai-grid">
-        <div><div class="k">Composante</div><div class="v">${esc(c.name)}</div></div>
-        <div><div class="k">Cote proposée</div><div class="v" style="color:${rInfo ? rInfo.color : 'var(--ink-500)'}">${esc(label)}</div></div>
-      </div>
-      ${line('Observation', r.observation)}
-      ${line('Cause possible', r.causePossible)}
-      ${line('Délai suggéré', r.delaiSuggere)}
-      ${line('Conséquences', r.consequences)}
-      ${line('Coût de remplacement', cost)}
-      ${r.source ? `<div class="ai-source">Source : ${esc(r.source)}</div>` : ''}
-      <button class="btn-apply" data-action="apply-ai">Appliquer ces valeurs</button>
+function analyseVisiteHtml() {
+  const pending = pendingAnalysisComponents().length;
+  const label = state.analyzingVisit
+    ? `Analyse ${state.analyzeProgress.done}/${state.analyzeProgress.total}…`
+    : (pending ? "Lancer l'analyse IA" : 'Visite analysée');
+  return `
+  <div class="ai-banner">
+    <div class="icon"><i data-lucide="sparkles"></i></div>
+    <div>
+      <div class="title">Analyse IA</div>
+      <div class="body">${pending
+        ? `${pending} composante${pending > 1 ? 's' : ''} documentée${pending > 1 ? 's' : ''} en attente. L'IA complète l'observation, la cause, le délai et le coût de remplacement à partir des photos.`
+        : "Toutes les composantes documentées ont été analysées."}</div>
     </div>
-  </div>`;
+  </div>
+  <button class="btn-cta" data-action="analyze-visit" ${state.analyzingVisit || !state.online || !pending ? 'disabled' : ''}>
+    <i data-lucide="${state.analyzingVisit ? 'loader-2' : 'sparkles'}" class="${state.analyzingVisit ? 'spin' : ''}"></i>${label}
+  </button>`;
 }
 
 function syntheseHtml() {
@@ -1512,6 +2180,8 @@ function syntheseHtml() {
         ${missingHtml}
       </div>` : ''}
 
+      ${analyseVisiteHtml()}
+
       <div class="fund-card">
         <div class="lbl">Fonds de prévoyance requis · ${proj ? proj.params.projectionYears : 30} ans</div>
         <div class="amount">${fundAmount}</div>
@@ -1530,6 +2200,11 @@ function syntheseHtml() {
           <div class="icon" style="background:var(--green)"><i data-lucide="table-2"></i></div>
           <div class="mid"><div class="t">Durées de vie + carnet</div><div class="s">Excel (.xlsx)</div></div>
           <button class="dl" data-action="download-xlsx" ${state.downloadingXlsx || !state.online ? 'disabled' : ''}><i data-lucide="${state.downloadingXlsx ? 'loader-2' : 'download'}"></i>${state.downloadingXlsx ? '…' : 'Télécharger'}</button>
+        </div>
+        <div class="report-row">
+          <div class="icon" style="background:var(--orange)"><i data-lucide="calendar-check"></i></div>
+          <div class="mid"><div class="t">Tableur suivi d'entretien</div><div class="s">Excel (.xlsx) · tâches par saison</div></div>
+          <button class="dl" data-action="download-suivi" ${state.downloadingSuivi || !state.online ? 'disabled' : ''}><i data-lucide="${state.downloadingSuivi ? 'loader-2' : 'download'}"></i>${state.downloadingSuivi ? '…' : 'Télécharger'}</button>
         </div>
       </div>
 
@@ -1555,37 +2230,45 @@ function onRootClick(e) {
   switch (action) {
     case 'select-dossier': selectDossier(t.dataset.id); break;
     case 'go-accueil': state.screen = 'accueil'; render(); break;
+    case 'go-dossiers': state.screen = 'dossiers'; render(); break;
     case 'go-immeuble': state.screen = 'immeuble'; render(); break;
     case 'go-liste': state.screen = 'liste'; render(); break;
     case 'go-synth': state.screen = 'synthese'; render(); break;
     case 'open-fiche': openFiche(t.dataset.id); break;
     case 'filter': state.filter = t.dataset.filter; render(); break;
+    case 'desactiver': setActif(t.dataset.id, false); break;
+    case 'reactiver': setActif(t.dataset.id, true); break;
+    case 'go-ajout': ouvrirAjout(); break;
+    case 'ajout-reactiver': reactiverEtOuvrir(t.dataset.id); break;
+    case 'ajout-catalogue': { const item = (state.catalogue || [])[Number(t.dataset.i)]; if (item) creerComposante(item); break; }
+    case 'ajout-ouvrir-libre': if (state.ajout) { state.ajout.libre = true; render(); } break;
+    case 'ajout-cat': if (state.ajout) { state.ajout.cat = t.dataset.val; render(); } break;
+    case 'ajout-libre': if (state.ajout && state.ajout.cat) creerComposante({ name: state.ajout.q, cat: state.ajout.cat, vu: state.ajout.vu }); break;
     case 'add-photo': triggerPhotoInput(); break;
-    case 'analyze': analyze(); break;
-    case 'apply-ai': applyAi(); break;
+    case 'analyze-visit': analyzeVisit(); break;
     case 'set-rating': onRatingClick(t.dataset.rating); break;
-    case 'toggle-rflag': onRflagClick(); break;
-    case 'set-facet': onFacetClick(t.dataset.field, t.dataset.val); break;
-    case 'toggle-facets': state.facetsOpen = !state.facetsOpen; render(); break;
-    case 'pick-delai': if (saveCompField('delai_suggere', t.dataset.val, { force: true })) render(); break;
-    case 'attr-add': onAttrAdd(); break;
-    case 'attr-del': onAttrDelete(t.dataset.key); break;
-    case 'attr-suggest': {
-      state.attrKeyDraft = t.dataset.key;
-      const keyEl = document.getElementById('attrKeyInput');
-      if (keyEl) keyEl.value = state.attrKeyDraft;
-      const valEl = document.getElementById('attrValInput');
-      if (valEl) valEl.focus();
-      break;
-    }
+    case 'tache-retirer': retirerTache(t.dataset.id); break;
+    case 'tache-retablir': retablirTache(t.dataset.id); break;
+    case 'tache-form': state.tacheForm = { x: '', f: 'S', q: '', mois: [] }; render(); break;
+    case 'tache-annuler': state.tacheForm = null; render(); break;
+    case 'tache-ajouter': ajouterTache(); break;
+    case 'tache-freq': if (state.tacheForm) { state.tacheForm.f = t.dataset.val; render(); } break;
+    case 'tache-qui': if (state.tacheForm) { state.tacheForm.q = t.dataset.val; render(); } break;
+    case 'tache-mois': if (state.tacheForm) {
+      const m = Number(t.dataset.val); const l = state.tacheForm.mois;
+      state.tacheForm.mois = l.includes(m) ? l.filter(x => x !== m) : l.concat([m]);
+      render();
+    } break;
     case 'imm-choice': onImmChoice(t.dataset.sec, t.dataset.key, t.dataset.val); break;
     case 'toggle-voice': toggleVoice(); break;
     case 'note-fallback-send': onNoteFallbackSend(); break;
     case 'save-fiche': saveFiche(); break;
     case 'download-docx': downloadReport('docx'); break;
     case 'download-xlsx': downloadReport('xlsx'); break;
+    case 'download-suivi': downloadReport('suivi'); break;
     case 'generate-reports': generateReports(); break;
     case 'dismiss-error': state.error = null; render(); break;
+    case 'dismiss-rejets': state.rejets = []; render(); break;
     case 'logout': logout(); break;
   }
 }
@@ -1598,10 +2281,12 @@ function onRootInput(e) {
     render();
   } else if (t.matches('[data-role="note-fallback-text"]')) {
     state.noteDraft = t.value;
-  } else if (t.matches('[data-role="attr-key-draft"]')) {
-    state.attrKeyDraft = t.value;
-  } else if (t.matches('[data-role="attr-val-draft"]')) {
-    state.attrValDraft = t.value;
+  } else if (t.matches('[data-role="ajout-q"]')) {
+    if (state.ajout) { state.ajout.q = t.value; render(); }
+  } else if (t.matches('[data-role="ajout-vu"]')) {
+    if (state.ajout) state.ajout.vu = t.value;
+  } else if (t.matches('[data-role="tache-texte"]')) {
+    if (state.tacheForm) state.tacheForm.x = t.value;
   } else if (t.matches('[data-role="login-email"]')) {
     state.loginEmail = t.value;
   } else if (t.matches('[data-role="login-password"]')) {
@@ -1617,17 +2302,19 @@ function onRootChange(e) {
 function onRootFocusout(e) {
   const t = e.target;
   if (!t || !t.matches) return;
-  if (t.matches('[data-role="year-input"]')) { onYearBlur(e); return; }
-  if (t.matches('[data-role="comp-number"]')) { onNumberBlur(t.dataset.field, e); return; }
   if (t.matches('[data-role="comp-text"]') || t.matches('[data-role="comp-textarea"]')) {
     const v = t.value.trim();
     saveCompField(t.dataset.field, v === '' ? null : v);
     return;
   }
-  if (t.matches('[data-role="attr-value"]')) { onAttrValueBlur(t.dataset.key, e); return; }
   if (t.matches('[data-role="imm-text"]')) { onImmTextBlur(t.dataset.sec, t.dataset.key, e); return; }
   if (t.matches('[data-role="dossier-number"]')) { onDossierNumberBlur(t.dataset.field, e); return; }
 }
+// Un rendu reporté pendant la saisie a lieu à la sortie du champ.
+root.addEventListener('focusout', () => {
+  if (!renduDiffere) return;
+  setTimeout(() => { if (renduDiffere) { renduDiffere = false; renderSiPossible(); } }, 60);
+});
 
 function onRootSubmit(e) {
   if (e.target && e.target.id === 'loginForm') {
@@ -1644,7 +2331,23 @@ root.addEventListener('change', onRootChange);
 root.addEventListener('focusout', onRootFocusout);
 root.addEventListener('submit', onRootSubmit);
 
-window.addEventListener('online', () => { state.online = true; render(); });
-window.addEventListener('offline', () => { state.online = false; showToast('Vous êtes hors connexion.'); render(); });
+window.addEventListener('online', () => {
+  state.online = true;
+  state.reseauInstable = false;
+  renderSiPossible();
+  synchroniser();
+  if (state.dossier && !(state.prepa && state.prepa.etat === 'pret')) preparerHorsLigne(state.dossier.id);
+});
+window.addEventListener('offline', () => {
+  state.online = false;
+  state.toast = "Hors connexion : vos modifications sont gardées sur l'appareil.";
+  renderSiPossible();
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { state.toast = null; renderSiPossible(); }, 3200);
+});
+// Filet de sécurité : l'événement « online » ne vient pas toujours (réseau
+// revenu sans changement d'interface, connexion instable qui se rétablit).
+setInterval(() => { if (state.online && state.envois.length) synchroniser(); }, 30000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) synchroniser(); });
 
 boot();

@@ -2885,6 +2885,12 @@ async function createSessionToken(userId, secret) {
   return `${payload}.${sig}`;
 }
 async function verifySessionToken(token, secret) {
+  return (await lireJetonSession(token, secret))?.userId ?? null;
+}
+// Le jeton porte son échéance ; sa date d'émission s'en déduit. Elle sert à
+// fermer d'un coup toutes les sessions d'un compte (mot de passe changé,
+// compte désactivé) : celles émises avant users.sessions_apres sont refusées.
+async function lireJetonSession(token, secret) {
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   const [userId, expiresAt, sig] = parts;
@@ -2892,7 +2898,7 @@ async function verifySessionToken(token, secret) {
   const expected = await hmac(secret, payload);
   if (expected !== sig) return null;
   if (Date.now() > Number(expiresAt)) return null;
-  return userId;
+  return { userId, emisLe: Number(expiresAt) - SESSION_TTL_MS };
 }
 const auth = new Hono();
 async function companyBrief(db, companyId) {
@@ -2909,10 +2915,17 @@ auth.post("/login", async (c) => {
   const email = body2.email?.trim().toLowerCase();
   const password = body2.password;
   if (!email || !password) return c.json({ error: "courriel et mot de passe requis" }, 400);
+  if (await tentativesRecentes(c.env.DB, `connexion:${email}`, 15) >= 8) {
+    return c.json({ error: "Trop de tentatives de connexion. Réessayez dans 15 minutes, ou utilisez « Mot de passe oublié »." }, 429);
+  }
   const user = await c.env.DB.prepare("SELECT * FROM users WHERE email = ?1").bind(email).first();
-  if (!user) return c.json({ error: "identifiants invalides" }, 401);
-  const ok = await verifyPassword(password, user.password_hash, user.password_salt);
-  if (!ok) return c.json({ error: "identifiants invalides" }, 401);
+  const ok = user ? await verifyPassword(password, user.password_hash, user.password_salt) : false;
+  if (!ok) {
+    await noterTentative(c.env.DB, `connexion:${email}`);
+    return c.json({ error: "identifiants invalides" }, 401);
+  }
+  if (user.actif === 0) return c.json({ error: "Ce compte a été désactivé par l'administrateur de votre firme." }, 403);
+  await c.env.DB.prepare("DELETE FROM tentatives_connexion WHERE cle = ?1").bind(`connexion:${email}`).run();
   const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
   return c.json({ token, user: await publicUser(c.env.DB, user) });
 });
@@ -2925,11 +2938,389 @@ async function getCurrentUser(c) {
   const authHeader = c.req.header("Authorization");
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
   if (!token) return null;
-  const userId = await verifySessionToken(token, c.env.SESSION_SECRET);
-  if (!userId) return null;
-  const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(userId).first();
-  return user ?? null;
+  const session = await lireJetonSession(token, c.env.SESSION_SECRET);
+  if (!session) return null;
+  const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(session.userId).first();
+  if (!user || user.actif === 0) return null;
+  if (user.sessions_apres && session.emisLe < Number(user.sessions_apres)) return null;
+  return user;
 }
+// ============================================================================
+// JOURNAL — historique des modifications d'un dossier et de ses composantes.
+// Chaque entrée garde l'auteur, le moment et, champ par champ, l'ancienne et
+// la nouvelle valeur. Les saisies d'une même personne sur une même fiche à
+// quelques minutes d'intervalle forment une seule entrée : le terrain
+// enregistre à chaque champ, le journal resterait sinon illisible.
+// ============================================================================
+const JOURNAL_REGROUPEMENT_MS = 10 * 60 * 1e3;
+const JOURNAL_VALEUR_MAX = 300;
+const LIBELLES_CHAMPS = {
+  name: "Nom", done: "Documentée", etat: "État", residual: "Vie résiduelle (%)", install_year: "Année d'installation",
+  qty: "Quantité", note: "Note", replacement_cost: "Coût de remplacement", useful_life_years: "Vie utile",
+  confirmed: "Confirmée au bureau", rating: "Cote", r_flag: "Remplacement (R)", observation: "Constats",
+  cause_possible: "Cause possible", delai_suggere: "Délai suggéré", consequences: "Conséquences",
+  uniformat_code: "Code Uniformat", position: "Position", emplacement: "Emplacement", variante: "Variante",
+  attributs: "Attributs", actif: "Dans la visite", etendue: "Étendue", etendue_qte: "Quantité touchée",
+  limite_observation: "Limite d'observation", limite_detail: "Détail de la limite", nature_risque: "Nature du risque",
+  source_annee: "Source de l'année", projet_ca: "Projet du CA", taches_entretien: "Tâches du carnet",
+  travaux_periode: "Travaux de la période", travaux_annee: "Année des travaux", cat: "Catégorie",
+  address: "Adresse", city: "Ville", units: "Unités", floors: "Étages", built_year: "Année de construction",
+  status: "Statut", current_fund_balance: "Solde du fonds", cotisation_annuelle: "Cotisation annuelle",
+  published_at: "Publication", batiment_info: "Fiche d'immeuble", assigne_a: "Responsable", echeance: "Échéance",
+  photos: "Photos", revision_de: "Révision de l'étude", revise_par: "Révisée par le dossier", composantes: "Composantes importées"
+};
+// Champs dont la valeur brute n'aide pas à la lecture : on note le changement seul.
+const CHAMPS_SANS_VALEUR = new Set(["taches_entretien", "attributs", "batiment_info"]);
+function valeurJournal(champ, v) {
+  if (v == null || v === "") return null;
+  if (CHAMPS_SANS_VALEUR.has(champ)) return null;
+  const t = String(v);
+  return t.length > JOURNAL_VALEUR_MAX ? `${t.slice(0, JOURNAL_VALEUR_MAX)}…` : t;
+}
+function differences(avant, apres, champs) {
+  const liste = [];
+  for (const champ of champs) {
+    const a = avant?.[champ] ?? null, b = apres?.[champ] ?? null;
+    if (String(a ?? "") === String(b ?? "")) continue;
+    liste.push({ champ, avant: valeurJournal(champ, a), apres: valeurJournal(champ, b) });
+  }
+  return liste;
+}
+// N'interrompt jamais la modification qu'il consigne.
+async function noterJournal(db, { dossierId, componentId = null, userId = null, action, champs = [] }) {
+  try {
+    if (["modification", "suivi"].includes(action) && !champs.length) return;
+    if (["modification", "photo"].includes(action)) {
+      const depuis = new Date(Date.now() - JOURNAL_REGROUPEMENT_MS).toISOString();
+      const dernier = await db.prepare(
+        `SELECT id, champs FROM journal WHERE dossier_id = ?1 AND COALESCE(component_id, '') = ?2 AND COALESCE(user_id, '') = ?3
+           AND action = ?4 AND moment >= ?5 ORDER BY moment DESC LIMIT 1`
+      ).bind(dossierId, componentId ?? "", userId ?? "", action, depuis).first();
+      if (dernier) {
+        const fusion = JSON.parse(dernier.champs || "[]");
+        for (const ch of champs) {
+          const deja = fusion.find((x) => x.champ === ch.champ);
+          if (!deja) fusion.push(ch);
+          else if (action === "photo") deja.apres = String(Number(deja.apres || 0) + Number(ch.apres || 0));
+          else deja.apres = ch.apres;
+        }
+        // Un champ revenu à sa valeur de départ n'a, au bout du compte, pas changé.
+        const utiles = action === "photo" ? fusion : fusion.filter((x) => String(x.avant ?? "") !== String(x.apres ?? "") || CHAMPS_SANS_VALEUR.has(x.champ));
+        if (!utiles.length) await db.prepare("DELETE FROM journal WHERE id = ?1").bind(dernier.id).run();
+        else await db.prepare("UPDATE journal SET champs = ?1, moment = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2")
+          .bind(JSON.stringify(utiles), dernier.id).run();
+        return;
+      }
+    }
+    await db.prepare("INSERT INTO journal (id, dossier_id, component_id, user_id, action, champs) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+      .bind(newId("jnl"), dossierId, componentId, userId, action, JSON.stringify(champs)).run();
+  } catch (e) {
+    console.error("journal non écrit", action, e?.message);
+  }
+}
+// ============================================================================
+// COMPTES AUTONOMES — invitations, mot de passe oublié, changement de mot de
+// passe. Les liens envoyés par courriel portent un jeton aléatoire dont seule
+// l'empreinte SHA-256 est gardée en base ; il sert une seule fois.
+// ============================================================================
+const DUREE_JETON = { invitation: 7 * 24 * 3600e3, reinitialisation: 3600e3 };
+const LONGUEUR_MIN_MOT_DE_PASSE = 10;
+async function empreinteJeton(jeton) {
+  const octets = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(jeton)));
+  return [...octets].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function creerJetonCompte(db, userId, type) {
+  const jeton = toBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+  // Un nouveau lien remplace les précédents du même type.
+  await db.prepare("DELETE FROM jetons_compte WHERE user_id = ?1 AND type = ?2").bind(userId, type).run();
+  await db.prepare("INSERT INTO jetons_compte (id, user_id, type, expire_le) VALUES (?1, ?2, ?3, ?4)")
+    .bind(await empreinteJeton(jeton), userId, type, Date.now() + DUREE_JETON[type]).run();
+  return jeton;
+}
+async function lireJetonCompte(db, jeton) {
+  if (!jeton || !/^[A-Za-z0-9_-]{30,60}$/.test(jeton)) return null;
+  const row = await db.prepare(
+    `SELECT j.*, u.email, u.name, u.company_id, u.actif, u.title, u.ordre_professionnel, u.no_membre
+       FROM jetons_compte j JOIN users u ON u.id = j.user_id WHERE j.id = ?1`
+  ).bind(await empreinteJeton(jeton)).first();
+  if (!row || row.utilise_le || Date.now() > Number(row.expire_le) || row.actif === 0) return null;
+  return row;
+}
+async function tentativesRecentes(db, cle, minutes) {
+  const row = await db.prepare("SELECT COUNT(*) AS n FROM tentatives_connexion WHERE cle = ?1 AND moment > ?2")
+    .bind(cle, Date.now() - minutes * 60e3).first();
+  return row?.n ?? 0;
+}
+async function noterTentative(db, cle) {
+  await db.prepare("INSERT INTO tentatives_connexion (cle, moment) VALUES (?1, ?2)").bind(cle, Date.now()).run();
+  // Ménage des vieilles entrées, au passage.
+  await db.prepare("DELETE FROM tentatives_connexion WHERE moment < ?1").bind(Date.now() - 24 * 3600e3).run();
+}
+function motDePasseRefuse(motDePasse) {
+  if (typeof motDePasse !== "string" || motDePasse.length < LONGUEUR_MIN_MOT_DE_PASSE) {
+    return `Le mot de passe doit compter au moins ${LONGUEUR_MIN_MOT_DE_PASSE} caractères.`;
+  }
+  if (motDePasse.length > 200) return "Mot de passe trop long.";
+  return null;
+}
+// Nouveau mot de passe : toutes les sessions ouvertes du compte se ferment.
+async function definirMotDePasse(db, userId, motDePasse) {
+  const { hash, salt } = await hashPassword(motDePasse);
+  await db.prepare(
+    "UPDATE users SET password_hash = ?1, password_salt = ?2, invitation_en_attente = 0, sessions_apres = ?3 WHERE id = ?4"
+  ).bind(hash, salt, Date.now(), userId).run();
+}
+// ---- Courriels ---------------------------------------------------------------
+function expediteur(env) {
+  return { email: env.COURRIEL_EXPEDITEUR || "no-reply@stratege.io", name: "Condo Stratégis" };
+}
+function courrielHtml({ titre, paragraphes, liste, bouton, pied }) {
+  const p = (t) => `<p style="margin:0 0 14px;font-size:15px;line-height:1.55;color:#2E2E2E">${t}</p>`;
+  return `<!DOCTYPE html><html lang="fr"><body style="margin:0;background:#F7F7F7;font-family:Helvetica,Arial,sans-serif">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F7F7F7;padding:32px 12px"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#FFFFFF;border-radius:14px;padding:32px 28px">
+<tr><td>
+<div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#FF5E39;font-weight:700;margin-bottom:10px">Condo Stratégis</div>
+<h1 style="margin:0 0 18px;font-size:22px;line-height:1.25;color:#0A0A0A">${echapperXml(titre)}</h1>
+${paragraphes.map(p).join("")}
+${liste && liste.length ? `<ul style="margin:0 0 14px;padding-left:20px;font-size:14px;line-height:1.6;color:#2E2E2E">${liste.map((l) => `<li style="margin-bottom:6px">${l}</li>`).join("")}</ul>` : ""}
+${bouton ? `<p style="margin:24px 0"><a href="${echapperXml(bouton.url)}" style="display:inline-block;background:#FF5E39;color:#FFFFFF;text-decoration:none;font-weight:700;font-size:15px;padding:13px 24px;border-radius:999px">${echapperXml(bouton.texte)}</a></p>
+<p style="margin:0 0 14px;font-size:12px;line-height:1.5;color:#6B6B6B">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br><span style="word-break:break-all">${echapperXml(bouton.url)}</span></p>` : ""}
+${pied ? `<p style="margin:22px 0 0;font-size:12px;line-height:1.5;color:#969696">${pied}</p>` : ""}
+</td></tr></table></td></tr></table></body></html>`;
+}
+async function envoyerCourriel(env, { to, subject, titre, paragraphes, liste, bouton, pied, replyTo }) {
+  if (!env.EMAIL) throw new Error("l'envoi de courriels n'est pas configuré sur ce serveur");
+  const texte = [titre, "", ...paragraphes.map((t) => t.replace(/<[^>]+>/g, "")), ...(liste ?? []).map((l) => `- ${l}`), ...bouton ? ["", `${bouton.texte} : ${bouton.url}`] : [], ...pied ? ["", pied.replace(/<[^>]+>/g, "")] : []].join("\n");
+  await env.EMAIL.send({
+    to,
+    from: expediteur(env),
+    subject,
+    html: courrielHtml({ titre, paragraphes: paragraphes.map(echapperXml), liste: (liste ?? []).map(echapperXml), bouton, pied: pied ? echapperXml(pied) : "" }),
+    text: texte,
+    ...replyTo ? { replyTo } : {}
+  });
+}
+// Les liens des courriels pointent toujours en https, sauf en développement local.
+function origineDe(c) {
+  const url = new URL(c.req.url);
+  if (url.hostname === "localhost" || url.hostname === "127.0.0.1") return url.origin;
+  return `https://${url.host}`;
+}
+async function envoyerInvitation(c, user, jeton, invitePar) {
+  if (user.role === "portail") return envoyerInvitationPortail(c.env, origineDe(c), user, jeton, null, invitePar);
+  const firme = await companyBrief(c.env.DB, user.company_id);
+  const nomFirme = firme?.name ?? "votre firme";
+  await envoyerCourriel(c.env, {
+    to: user.email,
+    subject: `${nomFirme} vous invite sur Condo Stratégis`,
+    titre: `Bienvenue, ${user.name}`,
+    paragraphes: [
+      `${invitePar?.name ?? "Votre administrateur"} vous a créé un compte sur la plateforme Condo Stratégis pour ${nomFirme} : visites terrain, études de fonds de prévoyance et carnets d'entretien.`,
+      "Choisissez votre mot de passe pour activer votre compte. Le lien est valable 7 jours."
+    ],
+    bouton: { texte: "Activer mon compte", url: `${origineDe(c)}/compte/?jeton=${jeton}` },
+    pied: "Vous n'attendiez pas cette invitation ? Ignorez ce courriel : aucun compte ne sera activé.",
+    replyTo: invitePar?.email ? { email: invitePar.email, name: invitePar.name ?? undefined } : void 0
+  });
+}
+async function envoyerReinitialisation(c, user, jeton) {
+  await envoyerCourriel(c.env, {
+    to: user.email,
+    subject: "Réinitialiser votre mot de passe — Condo Stratégis",
+    titre: "Nouveau mot de passe",
+    paragraphes: [
+      `Bonjour ${user.name}, une demande de réinitialisation du mot de passe a été faite pour votre compte.`,
+      "Le lien ci-dessous est valable une heure et ne sert qu'une fois."
+    ],
+    bouton: { texte: "Choisir un nouveau mot de passe", url: `${origineDe(c)}/compte/?jeton=${jeton}` },
+    pied: "Vous n'avez rien demandé ? Ignorez ce courriel : votre mot de passe actuel reste valide."
+  });
+}
+// ---- Routes publiques --------------------------------------------------------
+// La réponse est la même que le compte existe ou non : on ne révèle pas qui
+// a un compte.
+auth.post("/oubli", async (c) => {
+  const body2 = await c.req.json().catch(() => ({}));
+  const email = String(body2.email ?? "").trim().toLowerCase();
+  const reponse = { ok: true, message: "Si un compte existe pour cette adresse, un courriel vient d'être envoyé." };
+  if (!email || !email.includes("@")) return c.json({ error: "adresse courriel requise" }, 400);
+  if (await tentativesRecentes(c.env.DB, `oubli:${email}`, 60) >= 3) return c.json(reponse);
+  await noterTentative(c.env.DB, `oubli:${email}`);
+  const user = await c.env.DB.prepare("SELECT * FROM users WHERE email = ?1").bind(email).first();
+  if (!user || user.actif === 0) return c.json(reponse);
+  try {
+    if (user.invitation_en_attente) await envoyerInvitation(c, user, await creerJetonCompte(c.env.DB, user.id, "invitation"), null);
+    else await envoyerReinitialisation(c, user, await creerJetonCompte(c.env.DB, user.id, "reinitialisation"));
+  } catch (e) {
+    console.error("courriel de réinitialisation non envoyé", e?.code, e?.message);
+  }
+  return c.json(reponse);
+});
+auth.get("/jeton/:jeton", async (c) => {
+  const j = await lireJetonCompte(c.env.DB, c.req.param("jeton"));
+  if (!j) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Demandez-en un nouveau." }, 404);
+  const firme = await companyBrief(c.env.DB, j.company_id);
+  const role = (await c.env.DB.prepare("SELECT role FROM users WHERE id = ?1").bind(j.user_id).first())?.role;
+  return c.json({
+    type: j.type,
+    portail: role === "portail",
+    email: j.email,
+    name: j.name,
+    firme: firme?.name ?? null,
+    signature: { title: j.title, ordre_professionnel: j.ordre_professionnel, no_membre: j.no_membre },
+    longueur_min: LONGUEUR_MIN_MOT_DE_PASSE
+  });
+});
+auth.post("/jeton/:jeton", async (c) => {
+  const j = await lireJetonCompte(c.env.DB, c.req.param("jeton"));
+  if (!j) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Demandez-en un nouveau." }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const refus = motDePasseRefuse(body2.password);
+  if (refus) return c.json({ error: refus }, 400);
+  await c.env.DB.prepare("UPDATE jetons_compte SET utilise_le = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1").bind(j.id).run();
+  await definirMotDePasse(c.env.DB, j.user_id, body2.password);
+  // À l'activation, l'ingénieur complète son bloc de signature.
+  if (j.type === "invitation") {
+    const champ = (v, max) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null);
+    await c.env.DB.prepare("UPDATE users SET title = COALESCE(?1, title), ordre_professionnel = COALESCE(?2, ordre_professionnel), no_membre = COALESCE(?3, no_membre) WHERE id = ?4")
+      .bind(champ(body2.title, 60), champ(body2.ordre_professionnel, 10)?.toUpperCase() ?? null, champ(body2.no_membre, 30), j.user_id).run();
+  }
+  const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(j.user_id).first();
+  const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
+  return c.json({ token, user: await publicUser(c.env.DB, user) });
+});
+// ---- Inscription d'une firme ---------------------------------------------------
+// Une firme ouvre son compte seule. Rien n'est créé avant que l'adresse soit
+// confirmée par le lien reçu : la firme et son premier administrateur naissent
+// à ce moment. Le super admin est averti de chaque nouvelle firme.
+// INSCRIPTION_OUVERTE = "non" ferme la porte.
+const DUREE_INSCRIPTION = 48 * 3600e3;
+const inscriptionFermee = (env) => String(env.INSCRIPTION_OUVERTE ?? "oui").toLowerCase() === "non";
+async function lireInscription(db, jeton) {
+  if (!jeton || !/^[A-Za-z0-9_-]{30,60}$/.test(jeton)) return null;
+  const row = await db.prepare("SELECT * FROM inscriptions WHERE id = ?1").bind(await empreinteJeton(jeton)).first();
+  if (!row || row.utilise_le || Date.now() > Number(row.expire_le)) return null;
+  return row;
+}
+auth.get("/inscription", (c) => c.json({ ouverte: !inscriptionFermee(c.env), longueur_min: LONGUEUR_MIN_MOT_DE_PASSE }));
+auth.post("/inscription", async (c) => {
+  if (inscriptionFermee(c.env)) return c.json({ error: "Les inscriptions sont fermées pour l'instant. Écrivez-nous pour ouvrir un compte." }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const firme = String(body2.firme ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+  const nom = String(body2.nom ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+  const email = String(body2.email ?? "").trim().toLowerCase().slice(0, 160);
+  if (!firme || !nom) return c.json({ error: "Le nom de la firme et votre nom sont requis." }, 400);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return c.json({ error: "Adresse courriel invalide." }, 400);
+  const reponse = { ok: true, message: `Un courriel de confirmation vient d'être envoyé à ${email}. Le lien est valable 48 heures.` };
+  // Champ piège, invisible pour une personne : un robot le remplit.
+  if (body2.site) return c.json(reponse);
+  const ip = c.req.header("cf-connecting-ip") ?? "inconnue";
+  if (await tentativesRecentes(c.env.DB, `inscription:${email}`, 60) >= 3 || await tentativesRecentes(c.env.DB, `inscription-ip:${ip}`, 24 * 60) >= 10) {
+    return c.json({ error: "Trop de demandes d'inscription. Réessayez plus tard." }, 429);
+  }
+  await noterTentative(c.env.DB, `inscription:${email}`);
+  await noterTentative(c.env.DB, `inscription-ip:${ip}`);
+  const origine = origineDe(c);
+  try {
+    // Adresse déjà inscrite : même réponse, et un courriel qui le lui dit.
+    const existant = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(email).first();
+    if (existant) {
+      await envoyerCourriel(c.env, {
+        to: email,
+        subject: "Vous avez déjà un compte sur Condo Stratégis",
+        titre: "Vous avez déjà un compte",
+        paragraphes: [`Une inscription a été demandée pour ${email}, mais cette adresse a déjà un compte. Connectez-vous, ou choisissez un nouveau mot de passe si vous l'avez oublié.`],
+        bouton: { texte: "Mot de passe oublié", url: `${origine}/compte/?courriel=${encodeURIComponent(email)}` },
+        pied: "Si vous n'avez rien demandé, ignorez ce courriel."
+      });
+      return c.json(reponse);
+    }
+    const jeton = toBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+    await c.env.DB.prepare("INSERT INTO inscriptions (id, firme, nom, email, expire_le) VALUES (?1, ?2, ?3, ?4, ?5)")
+      .bind(await empreinteJeton(jeton), firme, nom, email, Date.now() + DUREE_INSCRIPTION).run();
+    await envoyerCourriel(c.env, {
+      to: email,
+      subject: `Confirmez l'inscription de ${firme}`,
+      titre: `Bienvenue, ${nom}`,
+      paragraphes: [
+        `Confirmez votre adresse pour ouvrir le compte de ${firme} sur Condo Stratégis. Vous en serez l'administrateur : vous inviterez ensuite votre équipe, importerez votre bibliothèque de composantes et réglerez l'identité de vos rapports.`
+      ],
+      bouton: { texte: "Confirmer et choisir mon mot de passe", url: `${origine}/compte/?inscription=${jeton}` },
+      pied: "Ce lien est valable 48 heures. Si vous n'avez rien demandé, ignorez ce courriel : aucun compte ne sera créé."
+    });
+  } catch (e) {
+    console.error("inscription : courriel non envoyé", e?.code, e?.message);
+    return c.json({ error: "Le courriel de confirmation n'a pas pu être envoyé. Réessayez dans quelques minutes." }, 502);
+  }
+  return c.json(reponse);
+});
+auth.get("/inscription/:jeton", async (c) => {
+  const i = await lireInscription(c.env.DB, c.req.param("jeton"));
+  if (!i) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Recommencez l'inscription." }, 404);
+  return c.json({ firme: i.firme, nom: i.nom, email: i.email, longueur_min: LONGUEUR_MIN_MOT_DE_PASSE });
+});
+auth.post("/inscription/:jeton", async (c) => {
+  const i = await lireInscription(c.env.DB, c.req.param("jeton"));
+  if (!i) return c.json({ error: "Ce lien n'est plus valide : il a expiré ou a déjà servi. Recommencez l'inscription." }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const refus = motDePasseRefuse(body2.password);
+  if (refus) return c.json({ error: refus }, 400);
+  if (await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(i.email).first()) {
+    return c.json({ error: "Cette adresse a déjà un compte. Connectez-vous." }, 409);
+  }
+  // Marqué utilisé d'abord : deux clics simultanés ne créent qu'une firme.
+  const pris = await c.env.DB.prepare("UPDATE inscriptions SET utilise_le = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1 AND utilise_le IS NULL").bind(i.id).run();
+  if (!pris.meta?.changes) return c.json({ error: "Ce lien a déjà servi." }, 409);
+  const companyId = newId("com");
+  let slug = slugify(i.firme) || companyId;
+  if (await c.env.DB.prepare("SELECT id FROM companies WHERE slug = ?1").bind(slug).first()) slug = `${slug}-${companyId.slice(-5)}`;
+  const { hash, salt } = await hashPassword(body2.password);
+  const champ = (v, max) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null);
+  const userId = newId("usr");
+  await c.env.DB.batch([
+    c.env.DB.prepare("INSERT INTO companies (id, name, slug) VALUES (?1, ?2, ?3)").bind(companyId, i.firme, slug),
+    c.env.DB.prepare(
+      `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role, title, ordre_professionnel, no_membre)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'admin', ?7, ?8, ?9)`
+    ).bind(userId, i.email, i.nom, hash, salt, companyId, champ(body2.title, 60), champ(body2.ordre_professionnel, 10)?.toUpperCase() ?? null, champ(body2.no_membre, 30))
+  ]);
+  try {
+    const admins = (await c.env.DB.prepare("SELECT email FROM users WHERE role = 'super_admin' AND actif = 1").all()).results;
+    for (const a of admins) {
+      await envoyerCourriel(c.env, {
+        to: a.email,
+        subject: `Nouvelle firme inscrite : ${i.firme}`,
+        titre: "Nouvelle firme inscrite",
+        paragraphes: [`${i.nom} (${i.email}) vient d'ouvrir le compte de ${i.firme}.`],
+        bouton: { texte: "Ouvrir l'administration", url: `${origineDe(c)}/admin/` }
+      });
+    }
+  } catch (e) {
+    console.error("inscription : avis au super admin non envoyé", e?.message);
+  }
+  const user = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(userId).first();
+  return c.json({ token: await createSessionToken(userId, c.env.SESSION_SECRET), user: await publicUser(c.env.DB, user) }, 201);
+});
+// Changer son mot de passe (connecté) : les autres sessions se ferment, la
+// session courante reçoit un nouveau jeton.
+auth.post("/mot-de-passe", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "non authentifié" }, 401);
+  const body2 = await c.req.json().catch(() => ({}));
+  if (await tentativesRecentes(c.env.DB, `changement:${user.id}`, 15) >= 5) {
+    return c.json({ error: "Trop de tentatives. Réessayez dans 15 minutes." }, 429);
+  }
+  if (!await verifyPassword(String(body2.actuel ?? ""), user.password_hash, user.password_salt)) {
+    await noterTentative(c.env.DB, `changement:${user.id}`);
+    return c.json({ error: "Le mot de passe actuel est incorrect." }, 400);
+  }
+  const refus = motDePasseRefuse(body2.nouveau);
+  if (refus) return c.json({ error: refus }, 400);
+  await definirMotDePasse(c.env.DB, user.id, body2.nouveau);
+  const token = await createSessionToken(user.id, c.env.SESSION_SECRET);
+  return c.json({ token, user: await publicUser(c.env.DB, user) });
+});
 function requireSuperAdmin(c, user) {
   if (!user || user.role !== "super_admin") {
     return c.json({ error: "accès réservé aux administrateurs" }, 403);
@@ -2963,7 +3354,8 @@ const CATEGORIES = {
   equipements: { ordre: 7, label: "Appareils, installations et équipements spéciaux" },
   cvac: { ordre: 8, label: "Systèmes de chauffage et ventilation" },
   electrique: { ordre: 9, label: "Installations électriques" },
-  plomberie: { ordre: 10, label: "Installations de plomberie, d'eau et d'égout" }
+  plomberie: { ordre: 10, label: "Installations de plomberie, d'eau et d'égout" },
+  piscines: { ordre: 11, label: "Piscines et centre aquatique" }
 };
 const RATING_LABELS = {
   1: "Bon état",
@@ -2983,40 +3375,102 @@ const DEFAULT_USEFUL_LIFE_YEARS = {
   equipements: 15,
   cvac: 25,
   electrique: 30,
-  plomberie: 20
+  plomberie: 20,
+  piscines: 20
 };
 const ALLOCATION_USEFUL_LIFE = 10;
 const MODEL = "claude-sonnet-5";
+function attendre(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Lit le flux SSE de l'API Messages et reconstitue le texte complet. Passer
+// par le streaming (plutôt qu'une réponse tamponnée) évite qu'un appel à
+// forte sortie — comme la répartition d'un gros gabarit importé, à
+// max_tokens 16000 — dépasse la fenêtre de timeout du gateway avant le
+// premier octet et échoue en 524.
+async function lireFluxClaude(corpsReponse) {
+  const lecteur = corpsReponse.pipeThrough(new TextDecoderStream()).getReader();
+  let tampon = "";
+  let texte = "";
+  let raisonArret = null;
+  let tokensSortis = null;
+  const typesBloc = [];
+  while (true) {
+    const { done, value } = await lecteur.read();
+    if (done) break;
+    tampon += value;
+    let fin;
+    while ((fin = tampon.indexOf("\n\n")) !== -1) {
+      const evenement = tampon.slice(0, fin);
+      tampon = tampon.slice(fin + 2);
+      const ligneDonnees = evenement.split("\n").find((l) => l.startsWith("data:"));
+      if (!ligneDonnees) continue;
+      const donnees = JSON.parse(ligneDonnees.slice(5).trim());
+      if (donnees.type === "content_block_start" && donnees.content_block?.type) {
+        typesBloc.push(donnees.content_block.type);
+      } else if (donnees.type === "content_block_delta" && donnees.delta?.type === "text_delta") {
+        texte += donnees.delta.text;
+      } else if (donnees.type === "message_delta") {
+        raisonArret = donnees.delta?.stop_reason ?? raisonArret;
+        tokensSortis = donnees.usage?.output_tokens ?? tokensSortis;
+      } else if (donnees.type === "error") {
+        throw new Error(`Anthropic API error en cours de flux : ${donnees.error?.message ?? JSON.stringify(donnees.error)}`);
+      }
+    }
+  }
+  return { texte, raisonArret, tokensSortis, typesBloc };
+}
+
 async function callClaude(apiKey, opts) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: opts.maxTokens,
-      system: opts.system,
-      messages: [{ role: "user", content: opts.content }]
-    })
+  const corps = JSON.stringify({
+    model: MODEL,
+    max_tokens: opts.maxTokens,
+    system: opts.system,
+    stream: true,
+    // Sonnet 5 pense par défaut (adaptatif) même sans le demander. Sur un gros
+    // classement déterministe (répartir un document dans des sections fixes),
+    // cette réflexion peut engloutir tout le budget de sortie avant le premier
+    // mot — d'où un stop_reason "max_tokens" avec pour seul bloc "thinking" et
+    // zéro texte. Les appelants qui n'ont pas besoin de raisonnement la
+    // désactivent via opts.thinking.
+    ...(opts.thinking ? { thinking: opts.thinking } : {}),
+    messages: [{ role: "user", content: opts.content }]
   });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`Anthropic API error (${res.status}): ${detail}`);
+  let derniereErreur;
+  // Jusqu'à 3 tentatives : un 524/529/502/503 est un incident d'infrastructure
+  // passager — plus probable sur un gros document — pas une erreur de
+  // contenu. Une deuxième tentative suffit presque toujours.
+  for (let essai = 0; essai < 3; essai++) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: corps
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      derniereErreur = new Error(`Anthropic API error (${res.status}): ${detail}`);
+      if (res.status >= 500 && essai < 2) {
+        await attendre(500 * 2 ** essai);
+        continue;
+      }
+      throw derniereErreur;
+    }
+    const { texte, raisonArret, tokensSortis, typesBloc } = await lireFluxClaude(res.body);
+    if (!texte) {
+      // Une réponse sans bloc de texte renvoyait une chaîne vide, que chaque
+      // appelant interprétait comme « le modèle n'a rien d'utile à dire » et
+      // traitait par un repli silencieux. Le plus souvent, max_tokens a été
+      // épuisé avant le premier mot : il faut le dire, pas le taire.
+      throw new Error(`réponse sans texte (stop_reason: ${raisonArret}, blocs: ${typesBloc.join(", ") || "aucun"}, jetons sortis: ${tokensSortis})`);
+    }
+    return texte;
   }
-  const data = await res.json();
-  const texte = data.content?.find((c) => c.type === "text")?.text ?? "";
-  if (!texte) {
-    // Une réponse 200 sans bloc de texte renvoyait une chaîne vide, que chaque
-    // appelant interprétait comme « le modèle n'a rien d'utile à dire » et
-    // traitait par un repli silencieux. Le plus souvent, max_tokens a été
-    // épuisé avant le premier mot : il faut le dire, pas le taire.
-    const blocs = (data.content ?? []).map((c) => c.type).join(", ") || "aucun";
-    throw new Error(`réponse sans texte (stop_reason: ${data.stop_reason}, blocs: ${blocs}, jetons sortis: ${data.usage?.output_tokens})`);
-  }
-  return texte;
+  throw derniereErreur;
 }
 // Récupère les objets complets d'un tableau JSON tronqué. Une réponse coupée en
 // plein milieu d'un objet faisait perdre la totalité de l'inventaire ; garder
@@ -3069,42 +3523,1608 @@ function extractJson(text) {
   }
   throw new Error("réponse IA sans JSON exploitable");
 }
-const DEFAULT_CHECKLIST = [
-  { cat: "terrain", name: "Aménagement paysager", code: "G40.10-50", vu: 25, qty: "—" },
-  { cat: "terrain", name: "Stationnement et voies de circulation – Pavage", code: "G10.10-30", vu: 25, qty: "—" },
-  { cat: "terrain", name: "Bordures de béton", code: "G10.10-30", vu: 35, qty: "—" },
-  { cat: "terrain", name: "Allées piétonnières", code: "G20.10-30", vu: 20, qty: "—" },
-  { cat: "terrain", name: "Garde-corps et mains courantes", code: "G20.30", vu: 40, qty: "—" },
-  { cat: "structure", name: "Murs de fondation", vu: 10, qty: "—" },
-  { cat: "structure", name: "Structure", vu: 10, qty: "—" },
-  { cat: "structure", name: "Stationnement intérieur – Dalle sur sol et dalle structurale", vu: 20, qty: "—" },
-  { cat: "enveloppe", name: "Surface de toit principal, solins", code: "B30.10-40", vu: 35, qty: "—" },
-  { cat: "enveloppe", name: "Gouttières", vu: 10, qty: "—" },
-  { cat: "enveloppe", name: "Parement extérieur – Maçonnerie", code: "B20.10", vu: 10, qty: "—" },
-  { cat: "enveloppe", name: "Parement extérieur – Scellants de rencontre", code: "B20.10", vu: 10, qty: "—" },
-  { cat: "ouvertures", name: "Portes d'entrée et imposte", code: "B40.40", vu: 45, qty: "—" },
-  { cat: "ouvertures", name: "Portes de services – Acier", code: "B40.50", vu: 35, qty: "—" },
-  { cat: "ouvertures", name: "Fenêtres", code: "B40.10", vu: 40, qty: "—" },
-  { cat: "ouvertures", name: "Scellants d'ouverture", code: "B40.10", vu: 7, qty: "—" },
-  { cat: "ouvertures", name: "Portes patios – Portes-fenêtres", code: "B40.20", vu: 40, qty: "—" },
-  { cat: "balcons", name: "Balcons – Structure", code: "B10.10-30", vu: 50, qty: "—" },
-  { cat: "balcons", name: "Garde-corps et escaliers en acier", code: "B10.80", vu: 40, qty: "—" },
-  { cat: "interieur", name: "Revêtement de placoplâtre – Peinture", code: "C10.10", vu: 15, qty: "—" },
-  { cat: "interieur", name: "Revêtement de sol – Corridors communs", code: "C30.30", vu: 20, qty: "—" },
-  { cat: "interieur", name: "Portes des unités", code: "C20.20", vu: 50, qty: "—" },
-  { cat: "equipements", name: "Système d'incendie – Éclairage d'urgence et panneau de sortie", code: "D50.40-50", vu: 10, qty: "—" },
-  { cat: "equipements", name: "Système d'incendie – Panneau d'alarme centrale, stations manuelles et avertisseurs", code: "D50.31", vu: 10, qty: "—" },
-  { cat: "equipements", name: "Détecteurs de fumée/chaleur et extincteurs portatifs", code: "D50.32", vu: 10, qty: "—" },
-  { cat: "equipements", name: "Boîtes aux lettres", vu: 20, qty: "—" },
-  { cat: "cvac", name: "Chauffage, ventilation et climatisation (CVAC) – Communs", code: "D30.45", vu: 35, qty: "—" },
-  { cat: "cvac", name: "Ventilation des salles de services", code: "D30.44", vu: 20, qty: "—" },
-  { cat: "electrique", name: "Alimentation électrique principale", code: "D50.10", vu: 10, qty: "—" },
-  { cat: "electrique", name: "Appareils d'éclairage intérieurs", code: "D50.23", vu: 35, qty: "—" },
-  { cat: "electrique", name: "Appareils d'éclairage extérieurs", code: "D50.22", vu: 25, qty: "—" },
-  { cat: "plomberie", name: "Système d'alimentation en eau potable", code: "D20.20", vu: 10, qty: "—" },
-  { cat: "plomberie", name: "Système d'évacuation sanitaire et pluvial", code: "D20.30-41", vu: 10, qty: "—" },
-  { cat: "plomberie", name: "Réservoirs d'eau chaude – Communs immeuble", code: "D20.27", vu: 25, qty: "—" }
+// Liste de départ de toute nouvelle visite : l'onglet SOMM30 du gabarit de
+// calculs Condo Stratégis (« 4.11 CALCULS - 26-001 PGA (2026) », avril 2026),
+// noms corrigés, complété des éléments que le gabarit de rapport (« 2.12.2
+// RAPPORT - 26-000 PGA ») traite sans que le gabarit de calculs les porte
+// (drain français, pierre, fibrociment, rangements grillagés…) et de ceux qui
+// manquaient aux deux (chaudière, bornes de recharge, inspections annuelles,
+// honoraires de révision de la Loi 16…).
+//   code   — code Uniformat II maison, repris du gabarit de rapport quand il y
+//            figure, sinon déduit de la même nomenclature.
+//   type   — remplacement ou allocation, explicite plutôt que deviné du nom.
+//   unite  — unité de quantité pour l'estimation des coûts.
+//   regle  — condition vérifiable qui active ou désactive la composante sans
+//            passer par l'IA (voir REGLES_GABARIT).
+const GABARIT_STRATEGIS = [
+  { cat: "terrain", name: "Aménagement paysager", vu: 25, code: "G40.10-50", type: "remplacement", unite: "global" },
+  { cat: "terrain", name: "Stationnement et voies de circulation – Pavage", vu: 25, code: "G10.10-30", type: "remplacement", unite: "m²" },
+  { cat: "terrain", name: "Voies de circulation – Débarcadère et accès", vu: 25, code: "G10.10-30", type: "remplacement", unite: "m²" },
+  { cat: "terrain", name: "Bordures de béton", vu: 35, code: "G10.10-30", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Lignage du stationnement extérieur – Allocation", vu: 5, code: "G10.10-30", type: "allocation", unite: "global" },
+  { cat: "terrain", name: "Allées piétonnières – Béton", vu: 35, code: "G20.10-30", type: "remplacement", unite: "m²" },
+  { cat: "terrain", name: "Escaliers et perrons extérieurs – Béton", vu: 35, code: "G20.10-30", type: "remplacement", unite: "u" },
+  { cat: "terrain", name: "Murets de soutènement – Modules de béton", vu: 40, code: "G30.20", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Murets de soutènement – Bois traité", vu: 25, code: "G30.20", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Garde-corps", vu: 40, code: "G20.30", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Garde-corps – Peinture – Allocation", vu: 10, code: "G20.30", type: "allocation", unite: "global" },
+  { cat: "terrain", name: "Terrasse sur sol – Pavé de béton", vu: 25, code: "B10.50", type: "remplacement", unite: "m²" },
+  { cat: "terrain", name: "Clôture – Acier grillagé", vu: 30, code: "G30.10", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Clôture – Bois", vu: 15, code: "G30.10", type: "remplacement", unite: "ml" },
+  { cat: "terrain", name: "Structures de bois traité", vu: 25, code: "G30.10", type: "remplacement", unite: "global" },
+  { cat: "terrain", name: "Structure en acier galvanisé – Accès et rampes", vu: 40, code: "G30.10", type: "remplacement", unite: "global" },
+  { cat: "terrain", name: "Puisards et regards pluviaux – Allocation", vu: 10, code: "G30.30", type: "allocation", unite: "u" },
+  { cat: "structure", name: "Murs de fondation – Allocation", vu: 10, code: "A10.10", type: "allocation", unite: "global" },
+  { cat: "structure", name: "Fondation – Drain français – Allocation", vu: 30, code: "A10.10", type: "allocation", unite: "ml" },
+  { cat: "structure", name: "Structure – Allocation", vu: 10, code: "B10.10", type: "allocation", unite: "global" },
+  { cat: "structure", name: "Stationnement intérieur – Dalle sur sol et dalle structurale – Allocation", vu: 20, code: "A40.10", type: "allocation", unite: "m²", regle: "stationnement_int" },
+  { cat: "structure", name: "Stationnement intérieur – Membrane de surface", vu: 35, code: "A40.10", type: "remplacement", unite: "m²", regle: "stationnement_int" },
+  { cat: "structure", name: "Stationnement intérieur – Membrane de toit-terrasse", vu: 40, code: "A30.10", type: "remplacement", unite: "m²", regle: "stationnement_int" },
+  { cat: "structure", name: "Inspection des stationnements étagés – Loi 122", vu: 5, code: "A30.10", type: "allocation", unite: "global", regle: "stationnement_int" },
+  { cat: "enveloppe", name: "Surface de toit plat – Membrane", vu: 35, code: "B30.10-40", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Surface de toit en pente – Bardeaux de gravier fin", vu: 25, code: "B30.10-40", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Solins, parapets et couronnements – Allocation", vu: 10, code: "B30.10-40", type: "allocation", unite: "ml" },
+  { cat: "enveloppe", name: "Gouttières – Allocation", vu: 10, code: "B30.10-40", type: "allocation", unite: "ml" },
+  { cat: "enveloppe", name: "Soffites et fascias – Aluminium", vu: 35, code: "B20.40", type: "remplacement", unite: "ml" },
+  { cat: "enveloppe", name: "Puits de lumière", vu: 45, code: "B40.80", type: "remplacement", unite: "u" },
+  { cat: "enveloppe", name: "Toitures des saillies – Sous-terrasses", vu: 30, code: "B30.10", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Marquise – Panneaux de verre trempé", vu: 35, code: "B30.20", type: "remplacement", unite: "u" },
+  { cat: "enveloppe", name: "Marquise – Structure d'acier", vu: 50, code: "B30.20", type: "remplacement", unite: "u" },
+  { cat: "enveloppe", name: "Structure de service en bois traité – Trottoirs et accès de toiture", vu: 30, code: "B10.70", type: "remplacement", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Panneaux de béton préfabriqués", vu: 75, code: "B20.50", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Parement – Maçonnerie – Allocation", vu: 10, code: "B20.10", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Pierre – Allocation", vu: 10, code: "B20.10", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Linteaux – Allocation", vu: 10, code: "B20.10", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Scellants de rencontre", vu: 10, code: "B20.10", type: "remplacement", unite: "ml" },
+  { cat: "enveloppe", name: "Inspection des façades (5 étages et plus) – Loi 122", vu: 5, code: "B20.10", type: "allocation", unite: "global", regle: "etages5" },
+  { cat: "enveloppe", name: "Parement – Métallique – Allocation", vu: 20, code: "B20.40", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Vinyle", vu: 35, code: "B20.40", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Parement – Fibre de bois dur", vu: 30, code: "B20.40", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Parement – Fibrociment", vu: 50, code: "B20.30", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Parement – Panneaux composites", vu: 30, code: "B20.30", type: "remplacement", unite: "m²" },
+  { cat: "enveloppe", name: "Parement – Enduit acrylique – Allocation", vu: 20, code: "B20.30", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Stuc – Allocation", vu: 20, code: "B20.30", type: "allocation", unite: "global" },
+  { cat: "enveloppe", name: "Parement – Agrégats – Allocation", vu: 20, code: "B20.30", type: "allocation", unite: "global" },
+  { cat: "ouvertures", name: "Portes d'entrée", vu: 45, code: "B40.40", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Portes d'entrée – Allocation", vu: 10, code: "B40.40", type: "allocation", unite: "global" },
+  { cat: "ouvertures", name: "Porte et vitrage du vestibule intérieur", vu: 45, code: "C10.30", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Porte et vitrage du vestibule intérieur – Allocation", vu: 10, code: "C10.30", type: "allocation", unite: "global" },
+  { cat: "ouvertures", name: "Blocs de verre", vu: 40, code: "C10.30", type: "remplacement", unite: "m²" },
+  { cat: "ouvertures", name: "Portes de service – Acier", vu: 35, code: "B40.50", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Portes de service – Allocation", vu: 10, code: "B40.50", type: "allocation", unite: "global" },
+  { cat: "ouvertures", name: "Portes-patio et portes de balcon", vu: 40, code: "B40.20", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Porte simple – Balcon", vu: 40, code: "B40.50", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Fenêtres – Vinyle", vu: 40, code: "B40.10", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Fenêtres – Bois", vu: 45, code: "B40.10", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Fenêtres et portes-fenêtres – Aluminium", vu: 45, code: "B40.10", type: "remplacement", unite: "u" },
+  { cat: "ouvertures", name: "Fenêtres – Allocation", vu: 10, code: "B40.10", type: "allocation", unite: "global" },
+  { cat: "ouvertures", name: "Scellants d'ouverture – Allocation", vu: 7, code: "B40.10", type: "allocation", unite: "ml" },
+  { cat: "ouvertures", name: "Porte de garage", vu: 30, code: "B40.60", type: "remplacement", unite: "u", regle: "stationnement_int" },
+  { cat: "ouvertures", name: "Porte de garage – Moteur – Allocation", vu: 10, code: "B40.60", type: "allocation", unite: "u", regle: "stationnement_int" },
+  { cat: "ouvertures", name: "Mur-rideau", vu: 75, code: "B20.60", type: "remplacement", unite: "m²" },
+  { cat: "ouvertures", name: "Mur-rideau – Allocation", vu: 20, code: "B20.60", type: "allocation", unite: "global" },
+  { cat: "balcons", name: "Balcons – Dalles de béton", vu: 50, code: "B10.10-30", type: "remplacement", unite: "u" },
+  { cat: "balcons", name: "Balcons – Étanchéité des dalles de béton – Allocation", vu: 15, code: "B10.10-30", type: "allocation", unite: "m²" },
+  { cat: "balcons", name: "Balcons – Acier – Membrures et escaliers", vu: 50, code: "B10.10-30", type: "remplacement", unite: "u" },
+  { cat: "balcons", name: "Balcons – Acier – Membrures et escaliers – Allocation", vu: 10, code: "B10.10-30", type: "allocation", unite: "global" },
+  { cat: "balcons", name: "Balcons – Pontage en fibre de verre", vu: 25, code: "B10.70", type: "remplacement", unite: "m²" },
+  { cat: "balcons", name: "Balcons – Pontage métallique", vu: 35, code: "B10.70", type: "remplacement", unite: "m²" },
+  { cat: "balcons", name: "Balcons – Structure de bois", vu: 25, code: "B10.30", type: "remplacement", unite: "u" },
+  { cat: "balcons", name: "Balcons – Garde-corps métalliques", vu: 40, code: "B10.80", type: "remplacement", unite: "ml" },
+  { cat: "balcons", name: "Balcons – Garde-corps en aluminium et verre", vu: 40, code: "B10.80", type: "remplacement", unite: "ml" },
+  { cat: "balcons", name: "Balcons – Structure d'acier – Peinture – Allocation", vu: 15, code: "B10.70", type: "allocation", unite: "global" },
+  { cat: "balcons", name: "Terrasses urbaines – Bois traité", vu: 25, code: "B10.70", type: "remplacement", unite: "m²" },
+  { cat: "balcons", name: "Terrasses urbaines – Garde-corps métalliques", vu: 40, code: "B10.80", type: "remplacement", unite: "ml" },
+  { cat: "interieur", name: "Vides sous toit – Ventilation et isolation – Allocation", vu: 10, code: "B30.10-40", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Revêtement de placoplâtre – Peinture – Allocation", vu: 15, code: "C30.10", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Tuiles acoustiques suspendues – Allocation", vu: 20, code: "C30.20", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Lambris de bois – Allocation", vu: 20, code: "C30.10", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Revêtement de sol – Tapis", vu: 20, code: "C30.30", type: "remplacement", unite: "m²" },
+  { cat: "interieur", name: "Revêtement de sol – Carreaux de céramique – Allocation", vu: 10, code: "C30.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Revêtement de sol – Tuiles de vinyle", vu: 20, code: "C30.30", type: "remplacement", unite: "m²" },
+  { cat: "interieur", name: "Revêtement de sol – Bois franc", vu: 40, code: "C30.30", type: "remplacement", unite: "m²" },
+  { cat: "interieur", name: "Revêtement de sol – Bois franc – Allocation", vu: 10, code: "C30.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Revêtement de sol – Béton – Allocation", vu: 5, code: "C30.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Surfaces vitrées intérieures – Allocation", vu: 10, code: "C10.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Escaliers intérieurs – Allocation", vu: 15, code: "C40.21", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Portes des unités", vu: 50, code: "C20.20", type: "remplacement", unite: "u" },
+  { cat: "interieur", name: "Portes des unités – Allocation", vu: 10, code: "C20.20", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Portes de service intérieures – Acier", vu: 50, code: "C20.30", type: "remplacement", unite: "u" },
+  { cat: "interieur", name: "Portes de service intérieures – Acier – Allocation", vu: 10, code: "C20.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Portes de service intérieures – Bois", vu: 50, code: "C20.30", type: "remplacement", unite: "u" },
+  { cat: "interieur", name: "Portes de service intérieures – Bois – Allocation", vu: 10, code: "C20.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Portes coupe-feu – Ferme-portes et quincaillerie – Allocation", vu: 10, code: "C20.30", type: "allocation", unite: "global" },
+  { cat: "interieur", name: "Rangements grillagés – Allocation", vu: 10, code: "C20.30", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Système d'incendie – Éclairage d'urgence et panneaux de sortie", vu: 10, code: "D50.40-50", type: "remplacement", unite: "u" },
+  { cat: "equipements", name: "Système d'incendie – Panneau central, stations manuelles et avertisseurs", vu: 10, code: "D50.31", type: "remplacement", unite: "global" },
+  { cat: "equipements", name: "Système d'incendie – Inspection annuelle de l'alarme incendie (CAN/ULC-S536)", vu: 1, code: "D50.31", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Système d'incendie – Détecteurs d'incendie et extincteurs", vu: 10, code: "D50.32", type: "remplacement", unite: "u" },
+  { cat: "equipements", name: "Détecteurs d'incendie – Privatifs – Allocation", vu: 10, code: "D50.32", type: "allocation", unite: "u" },
+  { cat: "equipements", name: "Système d'incendie – Gicleurs et pompe – Allocation", vu: 10, code: "D40.10", type: "allocation", unite: "global", regle: "gicleurs" },
+  { cat: "equipements", name: "Système d'incendie – Inspection annuelle des gicleurs (NFPA 25)", vu: 1, code: "D40.10", type: "allocation", unite: "global", regle: "gicleurs" },
+  { cat: "equipements", name: "Interphones et système d'accès contrôlé", vu: 20, code: "D50.30", type: "remplacement", unite: "global" },
+  { cat: "equipements", name: "Système de surveillance – Caméras en circuit fermé", vu: 20, code: "D50.30", type: "remplacement", unite: "global" },
+  { cat: "equipements", name: "Casiers postaux – Allocation", vu: 10, code: "E10.90", type: "allocation", unite: "u" },
+  { cat: "equipements", name: "Mobilier – Espaces communs – Allocation", vu: 15, code: "E30.20", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Mobilier fixe – Espaces communs – Allocation", vu: 20, code: "E30.20", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Mobilier fixe – Portes-rideaux", vu: 20, code: "E30.20", type: "remplacement", unite: "u" },
+  { cat: "equipements", name: "Équipements de buanderie – Allocation", vu: 15, code: "E10.90", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Équipements sportifs – Espaces communs – Allocation", vu: 10, code: "E10.20", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Chute à déchets – Système de compacteur", vu: 25, code: "E10.30", type: "remplacement", unite: "u" },
+  { cat: "equipements", name: "Chute à déchets – Allocation", vu: 10, code: "E10.30", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Système d'ascenseur – Modernisation", vu: 35, code: "D10.10-20", type: "remplacement", unite: "u", regle: "ascenseur" },
+  { cat: "equipements", name: "Système d'ascenseur – Inspection annuelle", vu: 1, code: "D10.10-20", type: "allocation", unite: "global", regle: "ascenseur" },
+  { cat: "equipements", name: "Foyers et cheminées préfabriqués", vu: 10, code: "E10.90", type: "remplacement", unite: "u" },
+  { cat: "equipements", name: "Honoraires – Révision de l'étude du fonds de prévoyance (Loi 16)", vu: 5, code: "Z10", type: "allocation", unite: "global" },
+  { cat: "equipements", name: "Honoraires – Révision du carnet d'entretien (Loi 16)", vu: 5, code: "Z10", type: "allocation", unite: "global" },
+  { cat: "cvac", name: "Plinthes électriques", vu: 25, code: "D30.10", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Aérothermes muraux", vu: 25, code: "D30.10", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Aérothermes suspendus – Stationnement intérieur", vu: 30, code: "D30.10", type: "remplacement", unite: "u", regle: "stationnement_int" },
+  { cat: "cvac", name: "Chauffage à eau chaude – Chaudière", vu: 25, code: "D30.20", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Chauffage à eau chaude – Pompes de circulation – Allocation", vu: 10, code: "D30.20", type: "allocation", unite: "global" },
+  { cat: "cvac", name: "Système de ventilation – Privatif – Allocation", vu: 3, code: "D30.46", type: "allocation", unite: "global" },
+  { cat: "cvac", name: "Échangeurs d'air (VRC) – Espaces communs", vu: 20, code: "D30.45", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Chauffage CVAC – Communs – Toiture", vu: 35, code: "D30.45", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Climatisation de zone – Salles de services", vu: 25, code: "D30.45", type: "remplacement", unite: "u" },
+  { cat: "cvac", name: "Ventilation des salles de services", vu: 20, code: "D30.44", type: "remplacement", unite: "global" },
+  { cat: "cvac", name: "Système de détection des gaz d'échappement (monoxyde de carbone)", vu: 25, code: "D30.47", type: "remplacement", unite: "global", regle: "stationnement_int" },
+  { cat: "cvac", name: "Ventilation du stationnement intérieur et volets motorisés", vu: 25, code: "D30.41", type: "remplacement", unite: "global", regle: "stationnement_int" },
+  { cat: "cvac", name: "Dispositifs d'obturation (volets coupe-feu)", vu: 50, code: "D30.40", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Alimentation électrique principale – Allocation", vu: 10, code: "D50.10", type: "allocation", unite: "global" },
+  { cat: "electrique", name: "Panneaux de distribution et disjoncteurs", vu: 40, code: "D50.10", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Inspection thermographique des installations électriques", vu: 5, code: "D50.10", type: "allocation", unite: "global" },
+  { cat: "electrique", name: "Appareils d'éclairage intérieurs", vu: 35, code: "D50.23", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Appareils d'éclairage extérieurs", vu: 25, code: "D50.22", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Lampadaires", vu: 30, code: "D50.20", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Bornes de recharge pour véhicules électriques", vu: 15, code: "D50.90", type: "remplacement", unite: "u" },
+  { cat: "electrique", name: "Alimentation d'urgence – Génératrice et moteurs", vu: 40, code: "D50.61", type: "remplacement", unite: "u", regle: "generatrice" },
+  { cat: "electrique", name: "Alimentation d'urgence – Chargeur", vu: 35, code: "D50.61", type: "remplacement", unite: "u", regle: "generatrice" },
+  { cat: "electrique", name: "Alimentation d'urgence – Interrupteur de transfert", vu: 40, code: "D50.61", type: "remplacement", unite: "u", regle: "generatrice" },
+  { cat: "electrique", name: "Alimentation d'urgence – Conduit d'échappement", vu: 30, code: "D50.61", type: "remplacement", unite: "global", regle: "generatrice" },
+  { cat: "electrique", name: "Alimentation d'urgence – Réservoir de mazout", vu: 25, code: "D50.63", type: "remplacement", unite: "u", regle: "generatrice" },
+  { cat: "plomberie", name: "Système d'alimentation en eau potable – Allocation", vu: 10, code: "D20.20", type: "allocation", unite: "global" },
+  { cat: "plomberie", name: "Pompes de surpression d'eau", vu: 20, code: "D20.20", type: "remplacement", unite: "u" },
+  { cat: "plomberie", name: "Inspection des dispositifs antirefoulement (DAR)", vu: 1, code: "D20.20", type: "allocation", unite: "u" },
+  { cat: "plomberie", name: "Système d'évacuation pluviale et sanitaire – Allocation", vu: 10, code: "D20.30-41", type: "allocation", unite: "global" },
+  { cat: "plomberie", name: "Système d'évacuation sanitaire – Nettoyage des colonnes – Allocation", vu: 5, code: "D20.30-41", type: "allocation", unite: "global" },
+  { cat: "plomberie", name: "Clapets antiretour et regards de nettoyage – Allocation", vu: 10, code: "D20.30-41", type: "allocation", unite: "u" },
+  { cat: "plomberie", name: "Pompes de puisard et fosses de retenue", vu: 15, code: "D20.30-41", type: "remplacement", unite: "u" },
+  { cat: "plomberie", name: "Équipements de plomberie – Espaces communs", vu: 25, code: "D20.27", type: "remplacement", unite: "global" },
+  { cat: "plomberie", name: "Réservoir d'eau chaude – Conciergerie", vu: 10, code: "D20.26", type: "remplacement", unite: "u" },
+  { cat: "plomberie", name: "Réservoirs d'eau chaude – Communs de l'immeuble", vu: 25, code: "D20.27", type: "remplacement", unite: "u" },
+  { cat: "plomberie", name: "Alimentation en gaz naturel – Allocation", vu: 10, code: "D20.90", type: "allocation", unite: "global" },
+  { cat: "piscines", name: "Piscine extérieure – Bassin et revêtement – Allocation", vu: 15, code: "F10.10-12", type: "allocation", unite: "m²", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine extérieure – Enceinte en toile – Allocation", vu: 10, code: "F10.10-12", type: "allocation", unite: "global", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine extérieure – Contour de terrasse en béton", vu: 50, code: "F10.10-12", type: "remplacement", unite: "m²", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine extérieure – Contour de terrasse en pavé de béton", vu: 25, code: "F10.10-12", type: "remplacement", unite: "m²", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine extérieure – Système de filtration", vu: 20, code: "F10.40", type: "remplacement", unite: "u", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine extérieure – Système de chauffage (thermopompe)", vu: 20, code: "F10.40", type: "remplacement", unite: "u", regle: "piscine_exterieure" },
+  { cat: "piscines", name: "Piscine intérieure – Bassin et revêtement – Allocation", vu: 15, code: "F10.10-12", type: "allocation", unite: "m²", regle: "piscine_interieure" },
+  { cat: "piscines", name: "Piscine intérieure – Système de filtration", vu: 20, code: "F10.40", type: "remplacement", unite: "u", regle: "piscine_interieure" },
+  { cat: "piscines", name: "Piscine intérieure – Système de chauffage", vu: 20, code: "F10.40", type: "remplacement", unite: "u", regle: "piscine_interieure" },
+  { cat: "piscines", name: "Piscine intérieure – Système de contrôle de l'humidité", vu: 25, code: "F10.50", type: "remplacement", unite: "u", regle: "piscine_interieure" },
+  { cat: "piscines", name: "Centre aquatique – Mobilier – Allocation", vu: 10, code: "E30.20", type: "allocation", unite: "global" },
+  { cat: "piscines", name: "Sauna – Structure de bois", vu: 25, code: "F10.20", type: "remplacement", unite: "u" },
+  { cat: "piscines", name: "Sauna – Système de chauffage", vu: 20, code: "F10.20", type: "remplacement", unite: "u" }
 ];
+// Conditions certaines. Chacune rend true (la composante existe), false (elle
+// n'existe pas) ou undefined (on ne sait pas encore : l'IA ou l'inspecteur décide).
+// Les réponses viennent de la fiche d'immeuble remplie en terrain.
+const REGLES_GABARIT = {
+  // Loi 122 : l'inspection des façades vise les bâtiments de 5 étages et plus.
+  etages5: ({ etages }) => (etages > 0 ? etages >= 5 : void 0),
+  stationnement_int: ({ caracs }) => nombreOuInconnu(caracs.nb_stationnements_int),
+  ascenseur: ({ caracs }) => nombreOuInconnu(caracs.nb_ascenseurs),
+  gicleurs: ({ caracs }) => ouiNonOuInconnu(caracs.gicleurs),
+  generatrice: ({ caracs }) => ouiNonOuInconnu(caracs.generatrice),
+  piscine_interieure: ({ caracs }) => ouiNonOuInconnu(caracs.piscine_interieure),
+  piscine_exterieure: ({ caracs }) => ouiNonOuInconnu(caracs.piscine_exterieure)
+};
+function nombreOuInconnu(v) {
+  if (v == null || String(v).trim() === "") return void 0;
+  const n = Number(String(v).replace(",", "."));
+  return Number.isFinite(n) ? n > 0 : void 0;
+}
+function ouiNonOuInconnu(v) {
+  const t = String(v ?? "").trim().toLowerCase();
+  return t === "oui" ? true : t === "non" ? false : void 0;
+}
+function evaluerRegles(dossier) {
+  const contexte = {
+    etages: Number(dossier?.floors) || 0,
+    caracs: objetJson(dossier?.batiment_info)?.caracteristiques ?? {}
+  };
+  const resultat = {};
+  for (const [cle, regle] of Object.entries(REGLES_GABARIT)) resultat[cle] = regle(contexte);
+  return resultat;
+}
+// Désactive, selon le profil du syndicat, les composantes du gabarit qui ont
+// peu de chances d'exister dans l'immeuble (ascenseur dans un triplex, piscine,
+// génératrice…). Rien n'est supprimé : une composante désactivée reste au
+// dossier et l'inspecteur la réactive en un geste s'il la trouve sur place.
+// On demande au modèle les numéros à DÉSACTIVER plutôt qu'à garder : une
+// réponse tronquée ou vide laisse alors trop de composantes, jamais trop peu.
+async function filtrerGabarit(apiKey, profil, gabarit = GABARIT_STRATEGIS) {
+  const toutActif = (erreur) => ({ inactifs: new Set(), source: "gabarit", erreur });
+  if (!apiKey) return toutActif("aucune clé API configurée : aucune composante désactivée");
+  const liste = gabarit
+    .map((item, i) => `${i + 1}. [${CATEGORIES[item.cat].label}] ${item.name}`)
+    .join("\n");
+  const prompt = `Tu es ingénieur en bâtiment spécialisé dans les études de fonds de prévoyance
+pour syndicats de copropriété au Québec. Voici l'immeuble à visiter :
+- ${profil.units ? `${profil.units} unités` : "nombre d'unités inconnu"}
+- ${profil.floors ? `${profil.floors} étages` : "nombre d'étages inconnu"}
+- ${profil.builtYear ? `construit en ${profil.builtYear}` : "année de construction inconnue"}
+
+Voici la liste maison des composantes, numérotées :
+${liste}
+
+Indique les numéros des composantes qui ont PEU DE CHANCES d'exister dans un immeuble
+de ce gabarit. Exemples de raisonnement : un petit immeuble de 3 étages ou moins n'a
+généralement ni ascenseur, ni génératrice, ni chute à déchets, ni mur-rideau, ni
+stationnement étagé ; l'inspection des façades de la Loi 122 ne vise que les
+bâtiments de 5 étages et plus ; une piscine, un sauna ou un centre aquatique ne se
+trouvent que dans les grands ensembles.
+
+Sois prudent : dans le doute, ne désactive pas. Une composante oubliée coûte plus
+cher qu'une composante en trop, que l'inspecteur retire sur place. Les variantes de
+matériau (vinyle, maçonnerie, aluminium…) restent actives sauf si l'époque ou la
+taille de l'immeuble les rend improbables.
+
+Réponds UNIQUEMENT par les numéros séparés par des virgules, ou par le mot AUCUNE.`;
+  let texte = null;
+  try {
+    texte = await callClaude(apiKey, { content: prompt, maxTokens: 1500 });
+    // On retient la plus longue suite « 12, 31, 47 » de la réponse : un nom
+    // recopié (« Loi 122 », « 5 étages ») ne doit pas passer pour un numéro.
+    const suites = texte.match(/\d+(?:\s*,\s*\d+)*/g) ?? [];
+    const suite = suites.reduce((max, x) => (x.split(",").length > max.split(",").length ? x : max), "");
+    const inactifs = new Set();
+    for (const brut of suite.split(",")) {
+      const n = Number(brut.trim());
+      if (Number.isInteger(n) && n >= 1 && n <= gabarit.length) inactifs.add(n - 1);
+    }
+    if (inactifs.size === 0 && !/aucune/i.test(texte)) {
+      return toutActif(`réponse sans numéro exploitable | DÉBUT: « ${texte.slice(0, 200)} »`);
+    }
+    // Un filtre qui vide presque toute la liste est une réponse aberrante, pas
+    // un immeuble : mieux vaut tout présenter que de faire disparaître l'inventaire.
+    // Le plancher suit la taille de la liste : une firme peut en avoir une courte.
+    if (gabarit.length - inactifs.size < Math.min(20, Math.ceil(gabarit.length / 2))) {
+      return toutActif(`filtre ignoré : ${inactifs.size} composantes sur ${gabarit.length} auraient été désactivées`);
+    }
+    return { inactifs, source: "gabarit-filtre-ia", erreur: null };
+  } catch (e) {
+    const indice = texte ? ` | DÉBUT: « ${texte.slice(0, 200)} »` : "";
+    return toutActif(`${e && e.message}${indice}`);
+  }
+}
+// Colonnes de components ajoutées après la mise en production. Elles sont
+// créées au premier appel de chaque isolat plutôt que par une migration
+// manuelle : un déploiement ne peut pas précéder la base qu'il suppose.
+const COLONNES_AJOUTEES = [
+  ["companies", "theme", "TEXT"],
+  ["companies", "mise_en_page", "TEXT"],
+  ["companies", "bibliotheque", "TEXT"],
+  ["users", "actif", "INTEGER NOT NULL DEFAULT 1"],
+  ["users", "invitation_en_attente", "INTEGER NOT NULL DEFAULT 0"],
+  ["users", "sessions_apres", "INTEGER"],
+  ["actif", "INTEGER NOT NULL DEFAULT 1"],
+  ["etendue", "TEXT"],
+  ["etendue_qte", "TEXT"],
+  ["limite_observation", "TEXT"],
+  ["limite_detail", "TEXT"],
+  ["nature_risque", "TEXT"],
+  ["source_annee", "TEXT"],
+  ["projet_ca", "TEXT"],
+  ["taches_entretien", "TEXT"],
+  // Révision aux cinq ans : lien vers l'étude et la composante précédentes,
+  // et suivi des travaux que l'étude précédente prévoyait dans la période.
+  ["dossiers", "revision_de", "TEXT"],
+  ["origine_id", "TEXT"],
+  ["travaux_periode", "TEXT"],
+  ["travaux_annee", "INTEGER"],
+  // Dernier rappel envoyé à la firme pour une étude à réviser.
+  ["dossiers", "rappel_revision_le", "TEXT"],
+  // Suivi des dossiers : qui s'en occupe, et pour quand.
+  ["dossiers", "assigne_a", "TEXT"],
+  ["dossiers", "echeance", "TEXT"],
+  ["dossiers", "client_id", "TEXT"]
+];
+// Tables ajoutées après la mise en production, créées au premier appel.
+const TABLES_AJOUTEES = [
+  `CREATE TABLE IF NOT EXISTS jetons_compte (
+     id         TEXT PRIMARY KEY,
+     user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     type       TEXT NOT NULL,
+     expire_le  INTEGER NOT NULL,
+     utilise_le TEXT,
+     cree_le    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
+  `CREATE TABLE IF NOT EXISTS tentatives_connexion (cle TEXT NOT NULL, moment INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS idx_tentatives_cle ON tentatives_connexion(cle, moment)`,
+  // Portail du syndicat : qui a accès à quel immeuble, qui fait quelle tâche, ce qui a été fait.
+  `CREATE TABLE IF NOT EXISTS portail_acces (
+     user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+     fonction   TEXT,
+     cree_le    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+     PRIMARY KEY (user_id, dossier_id))`,
+  `CREATE TABLE IF NOT EXISTS carnet_regles (
+     dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+     cle        TEXT NOT NULL,
+     user_id    TEXT,
+     PRIMARY KEY (dossier_id, cle))`,
+  `CREATE TABLE IF NOT EXISTS carnet_suivi (
+     id         TEXT PRIMARY KEY,
+     dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+     cle_tache  TEXT NOT NULL,
+     annee      INTEGER NOT NULL,
+     mois       INTEGER NOT NULL,
+     fait_le    TEXT NOT NULL,
+     fait_par   TEXT,
+     note       TEXT,
+     UNIQUE (dossier_id, cle_tache, annee, mois))`,
+  // Historique des modifications : qui a changé quoi, et quand.
+  `CREATE TABLE IF NOT EXISTS journal (
+     id           TEXT PRIMARY KEY,
+     dossier_id   TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+     component_id TEXT,
+     user_id      TEXT,
+     action       TEXT NOT NULL,
+     champs       TEXT,
+     moment       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
+  `CREATE INDEX IF NOT EXISTS idx_journal_dossier ON journal(dossier_id, moment)`,
+  // Clients de la firme : les syndicats, leurs contacts et leurs études.
+  `CREATE TABLE IF NOT EXISTS clients (
+     id                 TEXT PRIMARY KEY,
+     company_id         TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+     nom                TEXT NOT NULL,
+     adresse            TEXT,
+     ville              TEXT,
+     code_postal        TEXT,
+     unites             INTEGER,
+     annee_construction INTEGER,
+     neq                TEXT,
+     contacts           TEXT,
+     notes              TEXT,
+     crm_id             TEXT,
+     cree_le            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`,
+  `CREATE INDEX IF NOT EXISTS idx_clients_firme ON clients(company_id, nom)`,
+  // Inscriptions de firmes en attente de confirmation de l'adresse.
+  `CREATE TABLE IF NOT EXISTS inscriptions (
+     id        TEXT PRIMARY KEY,
+     firme     TEXT NOT NULL,
+     nom       TEXT NOT NULL,
+     email     TEXT NOT NULL,
+     expire_le INTEGER NOT NULL,
+     utilise_le TEXT,
+     cree_le   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`
+];
+let colonnesPretes = null;
+function assurerColonnes(db) {
+  if (!colonnesPretes) {
+    colonnesPretes = (async () => {
+      for (const sql of TABLES_AJOUTEES) await db.prepare(sql).run();
+      // Entrées [colonne, type] : table components ; [table, colonne, type] sinon.
+      const parTable = new Map();
+      for (const entree of COLONNES_AJOUTEES) {
+        const [table, nom, type] = entree.length === 3 ? entree : ["components", ...entree];
+        if (!parTable.has(table)) parTable.set(table, []);
+        parTable.get(table).push([nom, type]);
+      }
+      for (const [table, colonnes] of parTable) {
+        const infos = await db.prepare(`PRAGMA table_info(${table})`).all();
+        const presentes = new Set(infos.results.map((col) => col.name));
+        for (const [nom, type] of colonnes) {
+          if (!presentes.has(nom)) await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${nom} ${type}`).run();
+        }
+      }
+    })().catch((e) => {
+      colonnesPretes = null;
+      throw e;
+    });
+  }
+  return colonnesPretes;
+}
+function estActive(component) {
+  return component.actif !== 0;
+}
+// ============================================================================
+// GABARIT DE RÉPONSE — vocabulaire fermé du relevé et guides de rédaction.
+// ----------------------------------------------------------------------------
+// Le relevé (terrain, analyse photo) et la rédaction (ÉTAT DE L'ACTIF,
+// ATTENTION SPÉCIALE) partagent les mêmes champs et les mêmes valeurs pour
+// toutes les composantes. Les clés sont stockées ; les libellés s'impriment.
+// ============================================================================
+const ETENDUES = { ponctuel: "Ponctuel", localise: "Localisé", generalise: "Généralisé" };
+const LIMITES_OBSERVATION = {
+  de_pres: "Observé de près",
+  distance: "Observé à distance",
+  partiel: "Partiellement accessible",
+  inaccessible: "Non accessible"
+};
+const NATURES_RISQUE = {
+  securite: "Sécurité des personnes",
+  infiltration: "Infiltration d'eau",
+  degradation: "Dégradation accélérée",
+  conformite: "Conformité réglementaire",
+  esthetique: "Esthétique"
+};
+const SOURCES_ANNEE = {
+  plaque: "Plaque signalétique",
+  carnet: "Carnet d'entretien",
+  administration: "Administration",
+  estimee: "Estimée"
+};
+// Délais : des fourchettes qui tombent sur les années du calcul, au lieu de
+// « à planifier » ou « dans les 5 ans » qui se chevauchaient.
+const DELAIS_MAISON = [
+  { libelle: "Immédiat (moins de 1 an)", phrase: "immédiatement, soit d'ici un an" },
+  { libelle: "Court terme (1 à 2 ans)", phrase: "à court terme, soit d'ici 1 à 2 ans" },
+  { libelle: "Moyen terme (3 à 5 ans)", phrase: "à moyen terme, soit d'ici 3 à 5 ans" },
+  { libelle: "Long terme (plus de 5 ans)", phrase: "à long terme, soit au-delà de 5 ans" },
+  { libelle: "Aucun suivi particulier", phrase: null }
+];
+// Guides de rédaction par élément, tirés du gabarit de rapport de la firme
+// (« 2.12.2 RAPPORT - 26-000 PGA ») : ce qu'il faut décrire, la portée du
+// calcul, l'avis réglementaire, les défauts à surveiller (« Caractéristique à
+// retenir lors de la rédaction ») et des constats types. Les constats types
+// sont des formulations d'autres immeubles : jamais des faits de celui-ci.
+// Ordre significatif : première expression reconnue dans le nom.
+const GUIDES_REDACTION = [
+  {"re": /honoraires/i, "element": "Honoraires professionnels", "points": "Date de la dernière étude du fonds de prévoyance ou de la dernière révision du carnet d'entretien, professionnel mandaté, prochaine échéance légale.", "portee": [], "information": null, "defauts": [], "constats": []},
+  {"re": /am[ée]nagement paysager/i, "element": "Aménagement paysager", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Plusieurs endroits, à l'arrière de l'immeuble, où les pentes du sol sont négatives terrains bas et à risque d'accumulation d'eau près de la fondation", "Des arbres matures à proximité des fondations, au côté droit, posent un potentiel de dommages par leur système racinaire. Ces risques sont particulièrement en liens avec le système de drain français", "Le dégagement entre le sol et le haut de la fondation est un risque d'infiltration d'eau (moins de 6 à 8 pouces) à plusieurs endroits en façade avant", "Les plantes grimpantes posent un potentiel de dommages au mortier à long terme", "Aucun chaperon sur les murets de maçonnerie, fissure, mortier détérioré"]},
+  {"re": /^voies de circulation/i, "element": "Voies de circulation", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Le pavage de la voie principale, présente plusieurs fissurations, éclatement de la surface, grandes cavités, crevasse, bosses", "Certaines fissurations contour de certains cadres grillagés d'évacuation sont suffisamment importantes et semble avoir causé de l'érosion sous le pavage", "Plusieurs endroits, au côté nord, où les pentes du pavage sont négatives et à risque d'accumulation d'eau près du bâtiment", "À l'entrée du stationnement intérieur, des fissurations sont à risque d'infiltration d'eau en bas de pente près des grilles du système de drainage", "Les cadres grillagées du système d'évacuation pluviale de l'entrée du stationnement intérieur, semblent partiellement bloqués par des débris", "Certains cadres grillagés pluviaux sont instables"]},
+  {"re": /^stationnement et voies|lignage|bordures|puisards et regards/i, "element": "Stationnement et voies de circulation", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Le pavage de la voie principale, présente plusieurs fissurations, éclatement de la surface, grandes cavités, crevasse, bosses", "Des fissurations au contour de certains cadres grillagés d'évacuation sont suffisamment importantes et semble avoir causé de l'érosion sous le pavage", "Plusieurs endroits, au côté nord, où les pentes du pavage sont négatives et à risque d'accumulation d'eau près du bâtiment", "À l'entrée du stationnement intérieur, des fissurations sont à risque d'infiltration d'eau en bas de pente près des grilles du système de drainage", "Les cadres grillagées du système d'évacuation pluviale de l'entrée du stationnement intérieur, semblent partiellement bloqués par des débris", "Certains cadres grillagés pluviaux sont instables"]},
+  {"re": /all[ée]es pi[ée]tonni|perrons/i, "element": "Allées piétonnières", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Au passage principal, des sections de béton sont détériorées, affaissées", "Il y a érosion du sol au contour de certaines sections de trottoir menant au accès arrière", "Plusieurs endroits, en façade avant, où les pentes des trottoirs sont négatives et à risque d'accumulation d'eau près du bâtiment", "Plusieurs sections sont fissurées avec dénivelé inégal. Ceci est un risque de chute", "Des sections, près des escaliers arrières, sont instables"]},
+  {"re": /murets/i, "element": "Murets de soutènement", "points": null, "portee": ["Le calcul de ces éléments a été inclus à la section 'Fondations« ."], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Les murets de maçonnerie sont sans chaperon", "Il y a absence de système de drainage derrière les murets, aux aménagements arrière", "Les murets ayant plus de 50 cm (20 pouces) ne possèdent pas de garde-corps. Ceci est un risque de chute"]},
+  {"re": /^garde-corps/i, "element": "Garde-corps et mains courantes", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Des sections de garde-corps du passage avant, présentent une corrosion avancée", "Plusieurs poteaux des garde-corps longeant le stationnement ont des ancrages, bases instables", "Des composantes de quincaillerie sont brisées ou absent aux garde-corps des accès piétonniers près de l'entrée du stationnement intérieur"]},
+  {"re": /terrasse sur sol/i, "element": "Terrasses sur sol", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Plusieurs terrasses privatives arrières où les pentes sont négatives et à risque d'accumulation d'eau près du bâtiment", "Le dégagement entre le haut de la fondation et la terrasse est un risque d'infiltration d'eau à plusieurs terrasses", "Les grilles de drainage sont obstruées"]},
+  {"re": /cl[ôo]ture/i, "element": "Clôture", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Des sections de la clôture arrière présentent une corrosion, dégradation, pourriture avancée", "Plusieurs poteaux de la clôture mitoyenne de gauche ont des ancrages, bases instables, bois dégradés", "Des composantes de quincaillerie sont brisées ou absent aux portes côté stationnement", "Des sections de grillage sont détachées à la clôture du stationnement", "Les portes et/ou quincaillerie sont difficiles de mouvement"]},
+  {"re": /^structures de bois trait|^structure en acier/i, "element": "Structure en acier", "points": null, "portee": [], "information": null, "defauts": ["Fissures", "effritement", "affaissements", "pentes négatives", "dégagements", "nid de poule", "usures", "détérioration des matériaux"], "constats": ["Des sections de la structure présentent une corrosion avancée", "Plusieurs poteaux ont des ancrages, bases instables", "Des composantes de quincaillerie sont brisées ou absent", "Le garde-corps de gauche est détaché de l'ancrage au mur"]},
+  {"re": /murs de fondation|drain fran/i, "element": "Murs de fondation", "points": "Type de fondation, portions visibles (intérieur, extérieur), présence d'un drain français et de regards de nettoyage, traces d'infiltration ou d'efflorescence.", "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Le crépi à la fondation arrière est endommagé et en perte d'adhérence", "Le crépi sur isolant rigide à la fondation arrière est endommagé et en perte d'adhérence", "Des fissures de moins de 2mm sont présentes et celle-ci semble migrer sous le niveau du sol au mur de gauche", "Des fissures de plus de 2mm avec indice de mouvement/ affaissement sont présentes et celle-ci semble migrer sous le niveau du sol au mur de gauche", "Au coin arrière gauche, une partie de la fondation est détachée et une section de maçonnerie est sans support", "Des traces d'efflorescence ont été observées aux salles techniques", "Des structures ou ancrage sont détaché ou arraché de la fondation à la salle technique des gicleurs", "Les margelles ne semblent pas avoir de système de drainage", "Le niveau du sol au fonds de la des margelles ne respecte pas le dégagement avec l'ouverture qu'elle protège", "Selon les informations obtenues, il semble que des infiltrations d'eau aient permis la détérioration des finis intérieurs à l'espace commun du vestibule avant", "Éclatement de surface du mortier, Fissuration communicative, Instabilité des pierres", "Dégradation du mortier"]},
+  {"re": /^structure – allocation/i, "element": "Structure", "points": null, "portee": ["Le calcul de la structure des balcons, incluant leur chape de béton, est inclus dans cette section.", "Le calcul de la structure des escaliers intérieurs, est inclus dans cette section."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Des fissures sont visibles aux finis intérieurs. Il semble que ces fissures suivent un même plan", "Des indices de mouvement longitudinaux sont visibles avec fissuration en cisaillement", "Plusieurs cadres de fenêtres sont désaxées ont leur solin écrasé et les volets présentent un mouvement d'ouverture/ fermeture difficile", "Des fissures ont été observées à la dalle du plafond", "En lien avec les fissures observées, des traces d'efflorescence sont présentes en périphérie", "Cette section est sous les aménagements extérieurs. Le constat d'infiltration d'eau laisse croire à une situations touchant la membrane d'.tanchéité", "Cette section est sous l'immeuble. Il s'agit possiblement d'une fuite d'eau par sinistre localisé . De traces présentes du moment de la construction", "Les deux cages d'escaliers présentes des traces de moisissures de surface près de la zone identifié avec infiltration d'eau par la firme d'ingénieurs près des sortie de robinet extérieur", "Le bas/ seuil de la porte de l'escalier qui mène au sous-sol présente des indices d'infiltration d'eau"]},
+  {"re": /stationnement int[ée]rieur –|stationnements [ée]tag/i, "element": "Stationnement intérieur", "points": "Dalle sur sol ou structurale, membrane de surface, drains, joints, colonnes et murs, nombre de niveaux, traces de sels ou d'efflorescence.", "portee": [], "information": "loi122_stationnements", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Ouverture non bouché (avec un scellant coupe-feu) dans la dalle de plafond", "Passage de conduit sans scellant pare-feu, scellant rouge, parfois gris", "Indices ou trace d'infiltration d'eau", "Infiltration avec détérioration des finis ou matériaux", "Isolation endommagée", "Traces d'infiltration d'eau, plancher mouillé, humide. (Photos B 12-13)", "Traces d'efflorescence. (Photo B 14)", "Traces de condensation sur les fenêtres", "Traces de moisissure", "Fissuration de surface", "Fissuration avec indice de mouvement", "Fissuration avec effritement et l'armature est apparente"]},
+  {"re": /toit plat|toit en pente|solins|goutti/i, "element": "Surface de toit principal, solins", "points": "Type de membrane ou de revêtement, pente, drains et gouttières, solins et parapets, accès à la toiture, équipements en toiture.", "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Pente, pente inverse-drain, drain et crépine", "Membrane élastomère", "Membrane sacrifice -passage des ouvriers", "Dégradation avancé des bardeaux sur le côté ensoleillée", "Cernes visibles au soffite. Ceci pourrait être un indice de ventilation inadéquate à l'entretoit", "Ruissellement entre la frise et la gouttière", "Il y a corrosion près des soudures sur les coins des solins en acier galvanisé", "Le niveau d'usure des bardeaux de plusieurs sections est avancé", "Les scellant d'ouverture sont fissuré ou en perte d'adhérence", "Des plis et délamination ont été observé sur la membrane", "Des bulles de bitumen ont été observes", "Il y a un manque de couverture de gravier"]},
+  {"re": /puits de lumi/i, "element": "Puits de lumière – Toiture principale", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Effritement du vitrage de plastique", "Vitrage fissuré", "Les scellant sont fissuré en perte d'adhérence", "Le boitier est instable", "Le recouvrement du boitier est détaché", "L'intérieur des puits de lumière présente des traces de moisissures, humidité", "La membrane de toiture ne semble pas remonter sur les faces du boitier"]},
+  {"re": /saillies/i, "element": "Toiture des saillies", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Pente, pente inverse-drain, drain et crépine", "Membrane élastomère", "Membrane sacrifice -passage des ouvriers", "Dégradation avancé des bardeaux sur le côté ensoleillée", "Cernes visibles au soffite. Ceci pourrait être un indice de ventilation inadéquate à l'entretoit", "Ruissellement entre la frise et la gouttière", "Il y a corrosion près des soudures sur les coins des solins en acier galvanisé", "Le niveau d'usure des bardeaux de plusieurs sections est avancé", "Les scellant d'ouverture sont fissuré ou en perte d'adhérence", "Des plis et délamination ont été observé sur la membrane", "Des bulles de bitumen ont été observes", "Il y a un manque de couverture de gravier"]},
+  {"re": /marquise/i, "element": "Marquise d'entrée", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Pente, pente inverse-drain, drain et crépine", "Membrane élastomère", "Membrane sacrifice -passage des ouvriers", "Dégradation avancé des bardeaux sur le côté ensoleillée", "Cernes visibles au soffite. Ceci pourrait être un indice de ventilation inadéquate à l'entretoit", "Ruissellement entre la frise et la gouttière", "Il y a corrosion près des soudures sur les coins des solins en acier galvanisé", "Le niveau d'usure des bardeaux de plusieurs sections est avancé", "Les scellant d'ouverture sont fissuré ou en perte d'adhérence", "Des plis et délamination ont été observé sur la membrane", "Des bulles de bitumen ont été observes", "Il y a un manque de couverture de gravier"]},
+  {"re": /structure de service/i, "element": "Structure de service en bois traité", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Les ancrages sont détachés", "La structure est instable et plusieurs pièces sont lâche", "Le fini de surface est défraichi et asséché", "Le bois est dégradé et pourri. Les supports n'ont aucune solidité", "Les coussins d'assise sur la membrane de la toiture sont déplacés. Il y risque de perforé la membrane"]},
+  {"re": /b[ée]ton pr[ée]fabriqu/i, "element": "Parement extérieur – Panneaux de béton préfabriqué", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie."], "information": "loi122_facades", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Mortier fissuré", "Panneaux fissurés", "Panneaux instables", "Bombement des sections", "Éclatement de surface", "Les scellant de rencontre sont fissuré ou absent", "Il y a absence de drain système de drainage", "Les drains sont bloqués par du scellant", "Les drains sont obstrués pas des insectes", "Dégagement avec le niveau du sol", "Drains de bas de panneaux bloqués", "Scellant en perte d'adhérence"]},
+  {"re": /ma[çc]onnerie|^parement – pierre|linteaux|scellants de rencontre|inspection des fa[çc]ades/i, "element": "Parement extérieur – Maçonnerie", "points": "Type de brique ou de pierre, linteaux (matériau et protection), chantepleures, joints de contrôle et scellants de rencontre, méthode d'observation (sol, balcons, jumelles).", "portee": ["Le calcul des scellants de rencontre architecturale des revêtements inclut les joints d'expansion et de contrôle."], "information": "loi122_facades", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Éclats, fissures", "Traces d'efflorescence sur les murs de briques. L'eau qui créé cette situation semble provenir de l'évacuation du toit de la terrasse", "La variation de la brique et du mortier permet de supposer qu'il y a déjà eu réparation", "Plusieurs briques sont éclatées et le mortier est fissuré et effrité", "La saillie de la brique reposant sur son appui de béton du côté gauche du garde-corps excède les 30 mm permis", "Les joints entre les éléments de béton du couronnement sont fissurés", "Une fissure en lézarde est présente au mur de gauche", "Plusieurs joints de mortier commencent à s'évider", "Les chantepleures en partie inférieure des murs creux ne sont pas distancées à 800 mm", "Il y a infiltration d'eau dans l'espace aménagé sous le balcon. Il n'y a pas de solin souple visible à la base des parapets, à la jonction de la dalle de balcon et des escaliers. L'infiltration proviendrait de cette jonction non étanche", "Le linteau en acier recouvert d'un fascia a subi une déflexion et un joint de scellant a été ajouté entre la brique et le linteau", "Les chantepleures au-dessus du linteau en acier recouvert d'un fascia sont scellées par un calfeutrant transparent"]},
+  {"re": /panneaux composites/i, "element": "Parement panneau composite", "points": null, "portee": ["Le calcul des scellants de rencontre des revêtements est inclus à la section Maçonnerie."], "information": "loi122_facades", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Panneaux fissurés", "Panneaux instables", "Bombement des sections", "Éclatement de surface", "Les scellant de rencontre sont fissuré ou absent", "Il y a absence de drain système de drainage", "Les drains sont bloqués par du scellant", "Les drains sont obstrués pas des insectes", "Dégagement avec le niveau du sol", "Drains de bas de panneaux bloqués", "Scellant en perte d'adhérence", "Ancrage déficient"]},
+  {"re": /fibrociment/i, "element": "Parement extérieur - Fibrociment", "points": null, "portee": ["Le calcul des scellants de rencontre des revêtements est inclus à la section Maçonnerie."], "information": "loi122_facades", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Panneaux fissurés", "Panneaux instables", "Bombement des sections", "Éclatement de surface", "Les scellant de rencontre sont fissuré ou absent", "Il y a absence de drain système de drainage", "Les drains sont bloqués par du scellant", "Les drains sont obstrués pas des insectes", "Dégagement avec le niveau du sol", "Drains de bas de panneaux bloqués", "Scellant en perte d'adhérence", "Ancrage déficient"]},
+  {"re": /agr[ée]gats/i, "element": "Parement extérieur – Agrégats", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie.", "Le calcul des scellants de rencontre des revêtements inclut les joints aux balcons si requis avec le type de revêtement."], "information": "loi122_facades", "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Le crépi présente des fissures qui laisse croire à des mouvements saisonniers. Il y a possiblement un risque d'infiltration d'eau", "Les agrégats sont en perte d'adhérence. Cette situation est plutôt esthétique", "La rencontre avec les autres revêtements est sans scellants", "Une section au mur arrière est détaché et à risque de tomber"]},
+  {"re": /^parement – vinyle/i, "element": "Parement de vinyle", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie.", "Le calcul considère que l'enveloppe en 2e plan de protection (membrane sous revêtement), la structure et l'isolation sont intègres et ne requiert aucun correctif."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["La rencontre avec les autres revêtements est sans scellants", "Plusieurs sections au mur arrière sont détachées et pendant. Ceci est un risque de blessure et d'infiltration d'eau", "Certaines sections semblent ne pas avoir été fixé adéquatement. Celles-ci sont détachées et à risque d'infiltration d'eau et d'insectes"]},
+  {"re": /^parement – m[ée]tallique|soffites/i, "element": "Parement métallique et soffite", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["La rencontre avec les autres revêtements est sans scellants", "Plusieurs sections au mur arrière sont détachées et pendant. Ceci est un risque de blessure et d'infiltration d'eau", "Certaines sections semblent ne pas avoir été fixé adéquatement. Celles-ci sont détachées et à risque d'infiltration d'eau et d'insectes", "À plusieurs endroits sur ces façades, le parement d'acier est endommagé et il y a des joints soulevés", "Les solins de départ ont une pente négative (accumulation d'eau)", "Usure, ternissement, bris, absence, perforation", "La pose du solin horizontal à la jonction du parement de brique est déficiente. Le solin n'est pas rectiligne et les chevauchements ne sont pas jointifs. Il y a une contrepente qui favorise le ruissellement sur la brique", "Mur latéral droit. Il y a endommagement par impact du parement d'aluminium et perforations au coin gauche de la fenêtre inférieure", "Parement brisée, perforé", "Section de parement instable", "Scellant de rencontre fissurée ou absent", "Dégagement avec le niveau du sol"]},
+  {"re": /fibre de bois/i, "element": "Parement de panneaux de fibre de bois", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["La rencontre avec les autres revêtements est sans scellants", "Plusieurs sections au mur arrière sont détachées et pendant. Ceci est un risque de blessure et d'infiltration d'eau", "Certaines sections semblent ne pas avoir été fixé adéquatement. Celles-ci sont détachées et à risque d'infiltration d'eau et d'insectes", "La tête des clous a perforé le revêtement. Ceci facilitera l'infiltration d'eau par capillarité et le ‘'bois'' gonflera puis se dégradera prématurément"]},
+  {"re": /enduit acrylique|^parement – stuc/i, "element": "Parement extérieur - Enduit acrylique", "points": null, "portee": ["Le calcul des scellants de rencontre architecturale des revêtements et des joints d'expansion et de contrôle est inclus à la section Maçonnerie."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Le crépi présente des fissures qui laisse croire à des mouvements saisonniers. Il y a possiblement un risque d'infiltration d'eau", "Le fini est en perte d'adhérence. Cette situation est plutôt esthétique", "La rencontre avec les autres revêtements est sans scellants", "Une section au mur arrière semble détaché et à risque de tomber", "La majorité des surfaces de stuc sont fissurées et on note plusieurs zones avec gonflement et réparations au silicone", "Il n'y a aucun dégagement a la base du parement pour permettre le drainage de la cavité d'air", "Il y a des cernes sur le larmier de départ", "Le pare-air est visible ce qui pourrait nous indiquer qu'il n'est pas scellé", "Il y a des traces d'eau sous deux coins de la saillie avant et ce qui s'est en lien avec la déchirure de l'acier au coin droit", "À la base du parement avec la brique et la jonction du parement avec la toiture, il n'y a pas d'espace d'air et le solin est mal positionné", "Des traces d'eau en suintement sont observées. Nous suggérons de procéder avec une expertise du revêtement acrylique"]},
+  {"re": /^portes d'entr/i, "element": "Portes d'entrée", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Cadres : Qualité, bris, détachement, délamination", "Quincaillerie : durabilité, corrosion, mouvement difficile, fermeture difficile inopérant, ajustements", "Coupe froid, brisée, détaché, absent", "Calfeutrage (Scellement) : intégrité, bris, perte d'adhérence, absence, fissuration", "Intercalaire : corrosion", "Le mécanisme de fermeture", "Les charnières", "Le ferme porte", "Les recouvrements de finition en aluminium est bosselé et détaché. Ceci est un risque d'infiltration d'eau et d'innsecte", "Les vitrage ‘'thermos'' est embuée", "Les coupe-son de néoprène sont détaché ou absent", "Les charnières de l'entrée principale sont corrodées"]},
+  {"re": /vestibule/i, "element": "Cadre et vitrage du vestibule intérieur", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Portes exposés aux intempéries", "Parois détériorées", "Vestibule adossé à l'enceinte de la piscine n'a pas de système de ventilation. Détérioration des surfaces causés par la condensation", "Le mécanisme de fermeture. (Photo E 1 à 7)", "Les charnières. (Photo E 8)", "L'ajustement des portes", "Une corrosion du solin de porte", "Les coupe-son de néoprène sont détaché ou absent"]},
+  {"re": /^blocs de verre/i, "element": "Blocs de verre", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Au mur de gauche du vestibule principal, les blocs de verre du bas présentent des indices d'infiltration d'eau", "La situation d'infiltration affecte le mortier", "Le mortier est dégradé et semble permettre une infiltration d'eau au niveau de la céramique du plancher"]},
+  {"re": /^portes de service – /i, "element": "Portes d'issues extérieures – Services", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Porte et cadre abimé, corrosion, rouille, instable sur les charnières, dispositif de fermeture automatique inopérant, infiltration d'air, infiltration d'eau, bas de porte voilé sans contact avec la coupe froid", "Le bas/ seuil de la porte de l'escalier qui mène au sous-sol présente des indices d'infiltration d'eau"]},
+  {"re": /portes-patio/i, "element": "Portes patios", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement", "gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages"], "constats": ["Le scellant en partie supérieure est fissuré ou en perte d'adhérence", "La finition est incomplète et l'étanchéité déficiente au seuil de plusieurs portes", "Il y a un problème de condensation sur les composantes en métal de la porte d'entrée", "Le seuil est désolidarisé, le jambage de bois recouvert de PVC est pourri et gonflé. Le mouvement par glissement lors de l'ouverture est difficile", "Les ouvertures de drainage situées sur le seuil des portes sont obstruées par le scellant sur plusieurs portes patio", "Le prolongement en aluminium du seuil de plusieurs portes-patios est en pente négative", "Mouvement de fermeture", "Mécanisme de barrure", "Ajustement de la porte au cadrage", "Les coupe-son de néoprène sont détaché ou"]},
+  {"re": /porte simple/i, "element": "Portes simple - Balcon", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Le scellant en partie supérieure est fissuré ou en perte d'adhérence", "La finition extérieure est incomplète et l'étanchéité déficiente au seuil de plusieurs portes", "Il y a un problème de condensation sur les composantes en métal", "Le seuil est désolidarisé, le jambage de bois recouvert de PVC est pourri et le glissement lors de l'ouverture est difficile", "Les ouvertures de drainage situées sur le seuil des portes sont obstruées par le scellant sur plusieurs portes", "Le prolongement en aluminium du seuil de plusieurs portes de balcon est en pente négative", "Mouvement de fermeture", "Mécanisme de barrure", "Ajustement de la porte au cadrage", "Les coupe-son de néoprène sont détaché"]},
+  {"re": /^fen[êe]tres|scellants d'ouverture/i, "element": "Fenêtres", "points": "Type d'ouvrant, matériau du cadre, vitrage isolant (date inscrite à l'intercalaire), quincaillerie, scellants de contour, allèges.", "portee": ["Le calcul des scellants d'étanchéité des contours d'ouvertures; incluant les passages des conduits et des rencontres des balcons, est inclus dans cette section."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Cadres extérieurs : Qualité, bris, détachement, délamination, abîmé", "Quincaillerie : durabilité, corrosion, mouvement difficile, fermeture difficile inopérant, ajustements", "Intercalaire : corrosion", "Coupe froid, brisée, détaché, absent", "Calfeutrage (Scellement) : intégrité, bris, perte d'adhérence, absence, fissuration", "Allèges : fissurés, éclaté, mortier absent", "Linteaux : corrodé, écaillé, affaissé, soutient affecté déficient", "Il y a des thermos qui contiennent de l'humidité entre les deux verres descellés", "Il y a de la condensation sur l'allège intérieur de la fenêtre de l'étage, de la cage d'escalier arrière", "Il y a corrosion du mécanisme de la même fenêtre arrière et la fenêtre est difficile de manipulation", "Le mécanisme de la fenêtre est brisé", "Le mécanisme de la fenêtre de la cuisine est difficile de manipulation"]},
+  {"re": /porte de garage/i, "element": "Portes de garage", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Usures, corrosion des charnières, qualité des barrures", "Les fascias aux jambages et au-dessus des entrées sont bosselées, et la boiserie derrière ceux-ci est exposée", "Mécanisme de fermeture", "Mouvement de fermeture", "Mécanisme de sécurité", "Panneau abîmé", "Panneau écrasé", "Panneau corrodé", "Scellant fissuré ou absent", "Système d'ouverture manuel"]},
+  {"re": /mur-rideau/i, "element": "Mur rideau", "points": null, "portee": ["Le calcul des scellants d'étanchéité des contours est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Le panneau de verre au-dessus de l'accès piscine est détaché. Il semble que les attaches intérieurs soient absentes. Ceci est un risque de blessure", "Nous avons observé des indices avec trace d'infiltration d'eau active au panneau surplombant le vestibule piscine", "Les cadrages métalliques qui assurent la continuité avec le mur de maçonnerie sont corrodés"]},
+  {"re": /^balcons – (pontage en fibre|structure de bois)/i, "element": "Balcons – Bois", "points": "Structure et pontage, garde-corps, escaliers, fixations, protection du bois et rencontres avec le parement.", "portee": ["Le calcul des scellants d'étanchéité des rencontres est inclus à la section Fenêtre."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Corrosion des membrures", "Instabilité des poteaux", "Délamination, perforation du pontage de fibre de verre", "Instabilité au poids", "Hauteur du garde-corps / CNB 9.8.7.4 : 31 à 38 pouces (800 à 965mm) avec dégagement de2 pouces (50mm)", "Stabilité du garde-corps", "Stabilité des ancrages", "Scellant de rencontre balcon parement", "Fini défraichit des composantes de bois", "Les 2 pontages en fibre de verre sont délaminés et il y a début d'endommagement par la pourriture. Au balcon supérieur, il y a des éclats de fibre de verre", "En sous-face du balcon supérieur, il y a des cernes sur les soffites attribuables à la pénétration d'eau par les pontages endommagés", "Le larmier est fissuré et il y a début d'endommagement du contre-plaqué"]},
+  {"re": /^balcons – /i, "element": "Balcons - Béton –Acier", "points": "Structure (dalle de béton, membrures d'acier), étanchéité ou chape, garde-corps, escaliers, ancrages et rencontres avec le parement.", "portee": ["Le calcul des scellants d'étanchéité des rencontres est inclus à la section 'Fenêtre« ."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["L'escalier n'a pas de main courante, il dessert deux logements et compte plus de trois contremarches. Il y a une variation de hauteur de 30 mm entre deux marches", "Le garde-corps en façade avant est instable", "Les limons en acier de l'escalier arrière de l'immeuble s'appuient directement sur le sol", "L'escalier de la façade n'est pas appuyé sur une base de béton à l'épreuve du gel", "Les deux volées de marches en bois sont affaissées et présentent des pertes de niveaux importantes", "La hauteur des contremarches n'est pas uniforme pour l'ensemble des marches de l'escalier", "Il n'y a pas de main courante sur les garde-corps en briques des escaliers de béton", "Les poteaux en acier supportant les marquises sont encastrés dans les couronnements de béton et ne comportent aucune ouverture apparente à la base pour l'écoulement d'eau", "Escaliers avant et arrière. Ces escaliers sont munis de garde-corps, mais ceux-ci ne peuvent être considérés comme une main courante; le montant supérieur du garde-corps n'est pas continu et ne se prolonge pas de 300 mm horizontalement au bas des escaliers", "Escaliers de béton avant et arrière. Il y a décollement du crépi cimentaire", "Corrosion des membrures", "Instabilité des poteaux"]},
+  {"re": /terrasses urbaines/i, "element": "Terrasses urbaines – Toiture", "points": null, "portee": ["Le calcul des garde-corps est inclus à la section Balcons béton."], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["On observe sur les garde-corps un peu de peinture écaillée et l'apparition de corrosion", "Quant au bois il est fortement recommandé de peindre ou de le teindre afin de le préserver", "Hauteur du garde-corps / CNB 9.8.7.4 : 31 à 38 pouces (800 à 965mm) avec dégagement de2 pouces (50mm)", "Les terrasses sont appuyées sur des morceaux de polystyrène. Cette installation est instable", "Le polystyrène se décompose sous l'effet du soleil et perd sa capacité de supporter des charges", "Les surfaces de bois sont défraîchies. Un entretien avec teinture est suggéré"]},
+  {"re": /vides sous toit/i, "element": "Vides sous toit", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "défaut de drainage", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des ancrages", "des attaches et des barres de renforcement"], "constats": ["Il y a de l'isolant sur les soffites de la corniche arrière, au-dessus de la porte-patio", "Les soffites de la corniche avant semblent mal dégagés", "L'isolant est mal placé aux abords des conduits et des câbles électriques", "Il y a un conduit avec volet motorisé s'ouvrant directement dans le vide sous toit", "Un conduit d'extracteur s'évacue dans le ventilateur Maximum, il y a des traces de formation de condensation", "Il manque une trappe pour aller dans une section des combles", "Il y a un manque de laine en général dans le comble visité", "La trappe a seulement 2 pouces d'isolation alors qu'elle devrait avoir plus de 5 pouces", "Il y a des traces de condensation/ moisissures dans le comble qui indiquent qu'il y a un problème de ventilation des combles", "Traces d'infiltration active", "Indice d'infiltration", "Extracteur de ventilation se terminant dans l'entre toit"]},
+  {"re": /placopl/i, "element": "Revêtement de placoplâtre", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Il y a des trous dans les murs de gypse qui sont situés dans les salles mécaniques", "Il y a plusieurs fissures aux plafonds des corridors. Aucun joint de dilatation n'est présent", "Usure normale. (Photo G 14)", "Bris de surface, écorchures, rayures", "Bris complet du panneau", "Fissures / indice de mouvement ?", "Vis apparente / indice d'humidité ?", "Peinture en perte d'adhérence ou gonflé / indice d'humidité ?", "Traces de moisissures"]},
+  {"re": /tuiles acoustiques/i, "element": "Tuiles acoustiques suspendues", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["La protection incendie des plafonds qui sont situés dans les salles mécaniques est déficiente", "Le plafond de tuiles acoustiques suspendues présente des signes d'infiltration d'eau (Photo G14.1)", "Indice d'instabilité", "Tuiles brisées", "Tuiles manquantes", "Toute situation d'infiltration d'eau doit être vérifiée et documentée. Dans le cas de plafonds avec espaces techniques, des solutions simples sont fréquemment possibles. Dans les situations moins évidentes, nous recommandons une expertise"]},
+  {"re": /lambris/i, "element": "Lambris de bois ou finis de maçonnerie", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Il y a des sections de bois manquante", "Il y a des cernes sur le bois du plafond de la salle du conseil, possiblement des fuites", "Il y a plusieurs fissures aux plafonds des corridors. Aucun joint de dilatation n'est présent", "Usure normale. (Photo G 14)", "Bris de surface, écorchures, rayures", "Fissures / indice de mouvement ?", "Sections I stables / indice de mauvaise installation ou d'humidité ?", "Traces de moisissures", "Assèchement et fissuration", "Perte esthétique de la teinture", "Usure normale selon l'âge"]},
+  {"re": /sol – tapis/i, "element": "Revêtement de sol – tapis", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Usure normale avec zone de haute circulation. (Photo F 1-2-3)", "Brûlures au tapis près des ascenseurs du niveau SS1. (Photo F 4-5)", "Tapis en perte adherence", "Transition mal exécuté tapis instable et risque de chute"]},
+  {"re": /c[ée]ramique/i, "element": "Revêtement de sol – Carreaux de céramique", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Le coulis des premières marches est désagrégé", "La rencontre carreau de céramique/ tapis à l'entrée de la salle du conseil est instable et présente un risque de blessure", "Certains carreaux sont fissurés, instable, absent"]},
+  {"re": /sol – tuiles de vinyle/i, "element": "Revêtement de sol – Tuiles de vinyle", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Les carreaux de vinyle sont en perte d'adhérence", "Certains carreaux de vinyle sont détachés, absent"]},
+  {"re": /bois franc/i, "element": "Revêtement de sol – Bois durs", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement", "gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion"], "constats": ["Certaines sections sont instables, se soulèvent et présentent un risque de chute", "Certaines planches présentent des indices d'humidité", "La rencontre sont instable, se soulèvent et présentent un risque de chute", "Les pavages sont"]},
+  {"re": /sol – b[ée]ton/i, "element": "Revêtement de sol – Planchers de béton", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": []},
+  {"re": /surfaces vitr/i, "element": "Surface vitrée – Intérieure", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Le cadrage de la fenêtre à la salle du conseil est détaché", "Le scellant de rencontre des vitrages à l'espace piscine est en perte d'adhérence", "Le vitrage être au poste d'accueil est fissuré"]},
+  {"re": /escaliers int/i, "element": "Escaliers intérieurs", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Il y a un décollement de la structure d'acier à l'extrémité d'un palier", "Les soudures de certaines rencontres de sections sont fissurées et détachées", "Au bas de l'escalier central, l'isolant giclé n'est pas protégé par du gypse", "Plusieurs surfaces en béton des paliers et des marches sont détériorées et fissurées", "La peinture est défraichie et absente sur plusieurs sections", "Il ne doit pas y avoir de rangement dans une cage d'escaliers"]},
+  {"re": /portes des unit/i, "element": "Portes des unités", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": []},
+  {"re": /portes de service int[ée]rieures – bois/i, "element": "Portes de services intérieures en bois", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Les fermes portes de la porte de l'espace casier ne sont pas ajustées", "Au stationnement intérieur, les portes des casiers privatifs visité ne referment pas adéquatement", "La porte du casier de l'administration frotte au seuil", "Le cadrage de la porte du casier de l'administration est détaché lâche", "Le vitrage de la porte donnant accès à l'espace casier est fissuré éclaté"]},
+  {"re": /portes de service int[ée]rieures|coupe-feu – ferme/i, "element": "Portes de service intérieures en acier", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Les fermes portes de la porte de la salle déchets/ recyclage ne sont pas ajustées", "Les coupes son sont déficients autour des portes des casiers", "Au stationnement intérieur, les portes de toutes salles techniques visitées ne referment pas adéquatement", "La porte de la salle du conseil frotte au seuil", "Le cadrage de la porte à la salle du conseil est détaché lâche", "Le vitrage de la porte au poste d'accueil est fissuré éclaté", "Le vitrage de la porte de service escalier 4e étage est fissuré éclaté"]},
+  {"re": /rangements grillag/i, "element": "Système grillagée intérieur - Rangement", "points": null, "portee": [], "information": null, "defauts": ["usure et détérioration des matériaux et des finis usures", "mouvement différentiel", "bombement, gonflement", "défaut d'isolation", "défaut d'étanchéité", "infiltration d'air ou d'eau", "condensation", "moisissures", "taches d'humidité", "décoloration", "fissure", "corrosion des attaches", "déflexion", "défaut de niveau"], "constats": ["Les fermes portes de la porte de l'espace casier ne sont pas ajustées", "Au stationnement intérieur, les portes des casiers privatifs visité ne referment pas adéquatement", "La porte du casier de l'administration frotte au seuil", "Le cadrage de la porte du casier de l'administration est détaché lâche", "Le vitrage de la porte donnant accès à l'espace casier est fissuré éclaté"]},
+  {"re": /[ée]clairage d'urgence/i, "element": "Éclairage d'urgence et panneau de sortie", "points": null, "portee": [], "information": null, "defauts": ["ancrage instable", "panneaux brisée", "panneau de sortie détachée", "extincteur manquant"], "constats": ["Les appareils d'éclairages d'urgences du garage sont sales et poussiéreux", "Les panneaux de sorties sont sales et poussiéreux", "Certains panneaux de sortie du corridor central sont instable, détaché de leur socle", "Le luminaire d'urgence principale dans la salle électrique au bâtiment 10 n'est pas fonctionnel. Cette batterie alimente les autres luminaires d'urgence. À vérifier et corriger"]},
+  {"re": /panneau central|alarme incendie/i, "element": "Panneau alarme centrale, stations manuelles et avertisseurs sonores", "points": null, "portee": [], "information": null, "defauts": ["ancrage instable", "panneaux brisée", "panneau de sortie détachée", "extincteur manquant"], "constats": ["Le panneau clignote - Selon les informations obtenues, le panneau est relié à une centrale mais présente des codes et alarmes fréquentes", "Le panneau est éteint - Selon les informations obtenues, le panneau est débranché et est en planification de réparation", "Des stations manuelles sont ouvertes/ déclenchées – selon les informations obtenues, celles-ci sont planifiées en correctif à la prochaine inspection incendie", "Un avertisseur sonore du corridor central est détaché instable absent"]},
+  {"re": /d[ée]tecteurs d'incendie – privatifs/i, "element": "Détecteurs de fumée autonome - privatifs", "points": null, "portee": [], "information": "rbq_avertisseurs", "defauts": ["ancrage instable", "panneaux brisée", "panneau de sortie détachée", "extincteur manquant"], "constats": ["Les détecteurs sont"]},
+  {"re": /d[ée]tecteurs d'incendie et extincteurs/i, "element": "Détecteurs de fumée/chaleur et extincteurs portatifs", "points": null, "portee": [], "information": "rbq_avertisseurs", "defauts": ["ancrage instable", "panneaux brisée", "panneau de sortie détachée", "extincteur manquant"], "constats": ["Des extincteurs sont absents de leur poste – Selon les informations obtenues, ceux-ci ont disparues dernièrement sont planifiés en remplacement cette année", "Des capteurs de chaleur/ incendie sont détachés", "Des capteurs de chaleur/ incendie sont très sales et poussiéreux", "Dans la salle d'entrée d'eau principale, un extincteur vide est présent au sol. S'il n'est pas utile, vous devez vous en départir"]},
+  {"re": /gicleurs/i, "element": "Système protection incendie – Réseau de gicleurs", "points": "Type de réseau (sous eau, sous air), zones protégées, pompe incendie, date de la dernière inspection.", "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les pompes de surpressions présentent des signes de fuite condensation", "Les conduits d'entrée principale présentent une grande condensation qui s'accumule au sol sans possibilité de drainage adéquat", "La valve principale semble saisie. Nous suggérons une visite de service", "Les panneaux de contrôles sont inaccessibles par cause de rangement inapproprié", "Par suite d'une rénovation aux escaliers, une tête de gicleur semble à risque d'accrochage. Ceci est un risque de blessure. Nous suggérons une visite de service"]},
+  {"re": /interphones/i, "element": "Interphones et système d'accès contrôlé", "points": null, "portee": [], "information": null, "defauts": ["ancrage instable", "panneaux brisée", "panneau détachée"], "constats": ["Le panneau principal est instable", "Le panneau extérieur est corrodé et semble nécessiter un remplacement", "Le panneau extérieur ne possède aucun scellant et est exposés aux intempéries", "Les témoins lumineux du panneau principal au vestibule ne fonctionnent pas. Selon les informations obtenues, l'administration planifie un remplacement en"]},
+  {"re": /surveillance/i, "element": "Système de surveillance - Camera en circuit fermé", "points": null, "portee": [], "information": null, "defauts": ["ancrage instable", "panneaux brisée", "panneau détachée", "camera manquante"], "constats": ["Le système informatique est débranché et désuet. Selon les informations obtenues, l'administration est en étude et planifie un remplacement en . Le coût estimé est de", "Plusieurs ancrages/ socles de camera sont brisée et semble nécessiter un remplacement"]},
+  {"re": /casiers postaux/i, "element": "Casiers postaux – Boites postales", "points": null, "portee": [], "information": null, "defauts": ["panneau instable", "panneau brisée", "panneau détachée", "porte manquante"], "constats": ["Le panneau des casiers est brisée et désuet. Selon les informations obtenues, l'administration est en étude et planifie un remplacement en . Le coût estimé est de", "Plusieurs portes/ serrures de casiers sont brisée et semble nécessiter un remplacement"]},
+  {"re": /centre aquatique/i, "element": "Mobilier – Centre aquatique", "points": null, "portee": [], "information": null, "defauts": ["chaise brisée", "pièce manquante"], "constats": ["Plusieurs éléments du mobilier de confort sont brisées et désuets. Selon les informations obtenues, l'administration est en étude et planifie un remplacement en . Le coût estimé est de", "Plusieurs chaises sont brisées et semble nécessiter un remplacement"]},
+  {"re": /^mobilier/i, "element": "Mobilier – Vestibule – Espaces communs", "points": null, "portee": [], "information": null, "defauts": ["chaise brisée", "pièce manquante"], "constats": ["Plusieurs éléments du mobilier de confort au vestibule du 4e étage sont brisés et désuets. Selon les informations obtenues, l'administration est en étude et planifie un remplacement en . Le coût estimé est de", "À la cuisinette, certaines portes et tiroirs ont des mécanismes désajustés ou brisés et semble nécessiter un entretien", "Les appareils de lavage communs présentent des signes de fuite d'eau d'huile sont instables lors du fonctionnement"]},
+  {"re": /sportifs/i, "element": "Équipement sportif – Salle d'entrainement", "points": null, "portee": [], "information": null, "defauts": ["chaise brisée", "pièce manquante"], "constats": ["Certains appareils sont désajustés ou brisés et semble nécessiter un entretien", "Certaines portes des vestiaires (homme) sont instables détachées absentes. Selon les informations obtenues, le conseil d'administration planifie des remplacements cette année"]},
+  {"re": /chute [àa] d[ée]chets/i, "element": "Chutes à déchets – Salle des bacs", "points": null, "portee": [], "information": null, "defauts": ["composante brisée", "pièce manquante", "traces d'huile", "insalubre", "bruit anormal"], "constats": ["L'espace présente une odeur caractéristique. Un nettoyage régulier est suggéré", "Plusieurs systèmes de roulement des conteneurs sont brisés et désuets. Selon les informations obtenues, l'administration est en étude et planifie un remplacement en . Le coût estimé est de", "Certaines portes aux étages ont des mécanismes difficiles d'ouverture, désajustés ou brisés et semble nécessiter un entretien", "L'appareil de compaction présente des signes de fuite d'huile est instable lors du fonctionnement", "Au démarrage, l'appareil semble avoir un fonctionnement difficile et est bruyant. Selon les informations obtenues de l'administration l'entretien est prévue prochainement"]},
+  {"re": /ascenseur/i, "element": "Ascenseur", "points": "Nombre de cabines, marque, capacité, année d'installation ou de modernisation, contrat d'entretien, date du dernier certificat d'inspection.", "portee": [], "information": null, "defauts": [], "constats": []},
+  {"re": /foyers/i, "element": "Foyers au bois et Cheminées préfabriquées", "points": null, "portee": [], "information": null, "defauts": [], "constats": []},
+  {"re": /plinthes/i, "element": "Plinthes électriques", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le calorifère de l'espace rangement du sous-sol est détaché et pend au sol", "Les calorifères des paliers d'escaliers aux entrées sont très corrodés", "Le calorifère du vestibule avant est instable et bosselé", "Les calorifère/ plinthe électrique au mur du stationnement intérieur sont très corrodés et semble nécessiter en remplacement", "Le calorifère de la salle électrique extérieure à l'arrière est près d'une zone d'infiltration d'eau connue. Ceci est un risque de blessure"]},
+  {"re": /a[ée]rothermes muraux/i, "element": "Aérothermes muraux", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["L'appareil aérotherme mural de l'espace rangement du sous-sol est détaché et pend au sol", "Les appareils aérothermes muraux des paliers d'escaliers aux entrées sont très corrodés", "L'appareil aérotherme mural du vestibule avant est instable et bosselé", "Les appareils aérothermes muraux électrique au mur du stationnement intérieur sont très corrodés et semble nécessiter en remplacement", "L'appareil aérotherme mural de la salle électrique extérieure à l'arrière est près d'une zone d'infiltration d'eau connue. Ceci est un risque de blessure"]},
+  {"re": /a[ée]rothermes suspendus/i, "element": "Chauffage stationnement intérieur", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["L'appareil aérotherme plafonnier de l'espace rangement du sous-sol est détaché et pend. Ceci est un risque de blessure", "Les appareils aérothermes plafonniers aux entrées piétonnières sont très corrodés", "L'appareil aérotherme mural à la porte de garage est instable et bosselé", "Les appareils aérothermes électrique au mur du stationnement intérieur sont très corrodés et semble nécessiter en remplacement"]},
+  {"re": /ventilation – privatif/i, "element": "Systèmes d'extraction – Sorties privatives", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Plusieurs sorties de sécheuse présentent une accumulation de charpie. Prévoir le nettoyage régulier", "Deux extracteurs au niveau de la toiture nord-est sont instables"]},
+  {"re": /climatisation de zone/i, "element": "Climatisation de zone - Espaces communs", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le système d'évacuation du condensat est débranché", "Les attaches du support au mur sont instables et lâches", "L'appareil évaporateur de la salle du conseil présente une fuite d'eau", "L'appareil compresseur extérieur présente un bruit anormal", "Absence de scellant ignifuge aux passages des conduits", "Aucun cahier de suivi de service d'entretien n'est disponible"]},
+  {"re": /cvac|[ée]changeurs d'air|chaudi|pompes de circulation/i, "element": "Chauffage, ventilation et climatisation – Espaces communs", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["L'appareil au toit est hors fonction. Selon les informations obtenues, celui-ci est planifié en remplacement cette année", "L'appareil au toit présente un bruit anormal. Nous suggérons une visite de service", "Absence de scellant ignifuge aux passages des conduits", "Aucun cahier de suivi de service d'entretien n'est disponible", "Les filtres semblent sales. À remplacer"]},
+  {"re": /ventilation des salles de services/i, "element": "Ventilation d'extraction des salles de services", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le système de ventilation de la salle électrique est débranché. Selon les informations obtenues, celui-ci est très bruyant. Lorsque requis, les copropriétaires le branche manuellement", "Les attaches du support au mur sont instables et lâches", "L'appareil mural de l'espace rangement présente un bruit anormal", "L'appareil mural de l'espace rangement est très poussiéreux. Nous suggérons une visite de service", "Absence de scellant ignifuge aux passages des conduits", "Quelques-uns d'entre eux ne sont pas fonctionnels. Selon les informations obtenues, ceux-ci sont prévue en remplacement prochainement"]},
+  {"re": /d[ée]tection des gaz/i, "element": "Système de détection des gaz d'échappement", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les dates des derniers services ne sont pas affichées", "L'appareil central, à la salle électrique, est instable et semble sur le point de tomber", "Les capteurs de la section avant du stationnement intérieur sont très poussiéreux"]},
+  {"re": /ventilation du stationnement/i, "element": "Ventilation du stationnement intérieur et Volets motorisés", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les appareils sont très poussiéreux. Nous suggérons une visite de service", "Le fonctionnement des volets motorisés est difficile. Selon les informations obtenues, une visite de service est déjà planifiée", "Aucun cahier de suivi de service d'entretien n'est disponible"]},
+  {"re": /obturation/i, "element": "Dispositif d'obturation (volet coupe-feu)", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": []},
+  {"re": /alimentation [ée]lectrique principale|panneaux de distribution|thermographi|bornes de recharge/i, "element": "Alimentation électrique principale", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["La salle électrique n'a pas de système de ventilation", "Nous constatons que les périmètres de certains conduits devraient être scellés afin de préserver l'intégrité coupe-feu de la séparation", "La porte du panneau PP1 n'a pas de porte", "Plusieurs prises électriques dans les corridors sont mal fixées. Il y a même une prise dont le neutre est bloqué par un élément métallique", "Il y a absence de volet coupe-feu sur le grillage de la porte qui donne accès à la salle électrique", "Il manque une plaque sur une boîte de jonction qui est située dans le vestibule de l'ascenseur au niveau sous-sol", "Les transformateurs sont très poussiéreux", "Des câbles électriques sont les balcons avant sont détachées. Ceci est un risque de blessure", "Les prises extérieures vérifiées ne sont parfois pas munies de système DDFT. Nous recommandons de vous assurer que ces prises sont sur un circuit électrique muni d'un disjoncteur DDFT"]},
+  {"re": /gaz naturel/i, "element": "Alimentation au gaz naturel", "points": null, "portee": [], "information": null, "defauts": [], "constats": []},
+  {"re": /[ée]clairage int[ée]rieurs/i, "element": "Appareils d'éclairage intérieurs", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les luminaires du vestibule avant est instable et pend au bout des câblages", "Le luminaire mural de l'entrée arrière n'a pas de globe de protection", "Un des câbles gainés de type BX de l'éclairage à la salle de la valve principale est apparent et a été écrasé. Selon les informations obtenues, ceci a été causé lors des travaux en juin dernier. Un correctif est déjà planifié par le CA", "Il y a une boîte de jonction sans couvercle de protection dans la salle des déchets"]},
+  {"re": /[ée]clairage ext[ée]rieurs/i, "element": "Appareils d'éclairage extérieurs", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les luminaires à l'entrée principale présentent une corrosion et écaillure de la peinture", "Le luminaire mural de l'entrée arrière n'a pas de globe de protection", "Des câbles gainés de type BX sont visible à l'entrée arrière. On note de plus que la boîte de jonction fixée au mur n'est pas pour usage extérieur", "Il y a une boîte de jonction sans couvercle de protection à l'enclos des déchets/ recyclage"]},
+  {"re": /lampadaires/i, "element": "Lampadaires", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les lampadaires bas de l'entrée principale présentent une corrosion de surface et écaillure de la peinture", "Le lampadaire central au stationnement arrière n'a pas de globe de protection est instable détachés de sa base et est un risque de blessure", "Un des câbles gainés de type BX de l'éclairage périphérique du stationnement est apparent. On note de plus que la boîte de jonction n'est pas pour usage extérieur", "Au lampadaire nord-est, la boîte de jonction est sans couvercle de protection"]},
+  {"re": /r[ée]servoir de mazout/i, "element": "Alimentation d'urgences - Réservoirs de mazout", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["La salle du réservoir présente une forte odeur de carburant diesel (mazout)", "Des traces de mazout sont présentes au sol sous le réservoir. Ceci est un risque de blessure", "Beaucoup de rangement sont présent dans la salle du réservoir. Ceci est un risque de blessure"]},
+  {"re": /alimentation d'urgence/i, "element": "Alimentation d'urgences – Génératrices", "points": "Marque, puissance (kW), carburant, date d'installation, charges alimentées, date du dernier essai sous charge.", "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["La salle de la génératrice présente une forte d'odeur de carburant diesel (mazout)", "Des signes de fuite d'huile (mazout) sont présent au sol à l'arrière de la génératrice", "Beaucoup de rangement sont présent dans la salle de la génératrice. Ceci est un risque de blessure", "La batterie de démarrage présente une importante corrosion des pôles", "Les documents d'entretien et services réguliers ne sont pas disponibles"]},
+  {"re": /eau potable|surpression|antirefoulement/i, "element": "Système d'alimentation en eau potable", "points": null, "portee": [], "information": "rbq_dar", "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les pompes de surpressions présentent des signes de fuite condensation", "Les conduits d'entrée principale présentent une grande condensation qui s'accumule au sol sans possibilité de drainage adéquat", "La valve principale semble saisie. Nous suggérons une visite de service", "Les conduits principaux d'alimentation sont en acier. Ce type de conduit d'une autre époque est fréquemment très corrodé à l'intérieur. Ceci est un risque pour plusieurs appareils. Nous suggérons une visite de service", "La salle mécanique est à risque de gel. Ceci est un risque pour plusieurs appareils"]},
+  {"re": /[ée]vacuation|clapets|pompes de puisard/i, "element": "Système d'évacuation sanitaire et pluvial", "points": null, "portee": [], "information": "rbq_clapets", "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le drain au sous-sol présente un bruit sourd. Nous suggérons une visite de service", "Les drains des terrasses extérieures sont bloqués par des déchets et matières organique et semble avoir un fonctionnement inadéquat", "Plusieurs collets de raccordement présentent des fuites. Nous suggérons une visite de service", "Les plans de plomberies ne font pas partie du registre de la copropriété", "Au 10298 (passage souterrain), le conduit d'évacuation de la pompe est perforé. À corriger", "Au 10294, le mouvement de la flotte est restreint par les tuyaux et la pompe ne peut démarrer. À corriger", "Au 10300, les conduits sont sales, ce qui peut les obstruer et nous porte à croire que la protection des conduits d'amenée d'eau contre les débris est défaillante. À vérifier", "Les conduits reliés au puisard ne comportent pas de té sanitaire ou de siphon à garde d'eau", "De façon générale, les couvercles des puisards devraient être étanches à l'air pour éviter que des gaz et des odeurs ne se dispersent. Il est à noter que lors des travaux d'étanchéité, un évent devra être installé afin d'avoir une pression d'air adéquate dans le puisard. Le remplacement des couvercles est requis"]},
+  {"re": /[ée]quipements de plomberie/i, "element": "Appareils de plomberie –Espaces communs", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le lavabo l'évier de la salle du conseil semble partiellement bloqué. Nous suggérons une visite de service", "La toilette du vestiaire homme est instable et est à risque de fuite. Ceci est aussi une risque de blessure. Nous suggérons une visite de service"]},
+  {"re": /conciergerie/i, "element": "Réservoirs chauffe-eau électrique", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le chauffe-eau a plus de 10 ans et présente une corrosion à sa base", "Le chauffe-eau présente une fuite d'eau au sol"]},
+  {"re": /r[ée]servoirs d'eau chaude/i, "element": "Réservoirs chauffe-eau commun - Gaz naturel", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le chauffe-eau a plus de 20 ans et présente des suintements de corrosion à sa base des sections d'isolant déchirée et absent", "Le chauffe-eau présente une fuite d'eau au sol", "Les réservoirs d'eau chaude sont tous instable et créé une tension sur certains conduits. Ceci est aussi un risque de blessure. À corriger", "Le système en série présente plusieurs fuite d'eau et selon les informations obtenues est en service fréquent"]},
+  {"re": /sauna/i, "element": "Sauna", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Le conduit d'alimentation présente une grande condensation qui s'accumule au sol sans possibilité de drainage adéquat", "Le système de chauffe est instable déplacée et ne fonctionne pas. Selon les informations obtenues, celui-ci n'est plus en usage .est planifié en remplacement cette année", "Les bancs de confort sont brisés et présente des risques de blessures", "La porte du sauna est difficile d'ouverture ne s'ouvre pas de l'intérieur"]},
+  {"re": /humidit/i, "element": "Condensateur – Contrôle d'humidité", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["L'appareil présente des signes de fuite condensation importante", "Les conduits présentent une grande condensation qui s'accumule au sol sans possibilité de drainage ou d'assèchement adéquat", "La conduits semblent lâche. Nous suggérons une visite de service", "L'appareil présente une grande corrosion. Nous suggérons une visite de service"]},
+  {"re": /filtration|piscine (ext|int)[ée]rieure – syst[èe]me de chauffage/i, "element": "Équipement de filtration et de chauffe-eau piscine", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant"], "constats": ["Les pompes de surpressions présentent des signes de fuite condensation", "L'appareil de chauffe-eau thermopompe est instable présente un bruit anormal. Une visite de service est suggérée"]},
+  {"re": /bassin|enceinte|contour de terrasse/i, "element": "Piscine", "points": null, "portee": [], "information": null, "defauts": ["condition des appareils", "signes de fuite", "de réparation", "usure", "détérioration", "corrosion", "signes d'entretien insuffisant", "fissuration", "affaissement différentiel", "sécurité"], "constats": ["Le contour terrasse de béton de carreaux de céramique présente plusieurs fissures importantes et des sections détachées. Selon les informations obtenues, des travaux de réparation sont déjà planifiées", "Une section de la toile de vinyle est détachée de ses bandes de rétention. Nous suggérons une visite de service", "Aucun équipement de sauvetage n'est présent. Ceci est un risque. Nous suggérons de vérifier la documentation provinciale relative aux équipements obligatoires"]}
+];
+const POINTS_PAR_CATEGORIE = {
+  "terrain": "Matériau et type de surface, localisation sur le site, pentes et drainage, éléments connexes (bordures, puisards).",
+  "structure": "Type de fondation et de structure (béton coulé, acier, bois), niveaux concernés, accès pour l'observation, traces d'infiltration.",
+  "enveloppe": "Matériau et système (type de membrane ou de parement), façades ou versants concernés, éléments connexes (solins, linteaux, scellants), méthode d'observation.",
+  "ouvertures": "Type et matériau des cadres, vitrage, quincaillerie, scellants de contour, localisation (façades, entrées, communs).",
+  "balcons": "Structure, pontage ou surface, garde-corps, escaliers, fixations et étanchéité aux rencontres avec le parement.",
+  "interieur": "Matériau et fini, espaces communs concernés (corridors, halls, escaliers, stationnement), usure générale.",
+  "equipements": "Type d'équipement, marque, modèle et capacité si visibles, localisation, date de fabrication ou d'inspection, contrat d'entretien.",
+  "cvac": "Type d'appareil (électrique, gaz, eau chaude), marque, modèle et capacité si visibles, espaces desservis, contrat d'entretien.",
+  "electrique": "Type d'installation, capacité (ampérage, tension) si indiquée, localisation (salle électrique, extérieur), date de fabrication.",
+  "plomberie": "Type de réseau ou d'appareil, matériau des conduits visibles, capacité, localisation (salle mécanique, conciergerie), date de fabrication.",
+  "piscines": "Type de piscine (intérieure ou extérieure), revêtement du bassin, équipements (filtration, chauffage, déshumidification), marque et capacité si visibles."
+};
+
+function guidePour(component) {
+  const nom = String(component?.name ?? "");
+  const guide = GUIDES_REDACTION.find((g) => g.re.test(nom)) ?? null;
+  return {
+    element: guide?.element ?? null,
+    points: guide?.points ?? POINTS_PAR_CATEGORIE[component?.cat] ?? null,
+    portee: guide?.portee ?? [],
+    information: guide?.information ?? null,
+    defauts: guide?.defauts ?? [],
+    constats: (guide?.constats ?? []).map((c) => sansNotesInternes(c)).filter(Boolean)
+  };
+}
+// Avis réglementaires, repris du gabarit de rapport. La phrase d'assujettissement
+// n'est écrite que si les données du dossier permettent de trancher.
+const INFORMATIONS_REGLEMENTAIRES = {
+  loi122_facades: (d) => {
+    const etages = Number(d?.floors) || 0;
+    const suite = etages > 0 ? (etages >= 5 ? " Votre immeuble est assujetti à cette loi." : " Votre immeuble n'est pas assujetti à cette loi.") : "";
+    return "INFORMATION : Façades en hauteur - Depuis le 18 mars 2013, selon la loi 122, les façades en maçonnerie de tous les immeubles ayant au moins 5 étages doivent maintenant faire l'objet d'une vérification et d'un entretien périodique tous les 5 ans." + suite;
+  },
+  loi122_stationnements: () => "INFORMATION : Stationnements étagés - Depuis le 18 mars 2013, selon la loi 122, les garages ayant 2 étages et plus doivent maintenant faire l'objet d'une inspection de la dalle et de la structure tous les 5 ans.",
+  rbq_avertisseurs: () => "INFORMATION : La Régie du bâtiment du Québec (RBQ) rappelle que tout avertisseur de fumée doit être remplacé 10 ans après la date de fabrication indiquée sur le boîtier. Si aucune date n'est indiquée ou si elle est illisible, le dispositif doit être remplacé immédiatement.",
+  rbq_dar: (d) => {
+    const unites = Number(d?.units) || 0;
+    const etages = Number(d?.floors) || 0;
+    let suite = "";
+    if (unites > 0 && etages > 0) {
+      suite = unites >= 9 && etages >= 3 ? " Votre immeuble est visé par cette obligation." : " Votre immeuble est exclu de cette obligation.";
+    }
+    return "INFORMATION : La Régie du bâtiment du Québec (RBQ) rappelle aux propriétaires de bâtiment qu'ils ont l'obligation de protéger le réseau d'eau potable contre la contamination en installant un dispositif anti-refoulement (DAR) et en le faisant vérifier chaque année. Les bâtiments existants totalement résidentiels de moins de neuf (9) unités ou de moins de trois (3) étages sont exclus de cette obligation." + suite;
+  },
+  rbq_clapets: () => "INFORMATION : La Régie du bâtiment du Québec (RBQ) rappelle aux propriétaires que dans un réseau de plomberie, il est obligatoire de bien protéger les appareils sanitaires contre le refoulement potentiel des égouts. En effet, les refoulements des eaux d'égout et des eaux de pluie sont à l'origine de bien des dommages à l'intérieur des bâtiments. Ces refoulements constituent d'ailleurs une des causes de réclamation les plus fréquentes auprès des compagnies d'assurance habitation."
+};
+// ============================================================================
+// RÉVISION AUX CINQ ANS (Loi 16)
+// ----------------------------------------------------------------------------
+// Une révision part de l'étude précédente du même immeuble : composantes,
+// années, durées de vie, coûts indexés à l'année courante, fiche d'immeuble et
+// tâches du carnet ajustées. Chaque composante garde le lien vers celle de
+// l'étude précédente (origine_id) : l'inspecteur voit ce qui avait été
+// observé, dit si les travaux prévus dans la période ont été faits, et le
+// rapport présente l'évolution.
+// ============================================================================
+const CHAMPS_REPRIS_REVISION = [
+  "cat", "name", "qty", "sort_order", "install_year", "residual", "useful_life_years", "uniformat_code",
+  "position", "emplacement", "variante", "attributs", "actif", "source_annee", "projet_ca", "taches_entretien"
+];
+const TRAVAUX_PERIODE = { fait: "Réalisés", reporte: "Reportés", abandonne: "Abandonnés" };
+function anneeEtude(dossier) {
+  const d = new Date(dossier?.published_at || dossier?.created_at || Date.now());
+  return Number.isNaN(d.getTime()) ? (/* @__PURE__ */ new Date()).getFullYear() : d.getFullYear();
+}
+function remplacementPrevu(comp) {
+  return comp?.install_year && comp?.useful_life_years ? Number(comp.install_year) + Number(comp.useful_life_years) : null;
+}
+function facteurIndexation(anneeDepart, anneeArrivee) {
+  return Math.pow(1 + RESERVE_FUND_PARAMS.inflationRate, Math.max(0, anneeArrivee - anneeDepart));
+}
+// Ce que l'étude précédente disait d'une composante.
+function resumePrecedent(prev, photos, annee) {
+  const prevu = remplacementPrevu(prev);
+  const actif = prev.actif !== 0;
+  return {
+    id: prev.id,
+    annee,
+    actif,
+    rating: prev.rating ?? null,
+    r_flag: prev.r_flag ?? 0,
+    observation: prev.observation ?? null,
+    cause_possible: prev.cause_possible ?? null,
+    delai_suggere: prev.delai_suggere ?? null,
+    install_year: prev.install_year ?? null,
+    useful_life_years: prev.useful_life_years ?? null,
+    replacement_cost: prev.replacement_cost ?? null,
+    remplacement_prevu: prevu,
+    // Un remplacement que l'étude précédente plaçait avant aujourd'hui, ou une
+    // cote « remplacement requis » : l'inspecteur dit s'il a été fait.
+    travaux_a_verifier: actif && ((prevu != null && prevu <= (/* @__PURE__ */ new Date()).getFullYear()) || prev.rating === 4),
+    photos: photos.map((p) => ({ id: p.id, tag: p.tag }))
+  };
+}
+async function precedentsPour(db, composantes) {
+  const ids = [...new Set(composantes.map((c) => c.origine_id).filter(Boolean))];
+  const resultat = new Map();
+  for (let i = 0; i < ids.length; i += 80) {
+    const lot = ids.slice(i, i + 80);
+    const marques = lot.map((_, k) => `?${k + 1}`).join(", ");
+    const rows = await db.prepare(
+      `SELECT cmp.*, d.published_at AS dossier_publie, d.created_at AS dossier_cree
+         FROM components cmp JOIN dossiers d ON d.id = cmp.dossier_id WHERE cmp.id IN (${marques})`
+    ).bind(...lot).all();
+    const photos2 = await db.prepare(`SELECT id, component_id, tag FROM photos WHERE component_id IN (${marques}) ORDER BY created_at ASC`).bind(...lot).all();
+    for (const r of rows.results) {
+      const annee = anneeEtude({ published_at: r.dossier_publie, created_at: r.dossier_cree });
+      resultat.set(r.id, resumePrecedent(r, photos2.results.filter((p) => p.component_id === r.id), annee));
+    }
+  }
+  return resultat;
+}
+async function avecPrecedents(db, composantes, { complet = true } = {}) {
+  const precedents = await precedentsPour(db, composantes);
+  if (!precedents.size) return composantes;
+  return composantes.map((c) => {
+    const p = c.origine_id ? precedents.get(c.origine_id) : null;
+    if (!p) return c;
+    return { ...c, precedent: complet ? p : { annee: p.annee, rating: p.rating, travaux_a_verifier: p.travaux_a_verifier } };
+  });
+}
+// Section « Évolution depuis l'étude précédente » du rapport.
+// Ce que l'étude précédente prévoyait pour aujourd'hui : sa projection refaite
+// telle qu'elle a été produite (même année de départ, mêmes composantes), lue
+// au début de l'année courante.
+function previsionEtudePrecedente(r, anneeCourante) {
+  const ecart = anneeCourante - r.annee;
+  if (ecart < 1 || ecart > RESERVE_FUND_PARAMS.projectionYears) return null;
+  if (r.dossier.current_fund_balance == null && r.dossier.cotisation_annuelle == null) return null;
+  const projection = projectReserveFund(r.composantes.filter(estActive), {
+    currentFundBalance: r.dossier.current_fund_balance,
+    baseCotisation: r.dossier.cotisation_annuelle,
+    units: r.dossier.units
+  }, { ...RESERVE_FUND_PARAMS, anneeReference: r.annee });
+  const scenario = scenarioRetenu(projection);
+  if (!scenario) return null;
+  // L'année 1 de la projection est l'année qui suit l'étude.
+  const solde = ecart === 1 ? projection.currentFundBalance : scenario.years[ecart - 2]?.soldeFin;
+  const cotisation = scenario.years[ecart - 1]?.cotisation;
+  return solde == null ? null : { solde, cotisation: cotisation ?? null, scenario: scenario.label };
+}
+function sectionEvolution(ctx, outils, anneeCourante) {
+  const r = ctx.revision;
+  if (!r) return [];
+  const { titre2, body, puce, tableauMaison } = outils;
+  const nom = (c) => sansNotesInternes(c.name ?? "");
+  const facteur = facteurIndexation(r.annee, anneeCourante);
+  const toutes = ctx.composantesToutes ?? ctx.components;
+  const actives = toutes.filter(estActive);
+  const prevParId = new Map(r.composantes.map((c) => [c.id, c]));
+  const out = [
+    titre2("1.7 Évolution depuis l'étude précédente"),
+    body(`La présente étude révise l'étude ${String(r.dossier.dossier_no ?? "").trim()} réalisée en ${r.annee}, conformément à l'obligation de mise à jour au moins tous les cinq ans. Pour la comparaison, les coûts de l'étude précédente sont indexés de ${pourcent(facteur - 1)}, soit l'inflation des coûts de la construction de ${r.annee} à ${anneeCourante}.`)
+  ];
+  // Fonds de prévoyance : réel aux deux études, et ce que la première prévoyait.
+  if (r.dossier.current_fund_balance != null || ctx.dossier.current_fund_balance != null) {
+    const prevision = previsionEtudePrecedente(r, anneeCourante);
+    out.push(tableauMaison(prevision ? ["", `Étude ${r.annee}`, `Prévu pour ${anneeCourante}`, `Réel ${anneeCourante}`] : ["", `Étude ${r.annee}`, `Étude ${anneeCourante}`], [
+      ["Solde du fonds de prévoyance", montantMaison(r.dossier.current_fund_balance) ?? "—", ...prevision ? [montantMaison(prevision.solde) ?? "—"] : [], montantMaison(ctx.dossier.current_fund_balance) ?? "—"],
+      ["Cotisation annuelle", montantMaison(r.dossier.cotisation_annuelle) ?? "—", ...prevision ? [montantMaison(prevision.cotisation) ?? "—"] : [], montantMaison(ctx.dossier.cotisation_annuelle) ?? "—"]
+    ]));
+    const reel = ctx.dossier.current_fund_balance;
+    if (prevision && reel != null) {
+      const diff = Number(reel) - prevision.solde;
+      const relatif = prevision.solde > 0 ? ` (${pourcent(Math.abs(diff) / prevision.solde)})` : "";
+      const constat = Math.abs(diff) < Math.max(1000, Math.abs(prevision.solde) * 0.02)
+        ? "Le solde réel du fonds correspond à ce que l'étude précédente prévoyait."
+        : diff > 0
+          ? `Le solde réel du fonds dépasse de ${montantMaison(diff)}${relatif} celui que l'étude précédente prévoyait pour ${anneeCourante}.`
+          : `Le solde réel du fonds est inférieur de ${montantMaison(-diff)}${relatif} à celui que l'étude précédente prévoyait pour ${anneeCourante} : cotisations moins élevées que recommandé ou dépenses plus hâtives que prévu, l'écart est à rattraper dans le scénario retenu.`;
+      out.push(body(`${constat} La prévision est celle du scénario « ${prevision.scenario} » de l'étude ${r.annee}, recalculée avec ses hypothèses d'origine.`));
+    }
+  }
+  // Travaux prévus dans la période
+  const parStatut = (statut) => actives.filter((c) => c.travaux_periode === statut);
+  const faits = parStatut("fait"), reportes = parStatut("reporte"), abandonnes = parStatut("abandonne");
+  if (faits.length || reportes.length || abandonnes.length) {
+    out.push(titre2("Travaux prévus à l'étude précédente"));
+    const ligne = (c) => {
+      const prevu = remplacementPrevu(prevParId.get(c.origine_id) ?? {});
+      if (c.travaux_periode === "fait") return `${nom(c)}${c.travaux_annee ? ` — réalisé en ${c.travaux_annee}` : ""}`;
+      return `${nom(c)}${prevu ? ` — prévu en ${prevu}` : ""}`;
+    };
+    for (const [liste, titre] of [[faits, "Réalisés"], [reportes, "Reportés"], [abandonnes, "Abandonnés"]]) {
+      if (!liste.length) continue;
+      out.push(body(`${titre} :`));
+      liste.forEach((c) => out.push(puce(ligne(c))));
+    }
+  }
+  // État des composantes
+  const comparees = actives.map((c) => [c, prevParId.get(c.origine_id)]).filter(([c, p]) => p && p.rating && c.rating);
+  const degradees = comparees.filter(([c, p]) => c.rating > p.rating);
+  const ameliorees = comparees.filter(([c, p]) => c.rating < p.rating);
+  if (comparees.length) {
+    out.push(titre2("État des composantes"));
+    const stables = comparees.length - degradees.length - ameliorees.length;
+    const compte = (n, un, plusieurs) => (n === 0 ? `aucune ${un.replace(/^(se |s')/, "ne $1").replace(/^est/, "n'est")}` : `${n} ${n > 1 ? plusieurs : un}`);
+    out.push(body(`Sur ${comparees.length} composante${comparees.length > 1 ? "s" : ""} cotée${comparees.length > 1 ? "s" : ""} aux deux études, ${compte(degradees.length, "s'est dégradée", "se sont dégradées")}, ${compte(ameliorees.length, "s'est améliorée", "se sont améliorées")} et ${compte(stables, "est restée au même niveau", "sont restées au même niveau")}.`));
+    if (degradees.length) {
+      out.push(tableauMaison(["Composante", `Cote ${r.annee}`, `Cote ${anneeCourante}`],
+        degradees.sort((a, b) => (b[0].rating - b[1].rating) - (a[0].rating - a[1].rating)).slice(0, 15)
+          .map(([c, p]) => [nom(c), RATING_LABELS[p.rating] ?? String(p.rating), RATING_LABELS[c.rating] ?? String(c.rating)])));
+    }
+  }
+  // Coûts de remplacement
+  const avecCouts = actives.map((c) => [c, prevParId.get(c.origine_id)]).filter(([c, p]) => p && p.replacement_cost > 0 && c.replacement_cost > 0);
+  if (avecCouts.length) {
+    const totalAvant = avecCouts.reduce((t, [, p]) => t + p.replacement_cost * facteur, 0);
+    const totalApres = avecCouts.reduce((t, [c]) => t + Number(c.replacement_cost), 0);
+    out.push(titre2("Coûts de remplacement"));
+    out.push(body(`Pour les composantes présentes aux deux études, les coûts de remplacement totalisent ${montantMaison(totalApres)}, contre ${montantMaison(totalAvant)} à l'étude précédente une fois indexée, un écart de ${pourcent((totalApres - totalAvant) / totalAvant)}.`));
+    const ecarts = avecCouts.map(([c, p]) => ({ c, avant: p.replacement_cost * facteur, apres: Number(c.replacement_cost) }))
+      .map((e) => ({ ...e, ecart: (e.apres - e.avant) / e.avant }))
+      .filter((e) => Math.abs(e.ecart) >= 0.15)
+      .sort((a, b) => Math.abs(b.apres - b.avant) - Math.abs(a.apres - a.avant))
+      .slice(0, 12);
+    if (ecarts.length) {
+      out.push(body("Principaux écarts (15 % et plus) :"));
+      out.push(tableauMaison(["Composante", `${r.annee}, indexé`, `${anneeCourante}`, "Écart"],
+        ecarts.map((e) => [nom(e.c), montantMaison(e.avant), montantMaison(e.apres), `${e.ecart > 0 ? "+" : ""}${pourcent(e.ecart)}`])));
+    }
+  }
+  // Composantes ajoutées ou retirées
+  const originesActives = new Set(actives.map((c) => c.origine_id).filter(Boolean));
+  const ajoutees = actives.filter((c) => !c.origine_id || prevParId.get(c.origine_id)?.actif === 0);
+  const retirees = r.composantes.filter((p) => p.actif !== 0 && !originesActives.has(p.id));
+  if (ajoutees.length || retirees.length) {
+    out.push(titre2("Composantes ajoutées ou retirées"));
+    if (ajoutees.length) { out.push(body("Ajoutées à la présente étude :")); ajoutees.forEach((c) => out.push(puce(nom(c)))); }
+    if (retirees.length) { out.push(body("Retirées depuis l'étude précédente :")); retirees.forEach((c) => out.push(puce(nom(c)))); }
+  }
+  return out;
+}
+// ============================================================================
+// CARNET D'ENTRETIEN — tâches par composante
+// ----------------------------------------------------------------------------
+// Bibliothèque tirée de la partie officielle (colonnes O et suivantes) du
+// gabarit « 5.10 - Suivi d'entretien 26-000 CE et CE MB - avr 2026 » de la
+// firme. Les onglets CE et CE MB y sont identiques, à deux lignes près ; la
+// section des heures (colonnes A à N) n'est pas reprise.
+//   e  — élément du carnet ; c — catégorie ; re — composantes rattachées
+//   t  — tâches : id stable, x texte, f fréquence, q responsable,
+//        o occurrences [saison, mois (1-12), mois connus ?, responsable propre ?]
+// Lecture du gabarit : le préfixe donne le rythme (H hebdomadaire, M mensuel,
+// S une fois dans la saison, A annuel, AS annuel par entrepreneur, A5 aux
+// 5 ans) et les cases grises de la colonne « Entretien » donnent les mois.
+// Les 81 cas incomplets du gabarit (texte sans case grise, case grise sans
+// texte) ont reçu leurs mois selon le climat québécois : scellants et
+// teintures en septembre, irrigation ouverte en mai et fermée en octobre,
+// inspections aux 5 ans planifiées en février… Les rappels « en cas de doute,
+// contacter Hydro-Québec, le fournisseur de gaz, la Ville » deviennent des
+// consignes en tout temps (C). Une case grise restée sans texte est ignorée.
+// ============================================================================
+const TACHES_ENTRETIEN = [
+  { e: "Aménagement", c: "Terrain et aménagement", re: /aménagement paysager/i, t: [{"id":"cf7ac983","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"5280e42d","x":"Tonte des pelouses et arrangements floraux","f":"S","q":"Contrat","o":[["ete",[7,8,9],true]]},{"id":"7dcd31f4","x":"Ouverture du système d'irrigation","f":"S","q":"Contrat","o":[["printemps",[5],true]]},{"id":"24573b12","x":"Fermeture du système d'irrigation","f":"S","q":"Contrat","o":[["automne",[10],true]]},{"id":"3d6e8907","x":"Retirer les clôtures à neige, en protection des arbustes et plates-bandes","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"dfe3c18d","x":"Installer des clôtures à neige en protection des arbustes et plates-bandes","f":"S","q":"Contrat","o":[["automne",[10],true]]},{"id":"4435195f","x":"Vérifier que la végétation n'est pas en contact avec le bâtiment, élaguer au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"e44a7e71","x":"Vérifier l'état général des arbres, bois mort","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"57e84d0c","x":"Vérifier l'état général des pelouses, déchaumage, fertilisation","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"0325b9a9","x":"Vérifier les secteurs exposés aux grands vents : arbres, branches et éléments susceptibles de se détacher","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"3ffb7862","x":"Vérifier les secteurs à risque d'inondation : drainage, pentes et accumulations d'eau","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Pentes du sol - Aménagement", c: "Terrain et aménagement", re: /aménagement paysager/i, t: [{"id":"e84bdb01","x":"S'assurer que la pente du sol est positive, ajuster au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"813c8dd2","x":"S'assurer de conserver un dégagement d'au moins 6 pouces entre le sol et les revêtements et structures, consulter un professionnel au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Stationnement et voie de circulation", c: "Terrain et aménagement", re: /^stationnement et voies|^voies de circulation|bordures|lignage/i, t: [{"id":"89bafc5e","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"a6e94766","x":"Vérifier la surface du pavage : fissuration, soulèvement, crevasses…","f":"A","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"a70645d8","x":"Vérifier les lignes de stationnement et les indicateurs de directions","f":"A","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"dfc3a3fa","x":"Vérifier les bordures de béton : fissuration, soulèvement, effritement…","f":"A","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"b00452cf","x":"Nettoyer les surfaces asphaltées","f":"AS","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"13615836","x":"Faire nettoyer les regards et les fosses de captation du réseau pluvial","f":"AS","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"2059527c","x":"Libérer de la neige les fosses de captation du réseau pluvial","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["automne",[11,12],true]]},{"id":"66929e30","x":"Faire déneiger les stationnements et voies de circulation","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true]]}] },
+  { e: "Allées piétonnières", c: "Terrain et aménagement", re: /allées piétonnières|^garde-corps/i, t: [{"id":"fe824712","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11],true]]},{"id":"57218be6","x":"Nettoyer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"181871be","x":"Vérifier la surface des allées de béton : fissures, affaissement, éclatement","f":"A","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"2d43e8c5","x":"Vérifier les surfaces des pavés de béton: fissures, affaissement, instabilité","f":"A","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"8435289e","x":"Réparer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"325d1da0","x":"Vérifier la solidité et la stabilité des garde-corps","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"8a1cbb0a","x":"Vérifier pour toute trace de corrosion","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"d3ab17a2","x":"Gratter la corrosion et appliquer une peinture antirouille","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"6f519bf5","x":"Voir à faire stabiliser et solidifier les structures","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"b8af9609","x":"Faire déneiger les passages piétonniers et rampes d'accès","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true]]}] },
+  { e: "Terrasses sur sol", c: "Terrain et aménagement", re: /terrasse sur sol/i, t: [{"id":"a387b33f","x":"Nettoyer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"99666ee0","x":"Vérifier la surface des pavés, remettre de niveau au besoin","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"0870f396","x":"S'assurer que la pente des dalles est positive et faire corriger au besoin","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"c295c40d","x":"Béton-Vérifier et documenter toute fissure, éclats et détérioration","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"b32aeed1","x":"Vérifier la solidité et la stabilité des garde-corps et faire réparer au besoin","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"0aad78b9","x":"Vérifier l'adhérence de la peinture et faire corriger au besoin","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"b01e177d","x":"Gratter la corrosion et poser une peinture antirouille","f":"S","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Escaliers", c: "Terrain et aménagement", re: /escaliers et perrons|^structures de bois traité|structure en acier galvanisé/i, t: [{"id":"8d5f877c","x":"Nettoyer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"f1612b16","x":"Vérifier la stabilité, solidité, ancrages et faire réparer au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"8c93c430","x":"Vérifier l'adhérence de la peinture et faire corriger au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Murets de soutènement", c: "Terrain et aménagement", re: /murets/i, t: [{"id":"d334c6bc","x":"Vérifier les murets de soutènement: déformation, soulèvement, inclinaison, fissuration, détachement","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"91255979","x":"Vérifier le ruissellement au haut du mur et pour tout indice d'érosion","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"a44d0c25","x":"Vérifier l'efficacité du système de drainage au bas des murs","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"3f5389b9","x":"Vérifier la solidité et la stabilité des garde-corps, attaches, charnières, quincaillerie. Tout muret de plus de 20 pouces de hauteur doit être protégé avec un garde-corps","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Clôture", c: "Terrain et aménagement", re: /clôture/i, t: [{"id":"3ede48b6","x":"Nettoyer et retirer les herbes","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"1a7b3864","x":"Vérifier le fonctionnement des portes","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"a98f62be","x":"Vérifier la stabilité des poteaux, des attaches et de la quincaillerie","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Structure", c: "Fondation - structure et stationnement intérieur", re: /^structure – allocation/i, t: [{"id":"f38598c3","x":"Vérifier et documenter toute fissure ou indices d'infiltration d'eau aux finis intérieurs et structures accessibles","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Fondation", c: "Fondation - structure et stationnement intérieur", re: /murs de fondation|drain français/i, t: [{"id":"04b9533d","x":"Nettoyer et retirer les herbes","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"11265172","x":"Vérifier et documenter la face extérieure pour toutes fissures, éclats, etc","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"6f35ae2a","x":"Vérifier et documenter tout risque d'accumulation d'eau près de la fondation","f":"S","q":"","o":[["printemps",[4,5,6],true],["automne",[10,11,12],true]]},{"id":"ed986335","x":"Colmater les fissures au besoin. Des travaux d'excavation sont possible","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"d23a91be","x":"Vérifier les murs intérieurs et noter toute fissure, trace d'humidité, efflorescence, etc. Colmater les fissures au besoin. Des travaux d'excavation sont possible","f":"S","q":"","o":[["printemps",[4,5,6],true],["automne",[10,11,12],true]]},{"id":"80528851","x":"Vérifier les espaces sous-terrains et vides sanitaire pour tout indice d'infiltration ou accumulation d'humidité","f":"S","q":"","o":[["printemps",[4,5,6],true],["automne",[10,11,12],true]]}] },
+  { e: "Margelle", c: "Fondation - structure et stationnement intérieur", re: /murs de fondation/i, t: [{"id":"3602f3f7","x":"Nettoyer et retirer les herbes","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"13e26058","x":"Vérifier que les margelles sont plus haut que le niveau du sol","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"72b798f1","x":"Vérifier que le drain de margelle soit dégagé et fonctionnel","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"4234cb65","x":"Nettoyer les margelles","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"1e58221e","x":"Vérifier à conserver un dégagement d'au moins 6 pouces entre le sol et les fenêtres","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Stationnement intérieur - Rampe d'accès", c: "Fondation - structure et stationnement intérieur", re: /stationnement intérieur – dalle/i, t: [{"id":"c58f4499","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7,8,9],true],["automne",[10,11],true]]},{"id":"4f412640","x":"Vérifier l'état de la surface pour toute fissuration, infiltration, détérioration, déformation","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"fb26bb11","x":"Vérifier le système de drainage au bas de la pente","f":"S","q":"","o":[["printemps",[4,5,6],true],["automne",[10],true]]},{"id":"a8685894","x":"Vérifier la grille du système de drainage: corrosion excessive, instabilité, mise à niveau","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"38bf6a16","x":"Libérer de la neige les fosses de captation du réseau pluvial","f":"S","q":"Contrat","o":[["hiver",[1],true]]},{"id":"fad6eab8","x":"Faire nettoyer les regards et les fosses de captation du réseau pluvial","f":"AS","q":"Contrat","o":[["printemps",[4],true],["automne",[11],true]]},{"id":"a701fcaf","x":"Faire déneiger les accès","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true]]}] },
+  { e: "Stationnement intérieur", c: "Fondation - structure et stationnement intérieur", re: /stationnement intérieur – (dalle|membrane de surface)/i, t: [{"id":"075bc62d","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true]]},{"id":"13dfe5ee","x":"Nettoyage des espaces","f":"M","q":"Ménagers","o":[["automne",[10],true]]},{"id":"cfe7d211","x":"Vérifier l'état de la dalle pour toute fissuration, infiltration, détérioration, déformation","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"3abc9a4b","x":"Vérifier l'état du revêtement, membrane","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"33ddada8","x":"Vérifier l'état des colonnes pour toutes fissuration, éclats, armature apparente, traces de coulures de rouille","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"fef38ad0","x":"Vérifier les bouches de drains pour toute accumulation","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"1ae13c59","x":"Vérifier la grille du système de drainage: corrosion excessive, instabilité, mise à niveau","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"27899437","x":"Vérification des pentes de drainage et de leur efficacité","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7],true],["automne",[10],true]]},{"id":"7efdbc60","x":"Vérifier le plafond pour déceler toute fuite sur le réseau de plomberie. Vérifier les scellants coupe-feu","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"6ca08b1f","x":"Faire nettoyer les regards, les fosses de captation et les drains","f":"AS","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"03ff3187","x":"Faire laver/dégraisser le plancher","f":"AS","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Inspections stationnement étagés - Loi 122", c: "Fondation - structure et stationnement intérieur", re: /stationnements étagés/i, t: [{"id":"c080242f","x":"Pour les stationnements de 2 niveaux et plus, planifier l'inspection requise aux 5 ans (loi 122)","f":"A5","q":"Contrat","o":[["hiver",[2],true]]}] },
+  { e: "Toit-terrasse", c: "Fondation - structure et stationnement intérieur", re: /toit-terrasse/i, t: [{"id":"6ffae724","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"0dd626eb","x":"Vérifier les plafonds et les équipements qui y sont suspendus pour déceler toute fissuration, traces d'infiltration, efflorescence, moisissures, condensation","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Toiture principale - Plat", c: "Enveloppe du bâtiment", re: /toit plat/i, t: [{"id":"57125e0b","x":"Vérifier la présence de glace aux gouttières, drain de toiture","f":"S","q":"","o":[["hiver",[1,2,3],true]]},{"id":"cd6d9502","x":"Vérifier l'état des membranes, du recouvrement de gravier, des scellants et des systèmes de drainage","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"7e3ada28","x":"Vérifier la présence de grande accumulation d'eau suite aux pluies","f":"S","q":"","o":[["ete",[7],true]]},{"id":"a7caeb97","x":"Vérifier les pentes de drainage et de leur efficacité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"1f64ca71","x":"Vérifier l'état des solins et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"2bd78134","x":"Vérifier l'état des membranes, réparer ou remplacer les sections endommagés, combler les espaces en manque de gravier","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"d65321d3","x":"Faire enlever les débris et nettoyer les drain de toits","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Toiture principale - Pente", c: "Enveloppe du bâtiment", re: /toit en pente|gouttières/i, t: [{"id":"e4dfc4e2","x":"Vérifier la présence de glace aux gouttières, drain de toiture","f":"S","q":"","o":[["hiver",[1,2,3],true]]},{"id":"6459aa5a","x":"Vérifier l'état des bardeaux, des scellants et des systèmes de drainage","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"7cc63767","x":"Vérifier les pentes de drainage et de leur efficacité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"0f5d4887","x":"Vérifier l'état des solins et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"707448d3","x":"Vérifier l'état des bardeaux, réparer ou remplacer les bardeaux endommagés","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"84cfa7f2","x":"Vérifier l'état et le scellement des solins ainsi que les fixations corriger si nécessaire","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"2745923f","x":"Faire enlever les débris et nettoyer les gouttières de toits","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Toiture des saillies", c: "Enveloppe du bâtiment", re: /saillies/i, t: [{"id":"861f8002","x":"Vérifier la présence de glace aux gouttières, drain de toiture","f":"S","q":"","o":[["hiver",[1,2,3],true]]},{"id":"dda6ed38","x":"Vérifier l'état des recouvrements, des scellants et des systèmes de drainage","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"f6667793","x":"Vérifier les pentes de drainage et de leur efficacité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"85ae502f","x":"Vérifier l'état des bardeaux, réparer ou remplacer les bardeaux endommagés","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"2b003e14","x":"Vérifier l'état et le scellement des solins ainsi que les fixations corriger si nécessaire","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"733fd256","x":"Faire enlever les débris et nettoyer les système de drainage","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Toiture des marquises", c: "Enveloppe du bâtiment", re: /marquise/i, t: [{"id":"d705e4c9","x":"Vérifier la présence de glace aux gouttières, drain de toiture","f":"S","q":"","o":[["hiver",[1,2,3],true]]},{"id":"05d49288","x":"Vérifier l'état des recouvrements, des scellants et des systèmes de drainage","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"5cb49273","x":"Vérifier les pentes de drainage et de leur efficacité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"43ce7a1d","x":"Éléments d'acier peint, vérifier l'état des surfaces et l'apparition de corrosion","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"b5cbbfba","x":"Vérifier l'état des bardeaux, réparer ou remplacer les bardeaux endommagés","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"c431d637","x":"Vérifier l'état et le scellement des solins ainsi que les fixations corriger si nécessaire","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"59abe763","x":"Faire enlever les débris et nettoyer les système de drainage","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Toiture - Équipements", c: "Enveloppe du bâtiment", re: /cvac – communs – toiture|puits de lumière|solins, parapets|structure de service/i, t: [{"id":"625716bf","x":"Vérifier que les condenseurs soient bien installés","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"6f4a106e","x":"Vérifier que les antennes soient bien fixés","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"a2cf75c0","x":"Vérifier que les drains de toiture ou gouttières soient bien nettoyés","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"4f34ca32","x":"Voir à faire identifier tous les appareils sur la toiture","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"2202ef20","x":"Vérifier les structures en bois traitées","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"2ebb6cfa","x":"Vérifier les pare-vents","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"aeea0815","x":"Vérifier les trottoirs","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"39183bc0","x":"Vérifier les potagers","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Enveloppe du bâtiment - Béton préfabriqué", c: "Enveloppe du bâtiment", re: /béton préfabriqués/i, t: [{"id":"3afe13d5","x":"Vérifier l'état des panneaux. Relever toutes fissures, éclatement et trace d'efflorescence","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"bc236f48","x":"S'assurer du bon dégagement des drains de panneau et nettoyer délicatement si nécessaire","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"84605b3a","x":"Vérifier les joints de scellant au périmètre des éléments traversant les panneaux","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"22f95723","x":"Vérifier et remplacer les joints de scellant au périmètre des éléments traversant les panneaux","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"a765f4fc","x":"Vérifier les joints de contrôle et d'expension","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"6b4ba185","x":"Vérifier et corriger les joints de contrôle et d'expension","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]}] },
+  { e: "Enveloppe du bâtiment - Maçonnerie", c: "Enveloppe du bâtiment", re: /maçonnerie|parement – pierre|linteaux|scellants de rencontre/i, t: [{"id":"f5708d9c","x":"Vérifier l'état du mortier et de la maçonnerie. Relever toutes fissures, éclatement et trace d'efflorescence","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"1e8948d2","x":"S'assurer du bon dégagement des chantepleures et nettoyer délicatement si nécessaire","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"21354cc5","x":"Vérifier les joints de scellant au périmètre des éléments traversant la maçonnerie","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"0c49c12e","x":"Vérifier et remplacer les joints de scellant au périmètre des éléments traversant le revêtement","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"98ea77c2","x":"Vérifier les joints de contrôle et d'expension","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"94cb0298","x":"Vérifier et corriger les joints de contrôle et d'expension","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"38802bfc","x":"Vérifier l'état des linteaux et des solins de maçonnerie","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"c329e62e","x":"Vérifier l'état des solins métalliques et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Enveloppe du bâtiment - Parement de fibro-ciment", c: "Enveloppe du bâtiment", re: /fibrociment|panneaux composites|enduit acrylique|parement – stuc|agrégats/i, t: [{"id":"ea552b8d","x":"Vérifier l'état du revêtement. Relever les éclats, bris et bosselures","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"3d71b5ff","x":"Vérifier les joints de scellant entre le parement de fibro-ciment et les autres surfaces","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"9902af65","x":"Vérifier et remplacer les joints de scellant au périmètre des éléments traversant le revêtement","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"059f5876","x":"Vérifier l'état des solins et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Enveloppe du bâtiment - Parement métallique", c: "Enveloppe du bâtiment", re: /parement – métallique|soffites/i, t: [{"id":"e370b6dc","x":"Vérifier l'état du revêtement. Relever les éclats, bris et bosselures","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"55b9e891","x":"Vérifier et faire remplacer les joints de scellant entre le parement métallique et les autres surfaces","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"1cd3d8f6","x":"Vérifier et remplacer les joints de scellant au périmètre des éléments traversant le revêtement","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"3074bbb7","x":"Vérifier l'état des solins et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Enveloppe du bâtiment - Parement de bois", c: "Enveloppe du bâtiment", re: /fibre de bois|parement – vinyle/i, t: [{"id":"8ebaae1d","x":"Vérifier l'état du revêtement. Relever les éclats, bris et bosselures","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"e03c27f7","x":"Vérifier l'état des enduits de surface. Planifier la pose de teinture, peinture","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"8e64e9ce","x":"Vérifier et faire remplacer les joints de scellant entre le parement d'aluminium et les autres surfaces","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"9cf03c74","x":"Vérifier et remplacer les joints de scellant au périmètre des éléments traversant le revêtement","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"1d1d5c25","x":"Vérifier l'état des solins et la solidité des sorties","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Bouches de ventilation", c: "Enveloppe du bâtiment", re: /ventilation – privatif/i, t: [{"id":"876e3a8a","x":"Rappeler aux copropriétaires de vérifier le branchement et l'efficacité des conduits de sécheuse","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"f7562be7","x":"Nettoyer les grilles de sortie","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"52d9d80a","x":"Nettoyer les conduits et les grilles de sortie","f":"S","q":"Contrat","o":[["printemps",[5],true],["ete",[8],true],["automne",[10],true]]}] },
+  { e: "Inspections des façades - Loi 122", c: "Enveloppe du bâtiment", re: /inspection des façades/i, t: [{"id":"039bbdfd","x":"Pour les immeubles de 5 étages et plus, planifier les inspections requises aux 5 ans (Loi 122)","f":"A5","q":"Contrat","o":[["hiver",[2],true]]}] },
+  { e: "Portes et fenêtres", c: "Portes extérieures et fenêtres", re: /^portes d'entrée|^portes de service – |portes-patio|porte simple|^fenêtres|scellants d'ouverture|vestibule|blocs de verre/i, t: [{"id":"fa5fbf82","x":"Nettoyage les surfaces, vitrages et huiler la quincaillerie","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"e393aca9","x":"Rappeler aux copropriétaires de vérifier le fonctionnement des portes-patios, portes-fenêtres et fenêtres et lubrifier/ajuster au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"bf15d40b","x":"Vérifier la présence de condensation et de buée à l'intérieur des verres thermos","f":"S","q":"","o":[["hiver",[1,2,3],true],["automne",[10],true]]},{"id":"0e9fdd92","x":"Vérifier la présence de traces d'infiltration d'eau à l'intérieur des vitrages et des contour de fenêtres et des portes","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"9cf0eeae","x":"Vérifier les allèges de fenêtre, les coupes-froids, scellants, nettoyage et lubrification des systèmes de fermeture des volets ouvrants","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"dbc0cc41","x":"Vérifier les seuils de porte, les coupes-froids, ferme-porte, scellants, nettoyage et lubrification des systèmes de fermeture des portes principales et de services","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"f8ca0e74","x":"Lubrifier les charnières de portes et resserrer les vis au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"a5c02213","x":"Ajuster les mécanismes d'ouverture, pognée, gache et barre panique","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"565ec25a","x":"Ajuster les charnières à ressort ou les cylindres des portes coupe-feu","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"9f162758","x":"Remplacer les joints de scellant au périmètre des portes et fenêtres","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]}] },
+  { e: "Portes de garage", c: "Portes extérieures et fenêtres", re: /porte de garage/i, t: [{"id":"dafffa0c","x":"Nettoyer les surfaces, les vitrages et huiler la quincaillerie","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"0e34a69e","x":"Vérifier les seuils, les coupes-froids et les scellants","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"38212e1a","x":"Vérifier le bon fonctionnement d'ouverture/fermeture des portes de stationnements","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"55d7a981","x":"Vérifier les panneaux, charnières et roues pour tout indices de bris, bosselures ou impacts - Usures et lubrification","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"eee2d46f","x":"Vérifier les resssorts, câbles de tension, fixations ainsi que les cablages électriques","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"75999ae7","x":"Vérifier la courroie d'entrainement","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"5dc43c97","x":"Vérifier le mécanisme d'ouverture manuel","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"ab7b1405","x":"Vérifier, nettoyer et lubrifier les éléments de la porte de garage et de son système d'ouverture","f":"S","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Mur rideau", c: "Portes extérieures et fenêtres", re: /mur-rideau/i, t: [{"id":"cdcd5591","x":"Nettoyage les surfaces et vitrages","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"64fdd6f6","x":"Vérifier la présence de condensation et de buée à l'intérieur des verres thermos","f":"S","q":"","o":[["hiver",[1,2,3],true],["automne",[10],true]]},{"id":"544fc403","x":"Remplacer les joints de scellant rigide au périmètre vitrage","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"9185b5ed","x":"Vérifier la présence de traces d'infiltration d'eau de l'intérieur des structures et des contour des vitrages","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Balcons", c: "Balcons escaliers et terrasses", re: /^balcons – /i, t: [{"id":"86756fd4","x":"Déneiger les balcons communs","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true]]},{"id":"8a1614ef","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"2e968c72","x":"Nettoyage des espaces","f":"M","q":"Ménagers","o":[["automne",[10,11,12],true]]},{"id":"9db7e777","x":"Rappel aux copropriétaires de déneiger leur balcon - si demandé par le syndicat","f":"M","q":"","o":[["hiver",[1,2,3],true]]},{"id":"fed99fdf","x":"Vérifier la stabilité et la fixation des mains courantes et garde-corps","f":"S","q":"","o":[["printemps",[4],true]]},{"id":"6a924a19","x":"Vérifier la stabilité et la fixation des mains courantes et garde-corps. Corriger au besoin","f":"S","q":"","o":[["automne",[10],true]]},{"id":"97c19d09","x":"Balcon composite - vérifier l'état des surfaces, mains courantes, garde-corps et poteaux, et l'apparition de corrosion. Retouches au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"8e11d571","x":"Vérifier l'état des pontages de fibre de verre","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"ed815c41","x":"Vérifier les pentes et l'efficacité du drainage. Noter toute trace d'accumulation d'eau","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"7ad01070","x":"Vérifier les joints de scellant à la jonction des murs, retoucher si nécessaire","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"b0b47816","x":"Balcon de béton - Vérifier et documenter toute fissuration, effritement, éclatement, ancrages…","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"4e5340e1","x":"Balcon de béton - vérifier l'état des surfaces, Corriger avec un scellant ou un mortier","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"84d15249","x":"Balcon de béton - vérifier l'état des, mains courantes, garde-corps et poteaux, et l'apparition de corrosion. Retouches au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Terrasses urbaine - Toiture", c: "Balcons escaliers et terrasses", re: /terrasses urbaines/i, t: [{"id":"8613a49c","x":"Vérifier la stabilité et la fixation des mains courantes et garde-corps","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"c59010ee","x":"Mains courantes et garde-corps, vérifier l'état des surfaces et l'apparition de corrosion. Retouches au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"8245774b","x":"Pontage de bois, vérifier l'état des surfaces et réparations locales au besoin","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"200bdabe","x":"Pontage de bois, appliquer une protection sur les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["automne",[9],true]]},{"id":"d48c902b","x":"Vérifier ou faire vérifier le plafond du niveau sous la terrasse","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"78ef89fa","x":"Vérifier les drains sous la terrasse et l'efficacité de l'évacuation vers les drains","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"88a70584","x":"Vérifier pour tout indice d'accumulation d'eau","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Vide sous toit", c: "Intérieur du bâtiment", re: /vides sous toit/i, t: [{"id":"acdf9ae4","x":"Vérifier le vide sous toit et documenter toutes traces d'infiltrations ou d'accumulation d'humidité","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Entrées et vestibules", c: "Intérieur du bâtiment", re: /vestibule/i, t: [{"id":"ef7773d4","x":"Nettoyer les espaces, surfaces, vitrages, sol et équipements","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"94579024","x":"Vérifier l'état des grilles grattes pieds","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[10],true]]},{"id":"fc524c62","x":"Vérifier l'état et le fonctionnement des systèmes de fermetures des portes de service. Mouvements, barrures, charnières","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Corridors et espaces communs", c: "Intérieur du bâtiment", re: /placoplâtre|revêtement de sol|tuiles acoustiques|lambris|escaliers intérieurs|surfaces vitrées intérieures|portes des unités|portes de service intérieures|rangements grillagés/i, t: [{"id":"acaf9146","x":"Nettoyer les espaces, surfaces, murs, planchers, plafonds, vitrages intérieures, équipements","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"5b28b4ef","x":"Vérifier l'état des planchers, murs et plafonds pour tout indice de soulèvement, détachement, perte d'adhérence, affaissement, infiltration","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"ed65ecdb","x":"Vérifier les drains de planchers pour tout indice de refoulement, débris, odeurs","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"dac97419","x":"Vérifier l'état et le fonctionnement des systèmes de fermetures des portes des unité/de service. Mouvements, barrures, charnières","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"bdb7d732","x":"Vérifier l'état des escaliers, stabilité, solidité, peintures, vernis","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"e82896d0","x":"Vérifier la stabilité et l'état des rampes et garde-corps des escaliers, peintures, vernis","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"07e914c7","x":"Vérifier l'état des équipements de cuisines communes: plomberie, robinetterie, cuisinière, ventilation/évacuation et clapet de sortie d'évacuation","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"915c9f6f","x":"Vérifier l'état des équipements de buanderie communes: plomberie, robinetterie, évacuation, grilles de sortie d'évacuation","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]},{"id":"a5479bf5","x":"Vérifier l'état des mobiliers fixes communs (salle de toilette, cuisine, salle commune): comptoirs, ajustements des charnières, glissière des tiroirs","f":"S","q":"","o":[["printemps",[4],true],["automne",[10],true]]}] },
+  { e: "Chauffage localisé des espaces communs", c: "Intérieur du bâtiment", re: /plinthes électriques|aérothermes muraux/i, t: [{"id":"f7fcce29","x":"Vérifier le fonctionnement, stabilité, accumulation de poussière excessive","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true],["hiver",[1,2],true],["automne",[10,11,12],true]]},{"id":"6b2141e4","x":"Nettoyer les ailettes des plinthes électriques et aérothermes","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7],true],["automne",[10,11,12],true]]},{"id":"57a27c36","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9c1f726f","x":"Vérifier les chauffages des espaces communs","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true]]},{"id":"53a221f3","x":"Près des sorties, vérifier pour toute corrosion excessive","f":"M","q":"","o":[["hiver",[1,2],true],["automne",[10,11,12],true]]}] },
+  { e: "Salle commune", c: "Mobiliers et installations de confort", re: /^mobilier – espaces communs|^mobilier fixe/i, t: [{"id":"605b83a6","x":"Vérifier le mobilier intérieur: solidité, stabilité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"7f278c0c","x":"Vérifier le mobilier fixe, stabilité, solidité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9f6faa65","x":"Vérifier les équipements, fonctionnement, stabilité, solidité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"bc20a6c4","x":"Vérifier les équipements de buanderie, fonctionnement, stabilité, solidité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Salle de confort / Bibliothèque", c: "Mobiliers et installations de confort", re: /^mobilier – espaces communs|^mobilier fixe/i, t: [{"id":"40eee11f","x":"Vérifier le mobilier intérieur: solidité, stabilité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Bureau de l'administration", c: "Mobiliers et installations de confort", re: /^mobilier – espaces communs/i, t: [{"id":"923d0967","x":"Vérifier le mobilier intérieur: solidité, stabilité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Bureau de la sécurité", c: "Mobiliers et installations de confort", re: /surveillance/i, t: [{"id":"41c1ff7b","x":"Vérifier le mobilier intérieur: solidité, stabilité - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Protection incendie", c: "Appareils et équipements spéciaux", re: /système d'incendie – (panneau central|détecteurs)/i, t: [{"id":"053b0ae1","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"83cf1563","x":"Planifier un exercice d'évacuation d'urgence - Incendie","f":"A","q":"","o":[["hiver",[2],true]]},{"id":"42a9e7fe","x":"Procéder à un exercice d'évacuation d'urgence - Incendie","f":"A","q":"","o":[["printemps",[5,6],true]]},{"id":"3c4ca8f5","x":"Planifier un plan de procédures d'urgence - Incendie","f":"A","q":"","o":[["hiver",[2],true]]},{"id":"1d102119","x":"Immeubles de 3 étages et plus: vérifier que des affiches d'évacuation soient placée près des ascenseurs","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Extincteurs portatifs", c: "Appareils et équipements spéciaux", re: /détecteurs d'incendie et extincteurs/i, t: [{"id":"0f9e09df","x":"Planifier l'inspection annuelle - NFPA 10","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"c2989888","x":"Vérifier les portes des rangement d'extincteurs - Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"1f38734c","x":"Vérifier que les extincteurs sont pleins, en place, visibles et accessibles","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Détecteurs d'incendie", c: "Appareils et équipements spéciaux", re: /détecteurs d'incendie/i, t: [{"id":"ace6fb31","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"68f27f31","x":"Rappel au copropriétaire de vérifier le fonctionnement des détecteurs autonomes","f":"AS","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"20a9bed8","x":"Rappel au copropriétaire de vérifier l'année d'installation des détecteurs autonomes (10 ans)","f":"A","q":"","o":[["hiver",[1],true],["ete",[7],true]]}] },
+  { e: "Alarme d'incendie", c: "Appareils et équipements spéciaux", re: /panneau central|alarme incendie/i, t: [{"id":"7b034fdc","x":"Planifier l'inspection annuelle CAN/ULC-S536","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"95550042","x":"Vérifier que le panneau d'alarme d'incendie n'indique pas de code de défectuosité","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"aece5dfa","x":"Vérifier que le certificatde bon fonctionnement du syst. Alarme incendie soit à jour","f":"A","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"dc19ba3d","x":"Vérifier que le certificat de bon fonctionnement du système de protection d'incendie soit affiché","f":"A","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"111d2531","x":"Vérifier les systèmes du poste central d'alarme: selon CAN/ULC-S561","f":"A","q":"Contrat","o":[["hiver",[1],true]]}] },
+  { e: "Éclairages d'urgences", c: "Appareils et équipements spéciaux", re: /éclairage d'urgence/i, t: [{"id":"ff27f7bf","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"2a6ddded","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"00754918","x":"Vérifier que les témoins lumineux des éclairages d'urgences sont visibles","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"92bb36e9","x":"Vérifier les systèmes d'éclairage autonome d'urgence - par batterie","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"e66579f4","x":"Vérifier les systèmes d'éclairage autonome d'urgence - par génératrice","f":"A","q":"Contrat","o":[["hiver",[1],true]]}] },
+  { e: "Communication avec les unités", c: "Appareils et équipements spéciaux", re: /interphones/i, t: [{"id":"10a9adb8","x":"Nettoyer adéquatement le système dans les halls principaux","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"d22d16f6","x":"Vérifier le bon fonctionnement des interphones dans les unités","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"1aadf030","x":"Vérifier l'état général du panneau de contrôle principal: émission/réception de message audible, ouverture des portes, délai","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Communication dans les espaces communs", c: "Appareils et équipements spéciaux", re: /interphones/i, t: [{"id":"0f7689a1","x":"Vérifier le fonctionnement du téléphone d'urgence","f":"H","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"61c95233","x":"Vérifier le fonctionnement du système de haut-parleur par étage","f":"H","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"8cd53054","x":"Faire vérifier les systèmes","f":"A","q":"Contrat","o":[["hiver",[1],true]]}] },
+  { e: "Système de surveillance CCTV", c: "Appareils et équipements spéciaux", re: /surveillance/i, t: [{"id":"848f2528","x":"Vérifier que les cameras et écrans sont fonctionnelles et stables","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"ec6541b5","x":"Vérifier que les enregistrements sont disponibles","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Séparations coupe-feu", c: "Appareils et équipements spéciaux", re: /coupe-feu|obturation/i, t: [{"id":"46cb1f9c","x":"S'assurer que les portes séparations coupe-feu soient bien fermées et enclanchées et que leur ouverture compléte est possible","f":"H","q":"","o":[["hiver",[1],true]]},{"id":"1cda4599","x":"S'assurer que les séparations coupe-feu soient bien fermées et enclanchées et que leur ouverture compléte est possible","f":"H","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"b1e4d2fc","x":"S'assurer que les registres et les clapets coupe-feu sont en bon état: maillon-fusible, guides et roulements, position ouverte","f":"A","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Foyers et cheminées - Combustible solide", c: "Appareils et équipements spéciaux", re: /foyers/i, t: [{"id":"94088c93","x":"S'assurer auprès du services d'incendie de votre municipalité que les normes et réglementation en vigueur soient respecté - Depuis septembre 2017 plusieurs municipalités limitent l'utilisation des systèmes à combustible solide","f":"A","q":"","o":[["printemps",[5],true]]},{"id":"da9fda2d","x":"Vérifier l'état de la paroi extérieure, chapeau, stabilité, insertion, scellant et faire ramoner","f":"S","q":"","o":[["printemps",[5],true],["automne",[11],true]]}] },
+  { e: "Système de gicleur", c: "Appareils et équipements spéciaux", re: /gicleurs/i, t: [{"id":"0bcffbac","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["hiver",[1,2,3],true]]},{"id":"4b691816","x":"Les têtes de gicleur ne présentent pas de fuites ou de déformation","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"57d5e75e","x":"Les systèmes de pompes de gicleurs ne présentent pas de fuite ou corrosion importante","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"cad4684c","x":"Le local des pompes est sécurisé en tout temps","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a74e6bd2","x":"Le chauffage des locaux des pompes est fonctionnel","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a7d7ed7d","x":"Les raccords extérieurs de pompiers sont visibles et accessibles en tout temps","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"a34e6b6e","x":"L'alarme de basse température est fonctionnelle","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"0e94851f","x":"Vérification complète du système de gicleurs automatique - Selon NFPA 25","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"2b9b1f3c","x":"Vérification (5 ans) du système de gicleurs automatique - Selon NFPA 25","f":"A5","q":"Contrat","o":[["hiver",[1],true]]}] },
+  { e: "Système fermeture automatique des portes", c: "Appareils et équipements spéciaux", re: /ferme-portes/i, t: [{"id":"6f488377","x":"Vérifier le mécanisme de fermeture automatique","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"c2774f4e","x":"Vérifier le bon fonctionnement (aucun message d'erreurs)","f":"M","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Boites postales", c: "Appareils et équipements spéciaux", re: /casiers postaux/i, t: [{"id":"c214ad3b","x":"Nettoyer adéquatement, retirer toutes affiches ou publicité","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"e8f5eb74","x":"Vérifier les boites postales, fonctionnement, solidité, infraction, etc","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Chutes à déchets", c: "Appareils et équipements spéciaux", re: /chute à déchets – allocation/i, t: [{"id":"807639d3","x":"Nettoyer adéquatement et huiler la quincaillerie","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"e8b5e77e","x":"Vérifier l'état du conduit de chute et le système de fermeture des portes d'accès sur chaque étage","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"95044fac","x":"Vérifier l'état de la sortie du conduit et assurer la libre sortie, stabilité, propreté","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"51385518","x":"Faire nettoyer les chutes à déchets","f":"M","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"0606bdf2","x":"Vérifier l'état des conteneurs à déchets, roues, couvercles, stabilités, propreté","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"5b950eec","x":"Faire nettoyer/réparer les conteneurs à déchets","f":"M","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7,8,9],true],["automne",[10],true]]}] },
+  { e: "Compacteur à déchets", c: "Appareils et équipements spéciaux", re: /compacteur/i, t: [{"id":"406243ab","x":"Vérifier l'état général, stabilité, usure, fonctionnement, étanchéité des portes, aire de travail sécuritaire, propreté","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a7a993f1","x":"Vérifier le panneau électrique et le câblage, feux avertisseurs, fonctionnement du bouton d'urgence, niveau d'huile","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"c83148c3","x":"Faire vérifier et nettoyer le compâcteur à déchets","f":"M","q":"Contrat","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Ascenseur", c: "Appareils et équipements spéciaux", re: /ascenseur/i, t: [{"id":"8ce20b76","x":"Planifier l'inspection/maintenance annuelle","f":"A","q":"","o":[["hiver",[1],true]]},{"id":"e7245e8b","x":"Nettoyer adéquatement, retirer toutes affiches ou publicité","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"88b88002","x":"Vérifier que les essaies mensuels soit effectuées et inscrit au registre","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"22aff4ef","x":"Vérifier que les interventions, date, nom travail effectuée soient inscrit au registre","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"5aa4a0f2","x":"Vérifier que le registre des interventions et d'essaies annuels soient mis à jours par l'entrepreneur et présent dans la salle des ascenseurs - Selon (CSA B44-07) et (B44.2-07)","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"5a9f1dfb","x":"Vérifier que les attestations des essaies annuels des dispositifs de sécurité soit affiché ou au dossier","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"4e86a28c","x":"Faire effectuer la maintenance annuelle du système d'ascenseur - RBQ 14.1","f":"A","q":"","o":[["hiver",[1],true]]}] },
+  { e: "Apport d'air frais espaces communs", c: "Système de chauffage et ventilation", re: /échangeurs d'air|cvac – communs/i, t: [{"id":"9381255c","x":"Planifier le service d'entretien","f":"S","q":"","o":[["hiver",[1],true]]},{"id":"5e16d4e6","x":"Nettoyer adéquatement, vérifier les filtres et remplacer au besoin (3 mois)","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"1854a4bc","x":"Vérifier les ventilateurs, stabilité, bruits, courroies, alignement des poulies, poussières excessives","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"66ba255c","x":"Faire vérifier le ventilateur air neuf des espaces communs","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Climatisation localisée - espaces communs", c: "Système de chauffage et ventilation", re: /cvac – communs/i, t: [{"id":"a1e9a9d0","x":"Planifier le service d'entretien","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"b0a4d732","x":"Nettoyer adéquatement, vérifier les filtres et remplacer au besoin (minimum 3 mois ou selon manufacturier)","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"8f437c1c","x":"Nettoyer adéquatement, vérifier les filtres et remplacer au besoin (3 mois)","f":"M","q":"Ménagers","o":[["automne",[10,11,12],true]]},{"id":"7d4d6737","x":"Vérifier le fonctionnement, stabilité, bruits, filtres, poussières excessives","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"06d7ec8c","x":"Système CVAC des espaces communs","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Chauffage intégré grande surface - Communs", c: "Système de chauffage et ventilation", re: /chauffage à eau chaude/i, t: [{"id":"a4b038ac","x":"Planifier le service d'entretien","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"5fd92784","x":"Vérifier le fonctionnement, stabilité, câblage, branchement, filtres, corrosion","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[11,12],true]]},{"id":"a5abdf4a","x":"Faire vérifier le système Chauffage intégré","f":"A","q":"","o":[["hiver",[1],true]]}] },
+  { e: "Ventilation salles techniques", c: "Système de chauffage et ventilation", re: /ventilation des salles de services/i, t: [{"id":"bb891249","x":"Nettoyer adéquatement, vérifier les filtres et remplacer au besoin (Minimum 3 mois ou selon manufacturier)","f":"M","q":"Ménagers","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"fc2f66d8","x":"Vérifier le fonctionnement, stabilité, bruits, filtres, poussières excessives","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"4023e354","x":"Faire vérifier les ventilateur des salles techniques","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Climatisation - salles techniques", c: "Système de chauffage et ventilation", re: /climatisation de zone/i, t: [{"id":"d0a9002e","x":"Planifier le service d'entretien","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"6dd81ba8","x":"Nettoyer adéquatement, vérifier les filtres et remplacer au besoin (Minimum 3 mois ou selon manufacturier)","f":"M","q":"Ménagers","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"c1320b0e","x":"Vérifier le fonctionnement, stabilité, bruits, filtres, poussières excessives","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"34331114","x":"Faire vérifier la climatisation des salles techniques","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Apport d'air frais - Stationnement intérieur", c: "Système de chauffage et ventilation", re: /ventilation du stationnement/i, t: [{"id":"6d8dbe09","x":"Planifier le service d'entretien","f":"S","q":"Contrat","o":[["printemps",[4],true]]},{"id":"c0efe5d8","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"31171261","x":"Vérifier les ventilateurs et les volets persiennes motorisés: fonctionnement, stabilité, bruits, poussières excessives","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"51a38ca0","x":"Vérifier les boitiers: support, étanchéité, corrosion, peinture écaillée, stabilité","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"285e1f60","x":"Faire vérifier les ventilateurs air neuf et volets persiennes des stationnements","f":"S","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Chauffage - Stationnement intérieur", c: "Système de chauffage et ventilation", re: /aérothermes suspendus/i, t: [{"id":"30f771de","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"61f28234","x":"Vérifier le fonctionnement, stabilité, câblage, branchement, filtres, corrosion, bruits","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4],true],["automne",[10,11,12],true]]},{"id":"8d16a7d7","x":"Faire vérifier les aérothermes des stationnements","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Évacuation CO/NO2", c: "Système de chauffage et ventilation", re: /détection des gaz/i, t: [{"id":"972b7d6b","x":"Planifier l'inspection et calibration annuelle","f":"A","q":"","o":[["hiver",[1],true]]},{"id":"2c195803","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"0a92ceec","x":"Vérifier le fonctionnement, stabilité, bruits, contrôle de l'apport d'air frais et ouverture des volets motorisés","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"da2a20cc","x":"Faire effectuer la calibration des Sonde de détection CO\\NO2","f":"A","q":"Contrat","o":[["printemps",[4],true]]},{"id":"053283be","x":"Faire vérifier - Système d'évacuation CO\\NO2","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Système de désenfumage", c: "Système de chauffage et ventilation", re: /obturation/i, t: [{"id":"6009c8d9","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"76048633","x":"Vérifier le fonctionnement, stabilité, bruits, contrôle de l'apport d'air frais et les volets motorisés","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"f817f7e8","x":"Faire vérifier le système de désenfumage","f":"S","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Installations électriques intérieures", c: "Installation électriques/gaz naturel", re: /éclairage intérieurs/i, t: [{"id":"f4174b23","x":"Nettoyer adéquatement les espaces périphériques","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"749bd711","x":"Vérifier la stabilité des fixtures. Faire corriger au besoin","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"7c0290d8","x":"Vérifier le bon fonctionnement des luminaires intérieurs et des espaces communs. Corriger au besoin","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"b8a51616","x":"Vérifier le fonctionnement des prises intérieures","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"676722a3","x":"Vérifier le fonctionnement des prises des espaces communs","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Installations électriques extérieures", c: "Installation électriques/gaz naturel", re: /éclairage extérieurs|lampadaires|bornes de recharge/i, t: [{"id":"7de94fce","x":"Nettoyer adéquatement les espaces périphériques","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"b0f972b3","x":"Vérifier la stabilité des fixtures. Faire corriger au besoin","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"d76a2e98","x":"Vérifier le bon fonctionnement des luminaires extérieurs et des espaces communs. Corriger au besoin","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"939d6207","x":"Vérifier les prises extérieures - DDTF et/ou avec Disjoncteur différentiel","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Panneaux électriques principaux", c: "Installation électriques/gaz naturel", re: /panneaux de distribution|alimentation électrique principale|thermographique/i, t: [{"id":"2aabd314","x":"Nettoyer adéquatement les espaces périphériques","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"c16584c2","x":"Vérifier que les panneaux et les circuits soient identifiés","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"4835ad2e","x":"Vérifier que les espaces électriques soient libre de tout entreposage","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"46daf815","x":"Faire vérifier par un électricien que les espaces électriques soient libre de toute poussières excessives -","f":"M","q":"","o":[["hiver",[1],true]]},{"id":"5bc23a7a","x":"Vérifier que les espaces électriques soient libre de toute poussières excessives","f":"M","q":"","o":[["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"93f0b9f9","x":"Vérifier le bon fonctionnement du disjoncteur différentiel sur les prises extérieures","f":"AS","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"95774005","x":"Faire vérifier par un électricien avec capteur infrarouge l'entrée principale","f":"A","q":"Contrat","o":[["printemps",[4],true]]},{"id":"8cbb0fe1","x":"Pour toute situation qui présente un doute contacter Hydro-Québec au 1-800-790-2424","f":"C","q":"","o":[["hiver",[],true],["printemps",[],true],["ete",[],true],["automne",[],true]]}] },
+  { e: "Transformateurs de courant", c: "Installation électriques/gaz naturel", re: /alimentation électrique principale/i, t: [{"id":"8aa8b9e3","x":"Nettoyer adéquatement les espaces périphériques","f":"M","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true,"Ménagers"],["ete",[7,8,9],true,"Ménagers"],["automne",[10,11,12],true,"Ménagers"]]},{"id":"98761930","x":"Vérifier visuellement et auditivement","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"57b0ed93","x":"Vérifier que les espaces électriques soient libre de tout entreposage","f":"M","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"a80a14f4","x":"Faire vérifier par un électricien que les espaces électriques soient libre de toute poussières excessives -","f":"M","q":"","o":[["printemps",[4],true]]}] },
+  { e: "Réseau - Gaz naturel", c: "Installation électriques/gaz naturel", re: /gaz naturel/i, t: [{"id":"7a8f416d","x":"Vérifier que les conduits intérieurs et extérieurs soient identifiés en jaune et idéalement avec la note ''GAZ NATUREL''","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"f8272f40","x":"Vérifier l'état des conduits et les valves intérieurs et extérieurs: de rouille excessive","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"8c43b29e","x":"Pour toute situation qui présente un doute contacter le fournisseur de gaz naturel - Montréal et les environs: Énergir au 1-800-361-8003","f":"C","q":"","o":[["hiver",[],true],["printemps",[],true],["ete",[],true],["automne",[],true]]}] },
+  { e: "Alimentation de secours - Génératrice", c: "Installation électriques/gaz naturel", re: /alimentation d'urgence/i, t: [{"id":"4dc98701","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["hiver",[1],true]]},{"id":"a2202bb0","x":"Nettoyer suite à demande du gestionnaire","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"aa1bdc75","x":"Vérifier que les essaies hebdomadaires sont effectués","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"7187d11e","x":"Vérifier que les essaies mensuels sont effectués","f":"H","q":"","o":[["automne",[10,11,12],true]]},{"id":"df7bb3f6","x":"Vérifier qu'ils n'y aie aucune fuite d'huile ou de carburant","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"209bdc91","x":"Vérifier les niveau de carburant, d'huile et de liquide de refroissement","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"acb91153","x":"Vérifier que les contact, câblages sont en bon état, bien fixés et solides","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"def101d5","x":"Vérifier l'état des courroies","f":"H","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"fc7f9bde","x":"Faire vérifier le système d'alimentation de secours : selon CAN/CSA-C282","f":"A","q":"Contrat","o":[["printemps",[4],true]]},{"id":"0ef0ad80","x":"Faire vérifier (5ans) le système d'alimentation de secours : selon CAN/CSA-C282","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Alimentation en eau", c: "Alimentation et évacuation", re: /eau potable|antirefoulement/i, t: [{"id":"6ad25ae1","x":"Vérifier que les valve principales soient identifiés en bleu","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"78664e91","x":"Vérifier les conduits pour tout indice de coulure, bris, condensation, corrosion excessive","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"31b28cc6","x":"Vérifier les isolants de conduits pour les bris, déchirures, détachements","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"e3edf0e2","x":"Faire mettre à l'essai les valves d'arrêt graduellement, de l'entrée principale, pour s'assurer qu'elles fonctionnent et les empêcher de raidir. Demander l'assistance d'un plombier lorsque la valve présente un doute ou si elle n'a pas été actionné depuis plusieurs années","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"e9366ce5","x":"Planifier l'inspection annuelle du dispositif anti-retour (DAR)","f":"A","q":"Contrat","o":[["hiver",[1],true]]}] },
+  { e: "Chauffe-eau", c: "Alimentation et évacuation", re: /réservoirs? d'eau chaude/i, t: [{"id":"3a408e7e","x":"Nettoyer adéquatement","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a3637c02","x":"Vérifier le chauffe-eau pour tout signe de corrosion excessive, fuite","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"35a4b615","x":"Vérifier le plancher, le bassin de rétention pour toute trace de fuite","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"5491b271","x":"Vérifier le fonctionnement du drain de plancher","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"0274f59e","x":"Vérifier que le contrôle de température ne soit pas inférieur à 60'Celcius","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"cb0934b6","x":"Vérifier le fonctionnement de soupape de sûreté","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]},{"id":"42f9998e","x":"Vérifier les isolants de conduits pour les bris, déchirures, détachements","f":"S","q":"","o":[["hiver",[1],true],["printemps",[4],true],["ete",[7],true],["automne",[10],true]]}] },
+  { e: "Pompe de surpression", c: "Alimentation et évacuation", re: /surpression/i, t: [{"id":"87344be1","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["hiver",[1],true]]},{"id":"71227447","x":"Nettoyer adéquatement les espaces","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a3185144","x":"Vérifier que l'interrupteur principal soit en mode ''Automatique''","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"96135f27","x":"Vérifier pour tout indice de fuite, corrosion excessive, instabilité","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a3280918","x":"Vérifier les supports, ancrage, stabilité, vibrations excessives","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"b291d370","x":"Vérifier de la soupape de sûreté et l'actionner manuellement","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"74b2bb8e","x":"Vérifier du réservoir d'expansion pour tout indice de corrosion de surface ou peinture écaillée","f":"M","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"bed7cd61","x":"Faire vérifier le système de surpression d'alimentation","f":"A","q":"","o":[["hiver",[1],true]]}] },
+  { e: "Salles communes", c: "Alimentation et évacuation", re: /équipements de plomberie/i, t: [{"id":"157c5dea","x":"Nettoyer adéquatement les équipements et l'espace","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"ddf81a4a","x":"Vérifier la robinetterie, salle commune, SDB: fonctionnement, fuite, corrosion","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"bd308b46","x":"Vérifier la toilette: fonctionnement, stabilité, fuite, condensation excessive","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Robinetterie extérieure", c: "Alimentation et évacuation", re: /équipements de plomberie|eau potable/i, t: [{"id":"9477e931","x":"Vérifier les robinets extérieurs: fonctionnement, fuite, corrosion","f":"S","q":"","o":[["printemps",[5,6],true],["ete",[7,8,9],true]]},{"id":"427fdc2a","x":"Après le 15 mai et dès que le climat le permet, cesser l'hivernisation et mettre en fonction les appareils et robinetteries extérieures. Vérifier le fonctionnement et tout indice de fuite","f":"S","q":"","o":[["printemps",[5,6],true]]},{"id":"141283ff","x":"Avant le 15 septembre, fermer et hiverniser les appareils et robinetteries extérieures. Vérifier pour tout indice de fuite","f":"S","q":"","o":[["ete",[9],true]]},{"id":"0716edf8","x":"Vérifier le système d'irrigation extérieur, tête, répartiteur de zone","f":"AS","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"e108792c","x":"Vérification et ouverture du système d'irrigation extérieur","f":"S","q":"Contrat","o":[["printemps",[5],true]]},{"id":"aae1c4de","x":"Vérification, fermeture et hivernisation du système d'irrigation extérieur","f":"S","q":"Contrat","o":[["ete",[9],true]]},{"id":"9b91e2d2","x":"Pour toute situation de bris d'acqueduc contacter les bureaux de la ville de Montréal au 3-1-1","f":"C","q":"","o":[["hiver",[],true],["printemps",[],true],["ete",[],true],["automne",[],true]]}] },
+  { e: "Évacuation sanitaire", c: "Alimentation et évacuation", re: /évacuation sanitaire|évacuation pluviale et sanitaire/i, t: [{"id":"d10e8c03","x":"Vérifier que les conduits soient sans coulures, bien soutenue et avec une pente adéquate","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"6662a1ca","x":"Vérifier les couvercles, stabilité, bris, solidité","f":"S","q":"","o":[["hiver",[1,2,3],true]]},{"id":"13436e18","x":"Vérifier les grilles: corrosion excessive, stabilité, bris, solidité","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9c4ebfa9","x":"Planifier l'inspection du clapet anti-retour","f":"A","q":"Contrat","o":[["printemps",[5,6],true]]}] },
+  { e: "Bassin collecteur et pompes - Sanitaire", c: "Alimentation et évacuation", re: /pompes de puisard/i, t: [{"id":"6ac3537c","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["printemps",[5,6],true]]},{"id":"37b71c2d","x":"Vérifier le controleur, les capteurs, la lampe témoin, la sonnerie de trop plein","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"ad58b129","x":"Faire vérifier le dispositif anti-refoulement par un plombier - selon la norme CAN/CSA-B64.10.1 «Guide d’entretien et de mise à l’essai à pied d’oeuvre des dispositifs anti refoulement»","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Évacuation pluviale extérieure", c: "Alimentation et évacuation", re: /puisards et regards|clapets/i, t: [{"id":"8db59bc0","x":"Vérifier les grilles: corrosion excessive, stabilité, bris, solidité, débris","f":"S","q":"","o":[["hiver",[3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10],true]]}] },
+  { e: "Bassin collecteur et pompes - Pluvial intérieure", c: "Alimentation et évacuation", re: /pompes de puisard|clapets/i, t: [{"id":"2c827807","x":"Planifier l'inspection annuelle","f":"A","q":"","o":[["printemps",[4],true]]},{"id":"f51e49f9","x":"Vérifier le bassin et les caniveaux pour tout accumulation de débris, boue","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9cfcabe7","x":"Vérifier la garde d'eau des avaloirs de sol et ajouter de l'eau au besoin","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"c23bb852","x":"Vérifier le fonctionnement du système de pompage de la fosse de retenue","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f4b0c171","x":"Vérifier les branchements, les supports, les ancrages, du système de pompe","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f9f92f81","x":"Vérifier le controleur, les capteurs, la lampe témoin, la sonnerie de trop plein","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9cb4c2e9","x":"Vérifier les branchements, les supports, les ancrages","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"b8b0a6f2","x":"Faire vérifier système de pompes par un plombier -","f":"A","q":"Contrat","o":[["printemps",[4],true]]}] },
+  { e: "Piscine - Bassin (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(bassin)/i, t: [{"id":"bf493f85","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"bb2653c4","x":"Faire vérifier et ouvrir le valve d'eau - Faire hiverniser les valves d'eau","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"9492e19e","x":"Faire vérifier et mettre en fonction les circuits électriques - Faire mettre hors fonction les circuits électriques","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"a2108265","x":"Faire vérifier pour tout débris et faire retirer","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"4263a984","x":"Planifier la vérification et l'entretien de la qualité de l'eau de baignade","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"cb7bfa99","x":"Vérifier et documenter les revêtement intérieur du bassin, béton, carreaux de céramique, fibre de verre, toile de vinyle, structure pour tout indice de bris, délamination, fissure, déchirement, détachement, perte de volume d'eau, etc","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"3744abe8","x":"Faire réparer les surfaces intérieures","f":"S","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"354900ca","x":"Faire vérifier que les équipements et installations soient sécuritaires et respectent les règlements municipaux et recommandations de l'INSPQ","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"3e5579d6","x":"Faire corriger selon les règlementations","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"23e73d61","x":"Vérifier que les équipements de sécurité sont visibles et accessibles en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"5fd2af87","x":"Vérifier que les affiches des règlements soient affichées et bien en vu en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"acecc1e7","x":"Prendre connaissance des recommandations concernant les règlementations à maintenir et faire respecter pour assurer la sécurité dans les espaces piscines (INSPQ)","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]}] },
+  { e: "Piscine - Enceinte, espace piétonnier et terrasse (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – (enceinte|contour)/i, t: [{"id":"36ba3084","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"cfe4014b","x":"Faire nettoyer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"8df6bae7","x":"Vérifier et documenter la surface des allées de béton : fissures, affaissement, éclatement","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"b76edfa0","x":"Faire réparer les surfaces","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"fe8686f8","x":"Vérifier et documenter les surfaces des pavés de béton: fissures, affaissement, instabilité","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"b3e08792","x":"S'assurer que la pente des dalles est positive","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"e502bce2","x":"Faire réparer les surfaces et remettre de niveau au besoin","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"4c9791c6","x":"Vérifier que la clôture et les accès sont stables, solides et barrés en tout temps","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"ae056640","x":"Vérifier pour toute trace de corrosion","f":"S","q":"","o":[["printemps",[4],true],["ete",[7],true],["printemps",[4],true],["ete",[7],true]]},{"id":"f062ceb0","x":"Gratter la corrosion et appliquer une peinture antirouille/zinc","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"21fa5b11","x":"Faire stabiliser et solidifier les structures","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true],["printemps",[4],true],["ete",[7],true]]},{"id":"ce4a7a7e","x":"Vérifier que les installations et supports d'équipements sont stables et bien fixés","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"0b3d31b2","x":"Gratter la corrosion et appliquer une peinture","f":"S","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]}] },
+  { e: "Piscine - Pompes et filtreur (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(filtration)/i, t: [{"id":"422cd27c","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"98e8fd3a","x":"Vérifier à faire remplacer le sable aux 3-4 ans","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"6e400231","x":"Vérifier que les cablages électriques soit protégés en tout temps","f":"A","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"9da50f5a","x":"Vérifier l'indicateur de pression (manomètre) et s'assurer que la pression rencontre les indications du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"e0376279","x":"Vérifier que la position des vannes soient adéquate et selon les recommandations du manufacturier","f":"A","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"8aa22759","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"63d8a898","x":"Vérifier pour tout éléments ou débris qui pourraient nuite au bouches d'aspiration et de rejet","f":"S","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]}] },
+  { e: "Piscine - Système de dosage (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(filtration)/i, t: [{"id":"637c7043","x":"Planifier la calibration annuelle","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"480b9d4a","x":"Vérifier le Chlorinateur, doseur de pH, doseur de sel, les lampes témoins et que ceux-ci fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"dc13f8cd","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]}] },
+  { e: "Piscine - Système de chauffe eau T/P (extérieure)", c: "Installations de piscine extérieur", re: /piscine extérieure – .*(chauffage)/i, t: [{"id":"07dadbee","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true]]},{"id":"a3befb15","x":"Faire vérifier la solidité des installations","f":"A","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"71211c9e","x":"Vérifier que les appareils fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"ff2562ab","x":"Vérifier que les cablage électrique et conduit des gaz soit protégés en tout temps, isolants, sécurité","f":"A","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]},{"id":"5dc90406","x":"Faire vérifier que les dégagements soient respectés (Min 24''au périmètre et min 48'' au dessus)","f":"A","q":"Contrat","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true]]}] },
+  { e: "Piscine - Système de traitement de l'air - Déshumidificateur mécanique (intérieure)", c: "Installations de piscine extérieur", re: /piscine intérieure – .*(humidité)/i, t: [{"id":"f8acb019","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["printemps",[4],true],["ete",[7],true],["hiver",[1],true]]},{"id":"94ce0b10","x":"Vérifier que les appareils fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"dc4f3f87","x":"Vérifier le controleur, les capteurs, la lampe témoin, la sonnerie de trop plein","f":"S","q":"","o":[["printemps",[4,5,6],true],["ete",[7,8,9],true],["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"1b0be245","x":"Planifier l'inspection saisonnière","f":"A","q":"Contrat","o":[["ete",[7],true]]}] },
+  { e: "Piscine - Bassin (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(bassin)/i, t: [{"id":"726e8872","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"351976f2","x":"Faire vérifier et ouvrir le valve d'eau - Faire hiverniser les valves d'eau","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"0d8a4a0b","x":"Faire vérifier et mettre en fonction les circuits électriques - Faire mettre hors fonction les circuits électriques","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"e8a1b169","x":"Faire vérifier pour tout débris et faire retirer","f":"S","q":"","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"55b89d1e","x":"Planifier la vérification et l'entretien de la qualité de l'eau de baignade","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"cd0b6f18","x":"Vérifier et documenter les revêtement intérieur du bassin, béton, carreaux de céramique, fibre de verre, toile de vinyle, structure pour tout indice de bris, délamination, fissure, déchirement, détachement, perte de volume d'eau, etc","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"07930389","x":"Faire réparer les surfaces intérieures","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f01a7afc","x":"Faire vérifier que les équipements et installations soient sécuritaires et respectent les règlements municipaux et recommandations de l'INSPQ","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"23388ad2","x":"Faire corriger selon les règlementations","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"de435578","x":"Vérifier que les équipements de sécurité sont visibles et accessibles en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"fcf614ac","x":"Vérifier que les affiches des règlements soient affichées et bien en vu en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"37d0a224","x":"Prendre connaissance des recommandations concernant les règlementations à maintenir et faire respecter pour assurer la sécurité dans les espaces piscines (INSPQ)","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]}] },
+  { e: "Piscine - Enceinte, espace piétonnier et terrasse (intérieure)", c: "Installations de piscine intérieure", re: /centre aquatique/i, t: [{"id":"9a6b3e80","x":"Nettoyer les espaces","f":"M","q":"Ménagers","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"b9695b08","x":"Faire nettoyer les surfaces","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"a5d045f7","x":"Vérifier et documenter la surface des allées de béton : fissures, affaissement, éclatement","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"2a736ed3","x":"Faire réparer les surfaces","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"2c8fff20","x":"Vérifier et documenter les surfaces des pavés de béton: fissures, affaissement, instabilité","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"8e096bdd","x":"S'assurer que la pente des dalles est positive","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"2545a761","x":"Faire réparer les surfaces et remettre de niveau au besoin","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"b5625e97","x":"Vérifier que la clôture et les accès sont stables, solides et barrés en tout temps","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"46a52472","x":"Vérifier pour toute trace de corrosion","f":"S","q":"","o":[["hiver",[1],true],["ete",[7],true],["hiver",[1],true],["printemps",[4],true],["ete",[7],true]]},{"id":"20d0092d","x":"Gratter la corrosion et appliquer une peinture antirouille/zinc","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"f7eba770","x":"Faire stabiliser et solidifier les structures","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true],["hiver",[1],true],["ete",[7],true]]},{"id":"a83153af","x":"Vérifier que les installations et supports d'équipements sont stables et bien fixés","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"9d2e44fb","x":"Gratter la corrosion et appliquer une peinture","f":"S","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]}] },
+  { e: "Piscine - Pompes et filtreur (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(filtration)/i, t: [{"id":"25c0f1dd","x":"Planifier l'ouverture annuelle des systèmes - planifier l'hivernisation des systèmes","f":"A","q":"Contrat","o":[["hiver",[1],true],["ete",[9],true]]},{"id":"fb213a88","x":"Vérifier à faire remplacer le sable aux 3-4 ans","f":"A","q":"Contrat","o":[["hiver",[1],true],["ete",[7],true]]},{"id":"bf194df5","x":"Vérifier que les cablages électriques soit protégés en tout temps","f":"A","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"fc6e4e14","x":"Vérifier l'indicateur de pression (manomètre) et s'assurer que la pression rencontre les indications du manufacturier","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"43c913eb","x":"Vérifier que la position des vannes soient adéquate et selon les recommandations du manufacturier","f":"A","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"c2f6c367","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"a00d776c","x":"Vérifier pour tout éléments ou débris qui pourraient nuite au bouches d'aspiration et de rejet","f":"S","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Piscine - Système de dosage (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(filtration)/i, t: [{"id":"6572d9a3","x":"Planifier la calibration annuelle","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"89c9bfd1","x":"Planifier la calibration saisonnière","f":"A","q":"Contrat","o":[["ete",[7],true]]},{"id":"a9a48c37","x":"Vérifier le Chlorinateur, doseur de pH, doseur de sel, les lampes témoins et que ceux-ci fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"18d82548","x":"Vérifier pour tout indice de dégradation, de fuite, de bruits inhabituel","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] },
+  { e: "Piscine - Système de chauffe eau T/P (intérieure)", c: "Installations de piscine intérieure", re: /piscine intérieure – .*(chauffage)/i, t: [{"id":"451b56eb","x":"Planifier l'inspection annuelle","f":"A","q":"Contrat","o":[["hiver",[1],true]]},{"id":"1dd95730","x":"Planifier l'inspection saisonnière","f":"A","q":"Contrat","o":[["ete",[7],true]]},{"id":"925e521a","x":"Faire vérifier la solidité des installations","f":"A","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"bf12de20","x":"Vérifier que les appareils fonctiopnnent selon les recommandations du manufacturier","f":"S","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["automne",[10,11,12],true]]},{"id":"55c12112","x":"Vérifier que les appareils fonctionnent selon les recommandations du manufacturier","f":"S","q":"","o":[["ete",[7,8,9],true]]},{"id":"eba9ee2e","x":"Vérifier que les cablage électrique et conduit des gaz soit protégés en tout temps, isolants, sécurité","f":"A","q":"","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]},{"id":"f7fbd267","x":"Faire vérifier que les dégagements soient respectés (Min 24''au périmètre et min 48'' au dessus)","f":"A","q":"Contrat","o":[["hiver",[1,2,3],true],["printemps",[4,5,6],true],["ete",[7,8,9],true],["automne",[10,11,12],true]]}] }
+];
+
+const FREQUENCES_ENTRETIEN = {
+  H: "Chaque semaine",
+  M: "Chaque mois",
+  S: "Une fois dans la saison",
+  A: "Annuelle",
+  AS: "Annuelle, par un entrepreneur",
+  A5: "Aux 5 ans",
+  C: "Consigne en tout temps"
+};
+const SAISONS_ENTRETIEN = [
+  { cle: "hiver", libelle: "Hiver", mois: [1, 2, 3] },
+  { cle: "printemps", libelle: "Printemps", mois: [4, 5, 6] },
+  { cle: "ete", libelle: "Été", mois: [7, 8, 9] },
+  { cle: "automne", libelle: "Automne", mois: [10, 11, 12] }
+];
+const MOIS_ABREGES = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
+const NOMS_MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
+function libelleResponsable(q) {
+  if (q === "Ménagers") return "Entretien ménager";
+  if (q === "Contrat") return "Entrepreneur (contrat)";
+  return q ? sansNotesInternes(q) : "Syndicat / gestionnaire";
+}
+function libelleFrequence(tache) {
+  const total = new Set(tache.o.flatMap((o) => o[1])).size;
+  // Une inspection « annuelle » cochée à deux saisons se fait à chacune.
+  if (tache.f === "A" && tache.o.length > 1) return "Aux mois indiqués";
+  if (tache.f === "AS" && tache.o.length > 1) return "Aux mois indiqués, par un entrepreneur";
+  return FREQUENCES_ENTRETIEN[tache.f] ?? (total >= 12 ? "Chaque mois" : "Aux mois indiqués");
+}
+// « avril », « avril à novembre », « avril et octobre », « toute l'année »,
+// « printemps (mois à préciser) ». Les mois consécutifs se fusionnent d'une
+// saison à l'autre : une tâche mensuelle d'avril à novembre se lit d'un coup.
+function quandTache(tache) {
+  if (tache.f === "C") return "En tout temps";
+  const connus = [...new Set(tache.o.filter((o) => o[2]).flatMap((o) => o[1]))].sort((a, b) => a - b);
+  if (connus.length === 12) return "Toute l'année";
+  const plages = [];
+  for (const m of connus) {
+    const derniere = plages[plages.length - 1];
+    if (derniere && m === derniere[1] + 1) derniere[1] = m;
+    else plages.push([m, m]);
+  }
+  const seul = plages.length === 1 && tache.o.every((o) => o[2]);
+  const morceaux = plages.map(([a, b]) => a === b ? NOMS_MOIS[a - 1] : b === a + 1 ? (seul ? `${NOMS_MOIS[a - 1]} et ${NOMS_MOIS[b - 1]}` : `${NOMS_MOIS[a - 1]}-${NOMS_MOIS[b - 1]}`) : `${NOMS_MOIS[a - 1]} à ${NOMS_MOIS[b - 1]}`);
+  for (const [saison, , estConnu] of tache.o) {
+    if (estConnu) continue;
+    const s = SAISONS_ENTRETIEN.find((x) => x.cle === saison);
+    morceaux.push(`${(s?.libelle ?? saison).toLowerCase()} (mois à préciser)`);
+  }
+  if (morceaux.length <= 1) return morceaux[0] ?? "";
+  return `${morceaux.slice(0, -1).join(", ")} et ${morceaux[morceaux.length - 1]}`;
+}
+// Tâches ajoutées à la main : les mois choisis donnent les occurrences par saison.
+function occurrencesDepuisMois(mois) {
+  const valides = [...new Set((mois ?? []).map(Number).filter((m) => m >= 1 && m <= 12))];
+  return SAISONS_ENTRETIEN.map((s) => [s.cle, s.mois.filter((m) => valides.includes(m)), true]).filter((o) => o[1].length > 0);
+}
+function nettoyerPersoEntretien(brut) {
+  const src = objetJson(brut);
+  const retirees = Array.isArray(src.retirees) ? src.retirees.map(String).filter((x) => /^[a-z0-9_]{1,24}$/.test(x)).slice(0, 500) : [];
+  const ajoutees = (Array.isArray(src.ajoutees) ? src.ajoutees : []).slice(0, 50).map((t) => ({
+    id: /^p_[a-z0-9]{4,16}$/.test(String(t?.id)) ? String(t.id) : `p_${crypto.randomUUID().replace(/-/g, "").slice(0, 10)}`,
+    x: String(t?.x ?? "").trim().slice(0, 300),
+    f: FREQUENCES_ENTRETIEN[t?.f] ? t.f : "S",
+    q: ["Ménagers", "Contrat", ""].includes(t?.q) ? t.q : "",
+    mois: [...new Set((Array.isArray(t?.mois) ? t.mois : []).map(Number).filter((m) => m >= 1 && m <= 12))]
+  })).filter((t) => t.x && t.mois.length);
+  return { retirees, ajoutees };
+}
+// Tâches d'une composante : celles des éléments du carnet qui la visent, moins
+// celles que l'ingénieur a retirées, plus celles qu'il a ajoutées. Quand la
+// firme a importé ses tâches, une composante de sa liste prend les siennes ;
+// une composante qui n'y figure pas (dossier créé avant l'import) garde celles
+// de la bibliothèque Condo Stratégis.
+function tachesPourComposante(component, { avecRetirees = false, biblio = null } = {}) {
+  const nom = String(component?.name ?? "");
+  const perso = nettoyerPersoEntretien(component?.taches_entretien);
+  const retirees = new Set(perso.retirees);
+  const taches = [];
+  const garder = (t, element, categorie) => {
+    const retiree = retirees.has(t.id);
+    if (retiree && !avecRetirees) return;
+    const { comps, ...tache } = t;
+    taches.push({ ...tache, element, categorie, retiree });
+  };
+  const cle = cleTexte(nom);
+  if (biblio?.taches && biblio.noms.has(cle)) {
+    for (const el of biblio.taches) {
+      for (const t of el.t) if (t.comps.includes(cle)) garder(t, el.e, el.c);
+    }
+  } else {
+    for (const el of TACHES_ENTRETIEN) {
+      if (!el.re.test(nom)) continue;
+      for (const t of el.t) garder(t, el.e, el.c);
+    }
+  }
+  for (const t of perso.ajoutees) {
+    taches.push({ id: t.id, x: t.x, f: t.f, q: t.q, o: occurrencesDepuisMois(t.mois), element: sansNotesInternes(nom), categorie: CATEGORIES[component?.cat]?.label ?? "", perso: true, retiree: false });
+  }
+  return taches;
+}
+function tacheAffichee(t) {
+  return {
+    id: t.id,
+    texte: t.x,
+    element: t.element,
+    frequence: libelleFrequence(t),
+    quand: quandTache(t),
+    responsable: libelleResponsable(t.q),
+    aPreciser: t.o.some((o) => !o[2]),
+    perso: !!t.perso,
+    retiree: !!t.retiree,
+    code: t.f,
+    mois: [...new Set(t.o.flatMap((o) => o[1]))].sort((a, b) => a - b)
+  };
+}
+// Tâches du dossier, regroupées par élément du carnet et sans doublon : deux
+// composantes du même élément (fenêtres en vinyle et portes-patio) partagent
+// ses tâches. Seules les composantes actives comptent.
+function carnetDuDossier(components, biblio = null) {
+  const parElement = new Map();
+  for (const comp of components) {
+    for (const t of tachesPourComposante(comp, { biblio })) {
+      if (!parElement.has(t.element)) parElement.set(t.element, { element: t.element, categorie: t.categorie, taches: new Map() });
+      parElement.get(t.element).taches.set(t.id, t);
+    }
+  }
+  const ordreCat = [...new Set([...TACHES_ENTRETIEN, ...biblio?.taches ?? []].map((e) => e.c))];
+  return [...parElement.values()]
+    .map((g) => ({ ...g, taches: [...g.taches.values()] }))
+    .sort((a, b) => {
+      const ia = ordreCat.indexOf(a.categorie), ib = ordreCat.indexOf(b.categorie);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
+}
+// ============================================================================
+// BIBLIOTHÈQUE DE LA FIRME — liste de composantes et tâches du carnet
+// ----------------------------------------------------------------------------
+// Par défaut, une nouvelle visite part de la liste Condo Stratégis
+// (GABARIT_STRATEGIS) et chaque composante reçoit les tâches du carnet qui la
+// visent (TACHES_ENTRETIEN). Une firme peut importer sa propre liste, avec ou
+// sans ses tâches, depuis un classeur au format de l'export : onglets
+// « Composantes » et « Tâches ». Elle est stockée dans companies.bibliotheque
+// et devient la liste de départ de ses nouvelles visites ; les dossiers
+// existants gardent leurs composantes.
+// ============================================================================
+const LIBELLES_REGLES = {
+  etages5: "5 étages et plus (Loi 122)",
+  stationnement_int: "Stationnement intérieur",
+  ascenseur: "Ascenseur",
+  gicleurs: "Gicleurs",
+  generatrice: "Génératrice",
+  piscine_interieure: "Piscine intérieure",
+  piscine_exterieure: "Piscine extérieure"
+};
+const LIMITES_BIBLIOTHEQUE = { composantes: 400, taches: 3000, octets: 900 * 1024 };
+// Clé de comparaison : sans accents, sans casse, tirets et espaces uniformisés.
+function cleTexte(s) {
+  return String(s ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase()
+    .replace(/[‐-―−]/g, "-").replace(/[’']/g, "'").replace(/\s+/g, " ").trim();
+}
+function bibliothequeDeFirme(company) {
+  const b = objetJson(company?.bibliotheque);
+  if (!Array.isArray(b.composantes) || !b.composantes.length) return null;
+  return {
+    ...b,
+    taches: Array.isArray(b.taches) && b.taches.length ? b.taches : null,
+    noms: new Set(b.composantes.map((item) => cleTexte(item.name)))
+  };
+}
+async function bibliothequeDuDossier(db, dossierId) {
+  const row = await db.prepare(
+    "SELECT co.bibliotheque FROM dossiers d JOIN companies co ON co.id = d.company_id WHERE d.id = ?1"
+  ).bind(dossierId).first();
+  return bibliothequeDeFirme(row);
+}
+function listeDeDepart(biblio) {
+  return biblio?.composantes ?? GABARIT_STRATEGIS;
+}
+// Vue de la bibliothèque pour l'admin : chaque composante avec ses tâches.
+function vueBibliotheque(biblio) {
+  const liste = listeDeDepart(biblio);
+  const ids = new Set();
+  let sansTache = 0;
+  const composantes = liste.map((item) => {
+    const taches = tachesPourComposante({ name: item.name, cat: item.cat }, { biblio }).map((t) => {
+      ids.add(t.id);
+      const a = tacheAffichee(t);
+      return { texte: a.texte, element: a.element, frequence: a.frequence, quand: a.quand, responsable: a.responsable };
+    });
+    if (!taches.length) sansTache += 1;
+    return {
+      cat: item.cat,
+      name: item.name,
+      code: item.code ?? "",
+      type: item.type ?? "",
+      unite: item.unite ?? "",
+      vu: item.vu ?? null,
+      condition: item.regle ? LIBELLES_REGLES[item.regle] ?? item.regle : "",
+      taches
+    };
+  });
+  return {
+    source: biblio ? "firme" : "defaut",
+    filename: biblio?.filename ?? null,
+    imported_at: biblio?.imported_at ?? null,
+    tachesPropres: !!biblio?.taches,
+    avertissements: biblio?.avertissements ?? [],
+    categories: Object.entries(CATEGORIES).sort((a, b) => a[1].ordre - b[1].ordre).map(([cle, cat]) => ({ cle, label: cat.label })),
+    composantes,
+    stats: { composantes: composantes.length, taches: ids.size, sansTache }
+  };
+}
+// ----------------------------------------------------------------------------
+// Lecture d'un classeur .xlsx : texte des cellules, feuille par feuille. La
+// bibliothèque tableur embarquée n'a gardé que l'écriture ; celle-ci suffit
+// à lire des valeurs, sans formules ni mise en forme.
+// ----------------------------------------------------------------------------
+function attributXml(balise, nom) {
+  const m = balise.match(new RegExp(`\\s${nom}="([^"]*)"`));
+  return m ? decodeEntitesXml(m[1]) : null;
+}
+function texteXmlRuns(xml) {
+  return [...xml.replace(/<rPh\b[\s\S]*?<\/rPh>/g, "").replace(/<t\b[^>]*\/>/g, "").matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)]
+    .map((m) => decodeEntitesXml(m[1])).join("");
+}
+function indexColonne(ref) {
+  const lettres = String(ref ?? "").match(/^[A-Z]+/)?.[0];
+  if (!lettres) return null;
+  let n = 0;
+  for (const ch of lettres) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n - 1;
+}
+function lignesFeuilleXlsx(xml, partages) {
+  const lignes = [];
+  for (const r of xml.matchAll(/<row\b([^>]*?)(?:\/>|>([\s\S]*?)<\/row>)/g)) {
+    const numero = Number(attributXml(r[1], "r")) || lignes.length + 1;
+    if (numero > 20000) break;
+    const cellules = [];
+    for (const cm of (r[2] ?? "").matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+      const col = indexColonne(attributXml(cm[1], "r")) ?? cellules.length;
+      if (col > 60) continue;
+      const type = attributXml(cm[1], "t");
+      const interieur = cm[2] ?? "";
+      const v = interieur.match(/<v>([\s\S]*?)<\/v>/)?.[1];
+      let valeur = "";
+      if (type === "s") valeur = partages[Number(v)] ?? "";
+      else if (type === "inlineStr") valeur = texteXmlRuns(interieur);
+      else if (type === "b") valeur = v === "1" ? "VRAI" : "FAUX";
+      else if (v != null) valeur = decodeEntitesXml(v);
+      cellules[col] = valeur.trim();
+    }
+    lignes[numero - 1] = Array.from(cellules, (x) => x ?? "");
+  }
+  return Array.from(lignes, (x) => x ?? []);
+}
+async function lireClasseurXlsx(bytes) {
+  const JSZip = import_jszip_min.default;
+  let zip;
+  try {
+    zip = await JSZip.loadAsync(bytes);
+  } catch {
+    throw new Error("ce fichier n'est pas un classeur Excel (.xlsx)");
+  }
+  const lire = async (chemin) => zip.file(chemin)?.async("string") ?? null;
+  const classeur = await lire("xl/workbook.xml");
+  if (!classeur) throw new Error("ce fichier n'est pas un classeur Excel (.xlsx)");
+  const cibles = new Map();
+  for (const m of ((await lire("xl/_rels/workbook.xml.rels")) ?? "").matchAll(/<Relationship\b[^>]*>/g)) {
+    const id = attributXml(m[0], "Id"), cible = attributXml(m[0], "Target");
+    if (id && cible) cibles.set(id, cible.startsWith("/") ? cible.slice(1) : `xl/${cible.replace(/^\.\//, "")}`);
+  }
+  const partages = [];
+  for (const m of ((await lire("xl/sharedStrings.xml")) ?? "").matchAll(/<si\b[^>]*?(?:\/>|>([\s\S]*?)<\/si>)/g)) {
+    partages.push(texteXmlRuns(m[1] ?? ""));
+  }
+  const feuilles = [];
+  for (const m of classeur.matchAll(/<sheet\b[^>]*>/g)) {
+    const chemin = cibles.get(attributXml(m[0], "r:id"));
+    const xml = chemin ? await lire(chemin) : null;
+    if (xml) feuilles.push({ nom: attributXml(m[0], "name") ?? "", lignes: lignesFeuilleXlsx(xml, partages) });
+  }
+  return feuilles;
+}
+// ----------------------------------------------------------------------------
+// Import : validation ligne par ligne. Une seule erreur bloque tout l'import,
+// pour ne jamais remplacer la liste d'une firme par une liste à moitié lue.
+// ----------------------------------------------------------------------------
+const COLONNES_BIBLIOTHEQUE = {
+  composantes: {
+    categorie: ["categorie"],
+    nom: ["composante", "nom de la composante", "nom"],
+    code: ["code uniformat", "uniformat", "code"],
+    type: ["type"],
+    unite: ["unite"],
+    vu: ["duree de vie", "vie utile", "dvu"],
+    regle: ["condition", "regle"]
+  },
+  taches: {
+    composante: ["composante"],
+    element: ["element du carnet", "element", "groupe"],
+    tache: ["tache", "description"],
+    frequence: ["frequence", "rythme"],
+    mois: ["mois"],
+    responsable: ["responsable", "qui"]
+  }
+};
+function reperesColonnes(lignes, colonnes, requises) {
+  for (let r = 0; r < Math.min(lignes.length, 10); r++) {
+    const reperes = {};
+    (lignes[r] ?? []).forEach((v, i) => {
+      const k = cleTexte(v);
+      if (!k) return;
+      for (const [champ, alias] of Object.entries(colonnes)) {
+        if (reperes[champ] == null && alias.some((a) => k === a || k.startsWith(`${a} `) || k.startsWith(`${a}(`))) {
+          reperes[champ] = i;
+          break;
+        }
+      }
+    });
+    if (requises.every((c) => reperes[c] != null)) return { ligneEntete: r, reperes };
+  }
+  return null;
+}
+function categorieDepuis(v) {
+  const k = cleTexte(v);
+  if (!k) return null;
+  for (const [cle, cat] of Object.entries(CATEGORIES)) if (k === cle || k === cleTexte(cat.label)) return cle;
+  // Un libellé abrégé (« Enveloppe », « Plomberie ») suffit s'il ne désigne qu'une catégorie.
+  const candidats = Object.entries(CATEGORIES).filter(([cle, cat]) => cleTexte(cat.label).includes(k) || k.includes(cle));
+  return candidats.length === 1 ? candidats[0][0] : null;
+}
+function frequenceDepuis(v) {
+  const code = String(v ?? "").trim().toUpperCase().replace(/\s+/g, "");
+  if (FREQUENCES_ENTRETIEN[code]) return code;
+  const k = cleTexte(v);
+  if (!k) return null;
+  if (/tout temps|consigne/.test(k)) return "C";
+  if (/5 ans|cinq ans/.test(k)) return "A5";
+  if (/annuel/.test(k)) return /entrepr|contrat/.test(k) ? "AS" : "A";
+  if (/hebdo|semaine/.test(k)) return "H";
+  if (/saison/.test(k)) return "S";
+  if (/mensuel|chaque mois/.test(k)) return "M";
+  return null;
+}
+const MOIS_MOTS = [
+  [/\bjanv(?:ier)?\b/g, 1], [/\bfevr?(?:ier)?\b/g, 2], [/\bmars\b/g, 3], [/\bavr(?:il)?\b/g, 4],
+  [/\bmai\b/g, 5], [/\bjuin\b/g, 6], [/\bjuil(?:let)?\b/g, 7], [/\baout\b/g, 8],
+  [/\bsept(?:embre)?\b/g, 9], [/\boct(?:obre)?\b/g, 10], [/\bnov(?:embre)?\b/g, 11], [/\bdec(?:embre)?\b/g, 12]
+];
+// « avril, octobre », « 4, 10 », « avril à juin », « 11-3 », « printemps »,
+// « toute l'année ». Rend null si un morceau n'est pas un mois.
+function moisDepuis(v) {
+  let k = cleTexte(v).replace(/\./g, " ");
+  if (!k) return [];
+  if (/toute l'annee|tous les mois|12 mois/.test(k)) return [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  for (const s of SAISONS_ENTRETIEN) k = k.replace(new RegExp(`\\b${cleTexte(s.libelle)}\\b`, "g"), ` ${s.mois[0]}-${s.mois[s.mois.length - 1]} `);
+  for (const [re, n] of MOIS_MOTS) k = k.replace(re, ` ${n} `);
+  k = k.replace(/\b(?:a|au|jusqu'a)\b/g, "-").replace(/\bet\b/g, ",");
+  if (/[^\d\s,;\/\-]/.test(k)) return null;
+  const jetons = k.match(/\d+|-/g) ?? [];
+  const mois = new Set();
+  for (let i = 0; i < jetons.length; i++) {
+    const n = Number(jetons[i]);
+    if (!Number.isInteger(n)) continue;
+    if (n < 1 || n > 12) return null;
+    if (jetons[i + 1] === "-" && /^\d+$/.test(jetons[i + 2] ?? "")) {
+      const fin = Number(jetons[i + 2]);
+      if (fin < 1 || fin > 12) return null;
+      // « novembre à mars » passe par décembre.
+      for (let m = n, garde = 0; garde < 12; m = m % 12 + 1, garde++) {
+        mois.add(m);
+        if (m === fin) break;
+      }
+      i += 2;
+    } else mois.add(n);
+  }
+  return [...mois].sort((a, b) => a - b);
+}
+function responsableDepuis(v) {
+  const k = cleTexte(v);
+  if (!k || /syndicat|gestionnaire|administrat/.test(k)) return "";
+  if (/menag|concierge/.test(k)) return "Ménagers";
+  if (/contrat|entrepreneur/.test(k)) return "Contrat";
+  return String(v).trim().slice(0, 40);
+}
+async function idTacheBibliotheque(element, texte, frequence) {
+  const donnees = new TextEncoder().encode(`${cleTexte(element)}|${cleTexte(texte)}|${frequence}`);
+  const empreinte = new Uint8Array(await crypto.subtle.digest("SHA-1", donnees));
+  return `f_${[...empreinte.slice(0, 5)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+async function analyserBibliotheque(bytes, filename) {
+  const feuilles = await lireClasseurXlsx(bytes);
+  const erreurs = [];
+  const avertissements = [];
+  const erreur = (feuille, ligne, message) => {
+    if (erreurs.length < 60) erreurs.push({ feuille, ligne, message });
+  };
+  const trouver = (motNom, colonnes, requises, exclue) => {
+    const candidates = [
+      ...feuilles.filter((f) => cleTexte(f.nom).includes(motNom)),
+      ...feuilles
+    ].filter((f) => f !== exclue);
+    for (const f of candidates) {
+      const r = reperesColonnes(f.lignes, colonnes, requises);
+      if (r) return { feuille: f, ...r };
+    }
+    return null;
+  };
+  const fc = trouver("composante", COLONNES_BIBLIOTHEQUE.composantes, ["categorie", "nom"]);
+  if (!fc) {
+    return { erreurs: [{ feuille: "", ligne: null, message: "Onglet des composantes introuvable : il faut au moins les colonnes « Catégorie » et « Composante ». Partez du fichier téléchargé avec « Télécharger la liste »." }], avertissements };
+  }
+  // --- Composantes ----------------------------------------------------------
+  const composantes = [];
+  const parCle = new Map();
+  const col = (ligne, champ, reperes) => (reperes[champ] != null ? String(ligne[reperes[champ]] ?? "").trim() : "");
+  for (let r = fc.ligneEntete + 1; r < fc.feuille.lignes.length; r++) {
+    const ligne = fc.feuille.lignes[r] ?? [];
+    const x = (champ) => col(ligne, champ, fc.reperes);
+    const nom = x("nom");
+    if (!nom && !x("categorie")) continue;
+    const n = r + 1;
+    const nomFeuille = fc.feuille.nom;
+    if (!nom) { erreur(nomFeuille, n, "nom de composante manquant"); continue; }
+    if (nom.length > 150) { erreur(nomFeuille, n, "nom de composante trop long (150 caractères au plus)"); continue; }
+    const cle = cleTexte(nom);
+    if (parCle.has(cle)) { erreur(nomFeuille, n, `« ${nom} » figure déjà à la ligne ${parCle.get(cle).ligne}`); continue; }
+    const cat = categorieDepuis(x("categorie"));
+    if (!cat) { erreur(nomFeuille, n, `catégorie « ${x("categorie")} » inconnue`); continue; }
+    let vu = null;
+    if (x("vu")) {
+      vu = Number(x("vu").replace(",", ".").replace(/\s*ans?$/i, ""));
+      if (!Number.isFinite(vu) || vu < 1 || vu > 200) { erreur(nomFeuille, n, `durée de vie « ${x("vu")} » invalide (nombre d'années entre 1 et 200)`); continue; }
+      vu = Math.round(vu);
+    } else avertissements.push(`${nomFeuille}, ligne ${n} : « ${nom} » n'a pas de durée de vie.`);
+    const typeBrut = cleTexte(x("type"));
+    const type = !typeBrut ? (/allocation/i.test(nom) ? "allocation" : "remplacement")
+      : typeBrut.startsWith("alloc") ? "allocation" : typeBrut.startsWith("rempl") ? "remplacement" : null;
+    if (!type) { erreur(nomFeuille, n, `type « ${x("type")} » inconnu (remplacement ou allocation)`); continue; }
+    let regle;
+    if (x("regle")) {
+      const k = cleTexte(x("regle"));
+      regle = Object.keys(LIBELLES_REGLES).find((cleRegle) => k === cleTexte(cleRegle) || k === cleTexte(LIBELLES_REGLES[cleRegle]));
+      if (!regle) { erreur(nomFeuille, n, `condition « ${x("regle")} » inconnue`); continue; }
+    }
+    const item = { cat, name: nom, vu, code: x("code").slice(0, 30), type, unite: x("unite").slice(0, 20), ...regle ? { regle } : {} };
+    parCle.set(cle, { item, ligne: n });
+    composantes.push(item);
+  }
+  if (!composantes.length && !erreurs.length) erreur(fc.feuille.nom, null, "aucune composante dans l'onglet");
+  if (composantes.length > LIMITES_BIBLIOTHEQUE.composantes) erreur(fc.feuille.nom, null, `${composantes.length} composantes : ${LIMITES_BIBLIOTHEQUE.composantes} au plus`);
+  // --- Tâches (facultatives) --------------------------------------------------
+  let taches = null;
+  const ft = trouver("tache", COLONNES_BIBLIOTHEQUE.taches, ["composante", "tache", "frequence"], fc.feuille);
+  if (!ft) {
+    avertissements.push("Aucun onglet de tâches : les composantes dont le nom correspond à la liste Condo Stratégis reçoivent ses tâches du carnet.");
+  } else {
+    const elements = new Map();
+    let total = 0;
+    for (let r = ft.ligneEntete + 1; r < ft.feuille.lignes.length; r++) {
+      const ligne = ft.feuille.lignes[r] ?? [];
+      const x = (champ) => col(ligne, champ, ft.reperes);
+      if (!x("composante") && !x("tache")) continue;
+      const n = r + 1;
+      const nomFeuille = ft.feuille.nom;
+      const comp = parCle.get(cleTexte(x("composante")));
+      if (!comp) { erreur(nomFeuille, n, `composante « ${x("composante")} » absente de l'onglet des composantes`); continue; }
+      const texte = x("tache");
+      if (!texte) { erreur(nomFeuille, n, "texte de la tâche manquant"); continue; }
+      if (texte.length > 300) { erreur(nomFeuille, n, "tâche trop longue (300 caractères au plus)"); continue; }
+      const f = frequenceDepuis(x("frequence"));
+      if (!f) { erreur(nomFeuille, n, `fréquence « ${x("frequence")} » inconnue (H, M, S, A, AS, A5 ou C)`); continue; }
+      const mois = moisDepuis(x("mois"));
+      if (mois === null) { erreur(nomFeuille, n, `mois « ${x("mois")} » illisibles (ex. : « avril, octobre » ou « 4, 10 »)`); continue; }
+      if (!mois.length && f !== "C") { erreur(nomFeuille, n, "aucun mois : indiquez quand la tâche se fait (seule une consigne C peut s'en passer)"); continue; }
+      const element = (x("element") || comp.item.name).slice(0, 150);
+      const cleElement = cleTexte(element);
+      if (!elements.has(cleElement)) elements.set(cleElement, { e: element, c: CATEGORIES[comp.item.cat].label, t: new Map() });
+      const groupe = elements.get(cleElement);
+      const id = await idTacheBibliotheque(element, texte, f);
+      const cleComp = cleTexte(comp.item.name);
+      // La même tâche d'un même élément, rattachée à plusieurs composantes, n'en fait qu'une.
+      if (groupe.t.has(id)) {
+        const t = groupe.t.get(id);
+        if (!t.comps.includes(cleComp)) t.comps.push(cleComp);
+        continue;
+      }
+      const o = f === "C" ? SAISONS_ENTRETIEN.map((s) => [s.cle, [], true]) : occurrencesDepuisMois(mois);
+      groupe.t.set(id, { id, x: texte, f, q: responsableDepuis(x("responsable")), o, comps: [cleComp] });
+      total += 1;
+    }
+    if (total > LIMITES_BIBLIOTHEQUE.taches) erreur(ft.feuille.nom, null, `${total} tâches : ${LIMITES_BIBLIOTHEQUE.taches} au plus`);
+    taches = [...elements.values()].map((g) => ({ e: g.e, c: g.c, t: [...g.t.values()] }));
+    if (!total) {
+      taches = null;
+      avertissements.push("L'onglet des tâches est vide : les composantes dont le nom correspond à la liste Condo Stratégis reçoivent ses tâches du carnet.");
+    } else {
+      const avecTache = new Set(taches.flatMap((g) => g.t.flatMap((t) => t.comps)));
+      const sans = composantes.filter((item) => !avecTache.has(cleTexte(item.name)));
+      if (sans.length) avertissements.push(`${sans.length} composante${sans.length > 1 ? "s n'ont" : " n'a"} aucune tâche : ${sans.slice(0, 8).map((item) => item.name).join(", ")}${sans.length > 8 ? "…" : ""}`);
+    }
+  }
+  const bibliotheque = {
+    v: 1,
+    filename: String(filename || "bibliotheque.xlsx").slice(0, 150),
+    imported_at: new Date().toISOString(),
+    avertissements: avertissements.slice(0, 30),
+    composantes,
+    taches
+  };
+  if (!erreurs.length && JSON.stringify(bibliotheque).length > LIMITES_BIBLIOTHEQUE.octets) {
+    erreur("", null, "bibliothèque trop volumineuse : raccourcissez les textes ou réduisez le nombre de tâches");
+  }
+  return { erreurs, avertissements: bibliotheque.avertissements, bibliotheque };
+}
+// ----------------------------------------------------------------------------
+// Export : la bibliothèque en vigueur, au format que l'import relit. Une firme
+// part de ce fichier, le corrige et le réimporte.
+// ----------------------------------------------------------------------------
+// [4, 5, 6, 10] → « avril à juin, octobre » : relisible par moisDepuis.
+function moisEnTexte(mois) {
+  if (mois.length === 12) return "toute l'année";
+  const plages = [];
+  for (const m of mois) {
+    const derniere = plages[plages.length - 1];
+    if (derniere && m === derniere[1] + 1) derniere[1] = m;
+    else plages.push([m, m]);
+  }
+  return plages.map(([a, b]) => b - a >= 2 ? `${NOMS_MOIS[a - 1]} à ${NOMS_MOIS[b - 1]}` : a === b ? NOMS_MOIS[a - 1] : `${NOMS_MOIS[a - 1]}, ${NOMS_MOIS[b - 1]}`).join(", ");
+}
+async function classeurBibliotheque(biblio, nomFirme) {
+  const liste = listeDeDepart(biblio);
+  const T = (v) => ({ v, s: 6 });
+  const E = (v) => ({ v, s: 9 });
+  const lisezMoi = [
+    [{ v: `Bibliothèque de composantes — ${nomFirme}`, s: 1 }],
+    [{ v: biblio ? `Liste importée de « ${biblio.filename} » le ${String(biblio.imported_at).slice(0, 10)}.` : "Liste Condo Stratégis, utilisée par défaut.", s: 2 }],
+    [],
+    [{ v: "Comment l'utiliser", s: 2 }],
+    [T("1. Corrigez ou complétez les onglets « Composantes » et « Tâches ». Gardez la ligne d'en-tête et le nom des colonnes.")],
+    [T("2. Importez le fichier depuis l'administration, page Bibliothèque. Une erreur bloque tout l'import et la liste en vigueur reste en place.")],
+    [T("3. La liste importée sert de départ à toutes les nouvelles visites de la firme. Les dossiers existants gardent leurs composantes.")],
+    [T("L'onglet « Tâches » est facultatif. Sans lui, une composante dont le nom correspond à la liste Condo Stratégis reçoit ses tâches du carnet.")],
+    [],
+    [{ v: "Onglet « Composantes »", s: 2 }],
+    [E("Colonne"), E("Contenu")],
+    [T("Catégorie"), T(`Obligatoire. Une de : ${Object.values(CATEGORIES).sort((a, b) => a.ordre - b.ordre).map((c) => c.label).join(" · ")}`)],
+    [T("Composante"), T("Obligatoire. Nom unique dans la liste.")],
+    [T("Code Uniformat"), T("Facultatif. Ex. : B20.10")],
+    [T("Type"), T("remplacement ou allocation. Vide : allocation si le nom contient « Allocation », sinon remplacement.")],
+    [T("Unité"), T("Facultatif. Ex. : m², ml, u, global")],
+    [T("Durée de vie (ans)"), T("Nombre d'années, de 1 à 200.")],
+    [T("Condition"), T(`Facultatif. La composante s'active ou se désactive selon la fiche d'immeuble : ${Object.values(LIBELLES_REGLES).join(" · ")}`)],
+    [],
+    [{ v: "Onglet « Tâches »", s: 2 }],
+    [E("Colonne"), E("Contenu")],
+    [T("Composante"), T("Obligatoire. Nom exact d'une composante de l'onglet « Composantes ». Une tâche partagée se répète sur une ligne par composante.")],
+    [T("Élément du carnet"), T("Facultatif. Regroupe les tâches dans le tableur de suivi (ex. : « Toiture »). Vide : le nom de la composante.")],
+    [T("Tâche"), T("Obligatoire. Le texte de la tâche.")],
+    [T("Fréquence"), T(Object.entries(FREQUENCES_ENTRETIEN).map(([k, v]) => `${k} = ${v}`).join(" · "))],
+    [T("Mois"), T("Les mois où la tâche se fait : « avril, octobre », « 4, 10 », « avril à juin », « printemps », « toute l'année ». Vide seulement pour une consigne C.")],
+    [T("Responsable"), T("Ménagers (entretien ménager), Contrat (entrepreneur) ou Syndicat. Vide : syndicat / gestionnaire.")]
+  ];
+  const lignesComposantes = [
+    ["Catégorie", "Composante", "Code Uniformat", "Type", "Unité", "Durée de vie (ans)", "Condition"].map(E),
+    ...liste.map((item) => [CATEGORIES[item.cat]?.label ?? item.cat, item.name, item.code ?? "", item.type ?? "", item.unite ?? "", item.vu ?? "", item.regle ? LIBELLES_REGLES[item.regle] ?? "" : ""].map(T))
+  ];
+  const lignesTaches = [["Composante", "Élément du carnet", "Tâche", "Fréquence", "Mois", "Responsable"].map(E)];
+  for (const item of liste) {
+    for (const t of tachesPourComposante({ name: item.name, cat: item.cat }, { biblio })) {
+      const mois = [...new Set(t.o.flatMap((o) => o[1]))].sort((a, b) => a - b);
+      const qui = t.q === "Ménagers" || t.q === "Contrat" ? t.q : t.q ? t.q : "Syndicat";
+      lignesTaches.push([item.name, t.element, t.x, t.f, moisEnTexte(mois), qui].map(T));
+    }
+  }
+  return classeurXlsx([
+    { nom: "Lisez-moi", lignes: lisezMoi, largeurs: [26, 120], paysage: true },
+    { nom: "Composantes", lignes: lignesComposantes, largeurs: [34, 58, 16, 16, 10, 18, 28], figer: 1 },
+    { nom: "Tâches", lignes: lignesTaches, largeurs: [48, 34, 70, 11, 30, 14], figer: 1 }
+  ]);
+}
+// ----------------------------------------------------------------------------
+// Tableur suivi d'entretien (.xlsx) — même présentation que le gabarit de la
+// firme : un onglet par saison, les mois où la tâche se fait grisés, puis les
+// colonnes de suivi à remplir par le syndicat. Un onglet « Calendrier » donne
+// la vue mois par mois. Écrit en SpreadsheetML directement : la version
+// communautaire de la bibliothèque tableur ne sait pas colorer une cellule.
+// ----------------------------------------------------------------------------
+function colonneXlsx(i) {
+  let s = "";
+  for (let n = i + 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + (n - 1) % 26) + s;
+  return s;
+}
+// Styles : 0 normal · 1 titre · 2 sous-titre · 3 en-tête jaune · 4 catégorie
+// · 5 élément · 6 texte encadré · 7 mois grisé · 8 mois vide · 9 en-tête gris
+// · 10 texte à préciser (italique)
+const STYLES_XLSX = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="5"><font><sz val="10"/><name val="Calibri"/></font><font><b/><sz val="14"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="10"/><name val="Calibri"/></font><font><i/><sz val="10"/><color rgb="FF6B6B6B"/><name val="Calibri"/></font></fonts>
+<fills count="6"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFBFBFBF"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFD9D9D9"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFF2F2F2"/><bgColor indexed="64"/></patternFill></fill></fills>
+<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"><color rgb="FFBFBFBF"/></left><right style="thin"><color rgb="FFBFBFBF"/></right><top style="thin"><color rgb="FFBFBFBF"/></top><bottom style="thin"><color rgb="FFBFBFBF"/></bottom><diagonal/></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="11">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+<xf numFmtId="0" fontId="3" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="3" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+<xf numFmtId="0" fontId="3" fillId="5" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="3" borderId="1" xfId="0" applyFill="1" applyBorder="1"/>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/>
+<xf numFmtId="0" fontId="3" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="4" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+</cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>`;
+// Une feuille : lignes de cellules { v, s } (ou null), largeurs, fusions.
+function feuilleXlsx({ lignes, largeurs, fusions = [], figer = null, paysage = true }) {
+  const rows = lignes.map((cellules, r) => {
+    const cs = (cellules ?? []).map((c, i) => {
+      if (c == null) return "";
+      const ref = `${colonneXlsx(i)}${r + 1}`;
+      const style = c.s ? ` s="${c.s}"` : "";
+      if (c.v == null || c.v === "") return `<c r="${ref}"${style}/>`;
+      return `<c r="${ref}"${style} t="inlineStr"><is><t xml:space="preserve">${echapperXml(String(c.v))}</t></is></c>`;
+    }).join("");
+    return `<row r="${r + 1}">${cs}</row>`;
+  }).join("");
+  const cols = largeurs.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("");
+  const volet = figer ? `<sheetViews><sheetView workbookViewId="0"><pane ySplit="${figer}" topLeftCell="A${figer + 1}" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>` : "";
+  const merges = fusions.length ? `<mergeCells count="${fusions.length}">${fusions.map((m) => `<mergeCell ref="${m}"/>`).join("")}</mergeCells>` : "";
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>${volet}<sheetFormatPr defaultRowHeight="15"/><cols>${cols}</cols><sheetData>${rows}</sheetData>${merges}<pageMargins left="0.4" right="0.4" top="0.5" bottom="0.5" header="0.3" footer="0.3"/><pageSetup orientation="${paysage ? "landscape" : "portrait"}" fitToWidth="1" fitToHeight="0"/></worksheet>`;
+}
+async function classeurXlsx(feuilles) {
+  const JSZip = import_jszip_min.default;
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${feuilles.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}</Types>`);
+  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`);
+  zip.file("xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${feuilles.map((f, i) => `<sheet name="${echapperXml(f.nom.slice(0, 31))}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets></workbook>`);
+  zip.file("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${feuilles.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join("")}<Relationship Id="rId${feuilles.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`);
+  zip.file("xl/styles.xml", STYLES_XLSX);
+  feuilles.forEach((f, i) => zip.file(`xl/worksheets/sheet${i + 1}.xml`, feuilleXlsx(f)));
+  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+async function tableurSuiviEntretien(ctx) {
+  const { dossier, components: components2, theme } = ctx;
+  const carnet = carnetDuDossier(components2, ctx.biblio);
+  const annee = new Date().getFullYear();
+  const titre = `${sansNotesInternes(dossier.name)} — ${dossier.dossier_no}`;
+  const entete = (sousTitre) => [
+    [{ v: theme?.nom || "", s: 2 }],
+    [{ v: titre, s: 1 }],
+    [{ v: "CARNET D'ENTRETIEN — IMMEUBLE ET INSTALLATIONS", s: 2 }],
+    [{ v: sousTitre, s: 2 }],
+    []
+  ];
+  const COLONNES_SUIVI = ["Vérifié par / date", "Action à prendre", "Photos", "OS", "Entrepreneur – contrat", "Coût", "Garantie"];
+  const feuilles = [];
+  for (const s of SAISONS_ENTRETIEN) {
+    const lignes = entete(`${s.libelle.toUpperCase()} ${annee} — ${s.mois.map((m) => NOMS_MOIS[m - 1]).join(", ")}`);
+    lignes.push([
+      { v: "Responsable", s: 3 }, { v: "Situation — demande d'étude", s: 3 }, { v: "Fréquence", s: 3 },
+      ...s.mois.map((m) => ({ v: MOIS_ABREGES[m - 1], s: 3 })),
+      ...COLONNES_SUIVI.map((c) => ({ v: c, s: 3 }))
+    ]);
+    let categorie = null;
+    for (const g of carnet) {
+      const saisonnieres = g.taches.filter((t) => t.o.some((o) => o[0] === s.cle));
+      if (!saisonnieres.length) continue;
+      if (g.categorie !== categorie) {
+        categorie = g.categorie;
+        lignes.push([{ v: "", s: 4 }, { v: String(categorie).toUpperCase(), s: 4 }, ...Array(3 + 1 + COLONNES_SUIVI.length).fill({ v: "", s: 4 })].slice(0, 13));
+      }
+      lignes.push([{ v: "", s: 5 }, { v: g.element, s: 5 }, ...Array(11).fill({ v: "", s: 5 })]);
+      for (const t of saisonnieres) {
+        const occ = t.o.find((o) => o[0] === s.cle);
+        const qui = occ[3] ?? t.q;
+        lignes.push([
+          { v: libelleResponsable(qui), s: 6 },
+          { v: occ[2] ? t.x : `${t.x} (mois à préciser)`, s: occ[2] ? 6 : 10 },
+          { v: libelleFrequence(t), s: 6 },
+          ...s.mois.map((m) => ({ v: "", s: occ[1].includes(m) ? 7 : 8 })),
+          ...COLONNES_SUIVI.map(() => ({ v: "", s: 8 }))
+        ]);
+      }
+    }
+    feuilles.push({ nom: `${s.libelle} ${annee}`, lignes, largeurs: [18, 58, 16, 6, 6, 6, 16, 22, 10, 8, 20, 10, 10], figer: 6 });
+  }
+  // Calendrier : chaque mois, ce qu'il y a à faire.
+  const cal = entete(`CALENDRIER ${annee} — tâches par mois`);
+  cal.push([{ v: "Mois", s: 3 }, { v: "Élément", s: 3 }, { v: "Tâche", s: 3 }, { v: "Fréquence", s: 3 }, { v: "Responsable", s: 3 }]);
+  for (let m = 1; m <= 12; m++) {
+    const duMois = carnet.flatMap((g) => g.taches.filter((t) => t.o.some((o) => o[1].includes(m))).map((t) => ({ g, t })));
+    if (!duMois.length) continue;
+    cal.push([{ v: NOMS_MOIS[m - 1].toUpperCase(), s: 4 }, { v: `${duMois.length} tâche${duMois.length > 1 ? "s" : ""}`, s: 4 }, { v: "", s: 4 }, { v: "", s: 4 }, { v: "", s: 4 }]);
+    for (const { g, t } of duMois) {
+      const occ = t.o.find((o) => o[1].includes(m));
+      cal.push([{ v: "", s: 8 }, { v: g.element, s: 6 }, { v: occ[2] ? t.x : `${t.x} (mois à préciser)`, s: occ[2] ? 6 : 10 }, { v: libelleFrequence(t), s: 6 }, { v: libelleResponsable(occ[3] ?? t.q), s: 6 }]);
+    }
+  }
+  feuilles.unshift({ nom: "Calendrier", lignes: cal, largeurs: [14, 34, 70, 18, 22], figer: 6 });
+  return classeurXlsx(feuilles);
+}
 const JARGON_STYLE_GUIDE = `Méthode et registre de la firme (Plan de gestion de l'actif — PGA) :
 
 ÉCHELLE D'ÉTAT (obligatoire, 4 niveaux + na) :
@@ -3139,90 +5159,6 @@ métrique entre parenthèses.
 
 SIGLES : PCUR = partie commune à usage restreint ; PCUG = partie commune à usage général ;
 FP = fonds de prévoyance ; CE = carnet d'entretien ; VU = durée de vie utile.`;
-function parseLignesChecklist(texte) {
-  const items = [];
-  for (const brut of String(texte ?? "").split("\n")) {
-    const ligne = brut.trim();
-    if (!ligne || !ligne.includes("|")) continue;
-    const champs = ligne.split("|").map((x) => x.trim());
-    if (champs.length < 2) continue;
-    const [cat, name, code, vu, qty] = champs;
-    // Une catégorie inconnue signalerait une ligne mal formée autant qu'une
-    // hallucination : on retombe sur « équipements », comme à l'insertion.
-    if (!name) continue;
-    const duree = Number(vu);
-    items.push({
-      cat: CATEGORIES[cat] ? cat : "equipements",
-      name,
-      code: code && code !== "-" && code !== "—" ? code : null,
-      vu: Number.isFinite(duree) && duree > 0 ? Math.round(duree) : null,
-      qty: qty || "—"
-    });
-  }
-  return items;
-}
-
-async function generateChecklist(apiKey, profile) {
-  if (!apiKey) return { items: DEFAULT_CHECKLIST, source: "generique", erreur: "aucune clé API configurée" };
-  const prompt = `Tu es ingénieur en bâtiment spécialisé dans les études de fonds de prévoyance
-pour syndicats de copropriété au Québec. Pour un immeuble résidentiel de
-${profile.units} unités${profile.floors ? `, ${profile.floors} étages` : ""}${profile.builtYear ? `, construit en ${profile.builtYear}` : ""}, propose la liste des composantes typiques à inspecter.
-
-Catégories valides (utilise exactement ces clés, dans cet ordre) :
-${Object.entries(CATEGORIES).map(([k, v]) => `${v.ordre}. ${k} — ${v.label}`).join("\n")}
-
-${JARGON_STYLE_GUIDE}
-
-Durées de vie utiles de référence (années) : pavage 25 · bordures de béton 35 · allées
-piétonnières 20 (all.) · murets de soutènement en modules de béton 40, en bois traité 25 ·
-garde-corps 40 · clôture acier grillagé 30, bois 15 · murs de fondation 10 (all.) · dalle de
-stationnement 20 (all.) · membrane de surface de roulement 35 · membrane toit-terrasse 40 ·
-inspection Loi 122 = 5 · toit plat membrane 35 · toit en pente bardeaux 25 · gouttières 10 (all.) ·
-puits de lumière 10 (all.) · marquise panneau de verre trempé 35, structure acier 50 · parement
-panneaux de béton préfabriqué 75, maçonnerie 10 (all.), linteaux 10 (all.), scellants de rencontre 10,
-métallique 15 (all.), vinyle 35, bois 15 (all.), enduit acrylique 20 (all.) · portes d'entrée 45 ·
-portes de service acier 35 · portes-patio 40 · fenêtre vinyle 40, bois 45 · scellant d'ouverture 7 ·
-porte de garage 30, moteur 10 (all.) · mur rideau 75 · balcons acier 50, pontage fibre de verre 25,
-structure de bois 25, garde-corps métallique 40 · terrasses urbaines bois traité 25 · placoplâtre
-peinture 15 (all.) · tuiles acoustiques 20 (all.) · tapis 20 · céramique 10 (all.) · vinyle 20 ·
-bois franc 40 · escaliers intérieurs 15 (all.) · portes des unités 50 · systèmes d'incendie 10 ·
-carillons 20 · CCTV 20 · boîtes aux lettres 20 (all.) · compacteur 25 · ascenseur (modernisation) 35 ·
-plinthes et aérothermes 25 · ventilation privative 3 (all.) · CVAC communs 35 · ventilation des
-salles de services 20 · détection des gaz 25 · alimentation électrique principale 10 (all.) ·
-éclairage intérieur 35, extérieur 25 · lampadaire 30 · génératrice 40 · réservoir de mazout 25 ·
-alimentation en eau potable 10 (all.) · inspection DAR 1 · évacuation sanitaire et pluviale 10 (all.) ·
-nettoyage des colonnes 5 (all.) · réservoir d'eau chaude conciergerie 10, communs 25 · gicleurs 10 (all.).
-
-Réponds UNIQUEMENT par une liste, UNE COMPOSANTE PAR LIGNE, au format exact :
-
-categorie|nom|code Uniformat|durée de vie|quantité
-
-Exemple de ligne : terrain|Stationnement et voies de circulation – Pavage|G10.10-30|25|—
-
-Le code Uniformat II est celui de l'élément parent ; mets un tiret « - » si tu n'en es pas
-certain. La durée de vie est en années. La quantité est approximative, ou « — ».
-Aucun en-tête, aucune numérotation, aucun commentaire, aucune ligne vide.
-Entre 20 et 34 composantes, couvrant les catégories pertinentes pour cet immeuble.`;
-  // 34 éléments JSON avec accents frôlent les 1500 jetons, sans compter le
-  // préambule que le modèle écrit parfois avant le tableau. Trop juste : la
-  // réponse était tronquée, extractJson échouait, et chaque dossier recevait
-  // silencieusement la liste générique au lieu d'un inventaire adapté à l'immeuble.
-  let texte = null;
-  try {
-    texte = await callClaude(apiKey, { content: prompt, maxTokens: 4000 });
-    // Une ligne par composante plutôt qu'un gros JSON : la réponse revenait
-    // tronquée à un endroit imprévisible et tout l'inventaire était perdu d'un
-    // coup. Ici, une ligne coupée se jette seule et les autres tiennent.
-    const propres = parseLignesChecklist(texte);
-    if (propres.length > 0) return { items: propres, source: "ia", erreur: null };
-    return { items: DEFAULT_CHECKLIST, source: "generique", erreur: `aucune ligne exploitable (${texte.length} caractères reçus) | DÉBUT: « ${texte.slice(0, 200)} »` };
-  } catch (e) {
-    // Un repli silencieux est pire qu'un repli : personne ne peut voir que
-    // l'inventaire proposé n'a rien à voir avec l'immeuble visité.
-    const indice = texte ? ` — ${texte.length} caractères reçus | DÉBUT: « ${texte.slice(0, 220)} » | FIN: « ${texte.slice(-120)} »` : " — aucune réponse reçue";
-    return { items: DEFAULT_CHECKLIST, source: "generique", erreur: `${e && e.message}${indice}` };
-  }
-}
 function heuristicEstimate(installYear, usefulLife) {
   const now = (/* @__PURE__ */ new Date()).getFullYear();
   const yr = installYear ?? now - 15;
@@ -3255,12 +5191,25 @@ async function analyzePhotos(apiKey, opts) {
       type: "text",
       text: `Composante inspectée : « ${opts.componentName} »${opts.uniformatCode ? ` (${opts.uniformatCode})` : ""}${opts.installYear ? `, dernier remplacement ou construction en ${opts.installYear}` : ""}${opts.usefulLife ? `, durée de vie utile de référence : ${opts.usefulLife} ans` : ""}.
 Tu relèves cette composante lors d'une visite de plan de gestion de l'actif. Analyse les
-photos et produis la fiche de relevé.
+photos et produis la fiche de relevé, selon le même gabarit pour toutes les composantes.
 
 ${JARGON_STYLE_GUIDE}
+${opts.guide?.defauts?.length ? `\nDÉFAUTS À SURVEILLER POUR CE TYPE D'ÉLÉMENT (grille de la firme) : ${opts.guide.defauts.join(", ")}.` : ""}
+${opts.guide?.constats?.length ? `FORMULATIONS TYPES DE LA FIRME (d'autres immeubles — la manière, jamais les faits) :\n${opts.guide.constats.slice(0, 6).map((c) => `· ${c}`).join("\n")}` : ""}
 
 Réponds UNIQUEMENT avec un objet JSON :
-{"rating": 1|2|3|4 (1=bon état, 2=entretien normal, 3=entretien requis, 4=remplacement requis ; null si non observable), "observation": "ce qui est visible sur les photos, en une à trois phrases, registre professionnel", "causePossible": "cause probable du constat, ou '' si aucun défaut", "delaiSuggere": "délai d'intervention suggéré (ex: 'à court terme', 'dans les 5 ans', 'à planifier', 'aucun suivi particulier')", "consequences": "conséquences additionnelles si rien n'est fait, ou ''", "cost": "coût de remplacement approximatif en $ CAD formaté (ex: '28 500 $'), arrondi à la centaine, ou 'à estimer' si non évaluable visuellement", "costEstimate": nombre brut CAD correspondant, ou null, "confidence": "pourcentage de confiance (ex: 82 %)"}
+{"rating": 1|2|3|4 (1=bon état, 2=entretien normal, 3=entretien requis, 4=remplacement requis ; null si non observable),
+ "constats": ["un constat par élément, au format « Localisation – ce qui est observé », registre professionnel ; [] si aucun défaut"],
+ "etendue": "ponctuel" | "localise" | "generalise" | null,
+ "etendueQte": "quantité touchée si estimable (ex: '≈ 4 m²', '3 fenêtres', '20 %'), ou ''",
+ "limiteObservation": "de_pres" | "distance" | "partiel" | "inaccessible",
+ "causePossible": "cause probable, modalisée (semble, serait), ou '' si aucun défaut",
+ "natureRisque": "securite" | "infiltration" | "degradation" | "conformite" | "esthetique" | null,
+ "delaiSuggere": ${DELAIS_MAISON.map((d) => `"${d.libelle}"`).join(" | ")},
+ "consequences": "conséquences additionnelles si rien n'est fait, ou ''",
+ "cost": "coût de remplacement approximatif en $ CAD formaté (ex: '28 500 $'), arrondi à la centaine, ou 'à estimer' si non évaluable visuellement",
+ "costEstimate": nombre brut CAD correspondant, ou null,
+ "confidence": "pourcentage de confiance (ex: 82 %)"}
 
 N'invente aucun défaut qui ne soit pas visible sur les photos. Si les photos ne permettent
 pas de statuer, mets "rating": null et explique-le dans "observation".`
@@ -3269,7 +5218,20 @@ pas de statuer, mets "rating": null et explique-le dans "observation".`
   try {
     const text = await callClaude(apiKey, { content, maxTokens: 700 });
     const parsed = extractJson(text);
-    return { ...parsed, ratingLabel: RATING_LABELS[parsed.rating] ?? null, source: "ia" };
+    // Les valeurs hors vocabulaire sont écartées plutôt que stockées : le
+    // gabarit de rédaction ne sait rien faire d'une étendue « moyenne ».
+    const constats = Array.isArray(parsed.constats) ? parsed.constats.map((c) => String(c).trim()).filter(Boolean) : [];
+    return {
+      ...parsed,
+      constats,
+      observation: constats.length ? constats.join("\n") : parsed.observation ?? "",
+      etendue: ETENDUES[parsed.etendue] ? parsed.etendue : null,
+      limiteObservation: LIMITES_OBSERVATION[parsed.limiteObservation] ? parsed.limiteObservation : null,
+      natureRisque: NATURES_RISQUE[parsed.natureRisque] ? parsed.natureRisque : null,
+      delaiSuggere: DELAIS_MAISON.some((d) => d.libelle === parsed.delaiSuggere) ? parsed.delaiSuggere : null,
+      ratingLabel: RATING_LABELS[parsed.rating] ?? null,
+      source: "ia"
+    };
   } catch {
     return heuristicEstimate(opts.installYear, opts.usefulLife);
   }
@@ -3540,7 +5502,7 @@ const ENTRETIEN_PAR_CODE = {
   "E30": ["neutre"],
   "F10": ["neutre"]
 };
-// Clé de recherche 3 — repli par catégorie maison (les 10 familles § 2.1).
+// Clé de recherche 3 — repli par catégorie maison (les familles § 2.1).
 const ENTRETIEN_PAR_CATEGORIE = {
   terrain: ["amenagement"],
   structure: ["structure"],
@@ -3551,7 +5513,8 @@ const ENTRETIEN_PAR_CATEGORIE = {
   equipements: ["neutre"],
   cvac: ["mecanique"],
   electrique: ["alimentationElectrique"],
-  plomberie: ["plomberie"]
+  plomberie: ["plomberie"],
+  piscines: ["mecanique"]
 };
 function blocsEntretien(component) {
   const nom = [component?.name, component?.variante].filter(Boolean).join(" ");
@@ -3594,6 +5557,7 @@ const LIMITE_RELEVE = {
 const CYCLES_REGLEMENTAIRES = [
   { re: /loi\s*122|inspection\s+des\s+fa[çc]ades|stationnements?\s+[ée]tag/i, cycle: 5, libelle: "Étude et rapport", texte: "Selon la loi 122, cette vérification périodique doit être reprise tous les 5 ans. Le calcul planifie pour l'étude et le rapport correspondants." },
   { re: /\bDAR\b|anti-?refoulement/i, cycle: 1, libelle: "Allocation", texte: "La vérification du dispositif anti-refoulement (DAR) est annuelle. Le calcul planifie pour des entretiens réguliers de sécurité sur un cycle de 1 an." },
+  { re: /fonds\s+de\s+pr[ée]voyance|carnet\s+d['’]entretien/i, cycle: 5, libelle: "Étude et rapport", texte: "Depuis la Loi 16, l'étude du fonds de prévoyance et le carnet d'entretien doivent être révisés par un professionnel au moins tous les 5 ans. Le calcul planifie pour les honoraires correspondants." },
   { re: /nettoyage\s+des\s+colonnes|colonnes?\s+(?:sanitaires?|pluviales?)/i, cycle: 5, libelle: "Allocation", texte: "Nous vous rappelons que vous avez avantage à planifier, tous les 3 à 5 ans, un nettoyage de ces conduits. Le calcul planifie pour ces travaux sur un cycle de 5 ans." }
 ];
 const MARQUEURS_ALLOCATION = /allocation|entretien|inspection|nettoyage|peinture|mise\s+[àa]\s+niveau|r[ée]parations?\s+ponctuelle|cyclique/i;
@@ -3613,6 +5577,10 @@ function ligneDureeVie(component, dossier) {
     allocation = true;
   } else if (attributs.allocation === false || String(attributs.type ?? "").toLowerCase() === "remplacement") {
     allocation = false;
+  } else if (/\ballocations?\b/i.test(nom)) {
+    // « Détecteurs d'incendie – Privatifs – Allocation » : le mot explicite
+    // l'emporte sur « détecteur », que MARQUEURS_REMPLACEMENT classe en remplacement.
+    allocation = true;
   } else if (MARQUEURS_REMPLACEMENT.test(nom)) {
     allocation = false;
   } else if (MARQUEURS_ALLOCATION.test(nom)) {
@@ -3690,41 +5658,81 @@ function phraseCarnet(dossier) {
   const info = infoBatiment(dossier);
   return info?.documents?.carnet_entretien === "oui" ? CARNET_REVISE : CARNET_ABSENT;
 }
-function etatDeterministe(component, dossier) {
-  const nom = sansNotesInternes(component?.name ?? "l'élément");
-  const cote = coteRapport(component?.rating);
+// Les 7 blocs, dans l'ordre fixe du gabarit maison. Seul le bloc 1 (la
+// description) peut venir du modèle ; les six autres sont écrits ici, à partir
+// des champs du relevé, pour que la même donnée donne la même phrase partout.
+//   1. Description   2. Méthode et limite d'observation   3. Portée du calcul
+//   4. Appréciation (imposée par la cote)   5. Année et sa source
+//   6. Projets du conseil d'administration   7. INFORMATION réglementaire
+function descriptionDeterministe(component) {
+  // « – Allocation » est un mode de calcul, pas une partie de l'élément décrit.
+  const nom = sansNotesInternes(component?.name ?? "l'élément").replace(/\s+[–-]\s+allocations?$/i, "");
   const localisation = localisationMaison(component);
-  const variante = sansNotesInternes(component?.variante ?? "");
-  const parties = [];
-  const description = localisation
-    ? [`« ${nom} » a été relevé à la ${localisation} de l'immeuble`]
-    : [`« ${nom} » fait partie des parties communes de l'immeuble`];
-  if (variante) description.push(` — ${variante}`);
-  description.push(".");
-  parties.push(description.join(""));
+  const variante = sansNotesInternes(component?.variante ?? "").replace(/[.;]$/, "");
+  const parties = [localisation
+    ? `L'élément « ${nom} » a été relevé à la ${localisation} de l'immeuble.`
+    : `L'élément « ${nom} » fait partie des parties communes de l'immeuble.`];
+  if (variante) parties.push(`Matériau ou type relevé : ${variante.charAt(0).toLowerCase()}${variante.slice(1)}.`);
   if (component?.qty && component.qty !== "—") parties.push(`Quantité relevée : ${sansNotesInternes(String(component.qty))}.`);
-  const observation = phraseFinale(component?.observation);
-  if (observation) parties.push(observation);
-  const cause = phraseFinale(component?.cause_possible);
-  if (cause) parties.push(`Selon nos observations, cette situation serait possiblement en lien avec : ${cause.charAt(0).toLowerCase()}${cause.slice(1)}`);
-  if (cote === "Bon") {
-    parties.push(observation
-      ? "Dans l'ensemble, l'état observé est bon."
-      : "L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée.");
-  } else if (cote === "Passable") {
-    parties.push(`Dans l'ensemble, l'état observé est passable et nécessite un entretien devancé. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.`);
-  } else if (cote === "Mauvais") {
-    parties.push(`Dans l'ensemble, l'état observé est mauvais et requiert la planification d'un remplacement. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.`);
-  } else if (!observation) {
-    parties.push("Aucune observation n'a été consignée pour cet élément lors de la visite; son état n'a pas été apprécié dans le cadre du présent relevé.");
-  }
-  const annee = anneeMaison(component?.install_year);
-  if (annee != null) parties.push(`Celles-ci sont de ${annee}.`);
-  else parties.push("Aucune information obtenue ne pouvait identifier le dernier remplacement.");
-  if (cote === "Bon") parties.push("Autre que l'entretien régulier, aucun suivi n'est prévu cette année.");
-  const limite = LIMITE_RELEVE[component?.cat];
-  if (limite) parties.push(limite);
   return assembler(parties);
+}
+function phraseLimite(component) {
+  const detail = sansNotesInternes(component?.limite_detail ?? "").replace(/[.;]$/, "");
+  const entre = detail ? ` (${detail})` : "";
+  switch (component?.limite_observation) {
+    case "distance":
+      return `L'observation s'est faite à distance${detail ? entre : " (du sol, des balcons ou à l'aide de jumelles)"}; certains défauts pourraient ne pas avoir été décelés.`;
+    case "partiel":
+      return `Cet élément n'était que partiellement accessible lors de la visite${entre}; l'appréciation se limite aux sections observées.`;
+    case "inaccessible":
+      return `Cet élément n'était pas accessible lors de la visite${entre}; son état n'a pu être apprécié et le calcul repose sur la durée de vie de référence.`;
+    default:
+      return "";
+  }
+}
+function phraseAppreciation(component) {
+  const cote = coteRapport(component?.rating);
+  const aConstats = !!String(component?.observation ?? "").trim();
+  if (cote === "Bon") {
+    return aConstats
+      ? "Dans l'ensemble, l'état observé est bon."
+      : "L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée.";
+  }
+  if (cote === "Passable") return "Dans l'ensemble, l'état observé est passable et nécessite un entretien devancé. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.";
+  if (cote === "Mauvais") return "Dans l'ensemble, l'état observé est mauvais et requiert la planification d'un remplacement. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.";
+  if (component?.limite_observation === "inaccessible") return "";
+  return "Aucune cote n'a été attribuée à cet élément lors de la visite; son état n'a pas été apprécié dans le cadre du présent relevé.";
+}
+function phraseAnnee(component) {
+  const annee = anneeMaison(component?.install_year);
+  if (annee == null) return "Aucune information obtenue ne pouvait identifier le dernier remplacement.";
+  switch (component?.source_annee) {
+    case "plaque": return `Celles-ci sont de ${annee}, selon la plaque signalétique.`;
+    case "carnet": return `Celles-ci sont de ${annee}, selon le carnet d'entretien.`;
+    case "administration": return `Celles-ci sont de ${annee}, selon les informations obtenues de l'administration.`;
+    case "estimee": return `Celles-ci seraient de ${annee}, selon notre estimation.`;
+    default: return `Celles-ci sont de ${annee}.`;
+  }
+}
+function blocsEtat(component, dossier, description) {
+  const guide = guidePour(component);
+  const cote = coteRapport(component?.rating);
+  const projet = phraseFinale(component?.projet_ca);
+  const information = guide.information ? INFORMATIONS_REGLEMENTAIRES[guide.information]?.(dossier) : null;
+  // L'avis réglementaire forme son propre paragraphe : le rapport Word l'encadre.
+  return paragraphes([assembler([
+    description || descriptionDeterministe(component),
+    phraseLimite(component),
+    guide.portee.join(" "),
+    phraseAppreciation(component),
+    phraseAnnee(component),
+    cote === "Bon" ? "Autre que l'entretien régulier, aucun suivi n'est prévu cette année." : null,
+    LIMITE_RELEVE[component?.cat] ?? null,
+    projet ? `Selon les informations obtenues, le conseil d'administration planifie ${projet.charAt(0).toLowerCase()}${projet.slice(1)}` : null
+  ]), information]);
+}
+function etatDeterministe(component, dossier) {
+  return blocsEtat(component, dossier, null);
 }
 function faitsElement(component, dossier, ligne) {
   const info = infoBatiment(dossier);
@@ -3740,7 +5748,14 @@ function faitsElement(component, dossier, ligne) {
     coteRapportLongue(component?.rating) ? `Cote au rapport : ${coteRapportLongue(component.rating)}` : null,
     anneeMaison(component?.install_year) != null ? `Année de construction ou de dernière réparation : ${anneeMaison(component.install_year)}` : "Année de construction ou de dernière réparation : inconnue",
     `Durée de vie retenue au calcul : ${ligne.duree} ans (${ligne.allocation ? "allocation cyclique" : "remplacement complet"})`,
-    component?.observation ? `Observation de l'inspecteur (données brutes) : ${component.observation}` : null,
+    component?.observation ? `Constats de l'inspecteur (données brutes) : ${component.observation}` : null,
+    ETENDUES[component?.etendue] ? `Étendue : ${ETENDUES[component.etendue]}${component?.etendue_qte ? ` (${component.etendue_qte})` : ""}` : null,
+    LIMITES_OBSERVATION[component?.limite_observation] ? `Limite d'observation : ${LIMITES_OBSERVATION[component.limite_observation]}${component?.limite_detail ? ` (${component.limite_detail})` : ""}` : null,
+    (() => {
+      const attributs = objetJson(component?.attributs);
+      const lignes = Object.entries(attributs).filter(([k]) => k !== "type" && k !== "unité").map(([k, v]) => `${k} : ${v}`);
+      return lignes.length ? `Attributs relevés : ${lignes.join(" · ")}` : null;
+    })(),
     component?.cause_possible ? `Cause possible relevée : ${component.cause_possible}` : null,
     component?.note ? `Note de visite : ${component.note}` : null,
     component?.r_flag ? "Travaux prévus au carnet précédent et non effectués : oui" : null,
@@ -3850,45 +5865,42 @@ d'autres immeubles : en importer un détail serait une faute dans un rapport sig
 
 async function etatDeLActif(component, dossier, apiKey, ligne, exemples) {
   const repli = etatDeterministe(component, dossier);
-  const sansDonnees = !String(component?.observation ?? "").trim() && component?.rating == null;
+  const sansDonnees = !String(component?.observation ?? "").trim() && component?.rating == null && !String(component?.variante ?? "").trim();
   if (!apiKey || sansDonnees) return { texte: repli, source: "gabarit" };
-  const prompt = `Tu rédiges la sous-section « ÉTAT DE L'ACTIF » d'une fiche d'élément du
-Plan de gestion de l'actif (carnet d'entretien) de Condo Stratégis, firme québécoise en
-science du bâtiment. Tu transposes la note brute de l'inspecteur dans le registre maison.
+  const guide = guidePour(component);
+  const prompt = `Tu rédiges le PREMIER BLOC — la description — de la sous-section « ÉTAT DE L'ACTIF »
+d'une fiche d'élément du Plan de gestion de l'actif de Condo Stratégis, firme québécoise en
+science du bâtiment. Les autres blocs (limite d'observation, portée du calcul, appréciation
+de l'état, année, projets du conseil, avis réglementaire) sont ajoutés après ton texte par
+le gabarit : ne les écris pas.
 
 ${JARGON_STYLE_GUIDE}
 
-ORDRE IMPOSÉ DE L'INFORMATION (gabarit maison) :
-1. Description matérielle et localisation, 1 à 3 phrases.
-2. Limite d'observation, seulement si les données le justifient.
-3. Appréciation d'état, avec les formules maison, par exemple :
-   « Dans l'ensemble, le parement est dans un bon état. »
-   « L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée. »
-   « Dans l'ensemble, l'état observé est passable et nécessite un entretien devancé.
-     Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE. »
-4. Année : « Celles-ci sont de <année>. » ou, à défaut, « Aucune information obtenue ne
-   pouvait identifier le dernier remplacement. » Si l'état est bon, clore par
-   « Autre que l'entretien régulier, aucun suivi n'est prévu cette année. »
+CE QUE TU ÉCRIS : 1 à 3 phrases qui décrivent l'élément tel qu'il est dans CET immeuble —
+matériau, système, localisation, éléments connexes — à partir des faits ci-dessous.
+${guide.points ? `Points à décrire pour ce type d'élément : ${guide.points}` : ""}
+
+CE QUE TU N'ÉCRIS PAS : aucune appréciation d'état (bon, passable, mauvais), aucune année,
+aucun défaut, aucune cause, aucun délai, aucun coût, aucune recommandation. Les défauts vont
+dans ATTENTION SPÉCIALE, écrite ailleurs.
 
 RÈGLES ABSOLUES :
-- N'invente AUCUN défaut, matériau, dimension, année ni quantité qui ne soit dans les faits
-  ci-dessous. Si une information manque, emploie la formule maison d'absence d'information.
-- Reste au constat : aucune cause certaine, aucun correctif prescrit, aucun coût.
-- Voix « nous » de firme, vouvoiement du client, modalisation constante
-  (semble, tout laisse croire, selon les informations obtenues).
-- Français du Québec. Aucun titre, aucune puce, aucun gras : 3 à 6 phrases en prose suivie.
+- N'invente AUCUN matériau, dimension ni quantité qui ne soit dans les faits. Si les faits ne
+  précisent pas le matériau, décris l'élément par sa fonction et sa localisation seulement.
+- Voix « nous » de firme, modalisation (semble, selon les informations obtenues).
+- Français du Québec. Aucun titre, aucune puce, aucun gras.
 - N'écris aucune note de rédaction interne, aucune mention d'un autre dossier, aucun « ??? ».
 
-${blocExemples(exemples)}
+${blocExemples(exemples)}${exemples && exemples.length ? "Dans ces exemples, ne prends modèle que sur la description matérielle du début.\n" : ""}
 FAITS DU RELEVÉ :
 ${faitsElement(component, dossier, ligne)}
 
-Réponds uniquement par le texte de la sous-section.`;
+Réponds uniquement par la description.`;
   try {
-    const brut = await callClaude(apiKey, { content: prompt, maxTokens: 700 });
-    const texte = sansNotesInternes(brut);
-    if (texte.length < 40) return { texte: repli, source: "gabarit" };
-    return { texte, source: exemples && exemples.length ? "ia+banque" : "ia" };
+    const brut = await callClaude(apiKey, { content: prompt, maxTokens: 400 });
+    const description = sansNotesInternes(brut);
+    if (description.length < 20) return { texte: repli, source: "gabarit" };
+    return { texte: blocsEtat(component, dossier, description), source: exemples && exemples.length ? "ia+banque" : "ia" };
   } catch {
     return { texte: repli, source: "gabarit" };
   }
@@ -3900,6 +5912,21 @@ Réponds uniquement par le texte de la sous-section.`;
 // commentaire ». Registre : « nous suggérons », jamais « nous exigeons ».
 // ----------------------------------------------------------------------------
 const AUCUNE_ATTENTION = "Aucun commentaire. Aucune situation pouvant affecter de façon significative la durée de vie de cet élément n'a été observée. Le suivi se limite à l'entretien régulier prévu au tableur suivi d'entretien.";
+const PHRASES_RISQUE = {
+  securite: "Cette situation présente un risque pour la sécurité des personnes.",
+  infiltration: "Cette situation présente un risque d'infiltration d'eau.",
+  degradation: "Cette situation risque d'accélérer la dégradation de l'élément.",
+  conformite: "Cette situation soulève un enjeu de conformité réglementaire.",
+  esthetique: "Cette situation est d'ordre esthétique."
+};
+function phraseDelai(valeur) {
+  const brut = sansNotesInternes(valeur ?? "").replace(/[.;]$/, "");
+  if (!brut) return "";
+  const maison = DELAIS_MAISON.find((d) => d.libelle.toLowerCase() === brut.toLowerCase());
+  if (maison) return maison.phrase ? `Selon notre opinion, l'intervention est à planifier ${maison.phrase}.` : "";
+  // Anciens relevés en texte libre (« à court terme », « dans les 5 ans »…).
+  return `Selon notre opinion, l'intervention est à planifier ${brut.charAt(0).toLowerCase()}${brut.slice(1)}.`;
+}
 function attentionSpeciale(component) {
   const rating = Number(component?.rating);
   const consequences = sansNotesInternes(component?.consequences ?? "");
@@ -3911,21 +5938,28 @@ function attentionSpeciale(component) {
   } else {
     parties.push("Cependant nous avons aussi remarqué des situations qui nécessitent un entretien devancé. Ce classement correspond à la cote « Passable – Nécessite un entretien » de notre légende.");
   }
+  // Un constat par ligne : « Localisation – ce qui est observé ». Une note d'un
+  // seul tenant, comme en saisissaient les anciens relevés, est coupée par phrase.
   const constats = [];
-  const observation = sansNotesInternes(component?.observation ?? "");
-  if (observation) {
-    for (const seg of observation.split(/(?<=[.;])\s+/)) {
-      const s = seg.trim().replace(/[.;]$/, "");
-      if (s) constats.push(`· ${s};`);
-    }
+  const observation = String(component?.observation ?? "");
+  const lignesConstats = observation.includes("\n") ? observation.split(/\n+/) : observation.split(/(?<=[.;])\s+/);
+  for (const seg of lignesConstats) {
+    const s = sansNotesInternes(seg).replace(/^[·•\-–]\s*/, "").replace(/[.;]$/, "");
+    if (s) constats.push(`· ${s};`);
+  }
+  if (ETENDUES[component?.etendue]) {
+    const qte = sansNotesInternes(component?.etendue_qte ?? "");
+    constats.push(`· Étendue : ${ETENDUES[component.etendue].toLowerCase()}${qte ? `, ${qte}` : ""};`);
   }
   const cause = sansNotesInternes(component?.cause_possible ?? "");
   if (cause) constats.push(`· Cause possible : ${cause.replace(/[.;]$/, "")};`);
   if (consequences) constats.push(`· ${consequences.replace(/[.;]$/, "")};`);
   if (constats.length === 0) constats.push("· Aucun commentaire détaillé n'a été consigné au relevé pour cette situation;");
   const suites = [];
-  const delai = sansNotesInternes(component?.delai_suggere ?? "");
-  if (delai) suites.push(`Selon notre opinion, l'intervention est à planifier ${delai.replace(/^[Àà]\s+/, "à ").replace(/[.;]$/, "")}.`);
+  const risque = PHRASES_RISQUE[component?.nature_risque];
+  if (risque) suites.push(risque);
+  const delai = phraseDelai(component?.delai_suggere);
+  if (delai) suites.push(delai);
   if (rating >= 4) {
     suites.push("Une inspection complémentaire ou une expertise par un professionnel, incluant un devis correctif et idéalement un processus d'appels d'offres seront requis afin d'évaluer le délai et les coûts connexes aux travaux.");
   } else {
@@ -4019,7 +6053,7 @@ async function listComponentsForDossier(db, dossierId) {
        GROUP BY component_id`
   ).bind(dossierId).all();
   const counts = new Map(photoCounts.results.map((r) => [r.component_id, r.n]));
-  return rows.results.map((row) => ({ ...row, photos: counts.get(row.id) ?? 0 }));
+  return avecPrecedents(db, rows.results.map((row) => ({ ...row, photos: counts.get(row.id) ?? 0 })), { complet: false });
 }
 async function getOwnedComponent(c, id) {
   const user = await getCurrentUser(c);
@@ -4031,11 +6065,23 @@ async function getOwnedComponent(c, id) {
   ).bind(id, user.company_id).first();
   return component ?? null;
 }
+// Une composante telle que la fiche du terrain la montre : photos, guide,
+// tâches du carnet et, en révision, l'étude précédente.
+async function composanteComplete(db, component, biblio) {
+  const photos2 = await db.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY created_at ASC").bind(component.id).all();
+  const guide = guidePour(component);
+  return {
+    ...component,
+    photos: photos2.results,
+    guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats },
+    entretien: tachesPourComposante(component, { avecRetirees: true, biblio: biblio ?? await bibliothequeDuDossier(db, component.dossier_id) }).map(tacheAffichee),
+    precedent: component.origine_id ? (await precedentsPour(db, [component])).get(component.origine_id) ?? null : null
+  };
+}
 components.get("/:id", async (c) => {
   const component = await getOwnedComponent(c, c.req.param("id"));
   if (!component) return c.json({ error: "composante introuvable" }, 404);
-  const photos2 = await c.env.DB.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY created_at ASC").bind(component.id).all();
-  return c.json({ ...component, photos: photos2.results });
+  return c.json(await composanteComplete(c.env.DB, component));
 });
 components.patch("/:id", async (c) => {
   const id = c.req.param("id");
@@ -4067,11 +6113,26 @@ components.patch("/:id", async (c) => {
     "emplacement",
     "variante",
     "attributs",
-    "parent_id"
+    "parent_id",
+    "actif",
+    "etendue",
+    "etendue_qte",
+    "limite_observation",
+    "limite_detail",
+    "nature_risque",
+    "source_annee",
+    "projet_ca",
+    "taches_entretien",
+    "travaux_periode",
+    "travaux_annee"
   ]) {
     if (key in body2) {
       fields.push(`${key} = ?${fields.length + 1}`);
-      values.push(body2[key]);
+      // Retraits et ajouts de tâches : validés avant d'être stockés.
+      values.push(key === "taches_entretien" ? JSON.stringify(nettoyerPersoEntretien(body2[key]))
+        : key === "travaux_periode" ? (TRAVAUX_PERIODE[body2[key]] ? body2[key] : null)
+        : key === "travaux_annee" ? (Number.isInteger(Number(body2[key])) && Number(body2[key]) > 1900 && Number(body2[key]) <= 2200 ? Number(body2[key]) : null)
+        : body2[key]);
     }
   }
   if (fields.length === 0) return c.json({ error: "aucun champ à mettre à jour" }, 400);
@@ -4080,7 +6141,12 @@ components.patch("/:id", async (c) => {
     `UPDATE components SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
   ).bind(...values).run();
   const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
-  return c.json(component);
+  const auteur = await getCurrentUser(c);
+  await noterJournal(c.env.DB, {
+    dossierId: component.dossier_id, componentId: id, userId: auteur?.id, action: "modification",
+    champs: differences(owned, component, Object.keys(body2).filter((k) => k in LIBELLES_CHAMPS))
+  });
+  return c.json({ ...component, entretien: tachesPourComposante(component, { avecRetirees: true, biblio: await bibliothequeDuDossier(c.env.DB, component.dossier_id) }).map(tacheAffichee) });
 });
 components.post("/:id/analyze", async (c) => {
   const component = await getOwnedComponent(c, c.req.param("id"));
@@ -4100,6 +6166,7 @@ components.post("/:id/analyze", async (c) => {
     installYear: component.install_year,
     usefulLife: component.useful_life_years ?? DEFAULT_USEFUL_LIFE_YEARS[component.cat] ?? null,
     uniformatCode: component.uniformat_code,
+    guide: guidePour(component),
     images
   });
   return c.json(analysis);
@@ -4112,9 +6179,21 @@ components.post("/:id/photos", async (c) => {
   const form = await c.req.formData();
   const file = form.get("file");
   if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  // Une photo prise hors connexion arrive avec l'identifiant choisi par
+  // l'appareil : si l'envoi est rejoué après une coupure, on rend la photo
+  // déjà reçue au lieu d'en créer une seconde.
+  const idClient = String(form.get("id") ?? "");
+  const idValide = /^pho_[a-f0-9]{20}$/.test(idClient);
+  if (idValide) {
+    const deja = await c.env.DB.prepare("SELECT * FROM photos WHERE id = ?1").bind(idClient).first();
+    if (deja) {
+      if (deja.component_id !== componentId) return c.json({ error: "identifiant de photo déjà utilisé" }, 409);
+      return c.json(deja, 200);
+    }
+  }
   const existing = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM photos WHERE component_id = ?1").bind(componentId).first();
   const tag = TAG_ORDER[existing?.n ?? 0] ?? `Photo ${(existing?.n ?? 0) + 1}`;
-  const id = `pho_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
+  const id = idValide ? idClient : `pho_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
   const ext = file.type === "image/png" ? "png" : "jpg";
   const r2Key = `photos/${componentId}/${id}.${ext}`;
   await c.env.PHOTOS.put(r2Key, await file.arrayBuffer(), {
@@ -4122,6 +6201,7 @@ components.post("/:id/photos", async (c) => {
   });
   await c.env.DB.prepare("INSERT INTO photos (id, component_id, r2_key, tag) VALUES (?1, ?2, ?3, ?4)").bind(id, componentId, r2Key, tag).run();
   const photo = await c.env.DB.prepare("SELECT * FROM photos WHERE id = ?1").bind(id).first();
+  await noterJournal(c.env.DB, { dossierId: component.dossier_id, componentId, userId: (await getCurrentUser(c))?.id, action: "photo", champs: [{ champ: "photos", avant: null, apres: "1" }] });
   return c.json(photo, 201);
 });
 components.post("/:id/structure-note", async (c) => {
@@ -4270,7 +6350,9 @@ function replacementEventsForComponent(c, params) {
   // Règle maison : l'année anticipée de remplacement est ancrée sur l'année de construction
   // ou de dernière réparation, plus la durée de vie utile. Un remplacement déjà échu est
   // reporté en première année de l'horizon.
-  const currentYear = (/* @__PURE__ */ new Date()).getFullYear();
+  // Année de départ de la projection : l'année courante, ou celle d'une étude
+  // passée qu'on recalcule telle qu'elle a été faite.
+  const currentYear = params.anneeReference ?? (/* @__PURE__ */ new Date()).getFullYear();
   let firstReplacementYear;
   if (c.install_year) {
     firstReplacementYear = Math.max(1, c.install_year + usefulLife - currentYear);
@@ -22527,10 +24609,6 @@ _defineProperty(Packer, "compiler", new Compiler());
 const LOGO_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAJsAAAFXCAYAAAC1PDz3AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAAFxEAABcRAcom8z8AABGnSURBVHhe7d0NlFxlfcfxUVDRVmvheKi8ZHfuc0feDxHOoaVQ03J6WqVqPT277M69d3aJMSvoSQieI4g9pymoFWjzoqKIvAmtEBI8SqgBVAxGLEfCWygVA6XkpIQkm+zcl3nZ2Xl7+jx3nlk24dLJ7jz3vzOzv/85HzaHzN6XmS93585cdhK6Zt9w8vjAZnfwZadwzzG5Dz0hEIoZs+zZxvf4aN8x6uGe30FsvQmxARnEBmQQG5BBbEAGsQEZxAZkEBuQQWxABrEBGcQGZBAbkNEa28bBxFGFdPK8rGPc6qeNW3yLfXfWbHazmzbuFl9fLI2mIjcaupcIrualjV1eOvWgb5k/8tLmj2fhAc8yfuRmzFUJvnrJ0dlh0ylkTJ4TolYGMFfyyJjPmFMiuH9FbBArGZtoa8p3jPsQG8RqOjY7uRGxQawQG5BBbEAGsQEZxAZkEBuQQWxABrEBGcQGZBAbkEFsQAaxARkZW84xy75lbEJsEKtGbKzs2anNiA1ihdiADGIDMogNyCA2IIPYgEz3xpZJ6TMfy49dxHa0I3Ids9NlsTHuW0meu26IT25cy0ubhI1r2iC+//71PC+W52c+JJZthHKrB/nkPf8klr8u4ntmQy5/HS98PcP9pWdw3xbbH7lfGtliHy4/j0/efZ3Y/vUR2zRL4j6evPNaHiw9ve3t767YxM56w4vCB1DblKfC4ILR07if7hfL7+OT997A65N5dYM2p1LmpS238WDsnHD5kfulk4gtd/XFvO7uVxvQ/tQOvM6Dz8rtT0av8wh1Z2ziiKNt3iq2Yk7doM2Zr9iy+9QGtD+18T2ITcsgtpaD2HQNYms5iE3XILaWoz82cwtiQ2yRozO2vIjNt1M/RWyILXIQm65BbC0HsekaxNZyEJuuQWwtB7HpGsTWchCbrkFsLQex6RrE1nIQm65BbC0HsekaxNZyEJuuQWwtB7HpGsTWchCbrkFsLQex6RrE1nJ0xpZzWMWzzK2IDbFFjq7YpFyGVVyHbUNsiC1yEJuuQWwtB7HpGsTWchCbrkFsLQex6RrE1nIQm65BbC0HsekaxNZyEJuuQWwtB7HpGsTWchCbrkFsLQex6RrE1nIQm65BbC0HsekaxNZytMdmsd8gNsQWOTpjCzKsKmJ7ErEhtshBbLoGsbUcxKZrEFvLQWx1cS/UxT/aVS69RWxB456O+p7ZqIiY5yW2vXq2X6iNvyZiO3cBxiYesMlbrubVnU8Lz/Lq78TXudr5DK+9/DwviuX5o6eGv/ZeLr/4nS/wyvOP8+pLO6K/70iFy9/Bi3f+Iw8+c3a4/Mj90knGduVf8PL2n/GqWHfkds2G2Ifyk4/wYPliLdvfPbE1ieian1nQPnEHyuVRLp+CiC56e+Yoah1z0H2xQddCbEAGsQEZxAZkEBuQQWxAJsiYVd8yt+uLTX6conzdSpcRsbyo9UDXkbF5lrmj/djki67yFfgNNzZevdYx6u0kf/DE+Xm9CrTSH9u9N6hSNIyMbdNaxNYjEBuQQWxABrEBGcQGZBAbkEFsQAaxARnEBmQQG5BBbEAGsQEZFdsLiA1iFzhmzU2znYgNYofYgAxiAzKIDcggNiCD2IAMYgMyiA3IIDYgg9iADGIDMogNyCA2oFQLbOMVxAYUauJx3IXYgAJiAzKIDcggNiCD2IAMYgMyiA3IIDYgg9iADGIDMppju+frjVCqlfZNFnjpvjWIrXdoik2yDR6suIAXvmrzwrVD7btumOdWXqj1YwhhXmmMrUkehXRxpIh1QPexzZrnsL16YwOIEMjYbLYPsUHsEBuQQWxABrEBGcR2uEyK+yOn6DEqyI/EjGv5TTOX38EQ2zTGfSvJc19z+OTmm3npoe/z0pY72nAnLz38fV5YM8b9pWeGy5avQ+a+/Ak++cNviL+7K+J7ZumhO3nx1i/zYPnZYtli+ZH71TkQW5Ot3gHZcCOvlwqNd0HanUpZBHE7D8bO4X66LwyueNMqXnPH1Q3anFqVl3ds47nP/Qn3h/uj96uDILamZmz33sDrxZx6NNscGduW2w6N7ZsreS27T92gzZGxPfcYYus6iC12iK0JscUOsTUhttghtibEFj/brLu2MY7YEBuFugjORWyIjQJiCyE2CogthNgoILYQYqOA2EKIjQJiCyE2CogthNgoILYQYqOA2EKIjQJiCyE2CogthNgoILYQYqOA2EKIjULds40cYkNsJDyLlRAbYiOB2CTERgKxSYiNBGKTEBsJxCYhNhKITUJsJBCbhNhIIDYJsZFAbBJiI4HYJMRGArFJiI0EYpMQGwnEJiE2Eq7FaogNsZFBbIiNDGJDbGQQWzO2e67n9YLPeb0uHsxae8olXvrJrYfFtoLXJl4XpWhYfrXMy89uRWxdR8Tmp/t5Yd3lvPzrB3n56Ud5efvP5u6pn/PK07/gxe9exYNlZ4llJ0VsBs9dO8ynHtvEy89sjf6+2XjqUV7auF7E/OFw2yP3qwMhtibbaDxw8kjULnGklEezQ5ffiDry9nMiI+uuj8lEbEAGsQEZxAZkEBuQQWxABrEBGcTWK0ZP5cHnz+e5FRfoIV8wPvwzU9uE2HqB/DzTL/0NrwcTjbezNEwte4AHl53Lwxelo9Y5B4itF8jYrr6Y13W99yqmNr6HB5+Vb7chNpgJsQEZxAZkEBuQQWxABrEBGcQGZBAbkEFsQAaxARnEBmQQG5Dpgthch1URWy/ogtjwi2V6BWIDMogNyCA2IIPYgAxiAzKIDcggNiCD2IAMYgMyiA3IIDYgg9iATOfHVvcsI0BsvaALYvNt00VsvQCxARnEBmQQG5BBbEAGsQEZxAZkEBuQQWxAJpbYXkdsEEHGdtXHeG3fLl6fmuT1UrFt1T2vqM9LRWxwCMb90dN57gsX8eCqv+bBF/+qbbkrL+J+5pSIdc0JYus58jNNxVGu8VWDqHXMDWIDGoFt1jyb7UNsEDvEBmQQG5BBbEBGf2wj4jR56Rn6jJ4avZ64hNt/+pu3Y67C7U+9sXz5cYqXalz+paeJZc5YfgfTF5s8RbaSvLBmjFe2/5SXH3+gPb/ezMtP/DvPr72Me8OLxDq0noK/Wbj9Bs//y3I+tfU+sf4Ho7frSMntF4rfvpIHy84K7xu5jtw/DPCpR+4O9y3y+2ZDLv8H1/Ng+Yd1vegaK62xecN9fHLDjeqNDg1TnuKl+9dzf/BE3a/3vNmM7ZevnGuZSpmXHrpDvQLfFwZXvGkVr7kH1A3anFqVl5/f1vgA2uH+6P3qIPpju/cGdU9oGBnbprW0sYntrxdzagPaHBnbltsOje2bK3lN13uXMrbnHkNsWgax/f+D2BDb9CC2QyC2JsQWO8TWhNhih9iaEFv8wtiMPYgNsVGoift5F2JDbBQQWwixUUBsIcRGAbGFEBsFxBZCbBQQWwixUUBsIcRGAbGFEBsFxBZCbBQQWwixUUBsIcRGAbGFEBsFxBZCbLELRGyuZbyM2BBb7MLY0mwnYkNssUNsTYgtdoitCbHFDrE1IbbYIbYmxBY7xNaE2GKH2JoQW+wQWxNiix1ia0JssUNsTYgtdoitCbHFDrE1IbbYBRmz6tnsRcSG2GIXxmaZOxAbYosdYmtCbLFDbE0zY5vMqw1oc8LYbj80tm9dwWvufnWDNieM7ZcLOLa7v8Lr5VJ4dGhbMMFL91xPG5vYfnnkkcFFbtNsBFleeuDbIjb5q+NVbOs+z6t7/kfP8vMen3ryYZ67/LwFFptkiwV+ZjEPVv05D674SPtWLeHB8sViuUb0+nQLt/9sHqz4M7F+se6obZoNuf3yU4ibH7ohgg4+faZY/gWNv4v6ntmQy7hMhCY/yCPuz4nQQG9sIbHT2j7rUi0ncj1xOWzdbXmL7Z/5d22Zj/tn7mKIDSAaYgMyiA3IIDYgg9iADGIDMogNyAQZVs0OG88iNoidjM212JOIDWKH2IAMYgMyiA3IIDYgg9iADGIDMogNyCA2IIPYgAxiAzKIDcggNiATOKziWeavEBvELpdhFddh2xAbxA6xARnEBmQQG5BBbEAGsQGJnJB3WCVrG7+Yjq0oQssLgfhLaF/UHb+QzLgPioHNduXSxhUJvmTJ0UHG+DvPYvuE14XXoD2+4NpGaeadv1DIyDzHrIs/F7I22+nb5io+lnhPAhPP1AfMD4jYflMeVb+fbQFQR7Jq4LDAt5NPHbSMS1cnEm9XdwkmjqkPnPRuz2HrxH/RU/JpyeEPSq9RkVXEczPXz5iP+unkJ9RdgYlzeCLxtgkreZYI7YVePqrJwMLIbFYWJ5UT4uv92YxxobobMBSz1zn+9/yMcYt4IKq9eGY/HZnDSiKw8azVf+vEMDtD7T6GavjqxNv9NDvfs82Xypf21lGtEZh44m+bk/Lkx7OSNx4cOOlEtesY6jnwyePeK04K7pIPTK8c1VRk4Zmlbxkve2njS3X72PepXcbMx/DBxFETTt9HxYnBq1M98FwtjMw2azlxZhlY7DnPYmNPjSXeoXYXM59zcIX5Pt82NhRGxAPVxUc19XysIs6iPfHjcps7nBxQu4jphJHvwHgZc1A+lyl16VGt8R8IKxcyZtbLGJtzjnGR2j1MJ4072vd+3zF+PDmSmn4i3Q3ktqojWUn8uBwXT/7vyo+mFqvdwnTa8LFz3+HayU+L5zf7ZWxRD2qnmY5MnFl6Ntsrnmeunxzq61e7hOnU8axFf5i1jIfkj89OP6qp7auLrwXPMV71LGM1X3bSsWpXMJ08fPD0d+ac/pXiR9DBYgcf1VRktcBhOd8yXsha/St3DyTerXYD0w3jZ049ThwdtlY69KRAnRVX8xnmi+18wnOStnzhWW0+plvmpY+a7xJHimt8mwWddlSTRzKxbeXCiJl1bePhiSHjY2qzMd044/aiD4on1493ylGtEZj8M5vKWeygmzY2HHT6/1htLqZb59XRvmNyjvFV+US7kJnf2JqRCfLMcr84M755fCj5IbWpmG4eeQnR/iGTuTbbXpnHN9sbR7FQUfyo3C2+fm3/aN8fqc3E9MLICyMD21jr2aZ8S+eQACioyGo5m+XdYeN34sflF+UFAGrzML0ynCfeNmUlzxI/rnZQH9XeOLNM+a6V3O5ai5a9MJh4p9o0TK9NeGGkzb4jHvQa1SVEjfXIN8ZTrvj6czfNPqU2B9OrI1+fCtLGhZ5jvhj3hZHNJ/3ykuuCYx700skfZq3UR9SmYHp9DnzylPcGlnF7zknFdmHkdGSNS673e0PG7ROXGGeqTcAshAkvjEwbFwcO++84jmrqSb/8Wgwc43+9YWNNdtBYpFaPWUjzyqDxB246+YOi5gsjVWThG+PiDHenOPH4+99+6oTj1GoxC23CCyPt/kvEEWd3SdPbUmGw4SXXZuCljWcDO/k5+ZKKWiVmoY68MNKzjPt1XEIkn+uJZVQKGdN1reSvxI/mYZ5IHKVWhVnIIy+MPOgkl4nnanvnemGkDHT6kusRc8JLswcnL0n9pVoFBtOY3QMnHSueS22WL+DO9qgWRiZ4DpvybeOAa7F/y9vsHLVoDOaNkRdGZh1jpW+zidkc1ZqRiT+Hl1z76f6bvKGTmVosBvPm8TMnHCdOCh6pHuFRTd2mLp6XFVzHeMW12Vdyw8nj1eIwmOhpXBiZvCaXYX6rCyPVSyG1vMMCEdh/+k7ySo43xjFHOgeGTz7Bc4yt8qh2eFxN6l2EaiGT8sTZ6n/k02wEb4xjZjV8tO8YceZ4nQipGHVhZPON8cJIKpu12CPZIfPj6lsxmCMfeWGkN8BM1zKeqM04qr3xpJ9N5TPsQNYyNvoD7Hz1bRjM7IePffA9gZ38ZxFWeGHkjMhK4sxyn2+b3wuGUqepm2Mwcxt5CZE72LdYHLWeqS1NyV9ALJ/8F32bvSp/F9lrf8tOVjfFYNqb/YMf+H1x5LpJkL+eP+/Zxm9FZNfsxv8xjtE54W+MdNifitC2+47xX57TP7bn4/hV6pgYRr5bIEJzvCE2tHVJ4mj1rzEYDAaDwWAwmAU4icT/AZFH2OBbmEutAAAAAElFTkSuQmCC";
 const LOGO_WIDTH = 155;
 const LOGO_HEIGHT = 343;
-const ORANGE = "FF5E39";
-const DARK = "1A1A1A";
-const GREY = "6B6B6B";
-const FONT = "Barlow";
 const ETAT_LABELS$1 = ["Excellent", "Bon", "Moyen", "Mauvais", "Critique"];
 function base64ToUint8Array(base64) {
   const bin = atob(base64);
@@ -22540,40 +24618,6 @@ function base64ToUint8Array(base64) {
 }
 function money(n) {
   return n.toLocaleString("fr-CA", { style: "currency", currency: "CAD", maximumFractionDigits: 0 });
-}
-function heading(text) {
-  return new Paragraph({
-    heading: HeadingLevel.HEADING_1,
-    spacing: { before: 320, after: 160 },
-    children: [new TextRun({ text, bold: true, color: ORANGE, font: FONT, size: 24 })]
-  });
-}
-function body(text, opts = {}) {
-  return new Paragraph({
-    spacing: { after: 100 },
-    children: [
-      new TextRun({ text, font: FONT, bold: opts.bold, color: opts.color ?? DARK, size: opts.size ?? 20 })
-    ]
-  });
-}
-function cell(text, opts = {}) {
-  return new TableCell({
-    shading: opts.header ? { type: ShadingType.CLEAR, fill: DARK } : void 0,
-    margins: { top: 60, bottom: 60, left: 80, right: 80 },
-    children: [
-      new Paragraph({
-        children: [
-          new TextRun({
-            text,
-            font: FONT,
-            size: 16,
-            bold: opts.header,
-            color: opts.header ? "FFFFFF" : opts.color ?? DARK
-          })
-        ]
-      })
-    ]
-  });
 }
 // ============================================================================
 // LE RAPPORT .DOCX — plan de gestion de l'actif, ossature maison
@@ -22954,6 +24998,106 @@ function paragraphesDocx(xml) {
   return paras;
 }
 
+// Un tableau Word contient des <w:p> comme le reste du document : les
+// aplatir avec paragraphesDocx mélangerait les cellules d'une même ligne
+// avec celles de la ligne suivante. On garde ici la structure
+// tableau > ligne > cellule pour pouvoir reconstituer les colonnes.
+function tableauxDocx(xml) {
+  const tableaux = [];
+  for (const tbl of xml.matchAll(/<w:tbl>[\s\S]*?<\/w:tbl>/g)) {
+    const lignes = [];
+    for (const tr of tbl[0].matchAll(/<w:tr[ >][\s\S]*?<\/w:tr>|<w:tr\/>/g)) {
+      const cellules = [];
+      for (const tc of tr[0].matchAll(/<w:tc[ >][\s\S]*?<\/w:tc>|<w:tc\/>/g)) {
+        const morceaux = [...tc[0].matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)].map((m) => m[1]);
+        cellules.push(decodeEntitesXml(morceaux.join("")).replace(/\s+/g, " ").trim());
+      }
+      if (cellules.length) lignes.push(cellules);
+    }
+    if (lignes.length) tableaux.push(lignes);
+  }
+  return tableaux;
+}
+
+// Une composante par ligne « categorie|nom|code|durée de vie|quantité » : une
+// ligne tronquée se jette seule et les autres tiennent.
+function parseLignesChecklist(texte) {
+  const items = [];
+  for (const brut of String(texte ?? "").split("\n")) {
+    const ligne = brut.trim();
+    if (!ligne || !ligne.includes("|")) continue;
+    const champs = ligne.split("|").map((x) => x.trim());
+    if (champs.length < 2) continue;
+    const [cat, name, code, vu, qty] = champs;
+    // Une catégorie inconnue signalerait une ligne mal formée autant qu'une
+    // hallucination : on retombe sur « équipements », comme à l'insertion.
+    if (!name) continue;
+    const duree = Number(vu);
+    items.push({
+      cat: CATEGORIES[cat] ? cat : "equipements",
+      name,
+      code: code && code !== "-" && code !== "—" ? code : null,
+      vu: Number.isFinite(duree) && duree > 0 ? Math.round(duree) : null,
+      qty: qty || "—"
+    });
+  }
+  return items;
+}
+
+
+// Reconnaît les composantes d'un document existant (ex. une étude
+// antérieure du même bâtiment) pour amorcer l'inventaire d'un dossier
+// précis. Contrairement au gabarit de rapport, qui trie du texte déjà
+// écrit, on demande ici au modèle de repérer des lignes de composantes
+// dans un tableau — ça reste un classement, donc la réflexion reste
+// désactivée pour ne pas répéter l'échec de sectionsDepuisTexte.
+async function composantesDepuisDocument(apiKey, { tableaux, paragraphes }) {
+  if (!apiKey) {
+    return { items: [], note: "Aucune clé API n'est configurée : impossible d'extraire les composantes automatiquement." };
+  }
+  let corpus;
+  if (tableaux.length > 0) {
+    // Le plus grand tableau du document est presque toujours celui des
+    // composantes ; les petits tableaux (page de garde, résumé financier)
+    // n'ont pas assez de lignes pour rivaliser.
+    const plusGrand = tableaux.reduce((a, b) => (b.length > a.length ? b : a));
+    corpus = plusGrand.map((ligne) => ligne.join(" | ")).join("\n");
+  } else {
+    corpus = paragraphes.join("\n");
+  }
+  corpus = corpus.slice(0, 60000);
+  const prompt = `Voici un extrait d'un document d'étude de fonds de prévoyance pour un
+immeuble résidentiel québécois — probablement le tableau des composantes
+(Uniformat II) d'une étude antérieure de CE bâtiment.
+
+Catégories valides (utilise exactement ces clés) :
+${Object.entries(CATEGORIES).map(([k, v]) => `${v.ordre}. ${k} — ${v.label}`).join("\n")}
+
+Extrait CHAQUE ligne qui décrit une composante réelle du bâtiment (ignore les
+en-têtes de colonnes, les titres de section, les totaux et les lignes vides).
+Ne complète PAS la liste avec des composantes typiques absentes du texte : si
+le document n'en mentionne que 12, réponds 12 lignes.
+
+Réponds UNIQUEMENT par une liste, UNE COMPOSANTE PAR LIGNE, au format exact :
+
+categorie|nom|code Uniformat|durée de vie|quantité
+
+Exemple de ligne : enveloppe|Surface de toit principal, solins|B30.10-40|35|—
+
+Mets un tiret « - » pour tout champ absent du document plutôt que d'inventer
+une valeur. Aucun en-tête, aucune numérotation, aucun commentaire.
+
+TEXTE :
+${corpus}`;
+  try {
+    const texte = await callClaude(apiKey, { content: prompt, maxTokens: 12000, thinking: { type: "disabled" } });
+    const items = parseLignesChecklist(texte);
+    return { items, note: items.length === 0 ? `aucune composante reconnue dans ce document (${texte.length} caractères reçus)` : null };
+  } catch (e) {
+    return { items: [], note: `l'extraction a échoué (${e && e.message})` };
+  }
+}
+
 // Répartit le texte importé sur les sections du rapport. Le modèle trie ; il ne
 // réécrit pas : c'est le texte de la firme qui doit ressortir, pas une
 // paraphrase.
@@ -22995,7 +25139,11 @@ TEXTE DU GABARIT :
 ${corpus}
 
 Réponds UNIQUEMENT avec un objet JSON dont les clés sont prises dans la liste ci-dessus.`;
-  const brut = await callClaude(apiKey, { content: prompt, maxTokens: 16000 });
+  // Répartir un texte déjà écrit dans des sections fixes est un classement, pas
+  // un problème à raisonner : désactiver la réflexion laisse tout le budget de
+  // sortie au JSON attendu, plutôt que de risquer qu'elle l'épuise avant le
+  // premier mot sur un gros document.
+  const brut = await callClaude(apiKey, { content: prompt, maxTokens: 16000, thinking: { type: "disabled" } });
   return { sections: nettoyerSections(extractJson(brut)), note: null };
 }
 
@@ -23004,39 +25152,726 @@ function peutGererEntreprise(user, companyId) {
   if (user.role === "super_admin") return true;
   return user.company_id === companyId;
 }
-function titre2(text) {
-  return new Paragraph({
-    spacing: { before: 240, after: 100 },
-    children: [new TextRun({ text, bold: true, color: DARK, font: FONT, size: 22 })]
-  });
-}
-function titre3(text) {
-  return new Paragraph({
-    spacing: { before: 160, after: 60 },
-    children: [new TextRun({ text, bold: true, color: ORANGE, font: FONT, size: 19 })]
-  });
-}
-function paras(texte, opts = {}) {
-  if (!texte) return [];
-  return String(texte).split(/\n{2,}/).map((bloc) => bloc.trim()).filter(Boolean).flatMap((bloc) => bloc.split("\n").map((ligne) => body(ligne.trim(), opts)));
-}
-function puce(text) {
-  return body(`· ${text}`);
-}
-function tableauMaison(entetes, lignes) {
-  return new Table({
-    width: { size: 100, type: WidthType.PERCENTAGE },
-    rows: [
-      new TableRow({ children: entetes.map((h) => cell(h, { header: true })) }),
-      ...lignes.map((ligne) => new TableRow({ children: ligne.map((v) => cell(String(v))) }))
-    ]
-  });
+// Modifier les réglages de la firme (bibliothèque, gabarits, identité) :
+// le super admin, ou un administrateur de cette firme. Les ingénieurs les
+// consultent sans pouvoir les changer.
+const ROLES_UTILISATEUR = ["engineer", "admin"];
+function peutAdministrerFirme(user, companyId) {
+  if (!user) return false;
+  if (user.role === "super_admin") return true;
+  return user.role === "admin" && user.company_id === companyId;
 }
 function pourcent(taux) {
   return `${(taux * 100).toFixed(2).replace(".", ",").replace(/,00$/, "")}${NBSP}%`;
 }
-async function generateReportDocx(ctx) {
+// ============================================================================
+// IDENTITÉ DU RAPPORT — thème de la firme, fiche composante, composition Word
+// ----------------------------------------------------------------------------
+// Chaque firme hébergée publie ses rapports à son image : couleurs, polices,
+// coordonnées et logo viennent de sa fiche d'entreprise (companies.theme), et
+// non plus de constantes Condo Stratégis codées en dur. Une firme peut aussi
+// fournir son propre gabarit Word de mise en page (companies.mise_en_page) :
+// ses pages liminaires, ses champs {{…}} et son repère {{RAPPORT}}, où la
+// plateforme verse le rapport qu'elle a rédigé, dans les styles de la firme.
+// ============================================================================
+const THEME_DEFAUT = {
+  accent: "FF5E39",
+  encre: "0A0A0A",
+  gris: "6B6B6B",
+  filet: "E0E0E0",
+  fond: "F7F7F7",
+  vert: "1F8A4E",
+  vertPale: "E6F2EB",
+  police: "Inter Tight",
+  policeTitres: "Archivo",
+  policeMono: "JetBrains Mono",
+  adresse: "",
+  telephone: "",
+  courriel: "",
+  site: ""
+};
+// Coordonnées historiques de Condo Stratégis : reprises seulement pour cette
+// firme tant qu'elle ne les a pas saisies à sa fiche, pour que ses rapports ne
+// perdent pas leur pied de page le jour du déploiement.
+const COORDONNEES_STRATEGIS = {
+  adresse: "82, rue de Brésol, Montréal, Québec, H2Y 1V5",
+  telephone: "(514) 508-6987",
+  courriel: "info@condostrategis.ca"
+};
+const CHAMPS_THEME_COULEUR = ["accent", "encre", "gris"];
+const CHAMPS_THEME_POLICE = ["police", "policeTitres", "policeMono"];
+const CHAMPS_THEME_TEXTE = ["adresse", "telephone", "courriel", "site"];
+function estStrategis(nom) {
+  return /strat[ée]gis/i.test(String(nom ?? ""));
+}
+function nettoyerTheme(brut) {
+  const src = objetJson(brut);
+  const theme = {};
+  for (const k of CHAMPS_THEME_COULEUR) {
+    const v = String(src[k] ?? "").trim().replace(/^#/, "").toUpperCase();
+    if (/^[0-9A-F]{6}$/.test(v)) theme[k] = v;
+  }
+  for (const k of CHAMPS_THEME_POLICE) {
+    const v = String(src[k] ?? "").trim();
+    if (/^[\p{L}0-9 \-]{1,40}$/u.test(v)) theme[k] = v;
+  }
+  for (const k of CHAMPS_THEME_TEXTE) {
+    const v = String(src[k] ?? "").trim().slice(0, 160);
+    if (v) theme[k] = v;
+  }
+  return theme;
+}
+function themeDeFirme(company) {
+  const propre = nettoyerTheme(company?.theme);
+  const theme = { ...THEME_DEFAUT, ...propre, nom: String(company?.name ?? "").trim() };
+  if (estStrategis(theme.nom)) {
+    for (const [k, v] of Object.entries(COORDONNEES_STRATEGIS)) if (!propre[k]) theme[k] = v;
+  }
+  return theme;
+}
+function coordonneesFirme(theme) {
+  return [theme.nom, theme.adresse, theme.telephone, theme.courriel, theme.site].filter(Boolean).join(" — ");
+}
+// Dimensions d'une image PNG ou JPEG, lues dans son en-tête : ImageRun exige
+// une taille, et une photo de téléphone n'a jamais les proportions du cadre.
+function imageDocx(bytes) {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (b.length > 24 && b[0] === 137 && b[1] === 80 && b[2] === 78 && b[3] === 71) {
+    const vue = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    return { data: b, type: "png", largeur: vue.getUint32(16), hauteur: vue.getUint32(20) };
+  }
+  if (b.length > 4 && b[0] === 255 && b[1] === 216) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 255) { i++; continue; }
+      const marqueur = b[i + 1];
+      const longueur = (b[i + 2] << 8) + b[i + 3];
+      // SOF0 à SOF15, sauf DHT (C4), JPG (C8) et DAC (CC).
+      if (marqueur >= 192 && marqueur <= 207 && marqueur !== 196 && marqueur !== 200 && marqueur !== 204) {
+        return { data: b, type: "jpg", largeur: (b[i + 7] << 8) + b[i + 8], hauteur: (b[i + 5] << 8) + b[i + 6] };
+      }
+      i += 2 + longueur;
+    }
+  }
+  return null;
+}
+function tailleImage(image, largeurMax, hauteurMax) {
+  const ratio = image.largeur > 0 && image.hauteur > 0 ? image.hauteur / image.largeur : 0.75;
+  let largeur = largeurMax;
+  let hauteur = Math.round(largeur * ratio);
+  if (hauteur > hauteurMax) {
+    hauteur = hauteurMax;
+    largeur = Math.round(hauteur / ratio);
+  }
+  return { width: largeur, height: hauteur };
+}
+const SANS_BORDURE = { style: BorderStyle.NONE, size: 0, color: "FFFFFF" };
+// Outils de mise en forme, liés au thème d'un rapport. `modeStyles` : le rapport
+// sera versé dans le gabarit Word d'une firme — les titres portent alors les
+// styles Titre 1 à 3 et le texte courant hérite de ses polices, au lieu de
+// formats directs qui écraseraient sa mise en page.
+function outilsDocx(t, { modeStyles = false } = {}) {
+  const police = modeStyles ? void 0 : t.police;
+  const policeTitres = modeStyles ? void 0 : t.policeTitres;
+  const policeMono = modeStyles ? void 0 : t.policeMono;
+  const run = (text, o = {}) => new TextRun({
+    text,
+    font: o.font === void 0 ? police : o.font,
+    bold: o.bold,
+    italics: o.italics,
+    allCaps: o.allCaps,
+    characterSpacing: o.characterSpacing,
+    color: o.color === void 0 ? (modeStyles ? void 0 : t.encre) : o.color,
+    size: o.size === void 0 ? (modeStyles ? void 0 : 20) : o.size
+  });
+  const bordures = {
+    top: SANS_BORDURE,
+    left: SANS_BORDURE,
+    right: SANS_BORDURE,
+    insideVertical: SANS_BORDURE,
+    bottom: { style: BorderStyle.SINGLE, size: 4, color: t.filet },
+    insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: t.filet }
+  };
+  const sansBordures = { top: SANS_BORDURE, bottom: SANS_BORDURE, left: SANS_BORDURE, right: SANS_BORDURE, insideHorizontal: SANS_BORDURE, insideVertical: SANS_BORDURE };
+  function heading(text, o = {}) {
+    return new Paragraph({
+      heading: HeadingLevel.HEADING_1,
+      pageBreakBefore: !o.sansSaut,
+      keepNext: true,
+      spacing: { before: 120, after: 200 },
+      border: modeStyles ? void 0 : { bottom: { style: BorderStyle.SINGLE, size: 12, color: t.accent, space: 6 } },
+      children: [modeStyles ? new TextRun({ text }) : run(text, { font: policeTitres, bold: true, size: 32, allCaps: true })]
+    });
+  }
+  function titre2(text) {
+    return new Paragraph({
+      // Le bundle ne garde que HeadingLevel.HEADING_1 : identifiant de style direct.
+      heading: "Heading2",
+      keepNext: true,
+      spacing: { before: 280, after: 100 },
+      children: [modeStyles ? new TextRun({ text }) : run(text, { font: policeTitres, bold: true, size: 24 })]
+    });
+  }
+  function titre3(text) {
+    return new Paragraph({
+      heading: "Heading3",
+      keepNext: true,
+      spacing: { before: 160, after: 60 },
+      children: [modeStyles ? new TextRun({ text }) : run(text, { font: policeTitres, bold: true, color: t.accent, size: 20 })]
+    });
+  }
+  function body(text, o = {}) {
+    return new Paragraph({
+      spacing: { after: 100 },
+      children: [run(text, { bold: o.bold, color: o.color, size: o.size })]
+    });
+  }
+  function puce(text) {
+    return new Paragraph({
+      spacing: { after: 60 },
+      indent: { left: 360, hanging: 200 },
+      children: [run(`·\t${text}`)],
+      tabStops: [{ type: TabStopType.LEFT, position: 360 }]
+    });
+  }
+  // Avis réglementaire : filet de la couleur d'accent à gauche, sur fond blanc
+  // — le gabarit maison ne pose jamais de texte sur un fond teinté.
+  function encadre(text) {
+    return new Paragraph({
+      spacing: { before: 120, after: 160 },
+      indent: { left: 220 },
+      border: { left: { style: BorderStyle.SINGLE, size: 18, color: t.accent, space: 10 } },
+      children: [run(text, { size: 17 })]
+    });
+  }
+  function paras(texte, o = {}) {
+    if (!texte) return [];
+    return String(texte).split(/\n{2,}/).map((bloc) => bloc.trim()).filter(Boolean).flatMap((bloc) => bloc.split("\n").map((ligne) => {
+      const l = ligne.trim();
+      if (/^INFORMATION\s*:/.test(l)) return encadre(l);
+      if (/^[·•]\s*/.test(l)) return puce(l.replace(/^[·•]\s*/, ""));
+      return body(l, o);
+    }));
+  }
+  function cell(text, o = {}) {
+    return new TableCell({
+      shading: o.header ? { type: ShadingType.CLEAR, fill: t.fond, color: "auto" } : void 0,
+      margins: { top: 70, bottom: 70, left: 100, right: 100 },
+      children: [new Paragraph({
+        alignment: o.droite ? AlignmentType.RIGHT : void 0,
+        children: [o.header
+          ? run(text, { font: policeMono, size: 14, color: t.gris, allCaps: true, characterSpacing: 10 })
+          : run(text, { size: 17, color: o.color })]
+      })]
+    });
+  }
+  function tableauMaison(entetes, lignes, o = {}) {
+    const droite = new Set(o.colonnesDroite ?? []);
+    return new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      borders: bordures,
+      rows: [
+        new TableRow({ tableHeader: true, children: entetes.map((h, i) => cell(h, { header: true, droite: droite.has(i) })) }),
+        ...lignes.map((ligne) => new TableRow({ cantSplit: true, children: ligne.map((v, i) => cell(String(v), { droite: droite.has(i) })) }))
+      ]
+    });
+  }
+  function etiquette(text) {
+    return new Paragraph({
+      keepNext: true,
+      spacing: { before: 220, after: 70 },
+      children: [run(text, { font: policeMono, size: 16, bold: true, color: t.accent, allCaps: true, characterSpacing: 20 })]
+    });
+  }
+  // Bandeau de synthèse : ce qu'on doit lire d'un coup d'œil en feuilletant.
+  function bandeau(cases) {
+    const cellules = cases.map((c) => {
+      const teinte = c.teinte ?? null;
+      return new TableCell({
+        shading: teinte?.fond ? { type: ShadingType.CLEAR, fill: teinte.fond, color: "auto" } : void 0,
+        margins: { top: 80, bottom: 80, left: 110, right: 110 },
+        children: [
+          // keepNext : le bandeau ne reste jamais seul en bas de page.
+          new Paragraph({ keepNext: true, children: [run(c.libelle, { font: policeMono, size: 13, color: teinte?.libelle ?? t.gris, allCaps: true, characterSpacing: 10 })] }),
+          new Paragraph({ keepNext: true, spacing: { before: 30 }, children: [run(c.valeur, { bold: true, size: 18, color: teinte?.texte ?? t.encre })] })
+        ]
+      });
+    });
+    return new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      borders: {
+        top: { style: BorderStyle.SINGLE, size: 4, color: t.filet },
+        bottom: { style: BorderStyle.SINGLE, size: 4, color: t.filet },
+        left: SANS_BORDURE,
+        right: SANS_BORDURE,
+        insideHorizontal: SANS_BORDURE,
+        insideVertical: { style: BorderStyle.SINGLE, size: 4, color: t.filet }
+      },
+      rows: [new TableRow({ cantSplit: true, children: cellules })]
+    });
+  }
+  function teinteCote(cote) {
+    if (cote === "Bon") return { fond: t.vertPale, texte: t.vert, libelle: t.vert };
+    if (cote === "Passable") return { fond: null, texte: t.accent, libelle: t.accent };
+    if (cote === "Mauvais") return { fond: t.accent, texte: "FFFFFF", libelle: "FFFFFF" };
+    return null;
+  }
+  function photoBloc(photo, largeurMax, hauteurMax) {
+    return [
+      new Paragraph({
+        keepNext: true,
+        spacing: { after: 30 },
+        children: [new ImageRun({ data: photo.image.data, type: photo.image.type, transformation: tailleImage(photo.image, largeurMax, hauteurMax) })]
+      }),
+      new Paragraph({
+        spacing: { after: 120 },
+        children: [run(sansNotesInternes(photo.tag ?? "Photo"), { font: policeMono, size: 13, color: t.gris, allCaps: true, characterSpacing: 10 })]
+      })
+    ];
+  }
+  // Fiche composante — gabarit « classique éditorial » de la firme : surtitre
+  // catégorie · code, titre, filet court, bandeau de synthèse, puis les quatre
+  // sections. Les photos sont celles de l'ingénieur ; sans photo, le texte prend
+  // toute la largeur plutôt que de laisser un cadre vide dans un rapport livré.
+  function ficheDocx({ numero, nom, categorie, code, cote, ligne, component, fiche, photos, taches = [] }) {
+    const blocs = [];
+    blocs.push(new Paragraph({
+      keepNext: true,
+      spacing: { before: 420, after: 40 },
+      children: [run(`${categorie.toUpperCase()}${code ? ` · ${code}` : ""}`, { font: policeMono, size: 14, color: t.gris, characterSpacing: 20 })]
+    }));
+    blocs.push(new Paragraph({
+      heading: "Heading3",
+      keepNext: true,
+      spacing: { after: 40 },
+      children: [modeStyles ? new TextRun({ text: `${numero} ${nom}` }) : run(`${numero} ${nom}`, { font: policeTitres, bold: true, size: 30, allCaps: true })]
+    }));
+    // Filet court : la bordure d'un paragraphe fait toute sa largeur, un
+    // retrait à droite la ramène à environ 2,5 cm.
+    blocs.push(new Paragraph({
+      keepNext: true,
+      spacing: { after: 160 },
+      indent: { right: 8200 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 12, color: t.accent, space: 1 } },
+      children: []
+    }));
+    const delai = DELAIS_MAISON.find((d) => d.libelle === component?.delai_suggere);
+    blocs.push(bandeau([
+      { libelle: "Cote", valeur: cote ?? "Non cotée", teinte: teinteCote(cote) },
+      { libelle: "Origine", valeur: ligne.anneeInstall != null ? String(ligne.anneeInstall) : ligne.anneeReference != null ? `${ligne.anneeReference} (calcul)` : "—" },
+      { libelle: ligne.allocation ? "Cycle" : "Durée de vie", valeur: `${ligne.duree} ans` },
+      { libelle: ligne.allocation ? "Débutant en" : "Remplacement", valeur: ligne.annee != null ? String(ligne.annee) : "à confirmer" },
+      { libelle: "Délai", valeur: delai ? delai.libelle.replace(/\s*\(.*\)$/, "") : sansNotesInternes(component?.delai_suggere ?? "") || "—" }
+    ]));
+    for (const section of fiche.sections) {
+      blocs.push(etiquette(section.cle === "etat" ? "État de l'actif" : section.cle === "duree_vie" ? "Durée de vie et remplacement" : section.cle === "entretien" ? "Commentaires d'entretien" : "Attention spéciale"));
+      const texte = paras(section.texte);
+      if (section.cle === "etat" && photos.length > 0) {
+        const aCote = photos.slice(0, 2);
+        const dessous = photos.slice(2, 4);
+        blocs.push(new Table({
+          width: { size: 100, type: WidthType.PERCENTAGE },
+          borders: sansBordures,
+          rows: [new TableRow({
+            children: [
+              new TableCell({ width: { size: 62, type: WidthType.PERCENTAGE }, margins: { right: 200 }, children: texte.length ? texte : [new Paragraph({ children: [] })] }),
+              new TableCell({ width: { size: 38, type: WidthType.PERCENTAGE }, children: aCote.flatMap((p) => photoBloc(p, 215, 170)) })
+            ]
+          })]
+        }));
+        if (dessous.length) {
+          blocs.push(new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            borders: sansBordures,
+            rows: [new TableRow({
+              cantSplit: true,
+              children: [0, 1].map((i) => new TableCell({
+                width: { size: 50, type: WidthType.PERCENTAGE },
+                children: dessous[i] ? photoBloc(dessous[i], 300, 220) : [new Paragraph({ children: [] })]
+              }))
+            })]
+          }));
+        }
+      } else {
+        blocs.push(...texte);
+      }
+      // Tâches du carnet d'entretien de cette composante, sous les commentaires.
+      if (section.cle === "entretien" && taches.length) {
+        blocs.push(new Paragraph({ keepNext: true, spacing: { before: 120, after: 60 }, children: [run("Tâches planifiées au carnet d'entretien", { font: policeMono, size: 14, color: t.gris, allCaps: true, characterSpacing: 10 })] }));
+        blocs.push(tableauMaison(
+          ["Tâche", "Fréquence", "Quand", "Responsable"],
+          taches.map((x) => [x.texte, x.frequence, x.quand, x.responsable])
+        ));
+      }
+      if (section.cle === "duree_vie") {
+        blocs.push(tableauMaison(
+          ["Élément", "Type", ligne.allocation ? "Cycle" : "Durée de vie", ligne.allocation ? "Débutant en" : "Remplacement", ligne.libelleMontant],
+          [[
+            titreTableauMaison(component, ligne),
+            ligne.reglementaire ? ligne.reglementaire.libelle : ligne.allocation ? "Allocation" : "Remplacement",
+            `${ligne.duree} ans`,
+            ligne.annee != null ? String(ligne.annee) : "à confirmer",
+            montantMaison(ligne.cout) ?? `-${NBSP}$`
+          ]],
+          { colonnesDroite: [4] }
+        ));
+      }
+    }
+    return blocs;
+  }
+  return { run, heading, titre2, titre3, body, puce, encadre, paras, cell, tableauMaison, etiquette, ficheDocx, bordures };
+}
+// ----------------------------------------------------------------------------
+// Post-traitement du .docx produit : table des matières, sommaire exécutif,
+// et composition dans le gabarit Word de la firme.
+// ----------------------------------------------------------------------------
+const MARQUE_TDM = "§§TABLE_DES_MATIERES§§";
+const MARQUE_DEBUT_SOMMAIRE = "§§DEBUT_SOMMAIRE§§";
+const MARQUE_FIN_SOMMAIRE = "§§FIN_SOMMAIRE§§";
+const MARQUE_BLOC = (nom) => `§§BLOC_${nom}§§`;
+const BLOCS_GABARIT = ["rapport", "table_des_matieres", "sommaire_executif"];
+// docx produit toutes ses images avec <wp:docPr id="1"> ; Word exige des
+// identifiants uniques et « répare » sinon le document à l'ouverture.
+function renumeroterDessins(xml) {
+  let n = 0;
+  return xml.replace(/<wp:docPr id="\d+"/g, () => `<wp:docPr id="${++n}"`);
+}
+function echapperXml(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function champTableDesMatieres() {
+  return '<w:p><w:r><w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \\o "1-3" \\h \\z \\u </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t xml:space="preserve">Table des matières : si elle n\'apparaît pas, faites un clic droit ici puis « Mettre à jour les champs ».</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>';
+}
+// Bornes du paragraphe <w:p> qui contient la position `pos`.
+function paragrapheAutour(xml, pos) {
+  const a = xml.lastIndexOf("<w:p>", pos);
+  const b = xml.lastIndexOf("<w:p ", pos);
+  const debut = Math.max(a, b);
+  const fin = xml.indexOf("</w:p>", pos);
+  if (debut < 0 || fin < 0) return null;
+  return { debut, fin: fin + 6 };
+}
+function remplacerParagraphe(xml, marque, remplacement) {
+  const pos = xml.indexOf(marque);
+  if (pos < 0) return { xml, trouve: false };
+  const p = paragrapheAutour(xml, pos);
+  if (!p) return { xml, trouve: false };
+  return { xml: xml.slice(0, p.debut) + remplacement + xml.slice(p.fin), trouve: true };
+}
+// Champs {{cle}} d'un XML Word. Word coupe souvent un champ en plusieurs <w:t>
+// dès qu'on change la mise en forme ou que le correcteur passe dessus : on lit
+// donc le texte de tous les <w:t> bout à bout, on y repère les champs, puis on
+// reporte la valeur dans le premier morceau et on vide les suivants.
+const RE_WT = /<w:t(\s[^>]*)?>([\s\S]*?)<\/w:t>|<w:t(\s[^>]*)?\/>/g;
+function remplacerChampsXml(xml, valeurPour) {
+  const noeuds = [];
+  let m;
+  RE_WT.lastIndex = 0;
+  while ((m = RE_WT.exec(xml))) {
+    noeuds.push({ debut: m.index, fin: m.index + m[0].length, texte: decodeEntitesXml(m[2] ?? "") });
+  }
+  const trouves = [];
+  if (!noeuds.length) return { xml, trouves };
+  const bornes = [];
+  let complet = "";
+  for (const n of noeuds) {
+    bornes.push(complet.length);
+    complet += n.texte;
+  }
+  const indexNoeud = (pos) => {
+    for (let i = noeuds.length - 1; i >= 0; i--) {
+      if (bornes[i] <= pos && pos < bornes[i] + noeuds[i].texte.length) return i;
+    }
+    return -1;
+  };
+  const remplacements = [];
+  const re = /\{\{\s*([A-Za-zÀ-ÿ_][A-Za-zÀ-ÿ0-9_]*)\s*\}\}/g;
+  while ((m = re.exec(complet))) {
+    const cle = m[1].toLowerCase();
+    trouves.push(cle);
+    const valeur = valeurPour(cle);
+    if (valeur == null) continue;
+    remplacements.push({ debut: m.index, fin: m.index + m[0].length, texte: String(valeur) });
+  }
+  if (!remplacements.length) return { xml, trouves };
+  const textes = noeuds.map((n) => n.texte);
+  const touches = new Set();
+  for (const r of remplacements.reverse()) {
+    const iDeb = indexNoeud(r.debut);
+    const iFin = indexNoeud(r.fin - 1);
+    if (iDeb < 0 || iFin < 0) continue;
+    const offDeb = r.debut - bornes[iDeb];
+    const offFin = r.fin - bornes[iFin];
+    if (iDeb === iFin) {
+      textes[iDeb] = textes[iDeb].slice(0, offDeb) + r.texte + textes[iDeb].slice(offFin);
+    } else {
+      textes[iDeb] = textes[iDeb].slice(0, offDeb) + r.texte;
+      for (let k = iDeb + 1; k < iFin; k++) { textes[k] = ""; touches.add(k); }
+      textes[iFin] = textes[iFin].slice(offFin);
+      touches.add(iFin);
+    }
+    touches.add(iDeb);
+  }
+  let sortie = "";
+  let curseur = 0;
+  noeuds.forEach((n, i) => {
+    if (!touches.has(i)) return;
+    sortie += xml.slice(curseur, n.debut) + `<w:t xml:space="preserve">${echapperXml(textes[i])}</w:t>`;
+    curseur = n.fin;
+  });
+  sortie += xml.slice(curseur);
+  return { xml: sortie, trouves };
+}
+function texteVisibleXml(xml) {
+  const morceaux = [];
+  let m;
+  RE_WT.lastIndex = 0;
+  while ((m = RE_WT.exec(xml))) morceaux.push(decodeEntitesXml(m[2] ?? ""));
+  return morceaux.join("");
+}
+function ajouterMiseAJourDesChamps(settingsXml) {
+  if (!settingsXml || settingsXml.includes("w:updateFields")) return settingsXml;
+  return settingsXml.replace(/(<w:settings\b[^>]*>)/, '$1<w:updateFields w:val="true"/>');
+}
+// Contenu du <w:body> d'un document.xml, sans son sectPr final.
+function corpsDocument(xml) {
+  const debut = xml.indexOf("<w:body>");
+  const fin = xml.lastIndexOf("</w:body>");
+  let corps = xml.slice(debut + 8, fin);
+  const sect = corps.lastIndexOf("<w:sectPr");
+  if (sect >= 0 && corps.slice(sect).trim().endsWith("</w:sectPr>")) corps = corps.slice(0, sect);
+  return corps;
+}
+// Extrait le sommaire exécutif balisé du corps : [corps sans sommaire, sommaire].
+function extraireSommaire(corps) {
+  const i = corps.indexOf(MARQUE_DEBUT_SOMMAIRE);
+  const j = corps.indexOf(MARQUE_FIN_SOMMAIRE);
+  if (i < 0 || j < 0) return [corps, ""];
+  const pDeb = paragrapheAutour(corps, i);
+  const pFin = paragrapheAutour(corps, j);
+  if (!pDeb || !pFin) return [corps, ""];
+  return [corps.slice(0, pDeb.debut) + corps.slice(pFin.fin), corps.slice(pDeb.fin, pFin.debut)];
+}
+function sansMarquesSommaire(corps) {
+  let xml = corps;
+  for (const marque of [MARQUE_DEBUT_SOMMAIRE, MARQUE_FIN_SOMMAIRE]) xml = remplacerParagraphe(xml, marque, "").xml;
+  return xml;
+}
+// Rapport autonome : on remplace la marque de table des matières par le champ
+// Word et on demande à Word de mettre les champs à jour à l'ouverture.
+async function finaliserRapportDocx(bytes) {
+  const JSZip = import_jszip_min.default;
+  const zip = await JSZip.loadAsync(bytes);
+  let doc = await zip.file("word/document.xml").async("string");
+  doc = remplacerParagraphe(doc, MARQUE_TDM, champTableDesMatieres()).xml;
+  const corps = corpsDocument(doc);
+  const nouveau = sansMarquesSommaire(corps);
+  doc = renumeroterDessins(doc.replace(corps, () => nouveau));
+  zip.file("word/document.xml", doc);
+  const settings = zip.file("word/settings.xml");
+  if (settings) zip.file("word/settings.xml", ajouterMiseAJourDesChamps(await settings.async("string")));
+  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+// Styles de titre : on relie Heading1..3 du rapport aux styles de la firme par
+// leur nom interne (« heading 1 »), puisque l'identifiant est traduit dans un
+// Word en français (« Titre1 »). Un style absent est copié du rapport.
+function relierStyles(stylesFirme, stylesRapport, corps) {
+  const parNom = new Map();
+  const defs = new Map();
+  const re = /<w:style\b([^>]*)>([\s\S]*?)<\/w:style>/g;
+  let m;
+  while ((m = re.exec(stylesFirme))) {
+    const type = /w:type="([^"]+)"/.exec(m[1])?.[1];
+    const id = /w:styleId="([^"]+)"/.exec(m[1])?.[1];
+    const nom = /<w:name w:val="([^"]+)"/.exec(m[2])?.[1];
+    if (type === "paragraph" && id && nom) parNom.set(nom.toLowerCase(), id);
+  }
+  re.lastIndex = 0;
+  while ((m = re.exec(stylesRapport))) {
+    const id = /w:styleId="([^"]+)"/.exec(m[1])?.[1];
+    if (id) defs.set(id, m[0]);
+  }
+  let styles = stylesFirme;
+  let xml = corps;
+  for (const niveau of [1, 2, 3]) {
+    const idRapport = `Heading${niveau}`;
+    const idFirme = parNom.get(`heading ${niveau}`);
+    if (idFirme) {
+      if (idFirme !== idRapport) xml = xml.split(`<w:pStyle w:val="${idRapport}"/>`).join(`<w:pStyle w:val="${idFirme}"/>`);
+    } else if (defs.has(idRapport) && !styles.includes(`w:styleId="${idRapport}"`)) {
+      const def = defs.get(idRapport);
+      styles = styles.replace("</w:styles>", () => `${def}</w:styles>`);
+    }
+  }
+  return { styles, corps: xml };
+}
+// Verse le rapport produit par la plateforme dans le gabarit Word de la firme :
+// champs remplis, blocs {{RAPPORT}}, {{SOMMAIRE_EXECUTIF}} et
+// {{TABLE_DES_MATIERES}} placés, images et relations recopiées.
+async function composerAvecGabarit(rapportBytes, gabaritBytes, valeurs) {
+  const JSZip = import_jszip_min.default;
+  const [rapport, gabarit] = await Promise.all([JSZip.loadAsync(rapportBytes), JSZip.loadAsync(gabaritBytes)]);
+  const docRapport = await rapport.file("word/document.xml").async("string");
+  let [corps, sommaire] = extraireSommaire(corpsDocument(docRapport));
+  // Images du rapport : recopiées sous un nom et un identifiant propres, pour
+  // ne jamais entrer en collision avec celles de la firme.
+  const relsRapport = await rapport.file("word/_rels/document.xml.rels").async("string");
+  const cheminRels = "word/_rels/document.xml.rels";
+  let relsFirme = await gabarit.file(cheminRels).async("string");
+  const extensions = new Set();
+  let n = 0;
+  const remplacerIds = async (xml) => {
+    const ids = [...new Set([...xml.matchAll(/r:embed="([^"]+)"/g)].map((x) => x[1]))];
+    for (const id of ids) {
+      const rel = new RegExp(`<Relationship\\b[^>]*Id="${id}"[^>]*/>`).exec(relsRapport)?.[0];
+      const cible = rel && /Target="([^"]+)"/.exec(rel)?.[1];
+      const fichier = cible && rapport.file(`word/${cible.replace(/^\//, "").replace(/^word\//, "")}`);
+      if (!fichier) continue;
+      n += 1;
+      const ext = (cible.split(".").pop() || "png").toLowerCase();
+      extensions.add(ext);
+      const nom = `media/plateforme-${n}.${ext}`;
+      gabarit.file(`word/${nom}`, await fichier.async("uint8array"));
+      const nouvelId = `rIdPlateforme${n}`;
+      relsFirme = relsFirme.replace("</Relationships>", `<Relationship Id="${nouvelId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${nom}"/></Relationships>`);
+      xml = xml.split(`r:embed="${id}"`).join(`r:embed="${nouvelId}"`);
+    }
+    return xml;
+  };
+  corps = await remplacerIds(corps);
+  sommaire = await remplacerIds(sommaire);
+  gabarit.file(cheminRels, relsFirme);
+  const ct = gabarit.file("[Content_Types].xml");
+  if (ct) {
+    let types = await ct.async("string");
+    const mime = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif" };
+    for (const ext of extensions) {
+      if (!new RegExp(`Extension="${ext}"`, "i").test(types) && mime[ext]) {
+        types = types.replace("</Types>", `<Default Extension="${ext}" ContentType="${mime[ext]}"/></Types>`);
+      }
+    }
+    gabarit.file("[Content_Types].xml", types);
+  }
+  // Styles de titre de la firme.
+  const stylesFirmeFichier = gabarit.file("word/styles.xml");
+  const stylesRapportFichier = rapport.file("word/styles.xml");
+  if (stylesFirmeFichier && stylesRapportFichier) {
+    const relie = relierStyles(await stylesFirmeFichier.async("string"), await stylesRapportFichier.async("string"), corps + MARQUE_DEBUT_SOMMAIRE + sommaire);
+    gabarit.file("word/styles.xml", relie.styles);
+    [corps, sommaire] = relie.corps.split(MARQUE_DEBUT_SOMMAIRE);
+  }
+  // Champs, puis blocs.
+  const valeurPour = (cle) => BLOCS_GABARIT.includes(cle) ? MARQUE_BLOC(cle) : Object.prototype.hasOwnProperty.call(valeurs, cle) ? valeurs[cle] : null;
+  const cheminDoc = "word/document.xml";
+  let doc = remplacerChampsXml(await gabarit.file(cheminDoc).async("string"), valeurPour).xml;
+  let placeSommaire = remplacerParagraphe(doc, MARQUE_BLOC("sommaire_executif"), sommaire);
+  doc = placeSommaire.xml;
+  doc = remplacerParagraphe(doc, MARQUE_BLOC("table_des_matieres"), champTableDesMatieres()).xml;
+  // Sans {{SOMMAIRE_EXECUTIF}} dans le gabarit, le sommaire reste en tête du rapport.
+  const contenu = placeSommaire.trouve ? corps : sommaire + corps;
+  const place = remplacerParagraphe(doc, MARQUE_BLOC("rapport"), contenu);
+  if (place.trouve) {
+    doc = place.xml;
+  } else {
+    // Sans repère, le rapport suit les pages de la firme, sur une nouvelle page.
+    const saut = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
+    const corpsFirme = corpsDocument(doc);
+    const pos = doc.indexOf(corpsFirme) + corpsFirme.length;
+    doc = doc.slice(0, pos) + saut + contenu + doc.slice(pos);
+  }
+  // Préfixes d'espaces de noms employés par le rapport et absents du gabarit.
+  const racineRapport = /<w:document\b[^>]*>/.exec(docRapport)?.[0] ?? "";
+  const racineFirme = /<w:document\b[^>]*>/.exec(doc)?.[0] ?? "";
+  let racine = racineFirme;
+  for (const [, prefixe, uri] of racineRapport.matchAll(/xmlns:([A-Za-z0-9]+)="([^"]+)"/g)) {
+    if (!racine.includes(`xmlns:${prefixe}=`)) racine = racine.replace(/>$/, ` xmlns:${prefixe}="${uri}">`);
+  }
+  if (racine !== racineFirme) doc = doc.replace(racineFirme, () => racine);
+  gabarit.file(cheminDoc, renumeroterDessins(doc));
+  // Champs aussi dans les en-têtes et pieds de page de la firme.
+  for (const chemin of Object.keys(gabarit.files).filter((f) => /^word\/(header|footer)\d*\.xml$/.test(f))) {
+    const xml = await gabarit.file(chemin).async("string");
+    gabarit.file(chemin, remplacerChampsXml(xml, (cle) => Object.prototype.hasOwnProperty.call(valeurs, cle) ? valeurs[cle] : null).xml);
+  }
+  const settings = gabarit.file("word/settings.xml");
+  if (settings) gabarit.file("word/settings.xml", ajouterMiseAJourDesChamps(await settings.async("string")));
+  return gabarit.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+// Champs offerts aux gabarits de firme. Une clé inconnue reste visible telle
+// quelle dans le document produit, pour que la firme la repère.
+const CHAMPS_GABARIT = [
+  ["immeuble", "Nom du syndicat ou de l'immeuble"],
+  ["adresse", "Adresse de l'immeuble"],
+  ["ville", "Ville"],
+  ["adresse_complete", "Adresse et ville"],
+  ["dossier", "Numéro de dossier"],
+  ["unites", "Nombre d'unités"],
+  ["etages", "Nombre d'étages"],
+  ["annee_construction", "Année de construction"],
+  ["date_rapport", "Date du rapport (ex. 25 septembre 2026)"],
+  ["annee", "Année courante"],
+  ["signataire", "Nom du signataire"],
+  ["signataire_titre", "Titre du signataire (ex. ing.)"],
+  ["ordre", "Ordre professionnel (OIQ, OTPQ…)"],
+  ["no_membre", "Numéro de membre"],
+  ["firme", "Nom de la firme"],
+  ["firme_adresse", "Adresse de la firme"],
+  ["firme_telephone", "Téléphone de la firme"],
+  ["firme_courriel", "Courriel de la firme"],
+  ["firme_site", "Site Web de la firme"],
+  ["solde_fonds", "Solde actuel du fonds de prévoyance"],
+  ["cotisation_actuelle", "Cotisation annuelle actuelle"],
+  ["cotisation_recommandee", "Cotisation annuelle recommandée (an 1)"],
+  ["cotisation_mensuelle_unite", "Cotisation mensuelle moyenne par unité"]
+];
+const BLOCS_GABARIT_LIBELLES = [
+  ["rapport", "Où la plateforme insère le rapport (sinon, à la fin du document)"],
+  ["sommaire_executif", "Sommaire exécutif — scénario de financement sur 5 ans"],
+  ["table_des_matieres", "Table des matières Word, mise à jour à l'ouverture"]
+];
+function dateLongue(date) {
+  return date.toLocaleDateString("fr-CA", { day: "numeric", month: "long", year: "numeric" });
+}
+// Analyse d'un gabarit importé : champs reconnus, inconnus, repère présent,
+// et notes de rédaction internes laissées dans les pages liminaires — elles
+// seraient reprises telles quelles dans chaque rapport livré.
+async function analyserGabaritMiseEnPage(bytes) {
+  const JSZip = import_jszip_min.default;
+  const zip = await JSZip.loadAsync(bytes);
+  const doc = zip.file("word/document.xml");
+  if (!doc) throw new Error("ce fichier n'est pas un document Word (.docx)");
+  const xml = await doc.async("string");
+  const extras = [];
+  for (const chemin of Object.keys(zip.files).filter((f) => /^word\/(header|footer)\d*\.xml$/.test(f))) {
+    extras.push(await zip.file(chemin).async("string"));
+  }
+  const trouves = new Set();
+  for (const source of [xml, ...extras]) for (const cle of remplacerChampsXml(source, () => null).trouves) trouves.add(cle);
+  const connus = new Set([...CHAMPS_GABARIT.map(([k]) => k), ...BLOCS_GABARIT]);
+  const texte = texteVisibleXml(xml);
+  const phrases = texte.split(/(?<=[.!?;])\s+|\s{2,}/).map((s) => s.trim()).filter(Boolean);
+  const notes = phrases.filter((s) => NOTES_INTERNES.some((re) => re.test(s)) || /\?\?/.test(s)).slice(0, 12).map((s) => s.slice(0, 160));
+  return {
+    champs: [...trouves].filter((k) => connus.has(k) && !BLOCS_GABARIT.includes(k)),
+    blocs: [...trouves].filter((k) => BLOCS_GABARIT.includes(k)),
+    inconnus: [...trouves].filter((k) => !connus.has(k)),
+    repere: trouves.has("rapport"),
+    notes
+  };
+}
+async function generateReportDocx(ctx, opts = {}) {
   const { dossier, components: components2, projection } = ctx;
+  // Thème de la firme : couleurs, polices, coordonnées. Les outils de mise en
+  // forme sont liés à ce thème et masquent ici les helpers de module du même nom.
+  const theme = ctx.theme ?? themeDeFirme(null);
+  const pourGabarit = !!opts.pourGabarit;
+  const outils = outilsDocx(theme, { modeStyles: pourGabarit });
+  const { heading, titre2, titre3, body, puce, paras, tableauMaison } = outils;
+  const ORANGE = theme.accent;
+  const DARK = theme.encre;
+  const GREY = theme.gris;
+  const FONT = pourGabarit ? void 0 : theme.police;
+  const nomFirme = theme.nom || "La firme";
   // Gabarit de la firme propriétaire du dossier, ou le gabarit intégré si elle
   // n'en a pas importé. Résolu en amont (buildReportContext) : la génération ne
   // doit pas dépendre d'un accès à la base au milieu de la rédaction.
@@ -23049,56 +25884,47 @@ async function generateReportDocx(ctx) {
   const anneeCourante = maintenant.getFullYear();
   const today = maintenant.toLocaleDateString("fr-CA");
   const info = infoBatiment(dossier);
-  const nomSignataire = ctx.engineerName || "Condo Stratégis";
+  const nomSignataire = ctx.engineerName || nomFirme;
+  // Page de garde : logo et coordonnées de la firme, jamais ceux d'une autre.
+  const logo = ctx.logo ?? null;
   const cover = [
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 200 },
-      children: [
-        new ImageRun({
-          data: base64ToUint8Array(LOGO_BASE64),
-          transformation: { width: LOGO_WIDTH * 0.5, height: LOGO_HEIGHT * 0.5 },
-          type: "png"
-        })
-      ]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 60 },
-      children: [new TextRun({ text: "PLAN DE GESTION DE L'ACTIF", bold: true, color: ORANGE, font: FONT, size: 20 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 40 },
-      children: [new TextRun({ text: dossier.name.toUpperCase(), bold: true, color: DARK, font: FONT, size: 40 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 400 },
-      children: [
-        new TextRun({
-          text: `${dossier.address ?? ""}${dossier.city ? ", " + dossier.city : ""}`,
-          color: GREY,
-          font: FONT,
-          size: 20
-        })
-      ]
-    }),
-    body("Inclus à votre Plan de gestion de l'actif : Carnet d'entretien · Étude en fonds de prévoyance · Scénario de financement · Tableur suivi d'entretien", { color: GREY, size: 18 }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [new TextRun({ text: `Notre dossier : ${dossier.dossier_no}`, color: GREY, font: FONT, size: 18 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 40 },
-      children: [new TextRun({ text: `Préparé le ${today} · Rédigé par ${nomSignataire}`, color: GREY, font: FONT, size: 18 })]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
+    ...logo ? [new Paragraph({
+      alignment: AlignmentType.LEFT,
       spacing: { after: 600 },
-      children: [new TextRun({ text: "Condo Stratégis — 82, rue de Brésol, Montréal, Québec, H2Y 1V5 — (514) 508-6987 — info@condostrategis.ca", color: GREY, font: FONT, size: 16 })]
+      children: [new ImageRun({ data: logo.data, type: logo.type, transformation: tailleImage(logo, 170, 110) })]
+    })] : [],
+    new Paragraph({
+      spacing: { before: logo ? 0 : 1200, after: 120 },
+      children: [outils.run("PLAN DE GESTION DE L'ACTIF", { font: theme.policeMono, bold: true, color: ORANGE, size: 20, characterSpacing: 30 })]
+    }),
+    new Paragraph({
+      spacing: { after: 120 },
+      children: [outils.run(dossier.name, { font: theme.policeTitres, bold: true, size: 52, allCaps: true })]
+    }),
+    new Paragraph({
+      spacing: { after: 480 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 12, color: ORANGE, space: 12 } },
+      children: [outils.run(`${dossier.address ?? ""}${dossier.city ? ", " + dossier.city : ""}`, { color: GREY, size: 22 })]
+    }),
+    outils.tableauMaison(
+      ["Notre dossier", "Préparé le", "Rédigé par"],
+      [[dossier.dossier_no, dateLongue(maintenant), nomSignataire]]
+    ),
+    new Paragraph({ spacing: { before: 360, after: 80 }, children: [outils.run("Inclus à votre Plan de gestion de l'actif", { font: theme.policeMono, size: 15, color: GREY, allCaps: true, characterSpacing: 20 })] }),
+    ...["Carnet d'entretien", "Étude du fonds de prévoyance", "Scénario de financement", "Tableur suivi d'entretien"].map((t) => puce(t)),
+    new Paragraph({
+      spacing: { before: 720 },
+      children: [outils.run(coordonneesFirme(theme), { color: GREY, size: 16 })]
     })
+  ];
+  const tableDesMatieres = [
+    new Paragraph({
+      pageBreakBefore: true,
+      spacing: { after: 240 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 12, color: ORANGE, space: 6 } },
+      children: [outils.run("Table des matières", { font: theme.policeTitres, bold: true, size: 32, allCaps: true })]
+    }),
+    new Paragraph({ children: [new TextRun({ text: MARQUE_TDM })] })
   ];
   // ---- Lecture du moteur financier ---------------------------------------
   // Le moteur simule plusieurs scénarios de financement. La rédaction s'appuie
@@ -23120,7 +25946,7 @@ async function generateReportDocx(ctx) {
   const anneeConstruction = anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier.built_year);
   const sommaireMandat = [
     heading("1.0 Sommaire du mandat"),
-    body(`Condo Stratégis a été retenue par le conseil d'administration du ${dossier.name}${dossier.address ? `, ${dossier.address}` : ""}${dossier.city ? ` à ${dossier.city}` : ""}, Qc, pour effectuer une étude du Plan de gestion de l'actif.`),
+    body(`${nomFirme} a été retenue par le conseil d'administration du ${dossier.name}${dossier.address ? `, ${dossier.address}` : ""}${dossier.city ? ` à ${dossier.city}` : ""}, Qc, pour effectuer une étude du Plan de gestion de l'actif.`),
     body("Le mandat est soumis aux particularités décrites à la section Méthodologie (2.0) et Limitations légales (7.0) et présentées à l'offre de service."),
     titre2("1.1 Description de l'immeuble"),
     body(assembler([
@@ -23141,7 +25967,8 @@ async function generateReportDocx(ctx) {
     body(`Cotisation annuelle : ${montantMaison(dossier.cotisation_annuelle) ?? "non disponible"}`),
     titre2("1.6 Visite"),
     body(`Inspecteur : ${nomSignataire}`),
-    body(`Préparé le : ${today}`)
+    body(`Préparé le : ${today}`),
+    ...sectionEvolution(ctx, outils, anneeCourante)
   ];
   // ---- 2.0 Méthodologie ---------------------------------------------------
   const methodologie = [
@@ -23216,17 +26043,18 @@ async function generateReportDocx(ctx) {
       const fiche = parId.get(comp.id);
       if (!fiche) continue;
       numeroElement += 1;
-      observation.push(titre3(`4.${numeroCategorie}.${numeroElement} ${fiche.titre}`));
-      if (fiche.coteRapport) observation.push(body(`Cote au rapport : ${COTES_RAPPORT[fiche.coteRapport]}`, { bold: true }));
-      for (const section of fiche.sections) {
-        observation.push(body(section.titre, { bold: true }));
-        observation.push(...paras(section.texte));
-        if (section.tableau) {
-          observation.push(body(titreTableauMaison(comp, ligneDureeVie(comp, dossier)), { bold: true, size: 18 }));
-          observation.push(tableauMaison(section.tableau.entetes, section.tableau.lignes));
-          observation.push(body(""));
-        }
-      }
+      observation.push(...outils.ficheDocx({
+        numero: `4.${numeroCategorie}.${numeroElement}`,
+        nom: sansNotesInternes(comp.name ?? "Élément"),
+        categorie: CATEGORIES[cle].label,
+        code: sansNotesInternes(comp.uniformat_code ?? ""),
+        cote: fiche.coteRapport,
+        ligne: ligneDureeVie(comp, dossier),
+        component: comp,
+        fiche,
+        photos: ctx.photos?.get(comp.id) ?? [],
+        taches: tachesPourComposante(comp, { biblio: ctx.biblio }).map(tacheAffichee)
+      }));
     }
   }
   // ---- 5.0 Résultats et scénarios de financement --------------------------
@@ -23423,6 +26251,51 @@ async function generateReportDocx(ctx) {
       body("")
     ])
   ];
+  // ---- Sommaire exécutif — 5 ans -----------------------------------------
+  // Balisé pour qu'un gabarit de firme puisse le placer où il veut
+  // ({{SOMMAIRE_EXECUTIF}}) ; sinon il ouvre le rapport.
+  const travauxParAnnee = new Map();
+  const inclus = new Set(projection.includedComponentIds ?? []);
+  for (const comp of components2) {
+    if (!inclus.has(comp.id)) continue;
+    for (const ev of replacementEventsForComponent(comp, projection.params).events) {
+      if (ev.year > 5) continue;
+      if (!travauxParAnnee.has(ev.year)) travauxParAnnee.set(ev.year, []);
+      travauxParAnnee.get(ev.year).push(`${sansNotesInternes(comp.name)} — ${montantMaison(ev.cost) ?? `-${NBSP}$`}`);
+    }
+  }
+  const sommaireExecutif = [
+    new Paragraph({ children: [new TextRun({ text: MARQUE_DEBUT_SOMMAIRE })] }),
+    heading("Sommaire exécutif — 5 ans — Scénario de financement", { sansSaut: pourGabarit }),
+    body(`Le sommaire exécutif permet une appréciation succincte des ajustements aux cotisations du fonds de prévoyance et des projets de remplacement prévus au cours des cinq prochaines années${scenarioPrefere ? `, selon le scénario de financement de préférence (${scenarioPrefere.code})` : ""}.`),
+    ...scenarioPrefere ? [tableauMaison(
+      ["Année", "Augmentation", "Cotisation annuelle", "Travaux prévus"],
+      anneesScenario.slice(0, 5).map((y) => [
+        String(anneeCourante + y.year - 1),
+        `${y.pctAugmentation.toFixed(1).replace(".", ",")}${NBSP}%`,
+        montantMaison(y.cotisation) ?? `-${NBSP}$`,
+        (travauxParAnnee.get(y.year) ?? []).join(" · ") || "Aucun remplacement"
+      ]),
+      { colonnesDroite: [2] }
+    )] : [body("Aucun des scénarios simulés ne satisfait le double critère d'acceptation : le sommaire exécutif sera établi après la révision du calcul de financement.", { bold: true, color: ORANGE })],
+    body("Pour toute divergence avec le scénario de financement, ce dernier devra être considéré comme conforme à l'étude.", { color: GREY, size: 18 }),
+    new Paragraph({ children: [new TextRun({ text: MARQUE_FIN_SOMMAIRE })] })
+  ];
+  // Un seul flux paginé : chaque grande section s'ouvre sur une nouvelle page
+  // (saut avant les titres de niveau 1) et les fiches se suivent sans page
+  // blanche. Le pied de page porte la firme et la pagination continue.
+  const piedDePage = {
+    options: {
+      children: [new Paragraph({
+        border: { top: { style: BorderStyle.SINGLE, size: 4, color: THEME_DEFAUT.filet, space: 6 } },
+        tabStops: [{ type: TabStopType.RIGHT, position: 9360 }],
+        children: [
+          outils.run(`${nomFirme} — Plan de gestion de l'actif — ${dossier.dossier_no}`, { font: theme.policeMono, size: 14, color: GREY }),
+          new TextRun({ children: ["\t", PageNumber.CURRENT], font: theme.policeMono, size: 14, color: GREY })
+        ]
+      })]
+    }
+  };
   const doc = new File$1({
     styles: {
       default: {
@@ -23430,21 +26303,26 @@ async function generateReportDocx(ctx) {
       }
     },
     background: { color: "FFFFFF" },
-    sections: [
-      { children: cover },
-      { children: sommaireMandat },
-      { children: methodologie },
-      { children: commentLire },
-      { children: observation },
-      { children: resultats },
-      { children: conclusion },
-      { children: limitations },
-      { children: declaration },
-      { children: suivi },
-      { children: lexique },
-      { children: annexeA },
-      { children: annexeB }
-    ]
+    sections: [{
+      properties: { page: { margin: { top: 1080, right: 1080, bottom: 1080, left: 1080 } } },
+      footers: pourGabarit ? void 0 : { default: piedDePage },
+      children: [
+        ...pourGabarit ? [] : [...cover, ...tableDesMatieres],
+        ...sommaireExecutif,
+        ...sommaireMandat,
+        ...methodologie,
+        ...commentLire,
+        ...observation,
+        ...resultats,
+        ...conclusion,
+        ...limitations,
+        ...declaration,
+        ...suivi,
+        ...lexique,
+        ...annexeA,
+        ...annexeB
+      ]
+    }]
   });
   return Packer.toBuffer(doc);
 }
@@ -43736,7 +46614,7 @@ function generateReportXlsx(ctx) {
         CATEGORIES[c.cat]?.label ?? c.cat,
         c.uniformat_code ?? "",
         c.name,
-        c.done || c.rating != null ? RATING_LABELS[c.rating] ?? "na" : "non documentée",
+        c.done ? RATING_LABELS[c.rating] ?? "na" : "non documentée",
         coteRapportLongue(c.rating) ?? "",
         ligne.allocation ? "Allocation" : "Remplacement",
         c.observation ?? "",
@@ -43878,19 +46756,29 @@ companies.patch("/:id", async (c) => {
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
   return c.json({ ...company, hasLogo: !!company.logo_r2_key });
 });
+// Le super admin, ou un administrateur de la firme. Celui-ci n'envoie qu'une
+// image PNG ou JPEG vérifiée : un SVG servi depuis le domaine de la plateforme
+// peut porter du script.
 companies.post("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
-  const deny = requireSuperAdmin(c, user);
-  if (deny) return deny;
   const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const company = await c.env.DB.prepare("SELECT id FROM companies WHERE id = ?1").bind(id).first();
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
   const form = await c.req.formData();
   const file = form.get("file");
   if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
-  const ext = file.type === "image/png" ? "png" : file.type === "image/svg+xml" ? "svg" : "jpg";
+  const octets = await file.arrayBuffer();
+  if (octets.byteLength > 5 * 1024 * 1024) return c.json({ error: "logo trop volumineux (max 5 Mo)" }, 413);
+  const t = new Uint8Array(octets.slice(0, 8));
+  const png = t[0] === 0x89 && t[1] === 0x50 && t[2] === 0x4e && t[3] === 0x47;
+  const jpeg = t[0] === 0xff && t[1] === 0xd8 && t[2] === 0xff;
+  const svg = file.type === "image/svg+xml" && user.role === "super_admin";
+  if (!png && !jpeg && !svg) return c.json({ error: "le logo doit être une image PNG ou JPEG" }, 400);
+  const ext = png ? "png" : jpeg ? "jpg" : "svg";
   const r2Key = `company-logos/${id}.${ext}`;
-  await c.env.PHOTOS.put(r2Key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type || "image/png" } });
+  await c.env.PHOTOS.put(r2Key, octets, { httpMetadata: { contentType: png ? "image/png" : jpeg ? "image/jpeg" : "image/svg+xml" } });
   await c.env.DB.prepare(
     "UPDATE companies SET logo_r2_key = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
   ).bind(r2Key, id).run();
@@ -43924,6 +46812,7 @@ companies.post("/:id/template", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const company = await c.env.DB.prepare("SELECT id FROM companies WHERE id = ?1").bind(id).first();
   if (!company) return c.json({ error: "entreprise introuvable" }, 404);
   const form = await c.req.formData();
@@ -43982,6 +46871,7 @@ companies.patch("/:id/template", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   const body2 = await c.req.json();
   const sections = nettoyerSections(body2.sections);
   await c.env.DB.prepare(
@@ -43996,8 +46886,143 @@ companies.delete("/:id/template", async (c) => {
   const user = await getCurrentUser(c);
   const id = c.req.param("id");
   if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
   await c.env.DB.prepare("DELETE FROM company_templates WHERE company_id = ?1").bind(id).run();
   return c.json({ ok: true, retour: "gabarit intégré" });
+});
+// Identité du rapport : couleurs, polices et coordonnées de la firme.
+companies.get("/:id/theme", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT id, name, theme FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  return c.json({ theme: nettoyerTheme(company.theme), effectif: themeDeFirme(company), defauts: THEME_DEFAUT });
+});
+companies.patch("/:id/theme", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const theme = nettoyerTheme(await c.req.json());
+  await c.env.DB.prepare(
+    "UPDATE companies SET theme = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
+  ).bind(JSON.stringify(theme), id).run();
+  const company = await c.env.DB.prepare("SELECT id, name, theme FROM companies WHERE id = ?1").bind(id).first();
+  return c.json({ theme, effectif: themeDeFirme(company), defauts: THEME_DEFAUT });
+});
+// Gabarit Word de mise en page : pages liminaires, champs {{…}} et repère
+// {{RAPPORT}}. Distinct du gabarit de textes (/template), qui alimente les
+// sections rédigées ; celui-ci est repris tel quel autour du rapport.
+companies.get("/:id/mise-en-page", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT mise_en_page FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  const miseEnPage = objetJson(company.mise_en_page);
+  return c.json({
+    importe: !!miseEnPage.r2_key,
+    ...miseEnPage.r2_key ? { filename: miseEnPage.filename, imported_at: miseEnPage.imported_at, analyse: miseEnPage.analyse } : {},
+    champs: CHAMPS_GABARIT,
+    blocs: BLOCS_GABARIT_LIBELLES
+  });
+});
+companies.post("/:id/mise-en-page", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 20 * 1024 * 1024) return c.json({ error: "document trop volumineux (max 20 Mo)" }, 413);
+  let analyse;
+  try {
+    analyse = await analyserGabaritMiseEnPage(new Uint8Array(buffer));
+  } catch (e) {
+    return c.json({ error: `lecture du .docx impossible : ${e.message}` }, 400);
+  }
+  const r2Key = `company-layouts/${id}.docx`;
+  await c.env.PHOTOS.put(r2Key, buffer, { httpMetadata: { contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" } });
+  const miseEnPage = { r2_key: r2Key, filename: file.name || "gabarit.docx", imported_at: new Date().toISOString(), analyse };
+  await c.env.DB.prepare(
+    "UPDATE companies SET mise_en_page = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
+  ).bind(JSON.stringify(miseEnPage), id).run();
+  return c.json({ importe: true, filename: miseEnPage.filename, imported_at: miseEnPage.imported_at, analyse, champs: CHAMPS_GABARIT, blocs: BLOCS_GABARIT_LIBELLES });
+});
+companies.delete("/:id/mise-en-page", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const company = await c.env.DB.prepare("SELECT mise_en_page FROM companies WHERE id = ?1").bind(id).first();
+  const r2Key = objetJson(company?.mise_en_page).r2_key;
+  if (r2Key) await c.env.PHOTOS.delete(r2Key);
+  await c.env.DB.prepare(
+    "UPDATE companies SET mise_en_page = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1"
+  ).bind(id).run();
+  return c.json({ importe: false, champs: CHAMPS_GABARIT, blocs: BLOCS_GABARIT_LIBELLES });
+});
+// Bibliothèque de composantes : la liste de départ des visites de la firme et
+// les tâches du carnet rattachées, importées d'un classeur ou, à défaut,
+// celles de Condo Stratégis.
+companies.get("/:id/bibliotheque", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT bibliotheque FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  return c.json({ ...vueBibliotheque(bibliothequeDeFirme(company)), peutModifier: peutAdministrerFirme(user, id) });
+});
+companies.get("/:id/bibliotheque.xlsx", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const company = await c.env.DB.prepare("SELECT name, slug, bibliotheque FROM companies WHERE id = ?1").bind(id).first();
+  if (!company) return c.json({ error: "entreprise introuvable" }, 404);
+  const bytes = await classeurBibliotheque(bibliothequeDeFirme(company), company.name ?? "");
+  return new Response(new Blob([bytes]), {
+    headers: {
+      "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "content-disposition": `attachment; filename="bibliotheque-${company.slug || "composantes"}.xlsx"`
+    }
+  });
+});
+companies.post("/:id/bibliotheque", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 5 * 1024 * 1024) return c.json({ error: "classeur trop volumineux (max 5 Mo)" }, 413);
+  let analyse;
+  try {
+    analyse = await analyserBibliotheque(new Uint8Array(buffer), file.name);
+  } catch (e) {
+    return c.json({ error: `lecture du classeur impossible : ${e.message}` }, 400);
+  }
+  if (analyse.erreurs.length) {
+    return c.json({ error: "Import refusé : corrigez les lignes signalées, puis réimportez le fichier.", erreurs: analyse.erreurs, avertissements: analyse.avertissements }, 422);
+  }
+  await c.env.DB.prepare(
+    "UPDATE companies SET bibliotheque = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2"
+  ).bind(JSON.stringify(analyse.bibliotheque), id).run();
+  return c.json({ ...vueBibliotheque(bibliothequeDeFirme({ bibliotheque: analyse.bibliotheque })), peutModifier: true });
+});
+companies.delete("/:id/bibliotheque", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  await c.env.DB.prepare(
+    "UPDATE companies SET bibliotheque = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1"
+  ).bind(id).run();
+  return c.json({ ...vueBibliotheque(null), peutModifier: true });
 });
 companies.get("/:id/logo", async (c) => {
   const user = await getCurrentUser(c);
@@ -44009,7 +47034,13 @@ companies.get("/:id/logo", async (c) => {
   const obj = await c.env.PHOTOS.get(company.logo_r2_key);
   if (!obj) return c.notFound();
   return new Response(obj.body, {
-    headers: { "content-type": obj.httpMetadata?.contentType ?? "image/png", "cache-control": "private, max-age=3600" }
+    headers: {
+      "content-type": obj.httpMetadata?.contentType ?? "image/png",
+      "cache-control": "private, max-age=3600",
+      // Une image, jamais un document actif, même ouverte directement.
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+      "x-content-type-options": "nosniff"
+    }
   });
 });
 companies.get("/:id/engineers", async (c) => {
@@ -44047,15 +47078,973 @@ companies.post("/:id/engineers", async (c) => {
   ).bind(id, email, name, hash, salt, companyId, title, ordreProfessionnel, noMembre).run();
   return c.json({ user: { id, email, name, role: "engineer", title, ordre_professionnel: ordreProfessionnel, no_membre: noMembre }, tempPassword }, 201);
 });
+// Rôle d'un compte de la firme : ingénieur ou administrateur de la firme.
+// Seul le super admin l'attribue.
+companies.patch("/:id/engineers/:userId", async (c) => {
+  const user = await getCurrentUser(c);
+  const deny = requireSuperAdmin(c, user);
+  if (deny) return deny;
+  const body2 = await c.req.json();
+  if (!ROLES_UTILISATEUR.includes(body2.role)) return c.json({ error: "rôle invalide (engineer ou admin)" }, 400);
+  const cible = await c.env.DB.prepare("SELECT id, role FROM users WHERE id = ?1 AND company_id = ?2").bind(c.req.param("userId"), c.req.param("id")).first();
+  if (!cible) return c.json({ error: "compte introuvable dans cette entreprise" }, 404);
+  if (cible.role === "super_admin") return c.json({ error: "le rôle du super admin ne se change pas ici" }, 400);
+  await c.env.DB.prepare("UPDATE users SET role = ?1 WHERE id = ?2").bind(body2.role, cible.id).run();
+  const u = await c.env.DB.prepare(
+    "SELECT id, name, email, role, title, ordre_professionnel, no_membre, created_at FROM users WHERE id = ?1"
+  ).bind(cible.id).first();
+  return c.json(u);
+});
+// ---- Équipe de la firme : son administrateur invite, désactive et nomme --
+function membreEquipe(u) {
+  return {
+    id: u.id, name: u.name, email: u.email, role: u.role, title: u.title,
+    ordre_professionnel: u.ordre_professionnel, no_membre: u.no_membre, created_at: u.created_at,
+    actif: u.actif !== 0, invitation_en_attente: !!u.invitation_en_attente
+  };
+}
+companies.get("/:id/export.zip", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const d = await donneesDeFirme(c.env.DB, id);
+  if (!d.firme) return c.json({ error: "entreprise introuvable" }, 404);
+  const noParDossier = new Map(d.dossiers.map((x) => [x.id, x.dossier_no]));
+  const octets = await zipper([
+    ["LISEZ-MOI.txt", LISEZ_MOI_EXPORT],
+    ["donnees.json", JSON.stringify(d, null, 1)],
+    ["dossiers.csv", csvExcel(CSV_DOSSIERS, d.dossiers)],
+    ["composantes.csv", csvExcel(CSV_COMPOSANTES, d.composantes.map((x) => ({ ...x, dossier_no: noParDossier.get(x.dossier_id) })))]
+  ]);
+  return reponseZip(octets, `export-${d.firme.slug || id}-${new Date().toISOString().slice(0, 10)}.zip`);
+});
+// L'équipe active, en noms seulement : de quoi choisir un responsable de dossier.
+companies.get("/:id/membres", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  const rows = await c.env.DB.prepare(
+    "SELECT id, name, role FROM users WHERE company_id = ?1 AND actif = 1 AND role != 'portail' AND COALESCE(invitation_en_attente, 0) = 0 ORDER BY name"
+  ).bind(id).all();
+  return c.json({ membres: rows.results, moi: user.id, admin: peutAdministrerFirme(user, id) });
+});
+companies.get("/:id/equipe", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const rows = await c.env.DB.prepare("SELECT * FROM users WHERE company_id = ?1 ORDER BY created_at ASC").bind(id).all();
+  return c.json({ membres: rows.results.map(membreEquipe), moi: user.id, courriel: !!c.env.EMAIL });
+});
+companies.post("/:id/equipe", async (c) => {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return c.notFound();
+  if (!peutAdministrerFirme(user, id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const email = String(body2.email ?? "").trim().toLowerCase();
+  const name = String(body2.name ?? "").trim().slice(0, 120);
+  const role = body2.role === "admin" ? "admin" : "engineer";
+  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return c.json({ error: "nom et courriel valide requis" }, 400);
+  const existant = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?1").bind(email).first();
+  if (existant) return c.json({ error: "un compte existe déjà avec ce courriel" }, 409);
+  // Mot de passe aléatoire jamais communiqué : l'ingénieur choisit le sien par le lien.
+  const { hash, salt } = await hashPassword(toBase64Url(crypto.getRandomValues(new Uint8Array(24))));
+  const nouveauId = newId("usr");
+  await c.env.DB.prepare(
+    `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role, invitation_en_attente)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)`
+  ).bind(nouveauId, email, name, hash, salt, id, role).run();
+  const membre = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(nouveauId).first();
+  return c.json(await inviter(c, membre, user), 201);
+});
+// Envoie l'invitation ; si le courriel ne part pas, le lien revient à
+// l'administrateur pour qu'il le transmette lui-même.
+async function inviter(c, membre, invitePar) {
+  const jeton = await creerJetonCompte(c.env.DB, membre.id, "invitation");
+  try {
+    await envoyerInvitation(c, membre, jeton, invitePar);
+    return { membre: membreEquipe(membre), envoye: true };
+  } catch (e) {
+    console.error("invitation non envoyée", e?.code, e?.message);
+    return { membre: membreEquipe(membre), envoye: false, lien: `${origineDe(c)}/compte/?jeton=${jeton}`, erreur: e?.message ?? "envoi impossible" };
+  }
+}
+async function membreDeLaFirme(c) {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  if (!peutGererEntreprise(user, id)) return { refus: c.notFound() };
+  if (!peutAdministrerFirme(user, id)) return { refus: c.json({ error: "réservé aux administrateurs de la firme" }, 403) };
+  const membre = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1 AND company_id = ?2").bind(c.req.param("userId"), id).first();
+  if (!membre) return { refus: c.json({ error: "compte introuvable dans cette firme" }, 404) };
+  return { user, membre };
+}
+companies.post("/:id/equipe/:userId/invitation", async (c) => {
+  const { refus, user, membre } = await membreDeLaFirme(c);
+  if (refus) return refus;
+  if (!membre.invitation_en_attente) return c.json({ error: "ce compte est déjà activé" }, 400);
+  if (membre.actif === 0) return c.json({ error: "réactivez d'abord ce compte" }, 400);
+  return c.json(await inviter(c, membre, user));
+});
+companies.patch("/:id/equipe/:userId", async (c) => {
+  const { refus, user, membre } = await membreDeLaFirme(c);
+  if (refus) return refus;
+  if (membre.role === "super_admin") return c.json({ error: "le compte du super admin ne se modifie pas ici" }, 400);
+  // Un administrateur ne se retire pas lui-même : la firme resterait sans personne pour la gérer.
+  if (membre.id === user.id) return c.json({ error: "vous ne pouvez pas modifier votre propre accès" }, 400);
+  const body2 = await c.req.json().catch(() => ({}));
+  const champs = [];
+  const valeurs = [];
+  if ("actif" in body2) {
+    champs.push(`actif = ?${champs.length + 1}`);
+    valeurs.push(body2.actif ? 1 : 0);
+    // Désactivé : ses sessions ouvertes se ferment tout de suite.
+    if (!body2.actif) { champs.push(`sessions_apres = ?${champs.length + 1}`); valeurs.push(Date.now()); }
+  }
+  if ("role" in body2) {
+    if (!ROLES_UTILISATEUR.includes(body2.role)) return c.json({ error: "rôle invalide (engineer ou admin)" }, 400);
+    champs.push(`role = ?${champs.length + 1}`);
+    valeurs.push(body2.role);
+  }
+  if (!champs.length) return c.json({ error: "rien à modifier" }, 400);
+  await c.env.DB.prepare(`UPDATE users SET ${champs.join(", ")} WHERE id = ?${champs.length + 1}`).bind(...valeurs, membre.id).run();
+  const maj = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(membre.id).first();
+  return c.json(membreEquipe(maj));
+});
+// ============================================================================
+// PORTAIL DU SYNDICAT — carnet d'entretien en ligne, gratuit
+// ----------------------------------------------------------------------------
+// La firme ouvre le portail d'un immeuble à des membres du syndicat
+// (gestionnaire, administrateurs, concierge…) et répartit les tâches du
+// carnet : par défaut selon le responsable prévu (syndicat, entretien
+// ménager, entrepreneur), puis tâche par tâche. Les membres voient les
+// tâches du mois, les cochent, et reçoivent un rappel le 1er du mois.
+// Un compte du portail (role « portail ») n'appartient à aucune firme et
+// n'atteint que /api/portail.
+// ============================================================================
+const MOIS_NOMS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
+const cleTacheCarnet = (element, id) => `${element}::${id}`;
+async function tachesCarnetDossier(db, dossierId) {
+  const comps = (await db.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossierId).all()).results;
+  const carnet = carnetDuDossier(comps, await bibliothequeDuDossier(db, dossierId));
+  const liste = [];
+  for (const g of carnet) {
+    for (const t of g.taches) {
+      const a = tacheAffichee(t);
+      liste.push({
+        cle: cleTacheCarnet(g.element, t.id), element: sansNotesInternes(g.element), categorie: g.categorie,
+        texte: a.texte, frequence: a.frequence, quand: a.quand, responsable: a.responsable,
+        q: t.q || "", mois: a.mois, consigne: t.f === "C"
+      });
+    }
+  }
+  return liste;
+}
+async function reglesCarnet(db, dossierId) {
+  const rows = (await db.prepare("SELECT cle, user_id FROM carnet_regles WHERE dossier_id = ?1").bind(dossierId).all()).results;
+  const regles = { defauts: {}, taches: {} };
+  for (const r of rows) {
+    if (r.cle.startsWith("q:")) regles.defauts[r.cle.slice(2)] = r.user_id || null;
+    else if (r.cle.startsWith("t:")) regles.taches[r.cle.slice(2)] = r.user_id || "";
+  }
+  return regles;
+}
+// Une règle propre à la tâche l'emporte (même « personne ») ; sinon, le
+// défaut de son type de responsable.
+function responsableEffectif(tache, regles) {
+  if (Object.prototype.hasOwnProperty.call(regles.taches, tache.cle)) return { user_id: regles.taches[tache.cle] || null, source: "tache" };
+  const defaut = regles.defauts[tache.q];
+  return defaut ? { user_id: defaut, source: "defaut" } : { user_id: null, source: null };
+}
+async function membresPortail(db, dossierId) {
+  return (await db.prepare(
+    `SELECT u.id, u.name, u.email, u.actif, u.invitation_en_attente, a.fonction, a.cree_le
+       FROM portail_acces a JOIN users u ON u.id = a.user_id WHERE a.dossier_id = ?1 ORDER BY a.cree_le ASC`
+  ).bind(dossierId).all()).results.map((m) => ({ ...m, actif: m.actif !== 0, invitation_en_attente: !!m.invitation_en_attente }));
+}
+async function envoyerInvitationPortail(env, origine, user, jeton, dossier, invitePar) {
+  const lien = jeton ? `${origine}/compte/?jeton=${jeton}` : `${origine}/portail/`;
+  await envoyerCourriel(env, {
+    to: user.email,
+    subject: dossier ? `Carnet d'entretien en ligne — ${dossier.name}` : "Votre carnet d'entretien en ligne",
+    titre: `Bonjour ${user.name}`,
+    paragraphes: [
+      `${invitePar?.name ?? "Votre firme d'ingénierie"} vous donne accès au carnet d'entretien${dossier ? ` de ${dossier.name}` : " de votre immeuble"} : les tâches de chaque mois, qui s'en occupe, ce qui a été fait, et l'état des composantes de l'immeuble.`,
+      jeton ? "Choisissez votre mot de passe pour activer votre accès. Le lien est valable 7 jours." : "Connectez-vous avec votre compte habituel.",
+      "Le service est gratuit pour le syndicat."
+    ],
+    bouton: { texte: jeton ? "Activer mon accès" : "Ouvrir le carnet", url: lien },
+    pied: "Vous n'attendiez pas ce courriel ? Ignorez-le : aucun accès ne sera activé sans vous.",
+    replyTo: invitePar?.email ? { email: invitePar.email, name: invitePar.name ?? undefined } : void 0
+  });
+}
+// Les tâches d'un mois pour un immeuble, avec qui les fait et ce qui est fait.
+async function moisDuCarnet(db, dossierId, annee, mois) {
+  const [taches, regles, membres, suivis] = await Promise.all([
+    tachesCarnetDossier(db, dossierId),
+    reglesCarnet(db, dossierId),
+    membresPortail(db, dossierId),
+    db.prepare(
+      `SELECT s.*, u.name AS fait_par_nom FROM carnet_suivi s LEFT JOIN users u ON u.id = s.fait_par
+         WHERE s.dossier_id = ?1 AND s.annee = ?2 AND s.mois = ?3`
+    ).bind(dossierId, annee, mois).all()
+  ]);
+  const noms = new Map(membres.map((m) => [m.id, m.name]));
+  const faits = new Map(suivis.results.map((r) => [r.cle_tache, r]));
+  const enrichir = (t) => {
+    const r = responsableEffectif(t, regles);
+    const fait = faits.get(t.cle);
+    return {
+      ...t,
+      responsable_id: r.user_id && noms.has(r.user_id) ? r.user_id : null,
+      responsable_nom: r.user_id ? noms.get(r.user_id) ?? null : null,
+      fait: fait ? { fait_le: fait.fait_le, par: fait.fait_par_nom ?? null, note: fait.note ?? "" } : null
+    };
+  };
+  return {
+    taches: taches.filter((t) => !t.consigne && t.mois.includes(mois)).map(enrichir),
+    consignes: taches.filter((t) => t.consigne).map(enrichir),
+    membres
+  };
+}
+// Rappels du mois pour un immeuble : un courriel par membre, avec ses tâches
+// du mois et celles du mois précédent restées à faire.
+async function envoyerRappelsDossier(env, origine, dossier, annee, mois) {
+  const courant = await moisDuCarnet(env.DB, dossier.id, annee, mois);
+  const precedentMois = mois === 1 ? 12 : mois - 1;
+  const precedentAnnee = mois === 1 ? annee - 1 : annee;
+  const precedent = await moisDuCarnet(env.DB, dossier.id, precedentAnnee, precedentMois);
+  let envoyes = 0;
+  for (const m of courant.membres) {
+    if (!m.actif || m.invitation_en_attente) continue;
+    const miennes = courant.taches.filter((t) => t.responsable_id === m.id);
+    const enRetard = precedent.taches.filter((t) => t.responsable_id === m.id && !t.fait);
+    if (!miennes.length && !enRetard.length) continue;
+    const ligne = (t) => `${t.texte} — ${t.element}${t.frequence ? ` (${t.frequence.toLowerCase()})` : ""}`;
+    await envoyerCourriel(env, {
+      to: m.email,
+      subject: `Carnet d'entretien — ${MOIS_NOMS[mois - 1]} ${annee} — ${dossier.name}`,
+      titre: `Vos tâches de ${MOIS_NOMS[mois - 1]}`,
+      paragraphes: [`Bonjour ${m.name}, voici les tâches d'entretien qui vous sont confiées ce mois-ci pour ${dossier.name}.`],
+      liste: [
+        ...miennes.slice(0, 40).map(ligne),
+        ...miennes.length > 40 ? [`… et ${miennes.length - 40} autres tâches ce mois-ci, dans le carnet en ligne`] : [],
+        ...enRetard.slice(0, 20).map((t) => `Restée à faire en ${MOIS_NOMS[precedentMois - 1]} : ${ligne(t)}`),
+        ...enRetard.length > 20 ? [`… et ${enRetard.length - 20} autres tâches restées à faire`] : []
+      ],
+      bouton: { texte: "Ouvrir le carnet", url: `${origine}/portail/?immeuble=${dossier.id}` },
+      pied: "Cochez chaque tâche une fois faite : l'historique d'entretien de l'immeuble se construit tout seul."
+    });
+    envoyes += 1;
+  }
+  return { envoyes, sans_responsable: courant.taches.filter((t) => !t.responsable_id).length };
+}
+async function rappelsMensuels(env) {
+  await assurerColonnes(env.DB);
+  const origine = env.URL_PLATEFORME || "https://pga.stratege.io";
+  const maintenant = new Date();
+  const annee = maintenant.getUTCFullYear(), mois = maintenant.getUTCMonth() + 1;
+  // Un immeuble révisé envoie ses rappels depuis la révision, pas depuis l'ancienne étude.
+  const rows = (await env.DB.prepare(
+    `SELECT DISTINCT d.* FROM portail_acces a JOIN dossiers d ON d.id = a.dossier_id
+       WHERE NOT EXISTS (SELECT 1 FROM dossiers r WHERE r.revision_de = d.id)`
+  ).all()).results;
+  for (const dossier of rows) {
+    try {
+      const r = await envoyerRappelsDossier(env, origine, dossier, annee, mois);
+      console.log("rappels du carnet", dossier.id, r);
+    } catch (e) {
+      console.error("rappels du carnet en échec", dossier.id, e?.code, e?.message);
+    }
+  }
+  await rappelsRevisions(env, origine);
+}
+// Études publiées dont la révision aux cinq ans arrive (ou est dépassée) et
+// n'est pas commencée : un résumé par firme à ses administrateurs. Chaque
+// étude revient au plus une fois par trimestre, pas chaque mois.
+const RAPPEL_REVISION_JOURS = 90;
+async function rappelsRevisions(env, origine) {
+  const annee = (/* @__PURE__ */ new Date()).getUTCFullYear();
+  const limite = new Date(Date.now() - RAPPEL_REVISION_JOURS * 864e5).toISOString();
+  const dus = (await env.DB.prepare(
+    `SELECT d.* FROM dossiers d
+       WHERE d.published_at IS NOT NULL AND d.company_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM dossiers r WHERE r.revision_de = d.id)
+         AND (d.rappel_revision_le IS NULL OR d.rappel_revision_le < ?1)`
+  ).bind(limite).all()).results.filter((d) => anneeEtude(d) + 5 <= annee + 1);
+  const parFirme = new Map();
+  for (const d of dus) {
+    if (!parFirme.has(d.company_id)) parFirme.set(d.company_id, []);
+    parFirme.get(d.company_id).push(d);
+  }
+  const bilan = [];
+  for (const [firmeId, liste] of parFirme) {
+    try {
+      const comptes = (await env.DB.prepare(
+        `SELECT id, name, email, role FROM users
+           WHERE company_id = ?1 AND actif = 1 AND COALESCE(invitation_en_attente, 0) = 0 AND role != 'portail'`
+      ).bind(firmeId).all()).results;
+      // Les administrateurs de la firme ; à défaut, toute l'équipe.
+      const admins = comptes.filter((u) => u.role === "admin" || u.role === "super_admin");
+      const destinataires = admins.length ? admins : comptes;
+      if (!destinataires.length) continue;
+      liste.sort((a, b) => anneeEtude(a) - anneeEtude(b));
+      const ligne = (d) => {
+        const echeance = anneeEtude(d) + 5;
+        const quand = echeance < annee ? `en retard depuis ${echeance}` : echeance === annee ? `due cette année` : `due en ${echeance}`;
+        return `${d.dossier_no} — ${d.name}${d.city ? `, ${d.city}` : ""} : étude de ${anneeEtude(d)}, révision ${quand}`;
+      };
+      const n = liste.length;
+      for (const u of destinataires) {
+        await envoyerCourriel(env, {
+          to: u.email,
+          subject: n > 1 ? `${n} études de fonds de prévoyance à réviser` : `Étude à réviser — ${liste[0].name}`,
+          titre: n > 1 ? `${n} études arrivent à leur révision` : "Une étude arrive à sa révision",
+          paragraphes: [
+            `Bonjour ${u.name}, la loi demande de mettre à jour l'étude du fonds de prévoyance tous les cinq ans. ${n > 1 ? "Ces études de votre firme arrivent" : "Cette étude de votre firme arrive"} à échéance et aucune révision n'a encore été commencée.`,
+            "La révision reprend l'inventaire et les coûts indexés de l'étude précédente : il reste à revoir l'immeuble sur place."
+          ],
+          liste: [...liste.slice(0, 40).map(ligne), ...n > 40 ? [`… et ${n - 40} autres études, dans la console bureau`] : []],
+          bouton: { texte: "Ouvrir la console bureau", url: `${origine}/bureau/` },
+          pied: "Ce rappel revient chaque trimestre tant que la révision n'est pas commencée."
+        });
+      }
+      const maintenant = (/* @__PURE__ */ new Date()).toISOString();
+      await env.DB.batch(liste.map((d) => env.DB.prepare("UPDATE dossiers SET rappel_revision_le = ?1 WHERE id = ?2").bind(maintenant, d.id)));
+      bilan.push({ firme: firmeId, etudes: n, destinataires: destinataires.length });
+    } catch (e) {
+      console.error("rappel des révisions en échec", firmeId, e?.message);
+    }
+  }
+  console.log("rappels des révisions", JSON.stringify(bilan));
+  return bilan;
+}
+// ============================================================================
+// CLIENTS — les syndicats de la firme : coordonnées, contacts, études.
+// Tout membre de la firme les tient à jour ; seul un administrateur en
+// supprime un, et jamais un client qui a encore des dossiers.
+// ============================================================================
+async function numeroPris(db, no) {
+  return !!await db.prepare("SELECT id FROM dossiers WHERE dossier_no = ?1").bind(String(no ?? "").trim()).first();
+}
+function texteClient(v, max = 200) {
+  const t = String(v ?? "").replace(/\s+/g, " ").trim();
+  return t ? t.slice(0, max) : null;
+}
+function entierClient(v, min, max) {
+  const n = Number(v);
+  return v === "" || v == null || !Number.isInteger(n) || n < min || n > max ? null : n;
+}
+function contactsClient(v) {
+  const liste = Array.isArray(v) ? v : [];
+  return liste.slice(0, 20).map((x) => ({
+    nom: texteClient(x?.nom, 120),
+    fonction: texteClient(x?.fonction, 80),
+    courriel: texteClient(x?.courriel, 160),
+    telephone: texteClient(x?.telephone, 40)
+  })).filter((x) => x.nom || x.courriel || x.telephone);
+}
+// Les champs d'une fiche, validés ; seuls ceux présents dans le corps.
+function champsClient(body2) {
+  const champs = {};
+  if ("nom" in body2) champs.nom = texteClient(body2.nom);
+  if ("adresse" in body2) champs.adresse = texteClient(body2.adresse);
+  if ("ville" in body2) champs.ville = texteClient(body2.ville, 80);
+  if ("code_postal" in body2) champs.code_postal = texteClient(body2.code_postal, 10)?.toUpperCase() ?? null;
+  if ("unites" in body2) champs.unites = entierClient(body2.unites, 1, 5000);
+  if ("annee_construction" in body2) champs.annee_construction = entierClient(body2.annee_construction, 1800, 2200);
+  if ("neq" in body2) champs.neq = texteClient(body2.neq, 20);
+  if ("contacts" in body2) champs.contacts = JSON.stringify(contactsClient(body2.contacts));
+  if ("notes" in body2) champs.notes = texteClient(body2.notes, 4000);
+  return champs;
+}
+function vueClient(r, dossiersDuClient = []) {
+  const tries = dossiersDuClient.slice().sort((a, b) => anneeEtude(b) - anneeEtude(a));
+  const actuel = tries.find((d) => !dossiersDuClient.some((x) => x.revision_de === d.id)) ?? tries[0] ?? null;
+  return {
+    id: r.id, nom: r.nom, adresse: r.adresse, ville: r.ville, code_postal: r.code_postal, unites: r.unites,
+    annee_construction: r.annee_construction, neq: r.neq, contacts: parseJsonArraySafe(r.contacts), notes: r.notes,
+    crm_id: r.crm_id, cree_le: r.cree_le,
+    dossiers: tries.map((d) => ({
+      id: d.id, dossier_no: d.dossier_no, name: d.name, annee: anneeEtude(d), published_at: d.published_at,
+      revision_de: d.revision_de, ...infoRevision(d, dossiersDuClient)
+    })),
+    etude_actuelle: actuel ? { id: actuel.id, dossier_no: actuel.dossier_no, annee: anneeEtude(actuel), publiee: !!actuel.published_at, ...infoRevision(actuel, dossiersDuClient) } : null
+  };
+}
+function parseJsonArraySafe(t) {
+  try { const v = JSON.parse(t || "[]"); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+async function clientDeFirme(c, id) {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return { user, client: null };
+  const client = await c.env.DB.prepare("SELECT * FROM clients WHERE id = ?1 AND company_id = ?2").bind(id, user.company_id).first();
+  return { user, client };
+}
+const clientsApi = new Hono();
+clientsApi.get("/", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json({ clients: [], sans_client: [] });
+  const [clients, dossiersFirme] = await Promise.all([
+    c.env.DB.prepare("SELECT * FROM clients WHERE company_id = ?1 ORDER BY nom COLLATE NOCASE").bind(user.company_id).all(),
+    c.env.DB.prepare("SELECT id, dossier_no, name, address, city, units, built_year, published_at, created_at, revision_de, client_id FROM dossiers WHERE company_id = ?1").bind(user.company_id).all()
+  ]);
+  const tous = dossiersFirme.results;
+  // Les dossiers sans client, regroupés par immeuble (une étude et ses révisions).
+  const racine = (d) => {
+    let r = d;
+    for (let i = 0; i < 20 && r.revision_de; i++) {
+      const precedent = tous.find((x) => x.id === r.revision_de);
+      if (!precedent) break;
+      r = precedent;
+    }
+    return r;
+  };
+  const groupes = new Map();
+  for (const d of tous.filter((x) => !x.client_id)) {
+    const r = racine(d);
+    if (!groupes.has(r.id)) groupes.set(r.id, { nom: d.name, adresse: d.address, ville: d.city, unites: d.units, annee_construction: d.built_year, dossiers: [] });
+    groupes.get(r.id).dossiers.push({ id: d.id, dossier_no: d.dossier_no, annee: anneeEtude(d) });
+  }
+  return c.json({
+    clients: clients.results.map((r) => vueClient(r, tous.filter((d) => d.client_id === r.id))),
+    sans_client: [...groupes.values()],
+    crm: !crmRefus(c, user)
+  });
+});
+clientsApi.post("/", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const champs = champsClient(body2);
+  if (!champs.nom) return c.json({ error: "le nom du syndicat est requis" }, 400);
+  const id = newId("cli");
+  const cols = Object.keys(champs);
+  await c.env.DB.prepare(`INSERT INTO clients (id, company_id, ${cols.join(", ")}) VALUES (?1, ?2, ${cols.map((_, i) => `?${i + 3}`).join(", ")})`)
+    .bind(id, user.company_id, ...cols.map((k) => champs[k])).run();
+  // Dossiers existants rattachés à la création (un immeuble et ses révisions).
+  const ids = Array.isArray(body2.dossiers) ? body2.dossiers.map(String).slice(0, 50) : [];
+  if (ids.length) {
+    await c.env.DB.batch(ids.map((d) => c.env.DB.prepare("UPDATE dossiers SET client_id = ?1 WHERE id = ?2 AND company_id = ?3").bind(id, d, user.company_id)));
+  }
+  const r = await c.env.DB.prepare("SELECT * FROM clients WHERE id = ?1").bind(id).first();
+  const siens = (await c.env.DB.prepare("SELECT * FROM dossiers WHERE client_id = ?1").bind(id).all()).results;
+  return c.json(vueClient(r, siens), 201);
+});
+// Syndicats du CRM Stratégis pas encore importés — Condo Stratégis seulement.
+clientsApi.get("/crm", async (c) => {
+  const user = await getCurrentUser(c);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const deja = new Set((await c.env.DB.prepare("SELECT crm_id FROM clients WHERE company_id = ?1 AND crm_id IS NOT NULL").bind(user.company_id).all()).results.map((r) => r.crm_id));
+  const rows = (await c.env.CRM.prepare(
+    `SELECT id, nom, address, city, units, neq, annee_construction, gestionnaire_name, gestionnaire_email FROM syndicats
+       WHERE actif = 1 AND superseded_by_syndicat_id IS NULL ORDER BY nom COLLATE NOCASE LIMIT 2000`
+  ).all()).results;
+  return c.json(rows.filter((r) => !deja.has(r.id)).map((r) => ({ id: r.id, nom: r.nom, adresse: r.address, ville: r.city, unites: r.units, gestionnaire: r.gestionnaire_name })));
+});
+clientsApi.post("/crm", async (c) => {
+  const user = await getCurrentUser(c);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const body2 = await c.req.json().catch(() => ({}));
+  const ids = Array.isArray(body2.ids) ? [...new Set(body2.ids.map(String))].slice(0, 500) : [];
+  if (!ids.length) return c.json({ error: "aucun syndicat choisi" }, 400);
+  const deja = new Set((await c.env.DB.prepare("SELECT crm_id FROM clients WHERE company_id = ?1 AND crm_id IS NOT NULL").bind(user.company_id).all()).results.map((r) => r.crm_id));
+  const lignes = [];
+  for (let i = 0; i < ids.length; i += 90) {
+    const lot = ids.slice(i, i + 90);
+    lignes.push(...(await c.env.CRM.prepare(
+      `SELECT id, nom, address, city, units, neq, annee_construction, gestionnaire_name, gestionnaire_email FROM syndicats WHERE id IN (${lot.map((_, k) => `?${k + 1}`).join(", ")})`
+    ).bind(...lot).all()).results);
+  }
+  const nouveaux = lignes.filter((r) => !deja.has(r.id));
+  const stmt = c.env.DB.prepare(
+    `INSERT INTO clients (id, company_id, nom, adresse, ville, unites, annee_construction, neq, contacts, crm_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+  );
+  for (let i = 0; i < nouveaux.length; i += 50) {
+    await c.env.DB.batch(nouveaux.slice(i, i + 50).map((r) => {
+      const ch = champsClient({ nom: r.nom, adresse: r.address, ville: r.city, unites: r.units, annee_construction: r.annee_construction, neq: r.neq,
+        contacts: r.gestionnaire_name || r.gestionnaire_email ? [{ nom: r.gestionnaire_name, fonction: "Gestionnaire", courriel: r.gestionnaire_email }] : [] });
+      return stmt.bind(newId("cli"), user.company_id, ch.nom ?? "Syndicat sans nom", ch.adresse, ch.ville, ch.unites, ch.annee_construction, ch.neq, ch.contacts, r.id);
+    }));
+  }
+  return c.json({ importes: nouveaux.length, deja: lignes.length - nouveaux.length });
+});
+clientsApi.get("/:id", async (c) => {
+  const { client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const siens = (await c.env.DB.prepare("SELECT * FROM dossiers WHERE client_id = ?1").bind(client.id).all()).results;
+  return c.json(vueClient(client, siens));
+});
+clientsApi.patch("/:id", async (c) => {
+  const { client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const champs = champsClient(await c.req.json().catch(() => ({})));
+  if ("nom" in champs && !champs.nom) return c.json({ error: "le nom du syndicat est requis" }, 400);
+  const cols = Object.keys(champs);
+  if (!cols.length) return c.json({ error: "rien à modifier" }, 400);
+  await c.env.DB.prepare(`UPDATE clients SET ${cols.map((k, i) => `${k} = ?${i + 1}`).join(", ")} WHERE id = ?${cols.length + 1}`)
+    .bind(...cols.map((k) => champs[k]), client.id).run();
+  const r = await c.env.DB.prepare("SELECT * FROM clients WHERE id = ?1").bind(client.id).first();
+  const siens = (await c.env.DB.prepare("SELECT * FROM dossiers WHERE client_id = ?1").bind(client.id).all()).results;
+  return c.json(vueClient(r, siens));
+});
+clientsApi.delete("/:id", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  if (!peutAdministrerFirme(user, client.company_id)) return c.json({ error: "réservé aux administrateurs de la firme" }, 403);
+  const n = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM dossiers WHERE client_id = ?1").bind(client.id).first();
+  if (n?.n) return c.json({ error: "ce client a des dossiers : détachez-les d'abord" }, 409);
+  await c.env.DB.prepare("DELETE FROM clients WHERE id = ?1").bind(client.id).run();
+  return c.json({ ok: true });
+});
+// Rattacher un dossier (avec ses révisions) à ce client, ou l'en détacher.
+clientsApi.put("/:id/dossiers/:dossierId", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const d = await c.env.DB.prepare("SELECT id FROM dossiers WHERE id = ?1 AND company_id = ?2").bind(c.req.param("dossierId"), user.company_id).first();
+  if (!d) return c.json({ error: "dossier introuvable" }, 404);
+  await c.env.DB.prepare("UPDATE dossiers SET client_id = ?1 WHERE id = ?2").bind(client.id, d.id).run();
+  return c.json({ ok: true });
+});
+clientsApi.delete("/:id/dossiers/:dossierId", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  await c.env.DB.prepare("UPDATE dossiers SET client_id = NULL WHERE id = ?1 AND client_id = ?2 AND company_id = ?3").bind(c.req.param("dossierId"), client.id, user.company_id).run();
+  return c.json({ ok: true });
+});
+// Nouvelle étude pour ce client : le dossier reprend ses coordonnées.
+clientsApi.post("/:id/dossiers", async (c) => {
+  const { user, client } = await clientDeFirme(c, c.req.param("id"));
+  if (!client) return c.json({ error: "client introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const no = texteClient(body2.dossier_no, 40);
+  if (!no) return c.json({ error: "numéro de dossier requis" }, 400);
+  if (await numeroPris(c.env.DB, no)) return c.json({ error: `le numéro de dossier ${no} est déjà utilisé` }, 409);
+  const floors = entierClient(body2.floors, 1, 200);
+  return c.json(await creerDossier(c, user, {
+    dossier_no: no, name: client.nom, address: client.adresse, city: client.ville, units: client.unites ?? 0,
+    floors, built_year: client.annee_construction, client_id: client.id
+  }), 201);
+});
+// ============================================================================
+// EXPORT ET SAUVEGARDES
+// ----------------------------------------------------------------------------
+// Export : tout ce qu'une firme a confié à la plateforme, pour qu'elle le
+// garde ou le reprenne ailleurs — sans mot de passe ni jeton. Archive d'un
+// dossier : ses données et ses photos. Sauvegarde : chaque semaine, toute la
+// base dans R2, conservée six mois, en plus du retour dans le temps de D1.
+// ============================================================================
+const EXPORT_VERSION = 1;
+const COLONNES_SECRETES = new Set(["password_hash", "password_salt", "sessions_apres"]);
+const sansSecrets = (rows) => rows.map((r) => Object.fromEntries(Object.entries(r).filter(([k]) => !COLONNES_SECRETES.has(k))));
+async function toutes(db, sql, ...params) {
+  return (await db.prepare(sql).bind(...params).all()).results;
+}
+async function donneesDeFirme(db, companyId) {
+  const dossiersFirme = `SELECT id FROM dossiers WHERE company_id = ?1`;
+  const [firme, equipe, clients2, dossiers2, composantes, photos2, journal2, regles, suivi2, portail2, gabarit, redactions2, prix2, sources] = await Promise.all([
+    db.prepare("SELECT * FROM companies WHERE id = ?1").bind(companyId).first(),
+    toutes(db, "SELECT * FROM users WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM clients WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM dossiers WHERE company_id = ?1", companyId),
+    toutes(db, `SELECT * FROM components WHERE dossier_id IN (${dossiersFirme}) ORDER BY dossier_id, sort_order`, companyId),
+    toutes(db, `SELECT p.* FROM photos p JOIN components cmp ON cmp.id = p.component_id WHERE cmp.dossier_id IN (${dossiersFirme})`, companyId),
+    toutes(db, `SELECT * FROM journal WHERE dossier_id IN (${dossiersFirme}) ORDER BY moment`, companyId),
+    toutes(db, `SELECT * FROM carnet_regles WHERE dossier_id IN (${dossiersFirme})`, companyId),
+    toutes(db, `SELECT * FROM carnet_suivi WHERE dossier_id IN (${dossiersFirme})`, companyId),
+    toutes(db, `SELECT a.dossier_id, a.fonction, a.cree_le, u.id AS user_id, u.name, u.email, u.actif FROM portail_acces a JOIN users u ON u.id = a.user_id WHERE a.dossier_id IN (${dossiersFirme})`, companyId),
+    db.prepare("SELECT company_id, sections, source_filename, imported_at, updated_at FROM company_templates WHERE company_id = ?1").bind(companyId).first(),
+    toutes(db, "SELECT * FROM redactions WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM price_observations WHERE company_id = ?1", companyId),
+    toutes(db, "SELECT * FROM price_observation_sources WHERE company_id = ?1", companyId)
+  ]);
+  return {
+    format: "condo-strategis-export", version: EXPORT_VERSION, exporte_le: (/* @__PURE__ */ new Date()).toISOString(),
+    firme, equipe: sansSecrets(equipe), clients: clients2, dossiers: dossiers2, composantes, photos: photos2,
+    journal: journal2, carnet: { regles, suivi: suivi2 }, portail: portail2, gabarit_texte: gabarit ?? null,
+    redactions: redactions2, prix: { observations: prix2, sources }
+  };
+}
+// CSV pour Excel en français : point-virgule, BOM UTF-8, virgule décimale.
+function csvExcel(entetes, lignes) {
+  const cellule = (v) => {
+    if (v == null) return "";
+    const t = typeof v === "number" ? String(v).replace(".", ",") : String(v);
+    return /[;"\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  return "\uFEFF" + [entetes.map(([, lib]) => cellule(lib)).join(";"), ...lignes.map((l) => entetes.map(([k]) => cellule(l[k])).join(";"))].join("\r\n");
+}
+const CSV_DOSSIERS = [["dossier_no", "Dossier"], ["name", "Syndicat"], ["address", "Adresse"], ["city", "Ville"], ["units", "Unités"], ["floors", "Étages"], ["built_year", "Construction"], ["current_fund_balance", "Solde du fonds"], ["cotisation_annuelle", "Cotisation annuelle"], ["published_at", "Publié le"], ["created_at", "Créé le"], ["id", "Identifiant"]];
+const CSV_COMPOSANTES = [["dossier_no", "Dossier"], ["cat", "Catégorie"], ["name", "Composante"], ["uniformat_code", "Uniformat"], ["actif", "Dans la visite"], ["done", "Documentée"], ["rating", "Cote"], ["install_year", "Année d'installation"], ["useful_life_years", "Vie utile"], ["replacement_cost", "Coût de remplacement"], ["qty", "Quantité"], ["observation", "Constats"], ["id", "Identifiant"]];
+const LISEZ_MOI_EXPORT = `Export des données — Condo Stratégis
+
+donnees.json     Toutes les données de la firme : équipe (sans mots de passe), clients,
+                 dossiers, composantes, métadonnées des photos, historique des
+                 modifications, carnets d'entretien, membres des portails, textes du
+                 rapport, rédactions et banque de prix.
+dossiers.csv     Les dossiers, à ouvrir dans Excel.
+composantes.csv  Les composantes de tous les dossiers, à ouvrir dans Excel.
+
+Les photos ne sont pas dans cet export : elles se téléchargent dossier par
+dossier (« Archive du dossier », dans la console bureau), avec les données du
+dossier.
+`;
+async function zipper(fichiers) {
+  const JSZip = import_jszip_min.default;
+  const zip = new JSZip();
+  for (const [nom, contenu, opts] of fichiers) zip.file(nom, contenu, opts);
+  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+}
+function reponseZip(octets, nom) {
+  return new Response(octets, {
+    headers: {
+      "content-type": "application/zip",
+      "content-disposition": `attachment; filename="${nom.replace(/[^A-Za-z0-9._-]/g, "_")}"`,
+      "cache-control": "no-store"
+    }
+  });
+}
+// Budget des photos d'une archive : un Worker n'a que 128 Mo de mémoire.
+const ARCHIVE_PHOTOS_OCTETS = 60 * 1024 * 1024;
+async function archiveDossier(env, dossier) {
+  const [composantes, photos2, journal2, regles, suivi2] = await Promise.all([
+    toutes(env.DB, "SELECT * FROM components WHERE dossier_id = ?1 ORDER BY sort_order", dossier.id),
+    toutes(env.DB, "SELECT p.* FROM photos p JOIN components cmp ON cmp.id = p.component_id WHERE cmp.dossier_id = ?1 ORDER BY p.created_at", dossier.id),
+    toutes(env.DB, "SELECT * FROM journal WHERE dossier_id = ?1 ORDER BY moment", dossier.id),
+    toutes(env.DB, "SELECT * FROM carnet_regles WHERE dossier_id = ?1", dossier.id),
+    toutes(env.DB, "SELECT * FROM carnet_suivi WHERE dossier_id = ?1", dossier.id)
+  ]);
+  const noms = new Map(composantes.map((c) => [c.id, c]));
+  const fichiers = [];
+  let budget = ARCHIVE_PHOTOS_OCTETS;
+  const absentes = [];
+  const rang = new Map();
+  for (const p of photos2) {
+    const c = noms.get(p.component_id);
+    const n = (rang.get(p.component_id) ?? 0) + 1;
+    rang.set(p.component_id, n);
+    const obj = await env.PHOTOS.get(p.r2_key);
+    if (!obj || obj.size > budget) { absentes.push(p.id); continue; }
+    budget -= obj.size;
+    const ext = p.r2_key.endsWith(".png") ? "png" : "jpg";
+    const dossierPhoto = `${String((c?.sort_order ?? 0) + 1).padStart(3, "0")} ${(c?.name ?? "composante").replace(/[\\/:*?"<>|]/g, "-").slice(0, 80)}`;
+    p.fichier = `photos/${dossierPhoto}/${n}${p.tag ? ` - ${String(p.tag).replace(/[\\/:*?"<>|]/g, "-")}` : ""}.${ext}`;
+    // Déjà compressées : stockées telles quelles.
+    fichiers.push([p.fichier, new Uint8Array(await obj.arrayBuffer()), { compression: "STORE" }]);
+  }
+  const donnees = { format: "condo-strategis-dossier", version: EXPORT_VERSION, exporte_le: (/* @__PURE__ */ new Date()).toISOString(), dossier, composantes, photos: photos2, journal: journal2, carnet: { regles, suivi: suivi2 }, photos_non_incluses: absentes };
+  fichiers.unshift(
+    ["donnees.json", JSON.stringify(donnees, null, 1)],
+    ["composantes.csv", csvExcel(CSV_COMPOSANTES, composantes.map((c) => ({ ...c, dossier_no: dossier.dossier_no })))]
+  );
+  if (absentes.length) fichiers.push(["PHOTOS-MANQUANTES.txt", `${absentes.length} photo(s) n'ont pas pu être incluses (taille de l'archive limitée à 60 Mo, ou fichier absent). Leurs identifiants sont dans donnees.json, clé photos_non_incluses.\n`]);
+  return zipper(fichiers);
+}
+// Sauvegarde complète : chaque table, chaque ligne, en JSON compressé.
+const SAUVEGARDES_GARDEES = 26;
+const CRON_SAUVEGARDE = "0 7 * * SUN";
+async function sauvegarderBase(env) {
+  const tables = (await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'd1_%' ORDER BY name"
+  ).all()).results.map((r) => r.name);
+  const contenu = { format: "condo-strategis-sauvegarde", version: EXPORT_VERSION, cree_le: (/* @__PURE__ */ new Date()).toISOString(), tables: {} };
+  for (const t of tables) {
+    const lignes = [];
+    for (let depart = 0; ; depart += 1000) {
+      const lot = (await env.DB.prepare(`SELECT * FROM "${t.replace(/"/g, "")}" LIMIT 1000 OFFSET ?1`).bind(depart).all()).results;
+      lignes.push(...lot);
+      if (lot.length < 1000) break;
+    }
+    contenu.tables[t] = lignes;
+  }
+  const flux = new Blob([JSON.stringify(contenu)]).stream().pipeThrough(new CompressionStream("gzip"));
+  const octets = new Uint8Array(await new Response(flux).arrayBuffer());
+  const cle = `sauvegardes/stratege-fp-${contenu.cree_le.slice(0, 19).replace(/[:T]/g, "-")}.json.gz`;
+  await env.PHOTOS.put(cle, octets, { httpMetadata: { contentType: "application/gzip" }, customMetadata: { tables: String(tables.length) } });
+  // Les plus anciennes au-delà de six mois de sauvegardes hebdomadaires.
+  const liste = (await env.PHOTOS.list({ prefix: "sauvegardes/" })).objects.sort((a, b) => a.key < b.key ? -1 : 1);
+  for (const vieille of liste.slice(0, Math.max(0, liste.length - SAUVEGARDES_GARDEES))) await env.PHOTOS.delete(vieille.key);
+  console.log("sauvegarde", cle, octets.length, "octets", tables.length, "tables");
+  return { cle, octets: octets.length, tables: tables.length };
+}
+// Liste et téléchargement des sauvegardes : super admin seulement.
+const sauvegardes = new Hono();
+sauvegardes.use("*", async (c, next) => {
+  const user = await getCurrentUser(c);
+  if (user?.role !== "super_admin") return c.json({ error: "réservé au super administrateur" }, 403);
+  return next();
+});
+sauvegardes.get("/", async (c) => {
+  const liste = (await c.env.PHOTOS.list({ prefix: "sauvegardes/" })).objects.sort((a, b) => a.key < b.key ? 1 : -1);
+  return c.json(liste.map((o) => ({ nom: o.key.slice("sauvegardes/".length), octets: o.size, le: o.uploaded })));
+});
+sauvegardes.post("/", async (c) => c.json(await sauvegarderBase(c.env), 201));
+sauvegardes.get("/:nom", async (c) => {
+  const nom = c.req.param("nom");
+  if (!/^stratege-fp-[\d-]+\.json\.gz$/.test(nom)) return c.json({ error: "nom invalide" }, 400);
+  const obj = await c.env.PHOTOS.get(`sauvegardes/${nom}`);
+  if (!obj) return c.json({ error: "sauvegarde introuvable" }, 404);
+  return new Response(obj.body, { headers: { "content-type": "application/gzip", "content-disposition": `attachment; filename="${nom}"`, "cache-control": "no-store" } });
+});
+// ---- Côté firme : membres et répartition, depuis la console bureau -------------
+async function dossierPortail(c, { ecriture = false } = {}) {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return { refus: c.json({ error: "dossier introuvable" }, 404) };
+  if (ecriture && !peutAdministrerFirme(user, dossier.company_id)) return { refus: c.json({ error: "réservé aux administrateurs de la firme" }, 403) };
+  return { user, dossier };
+}
+function nettoyerFonction(v) {
+  return String(v ?? "").trim().slice(0, 60) || null;
+}
+const dossiersPortail = new Hono();
+dossiersPortail.get("/:id/portail", async (c) => {
+  const { refus, user, dossier } = await dossierPortail(c);
+  if (refus) return refus;
+  const [membres, regles, taches, historique] = await Promise.all([
+    membresPortail(c.env.DB, dossier.id),
+    reglesCarnet(c.env.DB, dossier.id),
+    tachesCarnetDossier(c.env.DB, dossier.id),
+    c.env.DB.prepare(
+      `SELECT s.cle_tache, s.annee, s.mois, s.fait_le, s.note, u.name AS par FROM carnet_suivi s LEFT JOIN users u ON u.id = s.fait_par
+         WHERE s.dossier_id = ?1 ORDER BY s.fait_le DESC LIMIT 30`
+    ).bind(dossier.id).all()
+  ]);
+  return c.json({
+    membres,
+    regles,
+    types: [...new Set(taches.map((t) => t.q))].map((q) => ({ q, libelle: libelleResponsable(q), n: taches.filter((t) => t.q === q).length })),
+    taches: taches.map((t) => ({ ...t, ...responsableEffectif(t, regles) })),
+    historique: historique.results,
+    peutModifier: peutAdministrerFirme(user, dossier.company_id),
+    courriel: !!c.env.EMAIL
+  });
+});
+dossiersPortail.post("/:id/portail/membres", async (c) => {
+  const { refus, user, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const body2 = await c.req.json().catch(() => ({}));
+  const email = String(body2.email ?? "").trim().toLowerCase();
+  const name = String(body2.name ?? "").trim().slice(0, 120);
+  const fonction = nettoyerFonction(body2.fonction);
+  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return c.json({ error: "nom et courriel valide requis" }, 400);
+  let membre = await c.env.DB.prepare("SELECT * FROM users WHERE email = ?1").bind(email).first();
+  if (membre && membre.role !== "portail") return c.json({ error: "cette adresse appartient à un compte de firme : utilisez une autre adresse pour le portail" }, 409);
+  let jeton = null;
+  if (!membre) {
+    const { hash, salt } = await hashPassword(toBase64Url(crypto.getRandomValues(new Uint8Array(24))));
+    const id = newId("usr");
+    await c.env.DB.prepare(
+      `INSERT INTO users (id, email, name, password_hash, password_salt, company_id, role, invitation_en_attente) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'portail', 1)`
+    ).bind(id, email, name, hash, salt).run();
+    membre = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(id).first();
+  }
+  if (membre.invitation_en_attente) jeton = await creerJetonCompte(c.env.DB, membre.id, "invitation");
+  await c.env.DB.prepare("INSERT INTO portail_acces (user_id, dossier_id, fonction) VALUES (?1, ?2, ?3) ON CONFLICT (user_id, dossier_id) DO UPDATE SET fonction = excluded.fonction")
+    .bind(membre.id, dossier.id, fonction).run();
+  try {
+    await envoyerInvitationPortail(c.env, origineDe(c), membre, jeton, dossier, user);
+    return c.json({ membres: await membresPortail(c.env.DB, dossier.id), envoye: true }, 201);
+  } catch (e) {
+    console.error("invitation au portail non envoyée", e?.code, e?.message);
+    return c.json({ membres: await membresPortail(c.env.DB, dossier.id), envoye: false, erreur: e?.message ?? "envoi impossible", lien: jeton ? `${origineDe(c)}/compte/?jeton=${jeton}` : `${origineDe(c)}/portail/` }, 201);
+  }
+});
+dossiersPortail.patch("/:id/portail/membres/:userId", async (c) => {
+  const { refus, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const body2 = await c.req.json().catch(() => ({}));
+  await c.env.DB.prepare("UPDATE portail_acces SET fonction = ?1 WHERE user_id = ?2 AND dossier_id = ?3").bind(nettoyerFonction(body2.fonction), c.req.param("userId"), dossier.id).run();
+  return c.json({ membres: await membresPortail(c.env.DB, dossier.id) });
+});
+dossiersPortail.post("/:id/portail/membres/:userId/invitation", async (c) => {
+  const { refus, user, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const membre = await c.env.DB.prepare("SELECT u.* FROM users u JOIN portail_acces a ON a.user_id = u.id WHERE u.id = ?1 AND a.dossier_id = ?2").bind(c.req.param("userId"), dossier.id).first();
+  if (!membre) return c.json({ error: "membre introuvable" }, 404);
+  const jeton = membre.invitation_en_attente ? await creerJetonCompte(c.env.DB, membre.id, "invitation") : null;
+  try {
+    await envoyerInvitationPortail(c.env, origineDe(c), membre, jeton, dossier, user);
+    return c.json({ envoye: true });
+  } catch (e) {
+    return c.json({ envoye: false, erreur: e?.message ?? "envoi impossible", lien: jeton ? `${origineDe(c)}/compte/?jeton=${jeton}` : `${origineDe(c)}/portail/` });
+  }
+});
+// Retirer l'accès : ses tâches redeviennent sans responsable.
+dossiersPortail.delete("/:id/portail/membres/:userId", async (c) => {
+  const { refus, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const uid = c.req.param("userId");
+  await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM portail_acces WHERE user_id = ?1 AND dossier_id = ?2").bind(uid, dossier.id),
+    c.env.DB.prepare("DELETE FROM carnet_regles WHERE user_id = ?1 AND dossier_id = ?2").bind(uid, dossier.id)
+  ]);
+  return c.json({ membres: await membresPortail(c.env.DB, dossier.id) });
+});
+// Répartition : les défauts par type de responsable et les exceptions par
+// tâche, remplacés d'un bloc.
+dossiersPortail.put("/:id/portail/regles", async (c) => {
+  const { refus, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const body2 = await c.req.json().catch(() => ({}));
+  const ids = new Set((await membresPortail(c.env.DB, dossier.id)).map((m) => m.id));
+  const valide = (v) => (v === "" || v == null ? "" : ids.has(String(v)) ? String(v) : null);
+  const requetes = [c.env.DB.prepare("DELETE FROM carnet_regles WHERE dossier_id = ?1").bind(dossier.id)];
+  const inserer = (cle, uid) => requetes.push(c.env.DB.prepare("INSERT INTO carnet_regles (dossier_id, cle, user_id) VALUES (?1, ?2, ?3)").bind(dossier.id, cle, uid || null));
+  for (const [q, uid] of Object.entries(body2.defauts ?? {})) {
+    const v = valide(uid);
+    if (v === null) return c.json({ error: "membre inconnu dans la répartition" }, 400);
+    if (v) inserer(`q:${String(q).slice(0, 60)}`, v);
+  }
+  for (const [cle, uid] of Object.entries(body2.taches ?? {}).slice(0, 2000)) {
+    const v = valide(uid);
+    if (v === null) return c.json({ error: "membre inconnu dans la répartition" }, 400);
+    inserer(`t:${String(cle).slice(0, 300)}`, v);
+  }
+  for (let i = 0; i < requetes.length; i += 80) await c.env.DB.batch(requetes.slice(i, i + 80));
+  return c.json({ regles: await reglesCarnet(c.env.DB, dossier.id) });
+});
+dossiersPortail.post("/:id/portail/rappels", async (c) => {
+  const { refus, dossier } = await dossierPortail(c, { ecriture: true });
+  if (refus) return refus;
+  const maintenant = new Date();
+  try {
+    return c.json(await envoyerRappelsDossier(c.env, origineDe(c), dossier, maintenant.getFullYear(), maintenant.getMonth() + 1));
+  } catch (e) {
+    return c.json({ error: `envoi impossible : ${e?.message ?? e}` }, 502);
+  }
+});
+// ---- Côté syndicat : /api/portail ----------------------------------------------
+const portail = new Hono();
+// Un membre voit les immeubles où il a accès ; un compte de firme voit ceux
+// de sa firme (aperçu du portail depuis le bureau).
+async function immeublePortail(c) {
+  const user = await getCurrentUser(c);
+  const id = c.req.param("id");
+  const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  if (!user || !dossier) return { refus: c.json({ error: "immeuble introuvable" }, 404) };
+  if (user.role === "portail") {
+    const acces = await c.env.DB.prepare("SELECT fonction FROM portail_acces WHERE user_id = ?1 AND dossier_id = ?2").bind(user.id, id).first();
+    if (!acces) return { refus: c.json({ error: "immeuble introuvable" }, 404) };
+    return { user, dossier, fonction: acces.fonction };
+  }
+  if (!peutGererEntreprise(user, dossier.company_id)) return { refus: c.json({ error: "immeuble introuvable" }, 404) };
+  return { user, dossier, fonction: "Aperçu de la firme", apercu: true };
+}
+portail.get("/immeubles", async (c) => {
+  const user = await getCurrentUser(c);
+  const rows = user.role === "portail"
+    ? (await c.env.DB.prepare(
+        `SELECT d.id, d.name, d.address, d.city, d.company_id, a.fonction FROM portail_acces a JOIN dossiers d ON d.id = a.dossier_id
+           WHERE a.user_id = ?1 AND NOT EXISTS (SELECT 1 FROM dossiers r JOIN portail_acces a2 ON a2.dossier_id = r.id AND a2.user_id = ?1 WHERE r.revision_de = d.id)
+           ORDER BY d.name`
+      ).bind(user.id).all()).results
+    : [];
+  const firmes = new Map();
+  for (const r of rows) if (!firmes.has(r.company_id)) firmes.set(r.company_id, await companyBrief(c.env.DB, r.company_id));
+  return c.json(rows.map((r) => ({ id: r.id, name: r.name, address: r.address, city: r.city, fonction: r.fonction, firme: firmes.get(r.company_id) })));
+});
+portail.get("/immeubles/:id", async (c) => {
+  const { refus, user, dossier, fonction, apercu } = await immeublePortail(c);
+  if (refus) return refus;
+  const maintenant = new Date();
+  const annee = Number(c.req.query("annee")) || maintenant.getFullYear();
+  const mois = Math.min(12, Math.max(1, Number(c.req.query("mois")) || maintenant.getMonth() + 1));
+  const { taches, consignes, membres } = await moisDuCarnet(c.env.DB, dossier.id, annee, mois);
+  const company = await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(dossier.company_id).first();
+  const theme = themeDeFirme(company);
+  return c.json({
+    immeuble: { id: dossier.id, name: dossier.name, address: dossier.address, city: dossier.city, dossier_no: dossier.dossier_no, rapport: !!dossier.published_at },
+    firme: { id: company?.id, name: company?.name, hasLogo: !!company?.logo_r2_key, accent: theme.accent, telephone: theme.telephone, courriel: theme.courriel },
+    moi: { id: user.id, name: user.name, fonction, apercu: !!apercu },
+    membres: membres.filter((m) => m.actif).map((m) => ({ id: m.id, name: m.name, fonction: m.fonction })),
+    periode: { annee, mois, libelle: `${MOIS_NOMS[mois - 1]} ${annee}` },
+    taches,
+    consignes
+  });
+});
+portail.post("/immeubles/:id/suivi", async (c) => {
+  const { refus, user, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  const body2 = await c.req.json().catch(() => ({}));
+  const annee = Number(body2.annee), mois = Number(body2.mois);
+  const cle = String(body2.cle ?? "");
+  if (!Number.isInteger(annee) || annee < 2000 || annee > 2200 || !Number.isInteger(mois) || mois < 1 || mois > 12 || !cle) return c.json({ error: "tâche, année et mois requis" }, 400);
+  if (!(await tachesCarnetDossier(c.env.DB, dossier.id)).some((t) => t.cle === cle)) return c.json({ error: "tâche inconnue pour cet immeuble" }, 404);
+  const note = String(body2.note ?? "").trim().slice(0, 500) || null;
+  await c.env.DB.prepare(
+    `INSERT INTO carnet_suivi (id, dossier_id, cle_tache, annee, mois, fait_le, fait_par, note)
+     VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?6, ?7)
+     ON CONFLICT (dossier_id, cle_tache, annee, mois) DO UPDATE SET note = excluded.note, fait_par = excluded.fait_par`
+  ).bind(newId("svi"), dossier.id, cle, annee, mois, user.id, note).run();
+  return c.json({ ok: true });
+});
+portail.delete("/immeubles/:id/suivi", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  await c.env.DB.prepare("DELETE FROM carnet_suivi WHERE dossier_id = ?1 AND cle_tache = ?2 AND annee = ?3 AND mois = ?4")
+    .bind(dossier.id, String(c.req.query("cle") ?? ""), Number(c.req.query("annee")), Number(c.req.query("mois"))).run();
+  return c.json({ ok: true });
+});
+portail.get("/immeubles/:id/historique", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  const taches = new Map((await tachesCarnetDossier(c.env.DB, dossier.id)).map((t) => [t.cle, t]));
+  const rows = (await c.env.DB.prepare(
+    `SELECT s.*, u.name AS par FROM carnet_suivi s LEFT JOIN users u ON u.id = s.fait_par WHERE s.dossier_id = ?1 ORDER BY s.fait_le DESC LIMIT 300`
+  ).bind(dossier.id).all()).results;
+  return c.json(rows.map((r) => ({
+    texte: taches.get(r.cle_tache)?.texte ?? "Tâche retirée du carnet", element: taches.get(r.cle_tache)?.element ?? "",
+    periode: `${MOIS_NOMS[r.mois - 1]} ${r.annee}`, fait_le: r.fait_le, par: r.par, note: r.note
+  })));
+});
+portail.get("/immeubles/:id/composantes", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  const rows = (await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1 ORDER BY sort_order ASC").bind(dossier.id).all()).results;
+  return c.json(rows.map((r) => {
+    const prevu = remplacementPrevu(r);
+    return { name: sansNotesInternes(r.name), categorie: CATEGORIES[r.cat]?.label ?? "", cote: r.rating ? RATING_LABELS[r.rating] : null, rating: r.rating, remplacement: prevu, annee: r.install_year };
+  }));
+});
+portail.get("/immeubles/:id/logo", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  const company = await c.env.DB.prepare("SELECT logo_r2_key FROM companies WHERE id = ?1").bind(dossier.company_id).first();
+  const obj = company?.logo_r2_key ? await c.env.PHOTOS.get(company.logo_r2_key) : null;
+  if (!obj) return c.notFound();
+  return new Response(obj.body, { headers: { "content-type": obj.httpMetadata?.contentType ?? "image/png", "cache-control": "private, max-age=3600" } });
+});
+async function contexteRapportPortail(c, dossier, opts = {}) {
+  const signataire = dossier.created_by ? await c.env.DB.prepare("SELECT * FROM users WHERE id = ?1").bind(dossier.created_by).first() : null;
+  return buildReportContext(c, { ...opts, dossier, signataire });
+}
+portail.get("/immeubles/:id/suivi-entretien.xlsx", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  const bytes = await tableurSuiviEntretien(await contexteRapportPortail(c, dossier));
+  return new Response(new Blob([bytes]), { headers: { "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "content-disposition": `attachment; filename="${dossier.dossier_no}-suivi-entretien.xlsx"` } });
+});
+// Le rapport seulement une fois publié par la firme.
+portail.get("/immeubles/:id/rapport.docx", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  if (!dossier.published_at) return c.json({ error: "le rapport n'est pas encore publié par la firme" }, 404);
+  const bytes = await produireRapportDocx(c, await contexteRapportPortail(c, dossier, { word: true }));
+  return new Response(new Blob([new Uint8Array(bytes)]), { headers: { "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "content-disposition": `attachment; filename="${dossier.dossier_no}-etude-fonds-prevoyance.docx"` } });
+});
 const dossiers = new Hono();
 async function dossierStats(db, dossierId) {
   const row = await db.prepare(
     `SELECT
          COUNT(*) AS total,
          SUM(done) AS done,
-         SUM(CASE WHEN rating >= 3 THEN 1 ELSE 0 END) AS critical,
+         SUM(CASE WHEN done = 1 AND rating >= 3 THEN 1 ELSE 0 END) AS critical,
+         MAX(updated_at) AS derniere_modif,
          (SELECT COUNT(*) FROM photos p JOIN components c2 ON c2.id = p.component_id WHERE c2.dossier_id = ?1) AS photos_total
-       FROM components WHERE dossier_id = ?1`
+       FROM components WHERE dossier_id = ?1 AND actif = 1`
   ).bind(dossierId).first();
   const total = row?.total ?? 0;
   const done = row?.done ?? 0;
@@ -44065,6 +48054,7 @@ async function dossierStats(db, dossierId) {
     todo: total - done,
     critical: row?.critical ?? 0,
     photosTotal: row?.photos_total ?? 0,
+    derniereModif: row?.derniere_modif ?? null,
     pct: total > 0 ? Math.round(done / total * 100) : 0
   };
 }
@@ -44072,10 +48062,118 @@ dossiers.get("/", async (c) => {
   const user = await getCurrentUser(c);
   if (!user?.company_id) return c.json([]);
   const rows = await c.env.DB.prepare("SELECT * FROM dossiers WHERE company_id = ?1 ORDER BY created_at DESC").bind(user.company_id).all();
+  const noms = new Map((await c.env.DB.prepare("SELECT id, name FROM users WHERE company_id = ?1").bind(user.company_id).all()).results.map((u) => [u.id, u.name]));
   const withStats = await Promise.all(
     rows.results.map(async (d) => ({ ...d, stats: await dossierStats(c.env.DB, d.id) }))
   );
-  return c.json(withStats);
+  return c.json(withStats.map((d) => ({
+    ...d,
+    ...infoRevision(d, rows.results),
+    assigne: d.assigne_a && noms.has(d.assigne_a) ? { id: d.assigne_a, name: noms.get(d.assigne_a) } : null
+  })));
+});
+// Suivi : responsable et échéance du dossier. Un administrateur de la firme
+// répartit les dossiers ; un ingénieur prend un dossier libre ou le sien, ou
+// s'en retire, et règle l'échéance de ceux qu'il porte.
+dossiers.patch("/:id/suivi", async (c) => {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const admin = peutAdministrerFirme(user, dossier.company_id);
+  const sets = [], vals = [];
+  if ("assigne_a" in body2) {
+    const cible = body2.assigne_a ? String(body2.assigne_a) : null;
+    if (!admin) {
+      const libreOuMien = !dossier.assigne_a || dossier.assigne_a === user.id;
+      if (!libreOuMien || (cible && cible !== user.id)) return c.json({ error: "seul un administrateur de la firme répartit les dossiers des autres" }, 403);
+    }
+    if (cible) {
+      const membre = await c.env.DB.prepare(
+        "SELECT id FROM users WHERE id = ?1 AND company_id = ?2 AND actif = 1 AND role != 'portail'"
+      ).bind(cible, dossier.company_id).first();
+      if (!membre) return c.json({ error: "cette personne ne fait pas partie de l'équipe active de la firme" }, 400);
+    }
+    sets.push(`assigne_a = ?${sets.length + 1}`); vals.push(cible);
+  }
+  if ("echeance" in body2) {
+    const e = body2.echeance ? String(body2.echeance) : null;
+    if (e && (!/^\d{4}-\d{2}-\d{2}$/.test(e) || Number.isNaN(Date.parse(`${e}T00:00:00Z`)))) return c.json({ error: "échéance invalide (AAAA-MM-JJ)" }, 400);
+    const porteur = ("assigne_a" in body2 ? body2.assigne_a : dossier.assigne_a) === user.id;
+    if (!admin && !porteur) return c.json({ error: "l'échéance se règle par le responsable du dossier ou un administrateur" }, 403);
+    sets.push(`echeance = ?${sets.length + 1}`); vals.push(e);
+  }
+  if (!sets.length) return c.json({ error: "rien à modifier" }, 400);
+  vals.push(dossier.id);
+  await c.env.DB.prepare(`UPDATE dossiers SET ${sets.join(", ")} WHERE id = ?${vals.length}`).bind(...vals).run();
+  const d = await c.env.DB.prepare("SELECT id, assigne_a, echeance FROM dossiers WHERE id = ?1").bind(dossier.id).first();
+  const nom = d.assigne_a ? (await c.env.DB.prepare("SELECT name FROM users WHERE id = ?1").bind(d.assigne_a).first())?.name : null;
+  const nomAvant = dossier.assigne_a ? (await c.env.DB.prepare("SELECT name FROM users WHERE id = ?1").bind(dossier.assigne_a).first())?.name : null;
+  await noterJournal(c.env.DB, {
+    dossierId: dossier.id, userId: user.id, action: "suivi",
+    champs: differences({ assigne_a: nomAvant, echeance: dossier.echeance }, { assigne_a: nom, echeance: d.echeance }, ["assigne_a", "echeance"])
+  });
+  return c.json({ ...d, assigne: d.assigne_a ? { id: d.assigne_a, name: nom } : null });
+});
+// Où en est le dossier dans le cycle des révisions : l'étude qu'il révise,
+// celle qui le révise, et si sa révision aux cinq ans est due.
+function infoRevision(d, tous) {
+  const annee = anneeEtude(d);
+  const source = d.revision_de ? tous.find((x) => x.id === d.revision_de) : null;
+  const suivante = tous.find((x) => x.revision_de === d.id) ?? null;
+  const echeance = annee + 5;
+  return {
+    annee_etude: annee,
+    revision_source: source ? { id: source.id, dossier_no: source.dossier_no, annee: anneeEtude(source) } : null,
+    revise_par: suivante ? { id: suivante.id, dossier_no: suivante.dossier_no } : null,
+    revision_echeance: echeance,
+    // Due dans l'année qui vient, ou dépassée, et pas encore commencée.
+    revision_due: !suivante && !!d.published_at && echeance <= (/* @__PURE__ */ new Date()).getFullYear() + 1
+  };
+}
+dossiers.post("/:id/revision", async (c) => {
+  const { user, dossier: source } = await getOwnedDossier(c, c.req.param("id"));
+  if (!source) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const dossierNo = String(body2.dossier_no ?? "").trim().slice(0, 40);
+  if (!dossierNo) return c.json({ error: "numéro du nouveau dossier requis" }, 400);
+  if (await c.env.DB.prepare("SELECT id FROM dossiers WHERE dossier_no = ?1").bind(dossierNo).first()) {
+    return c.json({ error: `le numéro de dossier ${dossierNo} est déjà utilisé` }, 409);
+  }
+  const deja = await c.env.DB.prepare("SELECT id, dossier_no FROM dossiers WHERE revision_de = ?1").bind(source.id).first();
+  if (deja) return c.json({ error: `cette étude a déjà une révision : dossier ${deja.dossier_no}`, id: deja.id }, 409);
+  const anneeSource = anneeEtude(source);
+  const annee = (/* @__PURE__ */ new Date()).getFullYear();
+  const facteur = facteurIndexation(anneeSource, annee);
+  const id = newId("dos");
+  await c.env.DB.prepare(
+    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id, batiment_info, revision_de, client_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`
+  ).bind(id, dossierNo, source.name, source.address, source.city, source.units ?? 0, source.floors, source.built_year, user.id, source.company_id, source.batiment_info, source.id, source.client_id ?? null).run();
+  const anciennes = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 ORDER BY sort_order ASC, created_at ASC").bind(source.id).all();
+  const nouveauxIds = new Map(anciennes.results.map((comp) => [comp.id, newId("cmp")]));
+  const colonnes = ["id", "dossier_id", ...CHAMPS_REPRIS_REVISION, "replacement_cost", "parent_id", "origine_id"];
+  const sql = `INSERT INTO components (${colonnes.join(", ")}) VALUES (${colonnes.map((_, i) => `?${i + 1}`).join(", ")})`;
+  const requetes = anciennes.results.map((comp) => c.env.DB.prepare(sql).bind(
+    nouveauxIds.get(comp.id), id,
+    ...CHAMPS_REPRIS_REVISION.map((champ) => comp[champ] ?? (champ === "actif" ? 1 : champ === "sort_order" ? 0 : null)),
+    comp.replacement_cost != null ? Math.round(comp.replacement_cost * facteur) : null,
+    comp.parent_id ? nouveauxIds.get(comp.parent_id) ?? null : null,
+    comp.id
+  ));
+  for (let i = 0; i < requetes.length; i += 50) await c.env.DB.batch(requetes.slice(i, i + 50));
+  // Le portail du syndicat suit l'immeuble : mêmes membres, même répartition.
+  await c.env.DB.batch([
+    c.env.DB.prepare("INSERT OR IGNORE INTO portail_acces (user_id, dossier_id, fonction) SELECT user_id, ?1, fonction FROM portail_acces WHERE dossier_id = ?2").bind(id, source.id),
+    c.env.DB.prepare("INSERT OR IGNORE INTO carnet_regles (dossier_id, cle, user_id) SELECT ?1, cle, user_id FROM carnet_regles WHERE dossier_id = ?2").bind(id, source.id)
+  ]);
+  const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  await noterJournal(c.env.DB, { dossierId: id, userId: user.id, action: "creation", champs: [{ champ: "revision_de", avant: null, apres: String(source.dossier_no ?? "") }] });
+  await noterJournal(c.env.DB, { dossierId: source.id, userId: user.id, action: "revision", champs: [{ champ: "revise_par", avant: null, apres: dossierNo }] });
+  return c.json({
+    ...dossier,
+    stats: await dossierStats(c.env.DB, id),
+    revision: { source: { id: source.id, dossier_no: source.dossier_no, annee: anneeSource }, composantes: anciennes.results.length, indexation: facteur - 1 }
+  }, 201);
 });
 dossiers.post("/", async (c) => {
   const user = await getCurrentUser(c);
@@ -44083,12 +48181,19 @@ dossiers.post("/", async (c) => {
   if (!user.company_id) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
   const body2 = await c.req.json();
   if (!body2.dossier_no || !body2.name) return c.json({ error: "dossier_no et name requis" }, 400);
-  const dejaPris = await c.env.DB.prepare("SELECT 1 FROM dossiers WHERE dossier_no = ?1").bind(body2.dossier_no).first();
-  if (dejaPris) return c.json({ error: `le numéro de dossier ${body2.dossier_no} est déjà utilisé` }, 409);
+  if (await numeroPris(c.env.DB, body2.dossier_no)) return c.json({ error: `le numéro de dossier ${body2.dossier_no} est déjà utilisé` }, 409);
+  if (body2.client_id && !await c.env.DB.prepare("SELECT id FROM clients WHERE id = ?1 AND company_id = ?2").bind(body2.client_id, user.company_id).first()) {
+    return c.json({ error: "client introuvable" }, 404);
+  }
+  return c.json(await creerDossier(c, user, body2), 201);
+});
+// Nouveau dossier et sa liste de départ : celle de la firme, filtrée pour
+// l'immeuble par l'IA quand une clé est configurée.
+async function creerDossier(c, user, body2) {
   const id = newId("dos");
   await c.env.DB.prepare(
-    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+    `INSERT INTO dossiers (id, dossier_no, name, address, city, units, floors, built_year, created_by, company_id, client_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`
   ).bind(
     id,
     body2.dossier_no,
@@ -44099,40 +48204,46 @@ dossiers.post("/", async (c) => {
     body2.floors ?? null,
     body2.built_year ?? null,
     user.id,
-    user.company_id
+    user.company_id,
+    body2.client_id ?? null
   ).run();
-  const checklist = await generateChecklist(c.env.ANTHROPIC_API_KEY, {
+  const regles = evaluerRegles({ floors: body2.floors ?? null, batiment_info: null });
+  // La liste de la firme, si elle en a importé une ; sinon celle de Condo Stratégis.
+  const firme = user.company_id ? await c.env.DB.prepare("SELECT bibliotheque FROM companies WHERE id = ?1").bind(user.company_id).first() : null;
+  const gabarit = listeDeDepart(bibliothequeDeFirme(firme));
+  const filtre = await filtrerGabarit(c.env.ANTHROPIC_API_KEY, {
     units: body2.units ?? 0,
     floors: body2.floors ?? null,
     builtYear: body2.built_year ?? null
-  });
-  const items = checklist.items;
+  }, gabarit);
+  // ai_suggested reste à 0 : la liste vient du gabarit, l'IA n'a fait que la filtrer.
   const stmt = c.env.DB.prepare(
-    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)`
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code, attributs, actif) VALUES (?1, ?2, ?3, ?4, '—', 0, ?5, ?6, ?7, ?8, ?9)`
   );
   await c.env.DB.batch(
-    items.map(
-      (item, i) => stmt.bind(
-        newId("cmp"),
-        id,
-        CATEGORIES[item.cat] ? item.cat : "equipements",
-        item.name,
-        item.qty ?? "—",
-        i,
-        item.vu ?? DEFAULT_USEFUL_LIFE_YEARS[item.cat] ?? ALLOCATION_USEFUL_LIFE,
-        item.code ?? null
-      )
-    )
+    gabarit.map((item, i) => {
+      // Une règle certaine l'emporte sur le jugement de l'IA.
+      const certain = item.regle ? regles[item.regle] : void 0;
+      const actif = certain !== void 0 ? certain : !filtre.inactifs.has(i);
+      const attributs = JSON.stringify({ type: item.type, "unité": item.unite });
+      return stmt.bind(newId("cmp"), id, item.cat, item.name, i, item.vu, item.code, attributs, actif ? 1 : 0);
+    })
   );
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
-  return c.json({
+  await noterJournal(c.env.DB, { dossierId: id, userId: user.id, action: "creation", champs: [] });
+  return {
     ...dossier,
     stats: await dossierStats(c.env.DB, id),
-    // L'ingénieur doit savoir si l'inventaire a été adapté à son immeuble ou
-    // si c'est la liste générique : les deux ne se révisent pas de la même façon.
-    inventaire: { source: checklist.source, erreur: checklist.erreur, total: items.length }
-  }, 201);
-});
+    // L'inspecteur doit savoir si la liste a été filtrée pour son immeuble ou
+    // s'il reçoit le gabarit complet : les deux ne se révisent pas de la même façon.
+    inventaire: {
+      source: filtre.source,
+      erreur: filtre.erreur,
+      total: gabarit.length,
+      desactivees: filtre.inactifs.size
+    }
+  };
+}
 async function getOwnedDossier(c, id) {
   const user = await getCurrentUser(c);
   if (!user) return { user: null, dossier: null };
@@ -44143,45 +48254,249 @@ async function getOwnedDossier(c, id) {
 dossiers.get("/:id", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
-  return c.json({ ...dossier, stats: await dossierStats(c.env.DB, dossier.id) });
+  const lies = await c.env.DB.prepare("SELECT id, dossier_no, published_at, created_at, revision_de FROM dossiers WHERE id = ?1 OR revision_de = ?2")
+    .bind(dossier.revision_de ?? "", dossier.id).all();
+  return c.json({ ...dossier, stats: await dossierStats(c.env.DB, dossier.id), ...infoRevision(dossier, lies.results.concat([dossier])) });
 });
 dossiers.get("/:id/components", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
   return c.json(await listComponentsForDossier(c.env.DB, dossier.id));
 });
-// Ajout manuel d'une composante, depuis le bureau : sans visite, l'inventaire
-// généré à la création est le seul point de départ, et il faut pouvoir le compléter.
-dossiers.post("/:id/components", async (c) => {
+// Historique du dossier, du plus récent au plus ancien ; ?composante= pour
+// une seule fiche.
+dossiers.get("/:id/journal", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
-  const body2 = await c.req.json();
-  const name = String(body2.name ?? "").trim();
-  if (!name) return c.json({ error: "name requis" }, 400);
-  const cat = CATEGORIES[body2.cat] ? body2.cat : "equipements";
-  const last = await c.env.DB.prepare("SELECT MAX(sort_order) AS m FROM components WHERE dossier_id = ?1").bind(dossier.id).first();
-  const id = newId("cmp");
-  await c.env.DB.prepare(
-    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code)
-     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)`
-  ).bind(
-    id,
-    dossier.id,
-    cat,
-    name,
-    body2.qty ?? "—",
-    (last?.m ?? -1) + 1,
-    body2.useful_life_years ?? DEFAULT_USEFUL_LIFE_YEARS[cat] ?? ALLOCATION_USEFUL_LIFE,
-    body2.uniformat_code ? String(body2.uniformat_code).trim() : null
-  ).run();
-  const component = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
-  return c.json({ ...component, photos: 0 }, 201);
+  const composante = c.req.query("composante");
+  const limite = Math.min(Math.max(Number(c.req.query("limite")) || 100, 1), 500);
+  const rows = (await c.env.DB.prepare(
+    `SELECT j.*, u.name AS auteur, cmp.name AS composante FROM journal j
+       LEFT JOIN users u ON u.id = j.user_id
+       LEFT JOIN components cmp ON cmp.id = j.component_id
+       WHERE j.dossier_id = ?1 ${composante ? "AND j.component_id = ?3" : ""}
+       ORDER BY j.moment DESC LIMIT ?2`
+  ).bind(...composante ? [dossier.id, limite, composante] : [dossier.id, limite]).all()).results;
+  return c.json(rows.map((r) => ({
+    id: r.id,
+    moment: r.moment,
+    action: r.action,
+    auteur: r.auteur ?? null,
+    composante: r.component_id ? { id: r.component_id, name: r.composante ?? "Composante supprimée" } : null,
+    champs: JSON.parse(r.champs || "[]").map((x) => ({
+      ...x,
+      libelle: LIBELLES_CHAMPS[x.champ] ?? x.champ,
+      avant: x.champ === "rating" && x.avant ? RATING_LABELS[x.avant] ?? x.avant : x.avant,
+      apres: x.champ === "rating" && x.apres ? RATING_LABELS[x.apres] ?? x.apres : x.apres
+    }))
+  })));
 });
-async function buildReportContext(c) {
+dossiers.get("/:id/archive.zip", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  return reponseZip(await archiveDossier(c.env, dossier), `archive-${dossier.dossier_no}.zip`);
+});
+// Catalogue de la firme pour l'ajout sur le terrain : sa bibliothèque, ou la
+// liste de Condo Stratégis quand elle n'en a pas importé.
+dossiers.get("/:id/catalogue", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const liste = listeDeDepart(await bibliothequeDuDossier(c.env.DB, dossier.id));
+  return c.json(liste.map((item) => ({ cat: item.cat, name: item.name, vu: item.vu ?? null, code: item.code ?? null })));
+});
+// Composante trouvée sur place et absente de la liste. L'identifiant peut
+// venir de l'appareil : une création faite hors connexion et rejouée deux fois
+// (réponse perdue en route) ne crée qu'une composante.
+dossiers.post("/:id/components", async (c) => {
   const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const name = String(body2.name ?? "").replace(/\s+/g, " ").trim();
+  if (!name) return c.json({ error: "le nom de la composante est requis" }, 400);
+  if (name.length > 200) return c.json({ error: "nom trop long (200 caractères au plus)" }, 400);
+  const idClient = String(body2.id ?? "");
+  if (idClient && !/^cmp_[a-f0-9]{20}$/.test(idClient)) return c.json({ error: "identifiant invalide" }, 400);
+  if (idClient) {
+    const existante = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(idClient).first();
+    if (existante) {
+      if (existante.dossier_id !== dossier.id) return c.json({ error: "identifiant déjà utilisé" }, 409);
+      return c.json(await composanteComplete(c.env.DB, existante));
+    }
+  }
+  // Une composante de la bibliothèque apporte sa vie utile, son code et son type.
+  const biblio = await bibliothequeDuDossier(c.env.DB, dossier.id);
+  const modele = listeDeDepart(biblio).find((item) => cleTexte(item.name) === cleTexte(name)) ?? null;
+  const cat = CATEGORIES[body2.cat] ? body2.cat : modele?.cat ?? "equipements";
+  const vuDemandee = Number(body2.useful_life_years);
+  const vu = Number.isInteger(vuDemandee) && vuDemandee > 0 && vuDemandee <= 150 ? vuDemandee
+    : modele?.vu ?? DEFAULT_USEFUL_LIFE_YEARS[cat] ?? ALLOCATION_USEFUL_LIFE;
+  const code = String(body2.uniformat_code ?? "").trim().slice(0, 40) || modele?.code || null;
+  const attributs = modele ? JSON.stringify({ type: modele.type, "unité": modele.unite }) : null;
+  const qty = String(body2.qty ?? "").trim().slice(0, 80) || "—";
+  const depart = await c.env.DB.prepare(
+    "SELECT COALESCE(MAX(sort_order), -1) AS m FROM components WHERE dossier_id = ?1"
+  ).bind(dossier.id).first();
+  const id = idClient || newId("cmp");
+  await c.env.DB.prepare(
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code, attributs, actif)
+     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, 1)`
+  ).bind(id, dossier.id, cat, name, qty, (depart?.m ?? -1) + 1, vu, code, attributs).run();
+  const creee = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(id).first();
+  await noterJournal(c.env.DB, { dossierId: dossier.id, componentId: id, userId: user?.id, action: "ajout", champs: [{ champ: "name", avant: null, apres: name }] });
+  return c.json(await composanteComplete(c.env.DB, creee, biblio), 201);
+});
+// Toute la visite en un appel, pour la préparer hors connexion : chaque
+// composante avec ses photos, son guide et ses tâches du carnet, sous la
+// même forme que GET /api/components/:id.
+dossiers.get("/:id/hors-ligne", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const rows = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 ORDER BY sort_order ASC, created_at ASC").bind(dossier.id).all();
+  const photos2 = await c.env.DB.prepare(
+    `SELECT p.* FROM photos p JOIN components cmp ON cmp.id = p.component_id
+       WHERE cmp.dossier_id = ?1 ORDER BY p.created_at ASC`
+  ).bind(dossier.id).all();
+  const parComposante = new Map();
+  for (const p of photos2.results) {
+    if (!parComposante.has(p.component_id)) parComposante.set(p.component_id, []);
+    parComposante.get(p.component_id).push(p);
+  }
+  const biblio = await bibliothequeDuDossier(c.env.DB, dossier.id);
+  const precedents = await precedentsPour(c.env.DB, rows.results);
+  const composantes = rows.results.map((component) => {
+    const guide = guidePour(component);
+    return {
+      ...component,
+      photos: parComposante.get(component.id) ?? [],
+      guide: { element: guide.element, points: guide.points, defauts: guide.defauts, constats: guide.constats },
+      entretien: tachesPourComposante(component, { avecRetirees: true, biblio }).map(tacheAffichee),
+      precedent: component.origine_id ? precedents.get(component.origine_id) ?? null : null
+    };
+  });
+  return c.json({ dossier, composantes, genere_le: new Date().toISOString() });
+});
+dossiers.post("/:id/components/import", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  const buffer = await file.arrayBuffer();
+  if (buffer.byteLength > 20 * 1024 * 1024) return c.json({ error: "document trop volumineux (max 20 Mo)" }, 413);
+  let xml;
+  try {
+    xml = await lireDocx(buffer);
+  } catch (e) {
+    return c.json({ error: `lecture du .docx impossible : ${e.message}` }, 400);
+  }
+  const tableaux = tableauxDocx(xml);
+  const paragraphes = paragraphesDocx(xml);
+  if (tableaux.length === 0 && paragraphes.length === 0) {
+    return c.json({ error: "aucun texte trouvé dans ce document" }, 400);
+  }
+
+  const { items, note } = await composantesDepuisDocument(c.env.ANTHROPIC_API_KEY, { tableaux, paragraphes });
+  if (items.length === 0) {
+    return c.json({ ok: false, composantes_importees: 0, note: note || "aucune composante reconnue dans ce document." });
+  }
+
+  // On ajoute à la suite de l'inventaire existant plutôt que de l'écraser :
+  // un dossier peut déjà avoir des composantes documentées sur le terrain.
+  const depart = await c.env.DB.prepare(
+    "SELECT COALESCE(MAX(sort_order), -1) AS m FROM components WHERE dossier_id = ?1"
+  ).bind(dossier.id).first();
+  const base = (depart?.m ?? -1) + 1;
+  const stmt = c.env.DB.prepare(
+    `INSERT INTO components (id, dossier_id, cat, name, qty, ai_suggested, sort_order, useful_life_years, uniformat_code) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)`
+  );
+  await c.env.DB.batch(
+    items.map((item, i) => stmt.bind(
+      newId("cmp"),
+      dossier.id,
+      CATEGORIES[item.cat] ? item.cat : "equipements",
+      item.name,
+      item.qty ?? "—",
+      base + i,
+      item.vu ?? DEFAULT_USEFUL_LIFE_YEARS[item.cat] ?? ALLOCATION_USEFUL_LIFE,
+      item.code ?? null
+    ))
+  );
+  await noterJournal(c.env.DB, { dossierId: dossier.id, userId: (await getCurrentUser(c))?.id, action: "import", champs: [{ champ: "composantes", avant: null, apres: String(items.length) }] });
+  return c.json({
+    ok: true,
+    composantes_importees: items.length,
+    note,
+    stats: await dossierStats(c.env.DB, dossier.id)
+  });
+});
+// Photos d'un rapport : au plus 4 par fiche, dans l'ordre des étiquettes du
+// terrain, sous un budget total — un Worker n'a que 128 Mo, et un rapport de
+// 150 fiches en photos de téléphone pleine résolution ne tiendrait pas.
+const PHOTOS_PAR_FICHE = 4;
+const PHOTO_MAX_OCTETS = 4 * 1024 * 1024;
+const PHOTOS_BUDGET_OCTETS = 40 * 1024 * 1024;
+async function photosDuRapport(env, components2) {
+  const parComposante = new Map();
+  if (!components2.length) return parComposante;
+  const ids = components2.map((comp) => comp.id);
+  const lignes = [];
+  for (let i = 0; i < ids.length; i += 90) {
+    const lot = ids.slice(i, i + 90);
+    const r = await env.DB.prepare(
+      `SELECT id, component_id, r2_key, tag, created_at FROM photos WHERE component_id IN (${lot.map((_, k) => `?${k + 1}`).join(", ")}) ORDER BY created_at ASC`
+    ).bind(...lot).all();
+    lignes.push(...r.results);
+  }
+  const rang = (tag) => {
+    const i = TAG_ORDER.indexOf(tag);
+    return i < 0 ? TAG_ORDER.length : i;
+  };
+  const choisies = [];
+  for (const id of ids) {
+    const siennes = lignes.filter((l) => l.component_id === id).sort((a, b) => rang(a.tag) - rang(b.tag)).slice(0, PHOTOS_PAR_FICHE);
+    choisies.push(...siennes);
+  }
+  let budget = PHOTOS_BUDGET_OCTETS;
+  const chargees = await enParallele(choisies, 6, async (ligne) => {
+    const obj = await env.PHOTOS.get(ligne.r2_key);
+    if (!obj || obj.size > PHOTO_MAX_OCTETS || obj.size > budget) return null;
+    budget -= obj.size;
+    const image = imageDocx(new Uint8Array(await obj.arrayBuffer()));
+    return image ? { ligne, image } : null;
+  });
+  for (const p of chargees) {
+    if (!p) continue;
+    if (!parComposante.has(p.ligne.component_id)) parComposante.set(p.ligne.component_id, []);
+    parComposante.get(p.ligne.component_id).push({ image: p.image, tag: p.ligne.tag });
+  }
+  return parComposante;
+}
+async function logoDeFirme(env, company) {
+  if (company?.logo_r2_key) {
+    const obj = await env.PHOTOS.get(company.logo_r2_key);
+    const image = obj ? imageDocx(new Uint8Array(await obj.arrayBuffer())) : null;
+    if (image) return image;
+  }
+  // Le logo intégré est celui de Condo Stratégis : jamais sur le rapport d'une autre firme.
+  return estStrategis(company?.name) ? imageDocx(base64ToUint8Array(LOGO_BASE64)) : null;
+}
+async function buildReportContext(c, opts = {}) {
+  // Le portail fournit le dossier et son signataire ; ailleurs, le dossier
+  // vient de l'URL et doit appartenir à la firme de l'utilisateur.
+  const { user, dossier } = opts.dossier ? { user: opts.signataire ?? null, dossier: opts.dossier } : await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return null;
-  const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(dossier.id).all();
-  const components2 = await listComponentsForDossier(c.env.DB, dossier.id);
+  const company = dossier.company_id ? await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(dossier.company_id).first() : null;
+  // Une composante désactivée n'existe pas dans l'immeuble : ni au rapport, ni au fonds.
+  const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossier.id).all();
+  const composantesToutes = await listComponentsForDossier(c.env.DB, dossier.id);
+  const components2 = composantesToutes.filter(estActive);
+  // Étude révisée : son dossier et ses composantes, pour la section Évolution.
+  const source = dossier.revision_de ? await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1 AND company_id = ?2").bind(dossier.revision_de, dossier.company_id).first() : null;
+  const revision = source ? {
+    dossier: source,
+    annee: anneeEtude(source),
+    composantes: (await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(source.id).all()).results
+  } : null;
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
@@ -44194,15 +48509,73 @@ async function buildReportContext(c) {
     texteMaison: await texteMaisonPour(c.env.DB, dossier.company_id),
     banque: await banquePour(c.env.DB, dossier.company_id),
     textesValides: await textesValidesPour(c.env.DB, dossier.id),
-    engineerName: user?.name ?? "Condo Stratégis",
+    engineerName: user?.name ?? company?.name ?? "",
     signataire: user ?? null,
-    apiKey: c.env.ANTHROPIC_API_KEY ?? null
+    apiKey: c.env.ANTHROPIC_API_KEY ?? null,
+    company,
+    composantesToutes,
+    revision,
+    biblio: bibliothequeDeFirme(company),
+    theme: themeDeFirme(company),
+    ...opts.word ? {
+      logo: await logoDeFirme(c.env, company),
+      photos: await photosDuRapport(c.env, components2)
+    } : {}
   };
+}
+// Scénario dont le rapport tire la cotisation recommandée.
+function scenarioRetenu(projection) {
+  return projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
+    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+}
+// Valeurs des champs {{…}} d'un gabarit de firme.
+function valeursChamps(ctx) {
+  const { dossier, projection, theme, signataire } = ctx;
+  const info = infoBatiment(dossier);
+  const ordre = ordreDuSignataire(signataire);
+  const scenario = scenarioRetenu(projection);
+  const cotisation = scenario?.years?.[0]?.cotisation ?? null;
+  const unites = Number(dossier.units);
+  const valeur = (v) => v == null || v === "" ? "" : String(v);
+  return {
+    immeuble: valeur(dossier.name),
+    adresse: valeur(dossier.address),
+    ville: valeur(dossier.city),
+    adresse_complete: [dossier.address, dossier.city].filter(Boolean).join(", "),
+    dossier: valeur(dossier.dossier_no),
+    unites: valeur(dossier.units || ""),
+    etages: valeur(dossier.floors),
+    annee_construction: valeur(anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier.built_year)),
+    date_rapport: dateLongue(new Date()),
+    annee: String(new Date().getFullYear()),
+    signataire: valeur(signataire?.name ?? ctx.engineerName),
+    signataire_titre: valeur(signataire?.title),
+    ordre: valeur(signataire?.ordre_professionnel ?? ordre?.sigle),
+    no_membre: valeur(signataire?.no_membre),
+    firme: valeur(theme.nom),
+    firme_adresse: valeur(theme.adresse),
+    firme_telephone: valeur(theme.telephone),
+    firme_courriel: valeur(theme.courriel),
+    firme_site: valeur(theme.site),
+    solde_fonds: montantMaison(dossier.current_fund_balance) ?? "",
+    cotisation_actuelle: montantMaison(dossier.cotisation_annuelle) ?? "",
+    cotisation_recommandee: montantMaison(cotisation) ?? "",
+    cotisation_mensuelle_unite: cotisation != null && unites > 0 ? montantMaison(cotisation / 12 / unites) ?? "" : ""
+  };
+}
+// Le rapport Word livré : autonome aux couleurs de la firme, ou versé dans son
+// gabarit de mise en page quand elle en a importé un.
+async function produireRapportDocx(c, ctx) {
+  const miseEnPage = objetJson(ctx.company?.mise_en_page);
+  const gabarit = miseEnPage.r2_key ? await c.env.PHOTOS.get(miseEnPage.r2_key) : null;
+  if (!gabarit) return finaliserRapportDocx(await generateReportDocx(ctx));
+  const rapport = await generateReportDocx(ctx, { pourGabarit: true });
+  return composerAvecGabarit(rapport, new Uint8Array(await gabarit.arrayBuffer()), valeursChamps(ctx));
 }
 dossiers.get("/:id/projection", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
-  const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(dossier.id).all();
+  const componentsRaw = await c.env.DB.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossier.id).all();
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
@@ -44211,13 +48584,26 @@ dossiers.get("/:id/projection", async (c) => {
   return c.json(projection);
 });
 dossiers.get("/:id/report.docx", async (c) => {
-  const ctx = await buildReportContext(c);
+  const ctx = await buildReportContext(c, { word: true });
   if (!ctx) return c.json({ error: "dossier introuvable" }, 404);
-  const bytes = await generateReportDocx(ctx);
+  const bytes = await produireRapportDocx(c, ctx);
   return new Response(new Blob([new Uint8Array(bytes)]), {
     headers: {
       "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "content-disposition": `attachment; filename="${ctx.dossier.dossier_no}-etude-fonds-prevoyance.docx"`
+    }
+  });
+});
+// Tableur suivi d'entretien du dossier : les tâches du carnet des composantes
+// actives, saison par saison, dans la présentation du gabarit de la firme.
+dossiers.get("/:id/suivi-entretien.xlsx", async (c) => {
+  const ctx = await buildReportContext(c);
+  if (!ctx) return c.json({ error: "dossier introuvable" }, 404);
+  const bytes = await tableurSuiviEntretien(ctx);
+  return new Response(new Blob([bytes]), {
+    headers: {
+      "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "content-disposition": `attachment; filename="${ctx.dossier.dossier_no}-suivi-entretien.xlsx"`
     }
   });
 });
@@ -44232,9 +48618,33 @@ dossiers.get("/:id/report.xlsx", async (c) => {
     }
   });
 });
+// Quand une réponse de la fiche d'immeuble (ou le nombre d'étages) change et
+// tranche une règle, les composantes qu'elle gouverne suivent : « piscine
+// extérieure : non » désactive toute la piscine extérieure. Seules les règles
+// dont la réponse vient de changer sont appliquées, pour ne pas défaire à chaque
+// enregistrement une réactivation faite à la main par l'inspecteur.
+async function appliquerReglesModifiees(db, avant, apres, gabarit = GABARIT_STRATEGIS) {
+  const anciennes = evaluerRegles(avant);
+  const nouvelles = evaluerRegles(apres);
+  const requetes = [];
+  for (const [cle, valeur] of Object.entries(nouvelles)) {
+    if (valeur === void 0 || valeur === anciennes[cle]) continue;
+    const noms = gabarit.filter((item) => item.regle === cle).map((item) => item.name);
+    if (!noms.length) continue;
+    requetes.push(
+      db.prepare(
+        `UPDATE components SET actif = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+           WHERE dossier_id = ?2 AND actif != ?1 AND name IN (${noms.map((_, i) => `?${i + 3}`).join(", ")})`
+      ).bind(valeur ? 1 : 0, apres.id, ...noms)
+    );
+  }
+  if (!requetes.length) return 0;
+  const resultats = await db.batch(requetes);
+  return resultats.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
+}
 dossiers.patch("/:id", async (c) => {
   const id = c.req.param("id");
-  const { dossier: owned } = await getOwnedDossier(c, id);
+  const { user: auteur, dossier: owned } = await getOwnedDossier(c, id);
   if (!owned) return c.json({ error: "dossier introuvable" }, 404);
   const body2 = await c.req.json();
   const fields = [];
@@ -44263,7 +48673,16 @@ dossiers.patch("/:id", async (c) => {
     `UPDATE dossiers SET ${fields.join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${values.length}`
   ).bind(...values).run();
   const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
-  return c.json({ ...dossier, stats: await dossierStats(c.env.DB, id) });
+  const changes = differences(owned, dossier, Object.keys(body2).filter((k) => k in LIBELLES_CHAMPS));
+  const publication = changes.filter((x) => x.champ === "published_at");
+  if (publication.length) await noterJournal(c.env.DB, { dossierId: id, userId: auteur?.id, action: dossier.published_at ? "publication" : "depublication", champs: publication });
+  await noterJournal(c.env.DB, { dossierId: id, userId: auteur?.id, action: "modification", champs: changes.filter((x) => x.champ !== "published_at") });
+  // Les conditions viennent de la liste de la firme, complétée de celle de
+  // Condo Stratégis pour les dossiers créés avant son import.
+  const biblio = await bibliothequeDuDossier(c.env.DB, id);
+  const gabarit = biblio ? [...biblio.composantes, ...GABARIT_STRATEGIS.filter((item) => !biblio.noms.has(cleTexte(item.name)))] : GABARIT_STRATEGIS;
+  const composantesMisesAJour = await appliquerReglesModifiees(c.env.DB, owned, dossier, gabarit);
+  return c.json({ ...dossier, stats: await dossierStats(c.env.DB, id), composantes_mises_a_jour: composantesMisesAJour });
 });
 const photos = new Hono();
 photos.get("/:id/file", async (c) => {
@@ -44285,6 +48704,596 @@ photos.get("/:id/file", async (c) => {
     }
   });
 });
+// ── Banque de prix ───────────────────────────────────────────────────────────
+// Ce que la firme a réellement payé, ramené à un prix unitaire indexé. La
+// collecte seulement : aucune de ces routes n'écrit dans components — le coût
+// de remplacement reste saisi à la main tant qu'on n'aura pas vu ce que la
+// banque vaut sur un échantillon réel.
+const prix = new Hono();
+const PRIX_UNITES = {
+  pi2: { label: "pi²", quantifie: true },
+  pi_lin: { label: "pi lin.", quantifie: true },
+  unite: { label: "unité", quantifie: true },
+  forfait: { label: "forfait", quantifie: false }
+};
+const PRIX_PORTEES = {
+  complet: "Remplacement complet",
+  partiel: "Remplacement partiel",
+  reparation: "Réparation"
+};
+const PRIX_SOURCES = { facture: "Facture", soumission: "Soumission" };
+const PRIX_ECHANTILLON_MINCE = 5;   // en deçà, la médiane est indicative, pas une référence
+
+// Le coût par porte est le dénominateur qu'on possède toujours : le nombre
+// d'unités est connu de chaque syndicat, alors qu'une superficie de toit ne
+// l'est presque jamais. Il ne remplace pas le prix au pi² — la surface d'un toit
+// ne suit pas le nombre de portes — mais pour tout ce qui va par immeuble
+// (ascenseur, chaufferie, interphone) ou par porte, il se compare directement.
+//
+// Encore faut-il comparer ce qui se compare : un ascenseur dans un 8 portes et
+// dans un 120 portes n'est pas le même ouvrage. D'où les tranches.
+const PRIX_TRANCHES = [
+  { cle: "petit", label: "Moins de 12 portes", min: 1, max: 11 },
+  { cle: "moyen", label: "12 à 49 portes", min: 12, max: 49 },
+  { cle: "grand", label: "50 portes et plus", min: 50, max: null }
+];
+
+function trancheDe(unites) {
+  if (!unites || unites <= 0) return null;
+  return PRIX_TRANCHES.find((t) => unites >= t.min && (t.max == null || unites <= t.max)) ?? null;
+}
+
+function anneeCourante() {
+  return new Date().getUTCFullYear();
+}
+
+// Prix unitaire en dollars de l'année des travaux. Un forfait n'a pas de
+// quantité : son prix unitaire est le montant lui-même.
+function prixUnitaire(row) {
+  if (!PRIX_UNITES[row.unite]?.quantifie) return row.montant;
+  if (!row.quantite || row.quantite <= 0) return null;
+  return row.montant / row.quantite;
+}
+
+// Ramené en dollars d'aujourd'hui au même taux que la projection du fonds : un
+// prix de 2019 comparé tel quel à un prix de 2025 sous-estime le remplacement.
+// Taux constant — approximation assumée, l'indice réel varie d'une année à l'autre.
+function prixIndexe(montant, annee, anneeCible, taux) {
+  if (montant == null || !annee) return null;
+  return montant * Math.pow(1 + taux, anneeCible - annee);
+}
+
+function quantile(triees, q) {
+  if (triees.length === 0) return null;
+  const pos = (triees.length - 1) * q;
+  const bas = Math.floor(pos);
+  const haut = Math.ceil(pos);
+  if (bas === haut) return triees[bas];
+  return triees[bas] + (triees[haut] - triees[bas]) * (pos - bas);
+}
+
+function prixPublic(row, anneeCible, taux) {
+  const unitaire = prixUnitaire(row);
+  const parPorte = row.unites > 0 ? row.montant / row.unites : null;
+  const tranche = trancheDe(row.unites);
+  return {
+    ...row,
+    prix_unitaire: unitaire,
+    prix_unitaire_indexe: prixIndexe(unitaire, row.annee, anneeCible, taux),
+    prix_par_porte: parPorte,
+    prix_par_porte_indexe: prixIndexe(parPorte, row.annee, anneeCible, taux),
+    tranche: tranche?.cle ?? null,
+    tranche_label: tranche?.label ?? null,
+    unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite
+  };
+}
+
+function nombreOuNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Valide et normalise ce qui arrive du formulaire. Renvoie { erreur } ou { valeurs }.
+function lirePrixBody(body2, { partiel = false } = {}) {
+  const v = {};
+  const presence = (cle) => cle in body2;
+
+  if (!partiel || presence("description")) {
+    const description = String(body2.description ?? "").trim();
+    if (!description) return { erreur: "description requise" };
+    v.description = description;
+  }
+  if (!partiel || presence("annee")) {
+    const annee = nombreOuNull(body2.annee);
+    const max = anneeCourante() + 1;
+    if (annee == null || annee < 1980 || annee > max) return { erreur: `année des travaux invalide (1980 à ${max})` };
+    v.annee = Math.round(annee);
+  }
+  if (!partiel || presence("montant")) {
+    const montant = nombreOuNull(body2.montant);
+    if (montant == null || montant <= 0) return { erreur: "montant des travaux requis" };
+    v.montant = montant;
+  }
+  if (!partiel || presence("unite")) {
+    const unite = String(body2.unite ?? "").trim();
+    if (!PRIX_UNITES[unite]) return { erreur: "unité inconnue" };
+    v.unite = unite;
+  }
+  if (!partiel || presence("quantite")) {
+    v.quantite = nombreOuNull(body2.quantite);
+    if (v.quantite != null && v.quantite <= 0) return { erreur: "quantité invalide" };
+  }
+  if (presence("unites")) {
+    const unites = nombreOuNull(body2.unites);
+    if (unites != null && unites <= 0) return { erreur: "nombre de portes invalide" };
+    v.unites = unites == null ? null : Math.round(unites);
+  }
+  if (presence("portee")) {
+    const portee = body2.portee ? String(body2.portee) : null;
+    if (portee && !PRIX_PORTEES[portee]) return { erreur: "portée inconnue" };
+    v.portee = portee;
+  }
+  if (!partiel || presence("source")) {
+    const source = String(body2.source ?? "facture");
+    if (!PRIX_SOURCES[source]) return { erreur: "source inconnue" };
+    v.source = source;
+  }
+  if (presence("negocie")) v.negocie = body2.negocie ? 1 : 0;
+  if (presence("valide")) v.valide = body2.valide ? 1 : 0;
+  for (const cle of ["cat", "uniformat_code", "fournisseur", "ville", "source_ref", "note", "dossier_id"]) {
+    if (!partiel || presence(cle)) {
+      const brut = body2[cle];
+      v[cle] = brut === null || brut === undefined || String(brut).trim() === "" ? null : String(brut).trim();
+    }
+  }
+  return { valeurs: v };
+}
+
+// Une unité quantifiée sans quantité ne donne aucun prix unitaire : la ligne
+// serait dans la banque sans pouvoir servir. On la refuse à la saisie.
+function quantiteManquante(unite, quantite) {
+  return PRIX_UNITES[unite]?.quantifie && (quantite == null || quantite <= 0);
+}
+
+async function prixCompany(c) {
+  const user = await getCurrentUser(c);
+  if (!user?.company_id) return null;
+  return user;
+}
+
+prix.get("/", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const filtres = ["company_id = ?1"];
+  const valeurs = [user.company_id];
+  const valide = c.req.query("valide");
+  if (valide === "1" || valide === "0") {
+    filtres.push(`valide = ?${valeurs.length + 1}`);
+    valeurs.push(Number(valide));
+  }
+  const code = c.req.query("code");
+  if (code) {
+    filtres.push(`uniformat_code = ?${valeurs.length + 1}`);
+    valeurs.push(code);
+  }
+  const rows = await c.env.DB.prepare(
+    `SELECT * FROM price_observations WHERE ${filtres.join(" AND ")}
+      ORDER BY created_at DESC LIMIT 500`
+  ).bind(...valeurs).all();
+  const anneeCible = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+
+  // Les pièces du CRM derrière chaque ligne, pour que l'ingénieur voie ce qui a
+  // été fusionné avant de valider un montant.
+  const sources = await c.env.DB.prepare(
+    `SELECT s.* FROM price_observation_sources s
+       JOIN price_observations o ON o.id = s.observation_id
+      WHERE o.company_id = ?1
+      ORDER BY s.date_piece ASC`
+  ).bind(user.company_id).all();
+  const parObservation = new Map();
+  for (const s of sources.results) {
+    if (!parObservation.has(s.observation_id)) parObservation.set(s.observation_id, []);
+    parObservation.get(s.observation_id).push(s);
+  }
+
+  return c.json(rows.results.map((r) => ({
+    ...prixPublic(r, anneeCible, taux),
+    pieces: parObservation.get(r.id) ?? []
+  })));
+});
+
+// Ce que la banque sait dire aujourd'hui, par code Uniformat et par unité.
+// Les prix négociés sont écartés par défaut : un prix de portefeuille n'est pas
+// la juste valeur marchande qu'une étude doit retenir. On les compte quand même,
+// pour que la firme voie ce qui a été mis de côté.
+prix.get("/resume", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const inclureNegocies = c.req.query("negocie") === "inclus";
+  const rows = await c.env.DB.prepare(
+    "SELECT * FROM price_observations WHERE company_id = ?1"
+  ).bind(user.company_id).all();
+
+  const anneeCible = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+  const parUnite = new Map();
+  const parPorte = new Map();
+  let total = 0, valides = 0, negociesEcartes = 0, sansPrix = 0, sansPortes = 0;
+
+  const ajouter = (index, cle, base, valeur, annee) => {
+    if (!index.has(cle)) index.set(cle, { ...base, cle, prix: [], annees: [] });
+    const g = index.get(cle);
+    g.prix.push(valeur);
+    g.annees.push(annee);
+  };
+
+  for (const row of rows.results) {
+    total += 1;
+    if (row.valide !== 1) continue;
+    valides += 1;
+    if (row.negocie === 1 && !inclureNegocies) { negociesEcartes += 1; continue; }
+    const code = row.uniformat_code ?? row.cat ?? "—";
+
+    const indexe = prixIndexe(prixUnitaire(row), row.annee, anneeCible, taux);
+    if (indexe == null) sansPrix += 1;
+    else ajouter(parUnite, `${code}|${row.unite}`, {
+      uniformat_code: row.uniformat_code ?? null,
+      cat: row.cat ?? null,
+      unite: row.unite,
+      unite_label: PRIX_UNITES[row.unite]?.label ?? row.unite,
+      exemple: row.description
+    }, indexe, row.annee);
+
+    // Le coût par porte se calcule sur le montant entier, quelle que soit
+    // l'unité : c'est ce que l'immeuble a déboursé, divisé par ses portes.
+    const tranche = trancheDe(row.unites);
+    const porte = tranche ? prixIndexe(row.montant / row.unites, row.annee, anneeCible, taux) : null;
+    if (porte == null) sansPortes += 1;
+    else ajouter(parPorte, `${code}|${tranche.cle}`, {
+      uniformat_code: row.uniformat_code ?? null,
+      cat: row.cat ?? null,
+      tranche: tranche.cle,
+      tranche_label: tranche.label,
+      exemple: row.description
+    }, porte, row.annee);
+  }
+
+  const statistiques = (index) => [...index.values()].map((g) => {
+    const triees = g.prix.slice().sort((a, b) => a - b);
+    const { prix, annees, ...reste } = g;
+    return {
+      ...reste,
+      n: triees.length,
+      mince: triees.length < PRIX_ECHANTILLON_MINCE,
+      mediane: quantile(triees, 0.5),
+      p25: quantile(triees, 0.25),
+      p75: quantile(triees, 0.75),
+      annee_min: Math.min(...annees),
+      annee_max: Math.max(...annees)
+    };
+  });
+
+  // Les références au pi² se lisent par volume d'échantillon ; celles par porte
+  // se lisent par composante, pour que les trois tailles d'immeuble se suivent
+  // et que l'économie d'échelle saute aux yeux.
+  const ordreTranche = new Map(PRIX_TRANCHES.map((t, i) => [t.cle, i]));
+  const parVolume = (a, b) => b.n - a.n;
+  const parComposante = (a, b) => {
+    const codeA = a.uniformat_code ?? a.cat ?? "";
+    const codeB = b.uniformat_code ?? b.cat ?? "";
+    if (codeA !== codeB) return codeA.localeCompare(codeB);
+    return (ordreTranche.get(a.tranche) ?? 0) - (ordreTranche.get(b.tranche) ?? 0);
+  };
+
+  return c.json({
+    total,
+    valides,
+    a_valider: total - valides,
+    negocies_ecartes: negociesEcartes,
+    sans_prix_unitaire: sansPrix,
+    sans_cout_par_porte: sansPortes,
+    annee_reference: anneeCible,
+    taux_indexation: taux,
+    source_indexation: RESERVE_FUND_PARAMS.inflationSource,
+    echantillon_mince: PRIX_ECHANTILLON_MINCE,
+    tranches: PRIX_TRANCHES.map((t) => ({ cle: t.cle, label: t.label })),
+    lignes: statistiques(parUnite).sort(parVolume),
+    portes: statistiques(parPorte).sort(parComposante)
+  });
+});
+
+prix.post("/", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const { erreur, valeurs } = lirePrixBody(await c.req.json());
+  if (erreur) return c.json({ error: erreur }, 400);
+  if (quantiteManquante(valeurs.unite, valeurs.quantite)) {
+    return c.json({ error: "quantité requise pour cette unité" }, 400);
+  }
+
+  // Le dossier donne le contexte du bâtiment — un prix au pi² de toiture ne se
+  // compare qu'entre immeubles comparables. On en fige une copie : le dossier
+  // peut changer, la facture, elle, a été payée dans ce contexte-là.
+  let contexte = null;
+  if (valeurs.dossier_id) {
+    const dossier = await c.env.DB.prepare(
+      "SELECT * FROM dossiers WHERE id = ?1 AND company_id = ?2"
+    ).bind(valeurs.dossier_id, user.company_id).first();
+    if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+    contexte = JSON.stringify({
+      units: dossier.units ?? null,
+      floors: dossier.floors ?? null,
+      built_year: dossier.built_year ?? null,
+      city: dossier.city ?? null
+    });
+    if (!valeurs.ville) valeurs.ville = dossier.city ?? null;
+    // Le nombre de portes du dossier devient le dénominateur de la ligne, sauf
+    // si l'ingénieur en a saisi un autre — c'est lui qui a la facture sous les yeux.
+    if (valeurs.unites == null) valeurs.unites = dossier.units || null;
+  }
+
+  const id = newId("prx");
+  await c.env.DB.prepare(
+    `INSERT INTO price_observations
+       (id, company_id, dossier_id, cat, uniformat_code, description, fournisseur, annee,
+        montant, quantite, unite, portee, source, negocie, ville, unites, contexte, source_ref, note,
+        valide, created_by)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)`
+  ).bind(
+    id, user.company_id, valeurs.dossier_id ?? null, valeurs.cat ?? null, valeurs.uniformat_code ?? null,
+    valeurs.description, valeurs.fournisseur ?? null, valeurs.annee, valeurs.montant,
+    valeurs.quantite ?? null, valeurs.unite, valeurs.portee ?? null, valeurs.source,
+    valeurs.negocie ?? 0, valeurs.ville ?? null, valeurs.unites ?? null, contexte,
+    valeurs.source_ref ?? null, valeurs.note ?? null, valeurs.valide ?? 0, user.id
+  ).run();
+
+  const row = await c.env.DB.prepare("SELECT * FROM price_observations WHERE id = ?1").bind(id).first();
+  return c.json(prixPublic(row, anneeCourante(), RESERVE_FUND_PARAMS.inflationRate), 201);
+});
+
+// Correction d'une ligne, et validation : c'est ce geste-là qui la fait entrer
+// dans la banque.
+prix.patch("/:id", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const id = c.req.param("id");
+  const existante = await c.env.DB.prepare(
+    "SELECT * FROM price_observations WHERE id = ?1 AND company_id = ?2"
+  ).bind(id, user.company_id).first();
+  if (!existante) return c.json({ error: "ligne introuvable" }, 404);
+
+  const { erreur, valeurs } = lirePrixBody(await c.req.json(), { partiel: true });
+  if (erreur) return c.json({ error: erreur }, 400);
+  const cles = Object.keys(valeurs);
+  if (cles.length === 0) return c.json({ error: "aucun champ à mettre à jour" }, 400);
+
+  const fusionnee = { ...existante, ...valeurs };
+  if (quantiteManquante(fusionnee.unite, fusionnee.quantite)) {
+    return c.json({ error: "quantité requise pour cette unité" }, 400);
+  }
+  if (valeurs.dossier_id) {
+    const dossier = await c.env.DB.prepare(
+      "SELECT id FROM dossiers WHERE id = ?1 AND company_id = ?2"
+    ).bind(valeurs.dossier_id, user.company_id).first();
+    if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  }
+
+  const bind = cles.map((cle, i) => `${cle} = ?${i + 1}`);
+  const args = cles.map((cle) => valeurs[cle]);
+  args.push(id);
+  await c.env.DB.prepare(
+    `UPDATE price_observations SET ${bind.join(", ")},
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?${args.length}`
+  ).bind(...args).run();
+
+  const row = await c.env.DB.prepare("SELECT * FROM price_observations WHERE id = ?1").bind(id).first();
+  return c.json(prixPublic(row, anneeCourante(), RESERVE_FUND_PARAMS.inflationRate));
+});
+
+// ── Import depuis le CRM ─────────────────────────────────────────────────────
+// Le CRM Stratégis rattache déjà ses factures à un code de composante. On y lit
+// ces rattachements — jamais on n'y écrit — pour éviter de ressaisir à la main
+// ce qui est déjà classé. Ce que le CRM ne donne pas, c'est la quantité : une
+// ligne importée arrive donc à valider, et c'est l'ingénieur qui ajoute la
+// superficie sans laquelle il n'y a pas de prix unitaire.
+const CRM_CONFIANCE = "haute";
+const CRM_CANDIDATS_MAX = 400;
+
+// Le binding porte les factures d'une seule entreprise. Une autre firme
+// locataire de l'application ne doit pas les atteindre, binding ou pas.
+function crmRefus(c, user) {
+  if (!c.env.CRM) return "la base du CRM n'est pas liée à ce worker";
+  if (!c.env.CRM_COMPANY_ID || user.company_id !== c.env.CRM_COMPANY_ID) {
+    return "l'import depuis le CRM n'est pas ouvert à cette entreprise";
+  }
+  return null;
+}
+
+// Une facture de travaux est souvent payée en versements : quatre lignes, même
+// syndicat, même composante, le même mois, pour un seul toit. Prises une à une
+// elles donneraient quatre prix de toiture. La clé regroupe donc le travail,
+// et le détail des pièces reste visible pour qu'une fusion abusive se voie.
+function crmCle(piece) {
+  const syndicat = piece.syndicat_id ?? piece.syndicat_name ?? "sans-syndicat";
+  const mois = (piece.date ?? "").slice(0, 7);
+  return `${syndicat}|${piece.component_code}|${mois}`;
+}
+
+async function crmCandidats(c, user) {
+  const rows = await c.env.CRM.prepare(
+    `SELECT m.source_type, m.source_id, m.component_code, m.amount, m.description,
+            m.reference_url, m.document_date, m.syndicat_name,
+            f.numero_facture, f.vendor_name, f.date_facture, f.syndicat_id,
+            s.nom AS syndicat_nom, s.units, s.city
+       FROM component_cost_matches m
+       LEFT JOIN syndicat_factures f
+              ON f.id = m.source_id AND m.source_type = 'syndicat_facture'
+       LEFT JOIN syndicats s ON s.id = f.syndicat_id
+      WHERE m.confidence = ?1
+        AND m.amount > 0
+        AND (m.source_type <> 'syndicat_facture' OR f.deleted_at IS NULL)
+      ORDER BY COALESCE(f.date_facture, m.document_date) DESC
+      LIMIT ?2`
+  ).bind(CRM_CONFIANCE, CRM_CANDIDATS_MAX).all();
+
+  const dejaImportees = await c.env.DB.prepare(
+    "SELECT source_type, source_id FROM price_observation_sources WHERE company_id = ?1"
+  ).bind(user.company_id).all();
+  const vues = new Set(dejaImportees.results.map((r) => `${r.source_type}:${r.source_id}`));
+
+  const groupes = new Map();
+  let sansDate = 0, dejaVues = 0;
+
+  for (const row of rows.results) {
+    if (vues.has(`${row.source_type}:${row.source_id}`)) { dejaVues += 1; continue; }
+    const date = row.date_facture ?? row.document_date ?? null;
+    // Sans date, pas d'année de travaux — donc pas d'indexation possible.
+    if (!date) { sansDate += 1; continue; }
+    const piece = {
+      source_type: row.source_type,
+      source_id: row.source_id,
+      component_code: row.component_code,
+      montant: row.amount,
+      date: date.slice(0, 10),
+      description: row.description ?? null,
+      reference: row.numero_facture ?? row.reference_url ?? null,
+      fournisseur: row.vendor_name ?? null,
+      syndicat_id: row.syndicat_id ?? null,
+      syndicat_name: row.syndicat_nom ?? row.syndicat_name ?? null,
+      units: row.units ?? null,
+      city: row.city ?? null
+    };
+    const cle = crmCle(piece);
+    if (!groupes.has(cle)) {
+      groupes.set(cle, {
+        cle,
+        component_code: piece.component_code,
+        syndicat: piece.syndicat_name,
+        units: piece.units,
+        ville: piece.city,
+        mois: piece.date.slice(0, 7),
+        annee: Number(piece.date.slice(0, 4)),
+        pieces: []
+      });
+    }
+    const g = groupes.get(cle);
+    g.pieces.push(piece);
+    if (piece.units != null && g.units == null) g.units = piece.units;
+    if (piece.city && !g.ville) g.ville = piece.city;
+    if (piece.syndicat_name && !g.syndicat) g.syndicat = piece.syndicat_name;
+  }
+
+  const lignes = [...groupes.values()].map((g) => {
+    // Une facture payée l'emporte sur une soumission : c'est un prix conclu,
+    // pas un prix demandé.
+    const estFacture = g.pieces.some((p) => p.source_type === "syndicat_facture");
+    // La description la plus longue est celle qui dit le plus de la portée —
+    // l'objet d'un courriel dit rarement ce qui a été fait.
+    const description = g.pieces
+      .map((p) => (p.description ?? "").trim())
+      .sort((a, b) => b.length - a.length)[0] || `Travaux ${g.component_code}`;
+    return {
+      ...g,
+      total: g.pieces.reduce((s, p) => s + p.montant, 0),
+      source: estFacture ? "facture" : "soumission",
+      description: description.slice(0, 200),
+      fournisseur: g.pieces.find((p) => p.fournisseur)?.fournisseur ?? null,
+      reference: g.pieces.find((p) => p.reference)?.reference ?? null
+    };
+  }).sort((a, b) => (a.mois < b.mois ? 1 : a.mois > b.mois ? -1 : b.total - a.total));
+
+  return { lignes, sansDate, dejaVues };
+}
+
+prix.get("/crm", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+  const { lignes, sansDate, dejaVues } = await crmCandidats(c, user);
+  return c.json({
+    confiance: CRM_CONFIANCE,
+    candidats: lignes.length,
+    pieces_sans_date: sansDate,
+    pieces_deja_importees: dejaVues,
+    lignes
+  });
+});
+
+// L'import ne fait pas entrer un prix dans la banque : il crée une ligne à
+// valider, en forfait faute de quantité, avec ses pièces attachées.
+prix.post("/crm/import", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const refus = crmRefus(c, user);
+  if (refus) return c.json({ error: refus }, 403);
+
+  const body2 = await c.req.json();
+  const demandees = Array.isArray(body2.cles) ? body2.cles.map(String) : [];
+  if (demandees.length === 0) return c.json({ error: "aucun candidat demandé" }, 400);
+
+  // Les groupes sont recalculés ici : le total versé à la banque doit venir du
+  // CRM, jamais d'un montant envoyé par le navigateur.
+  const { lignes } = await crmCandidats(c, user);
+  const parCle = new Map(lignes.map((l) => [l.cle, l]));
+  const importees = [];
+  const ignorees = [];
+
+  for (const cle of demandees) {
+    const groupe = parCle.get(cle);
+    if (!groupe) { ignorees.push(cle); continue; }
+    const id = newId("prx");
+    const contexte = JSON.stringify({
+      units: groupe.units ?? null,
+      city: groupe.ville ?? null,
+      syndicat: groupe.syndicat ?? null,
+      crm_mois: groupe.mois
+    });
+    const note = `Importé du CRM — ${groupe.pieces.length} pièce(s) : ` + groupe.pieces
+      .map((p) => `${p.reference ?? p.source_id} (${Math.round(p.montant)} $, ${p.date})`)
+      .join(", ");
+
+    const instructions = [
+      c.env.DB.prepare(
+        `INSERT INTO price_observations
+           (id, company_id, uniformat_code, description, fournisseur, annee, montant,
+            quantite, unite, source, ville, unites, contexte, source_ref, note, valide, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'forfait', ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14)`
+      ).bind(
+        id, user.company_id, groupe.component_code, groupe.description,
+        groupe.fournisseur, groupe.annee, groupe.total, groupe.source,
+        groupe.ville ?? null, groupe.units ?? null, contexte, groupe.reference ?? null,
+        note, user.id
+      )
+    ];
+    for (const p of groupe.pieces) {
+      instructions.push(c.env.DB.prepare(
+        `INSERT INTO price_observation_sources
+           (observation_id, company_id, source_type, source_id, montant, reference, date_piece, description)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+      ).bind(id, user.company_id, p.source_type, p.source_id, p.montant,
+             p.reference ?? null, p.date, p.description ?? null));
+    }
+    await c.env.DB.batch(instructions);
+    importees.push({ cle, id, montant: groupe.total, pieces: groupe.pieces.length });
+  }
+
+  return c.json({ importees: importees.length, ignorees: ignorees.length, lignes: importees }, 201);
+});
+
+prix.delete("/:id", async (c) => {
+  const user = await prixCompany(c);
+  if (!user) return c.json({ error: "aucune entreprise associée à ce compte" }, 403);
+  const res = await c.env.DB.prepare(
+    "DELETE FROM price_observations WHERE id = ?1 AND company_id = ?2"
+  ).bind(c.req.param("id"), user.company_id).run();
+  if (!res.meta?.changes) return c.json({ error: "ligne introuvable" }, 404);
+  return c.json({ ok: true });
+});
+
 globalThis.process = _process;
 globalThis.console = workerdConsole;
 const app = new Hono();
@@ -44294,16 +49303,37 @@ app.use("/api/*", async (c, next) => {
   if (PUBLIC_PREFIXES.some((p) => c.req.path === p || c.req.path.startsWith(p + "/"))) return next();
   const user = await getCurrentUser(c);
   if (!user) return c.json({ error: "non authentifié" }, 401);
+  // Un membre du portail d'un syndicat n'atteint que le portail : jamais les
+  // dossiers, composantes ou réglages d'une firme.
+  if (user.role === "portail" && !c.req.path.startsWith("/api/portail")) return c.json({ error: "accès réservé au portail du syndicat" }, 403);
+  return next();
+});
+app.use("/api/*", async (c, next) => {
+  if (["/api/dossiers", "/api/components", "/api/companies", "/api/auth", "/api/portail", "/api/clients"].some((p) => c.req.path.startsWith(p))) {
+    await assurerColonnes(c.env.DB);
+  }
   return next();
 });
 app.route("/api/auth", auth);
 app.route("/api/companies", companies);
 app.route("/api/dossiers", dossiers);
+app.route("/api/dossiers", dossiersPortail);
 app.route("/api/components", components);
 app.route("/api/photos", photos);
+app.route("/api/prix", prix);
+app.route("/api/portail", portail);
+app.route("/api/clients", clientsApi);
+app.route("/api/sauvegardes", sauvegardes);
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 const index = {
-  fetch: app.fetch
+  fetch: app.fetch,
+  // Le 1er de chaque mois : les tâches du carnet partent par courriel aux
+  // membres des portails.
+  // Le dimanche : sauvegarde complète de la base dans R2.
+  async scheduled(event, env, ctx) {
+    if (event.cron === CRON_SAUVEGARDE) ctx.waitUntil(sauvegarderBase(env));
+    else ctx.waitUntil(rappelsMensuels(env));
+  }
 };
 export {
   index as default

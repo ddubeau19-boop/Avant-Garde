@@ -4,6 +4,9 @@
 // companies ("entreprises") and their engineer accounts.
 // ============================================================
 
+import { creerBibliotheque } from '../shared/bibliotheque.js';
+import { creerModeles } from '../shared/modeles.js';
+
 const TOKEN_KEY = 'cs_admin_token';
 
 // ---------------------------------------------------------------
@@ -11,7 +14,7 @@ const TOKEN_KEY = 'cs_admin_token';
 // ---------------------------------------------------------------
 const state = {
   booting: true,
-  screen: 'login', // login | forbidden | companies | company
+  screen: 'login', // login | forbidden | companies | company | bibliotheque
 
   token: null,
   user: null,
@@ -50,14 +53,7 @@ const state = {
   newEngineerOpen: false,
   newEngName: '',
   newEngEmail: '',
-  template: null,          // { catalogue, sections, defauts, source_filename, ... }
-  templateLoading: false,
-  templateError: null,
-  templateNote: null,
-  templateUploading: false,
-  templateOpenCle: null,   // section dépliée dans l'éditeur
-  templateEdits: {},       // clé -> texte brut en cours d'édition
-  templateSaving: false,
+  roleSaving: null,        // id du compte dont le rôle change
   newEngTitle: '',
   newEngOrdre: '',
   newEngNoMembre: '',
@@ -263,6 +259,42 @@ function doLogout() {
 // ---------------------------------------------------------------
 // Actions — companies list
 // ---------------------------------------------------------------
+// Sauvegardes hebdomadaires de la base (R2) : liste, téléchargement, sauvegarde immédiate.
+const sauv = { liste: null, erreur: null, enCours: false };
+async function chargerSauvegardes() {
+  try { sauv.liste = await apiJson('/api/sauvegardes'); sauv.erreur = null; }
+  catch (e) { sauv.erreur = e.message || 'Impossible de lister les sauvegardes.'; }
+  render();
+}
+async function sauvegarderMaintenant() {
+  sauv.enCours = true; sauv.erreur = null; render();
+  try { await apiJson('/api/sauvegardes', { method: 'POST' }); await chargerSauvegardes(); }
+  catch (e) { sauv.erreur = e.message || 'La sauvegarde a échoué.'; }
+  sauv.enCours = false; render();
+}
+async function telechargerSauvegarde(nom) {
+  try {
+    const res = await apiRaw(`/api/sauvegardes/${encodeURIComponent(nom)}`);
+    if (!res.ok) throw new Error('Téléchargement impossible.');
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement('a'); a.href = url; a.download = nom;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  } catch (e) { sauv.erreur = e.message; render(); }
+}
+function sauvegardesHtml() {
+  const taille = (o) => o < 1024 * 1024 ? `${Math.max(1, Math.round(o / 1024))} Ko` : `${(o / 1024 / 1024).toFixed(1).replace('.', ',')} Mo`;
+  return `
+    <div class="eng-section-head"><span class="lbl">Sauvegardes de la base</span><div class="rule"></div>
+      <button class="btn-row-action" data-action="sauvegarder" ${sauv.enCours ? 'disabled' : ''}>${sauv.enCours ? 'Sauvegarde…' : 'Sauvegarder maintenant'}</button></div>
+    <div class="tpl-lead">Chaque dimanche, toute la base est copiée dans R2 (26 dernières gardées, six mois). D1 permet aussi de revenir à n'importe quel moment des 30 derniers jours. Procédure de restauration : <code>worker/SAUVEGARDES.md</code>.</div>
+    ${sauv.erreur ? `<div class="login-error" style="margin:10px 0">${escapeHtml(sauv.erreur)}</div>` : ''}
+    ${!sauv.liste ? spinnerBlock('Chargement…') : sauv.liste.length ? `
+    <div class="dossiers-table">${sauv.liste.slice(0, 8).map(x => `
+      <div class="dt-row champ-row"><div class="mono-cell">${escapeHtml(x.nom)}</div><div style="display:flex;justify-content:space-between;align-items:center"><span class="dt-sub">${fmtDate(x.le)} · ${taille(x.octets)}</span><button class="btn-row-action" data-action="sauvegarde-dl" data-nom="${escapeHtml(x.nom)}">Télécharger</button></div></div>`).join('')}
+    </div>` : '<div class="tpl-lead">Aucune sauvegarde pour l\'instant : la première aura lieu dimanche, ou maintenant.</div>'}`;
+}
+
 async function loadCompanies() {
   state.companiesLoading = true;
   state.companiesError = null;
@@ -273,6 +305,7 @@ async function loadCompanies() {
     state.companiesLoading = false;
     render();
     loadListLogos(state.companies);
+    chargerSauvegardes();
   } catch (e) {
     state.companiesLoading = false;
     state.companiesError = e.message || 'Impossible de charger les entreprises.';
@@ -328,6 +361,8 @@ async function openCompany(id) {
   state.newEngError = null;
   state.tempPasswordInfo = null;
   state.logoError = null;
+  bib.reset();
+  modeles.reset();
   await loadCompanyDetail(id);
 }
 
@@ -341,7 +376,8 @@ async function loadCompanyDetail(id) {
     state.companyLoading = false;
     render();
     loadCompanyLogo(id, !!data.hasLogo);
-    loadTemplate(id);
+    modeles.charger();
+    bib.charger();
   } catch (e) {
     state.companyLoading = false;
     state.companyError = e.message || 'Impossible de charger cette entreprise.';
@@ -349,101 +385,59 @@ async function loadCompanyDetail(id) {
   }
 }
 
-async function loadTemplate(id) {
-  state.templateLoading = true;
-  state.templateError = null;
+// ---------------------------------------------------------------
+// Bibliothèque de composantes (page partagée avec la console bureau)
+// ---------------------------------------------------------------
+// Identité, mise en page et texte du rapport (page partagée avec la console bureau).
+const modeles = creerModeles({
+  apiJson: (path, opts) => apiJson(path, opts),
+  render: () => render(),
+  escapeHtml: (x) => escapeHtml(x),
+  fmtDate: (x) => fmtDate(x),
+  spinnerBlock: (x) => spinnerBlock(x),
+  companyId: () => state.companyId,
+});
+const bib = creerBibliotheque({
+  apiJson: (path, opts) => apiJson(path, opts),
+  apiRaw: (path, opts) => apiRaw(path, opts),
+  render: () => render(),
+  escapeHtml: (x) => escapeHtml(x),
+  fmtDate: (x) => fmtDate(x),
+  spinnerBlock: (x) => spinnerBlock(x),
+  companyId: () => state.companyId,
+});
+
+function openBibliotheque() {
+  state.screen = 'bibliotheque';
+  bib.s.note = null;
+  bib.s.erreurs = [];
+  bib.s.error = null;
   render();
-  try {
-    state.template = await apiJson(`/api/companies/${id}/template`);
-    state.templateEdits = {};
-  } catch (e) {
-    state.templateError = e.message || 'Impossible de charger le gabarit.';
-  }
-  state.templateLoading = false;
-  render();
+  window.scrollTo(0, 0);
+  if (!bib.s.biblio) bib.charger();
 }
 
-async function uploadTemplate(file) {
-  if (!file || state.templateUploading) return;
-  state.templateUploading = true;
-  state.templateError = null;
-  state.templateNote = null;
+function backToCompany() {
+  state.screen = 'company';
   render();
-  try {
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await apiJson(`/api/companies/${state.companyId}/template`, { method: 'POST', body: fd });
-    const n = (res.sections_remplies || []).length;
-    const reste = (res.sections_par_defaut || []).length;
-    state.templateNote = res.note
-      || `${res.paragraphes} paragraphes lus. ${n} section${n > 1 ? 's' : ''} reprise${n > 1 ? 's' : ''} du document${reste ? `, ${reste} conservée${reste > 1 ? 's' : ''} au gabarit intégré faute de correspondance claire` : ''}. Relisez-les avant de produire un rapport.`;
-    await loadTemplate(state.companyId);
-  } catch (e) {
-    state.templateError = e.message || "L'import du gabarit a échoué.";
-  }
-  state.templateUploading = false;
-  render();
+  window.scrollTo(0, 0);
 }
 
-// Enregistre une section. Le texte saisi est renvoyé dans la forme attendue par
-// la section : une chaîne, une liste de lignes, ou des paires « terme : définition ».
-async function saveTemplateSection(cle) {
-  const sec = (state.template && state.template.catalogue || []).find(x => x.cle === cle);
-  if (!sec || state.templateSaving) return;
-  const brut = state.templateEdits[cle];
-  if (brut == null) { state.templateOpenCle = null; render(); return; }
-  let valeur;
-  const lignes = brut.split('\n').map(l => l.trim()).filter(Boolean);
-  if (sec.forme === 'texte') valeur = brut.trim();
-  else if (sec.forme === 'paires') valeur = lignes.map(l => { const i = l.indexOf(' : '); return i < 0 ? null : [l.slice(0, i).trim(), l.slice(i + 3).trim()]; }).filter(Boolean);
-  else valeur = lignes;
-
-  const sections = Object.assign({}, state.template.sections || {});
-  if ((Array.isArray(valeur) && valeur.length === 0) || (typeof valeur === 'string' && !valeur)) delete sections[cle];
-  else sections[cle] = valeur;
-
-  state.templateSaving = true;
+// Rôle d'un compte : ingénieur ou administrateur de la firme.
+async function setEngineerRole(userId, role) {
+  if (state.roleSaving) return;
+  state.roleSaving = userId;
   render();
   try {
-    await apiJson(`/api/companies/${state.companyId}/template`, { method: 'PATCH', body: JSON.stringify({ sections }) });
-    state.templateOpenCle = null;
-    state.templateNote = null;
-    await loadTemplate(state.companyId);
+    const u = await apiJson(`/api/companies/${state.companyId}/engineers/${userId}`, { method: 'PATCH', body: JSON.stringify({ role }) });
+    const liste = (state.company && state.company.engineers) || [];
+    const idx = liste.findIndex(e => e.id === userId);
+    if (idx >= 0) liste[idx] = Object.assign({}, liste[idx], u);
   } catch (e) {
-    state.templateError = e.message || "L'enregistrement a échoué.";
+    alert(e.message || 'Le changement de rôle a échoué.');
   }
-  state.templateSaving = false;
+  state.roleSaving = null;
   render();
-}
-
-async function clearTemplateSection(cle) {
-  const sections = Object.assign({}, state.template && state.template.sections || {});
-  delete sections[cle];
-  state.templateSaving = true;
-  render();
-  try {
-    await apiJson(`/api/companies/${state.companyId}/template`, { method: 'PATCH', body: JSON.stringify({ sections }) });
-    delete state.templateEdits[cle];
-    state.templateOpenCle = null;
-    await loadTemplate(state.companyId);
-  } catch (e) {
-    state.templateError = e.message || "L'opération a échoué.";
-  }
-  state.templateSaving = false;
-  render();
-}
-
-async function resetTemplate() {
-  if (!confirm("Remettre toutes les sections au gabarit intégré ? Le document importé reste conservé, mais son texte ne sera plus utilisé dans les rapports.")) return;
-  try {
-    await apiJson(`/api/companies/${state.companyId}/template`, { method: 'DELETE' });
-    state.templateNote = null;
-    state.templateEdits = {};
-    await loadTemplate(state.companyId);
-  } catch (e) {
-    state.templateError = e.message || "L'opération a échoué.";
-    render();
-  }
 }
 
 function backToCompanies() {
@@ -623,6 +617,7 @@ function renderLogin() {
         <label class="field-label" for="login-password">Mot de passe</label>
         <div class="field-box"><i data-lucide="lock"></i><input id="login-password" data-role="login-password" name="password" type="password" autocomplete="current-password" placeholder="Mot de passe" value="${escapeHtml(state.loginPassword || '')}" required></div>
         <button type="submit" class="btn-primary" style="width:100%" ${state.loginLoading ? 'disabled' : ''}>${state.loginLoading ? 'Connexion…' : 'Se connecter'}<i data-lucide="${state.loginLoading ? 'loader-2' : 'arrow-right'}" class="${state.loginLoading ? 'spin' : ''}"></i></button>
+        <a href="/compte/?retour=/admin/" style="display:block;text-align:center;margin-top:14px;font-size:12.5px;color:var(--ink-500)">Mot de passe oublié ?</a>
       </form>
     </div>
   </div>`;
@@ -662,6 +657,7 @@ function renderShell() {
   let main = '';
   if (state.screen === 'companies') main = renderCompanies();
   else if (state.screen === 'company') main = renderCompanyDetail();
+  else if (state.screen === 'bibliotheque') main = renderBibliotheque();
   return `<div class="app-shell">${topbarHtml()}${main}</div>`;
 }
 
@@ -704,6 +700,7 @@ function renderCompanies() {
         <div><button class="btn-row-action" data-action="open-company" data-id="${c.id}">Ouvrir</button></div>
       </div>`).join('')}
     </div>`}
+    ${sauvegardesHtml()}
   </div>`;
 }
 
@@ -785,7 +782,11 @@ function renderCompanyDetail() {
       <div class="dt-row eng-row">
         <div class="dt-name">${escapeHtml(e.name || '—')}</div>
         <div class="mono-cell">${escapeHtml(e.email || '—')}</div>
-        <div><span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">${e.role === 'super_admin' ? 'Admin' : 'Ingénieur'}</span></div>
+        <div class="role-cell">${e.role === 'super_admin'
+          ? `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">Super admin</span>`
+          : e.role === 'admin'
+            ? `<span class="status-badge" style="background:var(--orange-wash);color:var(--ink-800)">Admin de la firme</span><button class="role-toggle" data-action="engineer-role" data-id="${e.id}" data-role-cible="engineer" ${state.roleSaving ? 'disabled' : ''}>${state.roleSaving === e.id ? '…' : 'Retirer'}</button>`
+            : `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">Ingénieur</span><button class="role-toggle" data-action="engineer-role" data-id="${e.id}" data-role-cible="admin" ${state.roleSaving ? 'disabled' : ''} title="Un administrateur de la firme peut importer sa bibliothèque de composantes depuis la console bureau.">${state.roleSaving === e.id ? '…' : 'Nommer admin'}</button>`}</div>
         <div>${e.ordre_professionnel && e.no_membre
           ? `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">${escapeHtml(e.ordre_professionnel)} ${escapeHtml(e.no_membre)}</span>`
           : `<span class="status-badge" title="La section 8.0 du rapport sortira avec « à compléter avant signature »." style="background:#FFF1EC;color:#B03A1A">Bloc incomplet</span>`}</div>
@@ -793,73 +794,36 @@ function renderCompanyDetail() {
       </div>`).join('')}
     </div>
 
-    ${templateCardHtml()}
+    ${bibliothequeCardHtml()}
+    ${modeles.themeCardHtml()}
+    ${modeles.miseEnPageCardHtml()}
+    ${modeles.templateCardHtml()}
   </div>`;
 }
 
-// Aperçu d'une section : ce que la firme a fourni, ou le texte intégré.
-function apercuSection(val) {
-  if (val == null) return '';
-  if (typeof val === 'string') return val;
-  if (Array.isArray(val)) {
-    if (val.length && Array.isArray(val[0])) return val.map(pr => pr.join(' : ')).join('\n');
-    return val.join('\n');
-  }
-  if (typeof val === 'object') return Object.entries(val).map(([k, v]) => k + '\n' + apercuSection(v)).join('\n\n');
-  return String(val);
-}
-
-function templateCardHtml() {
-  const t = state.template;
-  const importe = t && t.sections ? Object.keys(t.sections) : [];
+function bibliothequeCardHtml() {
   return `
   <div>
     <div class="eng-section-head">
-      <span class="lbl">Gabarit de rapport</span>
+      <span class="lbl">Bibliothèque de composantes</span>
       <div class="rule"></div>
-      <label class="btn-pill-sm">${state.templateUploading ? 'Lecture du document…' : 'Importer un .docx'}<input type="file" accept=".docx" data-role="template-file" style="display:none" ${state.templateUploading ? 'disabled' : ''}></label>
+      <button class="btn-pill-sm" data-action="biblio-open"><i data-lucide="library" style="width:14px;height:14px"></i>Ouvrir la bibliothèque</button>
     </div>
-    <div class="tpl-lead">Le texte de fond des rapports de cette entreprise — méthodologie, limitations légales, déclaration, lexique. Les sections non fournies gardent le gabarit intégré.</div>
-
-    ${state.templateError ? `<div class="login-error" style="margin:10px 0">${escapeHtml(state.templateError)}</div>` : ''}
-    ${state.templateNote ? `<div class="temp-pass-warn" style="margin:10px 0"><i data-lucide="info"></i><span>${escapeHtml(state.templateNote)}</span></div>` : ''}
-
-    ${state.templateLoading ? spinnerBlock('Chargement du gabarit…') : !t ? '' : `
-      <div class="tpl-lead" style="margin:10px 0 14px">
-        ${t.source_filename ? `Importé depuis <code>${escapeHtml(t.source_filename)}</code> le ${fmtDate(t.imported_at)} · ` : ''}
-        <strong>${importe.length}</strong> section${importe.length > 1 ? 's' : ''} sur ${t.catalogue.length} proviennent de cette entreprise.
-        ${importe.length ? `<button class="btn-row-action" style="margin-left:10px" data-action="template-reset">Tout remettre au gabarit intégré</button>` : ''}
-      </div>
-
-      <div class="dossiers-table">
-        ${t.catalogue.map(sec => {
-          const propre = t.sections && t.sections[sec.cle] != null;
-          const ouvert = state.templateOpenCle === sec.cle;
-          const valeur = state.templateEdits[sec.cle] != null
-            ? state.templateEdits[sec.cle]
-            : apercuSection(propre ? t.sections[sec.cle] : (t.defauts || {})[sec.cle]);
-          return `
-          <div class="dt-row tpl-row">
-            <div class="dt-name">${escapeHtml(sec.label)}</div>
-            <div>${propre
-              ? `<span class="status-badge" style="background:#E8F5E9;color:#1B5E20">Gabarit de l'entreprise</span>`
-              : `<span class="status-badge" style="background:var(--ink-100);color:var(--ink-600)">Gabarit intégré</span>`}</div>
-            <div><button class="btn-row-action" data-action="template-toggle" data-cle="${escapeHtml(sec.cle)}">${ouvert ? 'Fermer' : 'Voir / corriger'}</button></div>
-          </div>
-          ${ouvert ? `
-          <div class="tpl-edit">
-            <div class="tpl-lead" style="margin-bottom:8px">${sec.forme === 'paires' ? 'Une ligne par entrée, au format « terme : définition ».' : sec.forme === 'texte' ? 'Un seul bloc de texte.' : 'Une ligne par paragraphe ou par puce.'}${sec.sous ? ' Cette section contient plusieurs sous-parties : la modifier à la main est déconseillé, préférez réimporter le .docx.' : ''}</div>
-            <textarea data-role="template-text" data-cle="${escapeHtml(sec.cle)}" rows="10" ${sec.sous ? 'readonly' : ''}>${escapeHtml(valeur)}</textarea>
-            ${sec.sous ? '' : `<div class="tpl-actions">
-              <button class="btn-primary" data-action="template-save" data-cle="${escapeHtml(sec.cle)}" ${state.templateSaving ? 'disabled' : ''}>${state.templateSaving ? 'Enregistrement…' : 'Enregistrer cette section'}</button>
-              ${propre ? `<button class="btn-secondary" data-action="template-clear" data-cle="${escapeHtml(sec.cle)}">Revenir au gabarit intégré</button>` : ''}
-            </div>`}
-          </div>` : ''}`;
-        }).join('')}
-      </div>`}
+    <div class="tpl-lead">La liste de composantes qui sert de départ à chaque nouvelle visite, avec les tâches du carnet d'entretien rattachées à chacune. Un administrateur de la firme peut aussi importer sa liste depuis la console bureau.</div>
+    ${bib.resumeHtml()}
   </div>`;
 }
 
+function renderBibliotheque() {
+  const c = state.company;
+  return bib.html({
+    retour: `<button class="back-link" data-action="biblio-back"><i data-lucide="chevron-left"></i>${escapeHtml((c && c.name) || 'Entreprise')}</button>`,
+    eyebrow: (c && c.name) || '',
+  });
+}
+
+// Identité du rapport : couleurs, polices et coordonnées reprises par le
+// rapport Word. Un champ vide garde la valeur par défaut.
 // ---------------------------------------------------------------
 // Event delegation
 // ---------------------------------------------------------------
@@ -906,19 +870,16 @@ function initEvents() {
     else if (t.matches('[data-role="new-eng-title"]')) state.newEngTitle = t.value;
     else if (t.matches('[data-role="new-eng-ordre"]')) state.newEngOrdre = t.value;
     else if (t.matches('[data-role="new-eng-no-membre"]')) state.newEngNoMembre = t.value;
+    else if (bib.input(t)) return;
     // Pas de render() ici : re-dessiner le textarea à chaque frappe renverrait
     // le curseur à la fin.
-    else if (t.matches('[data-role="template-text"]')) state.templateEdits[t.getAttribute('data-cle')] = t.value;
+    else if (modeles.input(t)) return;
   });
 
   app.addEventListener('change', (e) => {
     const t = e.target;
-    if (t && t.matches && t.matches('[data-role="template-file"]')) {
-      const f = t.files && t.files[0];
-      t.value = '';
-      if (f) uploadTemplate(f);
-      return;
-    }
+    if (t && t.matches && modeles.change(t)) return;
+    if (t && t.matches && bib.change(t)) return;
     if (t && t.matches && t.matches('[data-role="logo-file"]')) {
       const file = t.files && t.files[0];
       if (file) uploadLogo(file);
@@ -929,24 +890,22 @@ function initEvents() {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
     const action = btn.getAttribute('data-action');
+    if (bib.click(action, btn)) return;
+    if (modeles.click(action, btn)) return;
     switch (action) {
+      case 'sauvegarder': sauvegarderMaintenant(); break;
+      case 'sauvegarde-dl': telechargerSauvegarde(btn.getAttribute('data-nom')); break;
       case 'logout':
         doLogout();
         break;
-      case 'template-toggle': {
-        const cle = btn.getAttribute('data-cle');
-        state.templateOpenCle = state.templateOpenCle === cle ? null : cle;
-        render();
+      case 'biblio-open':
+        openBibliotheque();
         break;
-      }
-      case 'template-save':
-        saveTemplateSection(btn.getAttribute('data-cle'));
+      case 'biblio-back':
+        backToCompany();
         break;
-      case 'template-clear':
-        clearTemplateSection(btn.getAttribute('data-cle'));
-        break;
-      case 'template-reset':
-        resetTemplate();
+      case 'engineer-role':
+        setEngineerRole(btn.getAttribute('data-id'), btn.getAttribute('data-role-cible'));
         break;
       case 'new-company-open':
         openNewCompany();

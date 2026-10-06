@@ -65,6 +65,13 @@ jobs:
           echo "$tables tables créées."
           [ "$tables" -ge 5 ]
 
+      # Le worker tourne en local sur une base créée à partir de schema.sql :
+      # moteur financier calculé à la main, étanchéité des firmes et des
+      # rôles, comptes, rapport, révision, portail. Aucun accès à la
+      # production. Un test qui échoue bloque le déploiement (needs).
+      - name: Tests automatisés
+        run: node worker/tests/run.mjs
+
   # Filet visible tant que la protection de branche n'est pas activée côté GitHub :
   # une poussée directe sur le tronc laisse une trace rouge au lieu de passer
   # inaperçue. Ne bloque rien par lui-même — seules les règles de branche le font.
@@ -86,11 +93,14 @@ jobs:
           echo "::warning::Commit poussé directement sur ${{ github.ref_name }} sans passer par une pull request."
           echo "Activez la protection de branche pour que ce chemin soit fermé, pas seulement signalé."
 
-            deploiement:
+  # Une fusion dans main part en production, seulement si les vérifications
+  # passent. Le jeton vient des secrets du dépôt.
+  deploiement:
     name: Déploiement en production
     needs: verification
-    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: Production
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
