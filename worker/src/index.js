@@ -48373,6 +48373,63 @@ function infoRevision(d, tous) {
     revision_due: !suivante && !!d.published_at && echeance <= (/* @__PURE__ */ new Date()).getFullYear() + 1
   };
 }
+async function fichierPhotoUtilise(db, r2Key) {
+  const r = await db.prepare(
+    "SELECT (SELECT COUNT(*) FROM photos WHERE r2_key = ?1) + (SELECT COUNT(*) FROM photos_a_classer WHERE r2_key = ?1) AS n"
+  ).bind(r2Key).first();
+  return (r?.n ?? 0) > 0;
+}
+// Copie complète d'un dossier, pour essayer sans toucher à l'original :
+// mêmes données, composantes, photos classées et à classer (les fichiers
+// sont partagés, pas recopiés). Ni portail du syndicat, ni fiche client, ni
+// publication : une copie n'avise personne et n'apparaît pas au CRM.
+const COPIE_DOSSIER_SANS = new Set(["id", "dossier_no", "name", "created_by", "created_at", "updated_at", "published_at", "client_id",
+  "revision_de", "rappel_revision_le", "rapport_publie_r2", "publie_par", "pdf_signe_r2", "pdf_signe_le", "pdf_signe_nom", "rapport_publie_pdf_r2", "status"]);
+function insertion(db, table, ligne) {
+  const cols = Object.keys(ligne).filter((k) => ligne[k] !== undefined);
+  return db.prepare(`INSERT INTO ${table} (${cols.join(", ")}) VALUES (${cols.map((_, i) => `?${i + 1}`).join(", ")})`).bind(...cols.map((k) => ligne[k] ?? null));
+}
+dossiers.post("/:id/copie", async (c) => {
+  const { user, dossier: source } = await getOwnedDossier(c, c.req.param("id"));
+  if (!source) return c.json({ error: "dossier introuvable" }, 404);
+  const db = c.env.DB;
+  let n = 1, dossierNo;
+  do { dossierNo = `${source.dossier_no}-COPIE${n > 1 ? `-${n}` : ""}`; n += 1; } while (await numeroPris(db, dossierNo));
+  const id = newId("dos");
+  const dossier = { id, dossier_no: dossierNo, name: `COPIE TEST – ${source.name}`.slice(0, 200), created_by: user.id, status: "en_cours" };
+  for (const [k, v] of Object.entries(source)) if (!COPIE_DOSSIER_SANS.has(k)) dossier[k] = v;
+  const requetes = [insertion(db, "dossiers", dossier)];
+
+  const comps = (await db.prepare("SELECT * FROM components WHERE dossier_id = ?1").bind(source.id).all()).results;
+  const idsComp = new Map(comps.map((x) => [x.id, newId("cmp")]));
+  const photos = comps.length ? (await db.prepare(`SELECT p.* FROM photos p JOIN components cmp ON cmp.id = p.component_id WHERE cmp.dossier_id = ?1`).bind(source.id).all()).results : [];
+  const idsPhoto = new Map(photos.map((x) => [x.id, newId("pho")]));
+  for (const x of comps) {
+    const attentions = lireAttentions(x).map((a) => ({ ...a, photos: (a.photos || []).map((p) => idsPhoto.get(p)).filter(Boolean) }));
+    requetes.push(insertion(db, "components", {
+      ...x, id: idsComp.get(x.id), dossier_id: id,
+      parent_id: x.parent_id ? idsComp.get(x.parent_id) ?? null : null,
+      attentions: attentions.length ? JSON.stringify(attentions) : null,
+      created_at: undefined, updated_at: undefined
+    }));
+  }
+  for (const x of photos) requetes.push(insertion(db, "photos", { ...x, id: idsPhoto.get(x.id), component_id: idsComp.get(x.component_id), created_at: x.created_at }));
+  const aClasser = (await db.prepare("SELECT * FROM photos_a_classer WHERE dossier_id = ?1").bind(source.id).all()).results;
+  for (const x of aClasser) {
+    let autres = x.autres;
+    try { const l = JSON.parse(x.autres || "null"); if (Array.isArray(l)) autres = JSON.stringify(l.map((v) => idsComp.get(v) ?? v)); } catch { /* gardé tel quel */ }
+    requetes.push(insertion(db, "photos_a_classer", {
+      ...x, id: newId("pac"), dossier_id: id,
+      suggestion_id: x.suggestion_id ? idsComp.get(x.suggestion_id) ?? null : null,
+      autres, created_by: user.id
+    }));
+  }
+  // Les colonnes absentes (undefined) prennent leur valeur par défaut.
+  for (let i = 0; i < requetes.length; i += 50) await db.batch(requetes.slice(i, i + 50));
+  await noterJournal(db, { dossierId: id, userId: user.id, action: "creation", champs: [{ champ: "copie_de", avant: null, apres: String(source.dossier_no ?? "") }] });
+  const cree = await db.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(id).first();
+  return c.json({ ...cree, copie: { composantes: comps.length, photos: photos.length, a_classer: aClasser.length } }, 201);
+});
 dossiers.post("/:id/revision", async (c) => {
   const { user, dossier: source } = await getOwnedDossier(c, c.req.param("id"));
   if (!source) return c.json({ error: "dossier introuvable" }, 404);
@@ -48661,7 +48718,9 @@ dossiers.delete("/:id/photos-a-classer/:pid", async (c) => {
   const row = await c.env.DB.prepare("SELECT * FROM photos_a_classer WHERE id = ?1 AND dossier_id = ?2").bind(c.req.param("pid"), dossier.id).first();
   if (!row) return c.json({ error: "photo introuvable" }, 404);
   await c.env.DB.prepare("DELETE FROM photos_a_classer WHERE id = ?1").bind(row.id).run();
-  await c.env.PHOTOS.delete(row.r2_key);
+  // Une copie de dossier partage les fichiers de l'original : on n'efface le
+  // fichier que si plus aucune photo ne s'en sert.
+  if (!await fichierPhotoUtilise(c.env.DB, row.r2_key)) await c.env.PHOTOS.delete(row.r2_key);
   return c.json({ ok: true });
 });
 // Historique du dossier, du plus récent au plus ancien ; ?composante= pour
