@@ -64,6 +64,9 @@ export function creerTriPhotos(opts) {
     survol: false,
     empreintes: [],         // empreintes des photos du dossier (classées ou non)
     doublons: [],           // photos écartées : { cle, fichier, empreinte, url }
+    file: [],               // photos à envoyer : { f, forcer, dossier }
+    ouvriers: 0,            // envois en route
+    pause: false,
   };
 
   function liberer(url) { try { URL.revokeObjectURL(url); } catch (e) { /* déjà libérée */ } }
@@ -71,7 +74,7 @@ export function creerTriPhotos(opts) {
   function reinitialiser(dossierId) {
     Object.values(t.vignettes).forEach(liberer);
     t.doublons.forEach((d) => liberer(d.url));
-    Object.assign(t, { dossierId, photos: [], charge: false, chargement: false, erreur: null, vignettes: {}, choix: {}, envoi: null, classement: false, survol: false, empreintes: [], doublons: [] });
+    Object.assign(t, { dossierId, photos: [], charge: false, chargement: false, erreur: null, vignettes: {}, choix: {}, envoi: null, classement: false, survol: false, empreintes: [], doublons: [], file: [], pause: false });
   }
 
   function estDoublon(empreinte) {
@@ -144,47 +147,70 @@ export function creerTriPhotos(opts) {
   }
 
   // forcer : l'ingénieur a demandé d'envoyer une photo écartée comme doublon.
-  async function deposer(fichiers, { forcer = false } = {}) {
+  // File d'envoi partagée : déposer y ajoute, la pause arrête d'y puiser (les
+  // photos déjà parties finissent), reprendre relance les envois.
+  // forcer : l'ingénieur a demandé d'envoyer une photo écartée comme doublon.
+  function deposer(fichiers, { forcer = false } = {}) {
     const id = t.dossierId;
     const images = Array.from(fichiers || []).filter((f) => !f.type || f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name || ''));
     if (!id || images.length === 0) return;
     if (t.envoi && t.envoi.faits < t.envoi.total) {
       t.envoi.total += images.length;
     } else {
-      t.envoi = { total: images.length, faits: 0, echecs: [], doublons: 0 };
+      t.envoi = { total: images.length, faits: 0, echecs: [], doublons: 0, abandonnees: 0 };
     }
+    images.forEach((f) => t.file.push({ f, forcer, dossier: id }));
+    lancer();
     render();
-    const attente = images.slice();
-    async function suivant() {
-      while (attente.length) {
-        const f = attente.shift();
-        try {
-          const { fichier, empreinte } = await reduire(f);
-          if (t.dossierId !== id) return;
-          // Vérifier et retenir l'empreinte sans attendre entre les deux : les
-          // envois parallèles d'une même rafale se voient ainsi l'un l'autre.
-          if (!forcer && estDoublon(empreinte)) {
-            t.doublons.push({ cle: `d${Date.now()}${Math.random().toString(16).slice(2, 8)}`, fichier, empreinte, url: URL.createObjectURL(fichier) });
-            if (t.envoi) t.envoi.doublons += 1;
-          } else {
-            if (empreinte) t.empreintes.push(empreinte);
-            const fd = new FormData();
-            fd.append('file', fichier);
-            if (empreinte) fd.append('empreinte', empreinte);
-            const p = await apiJson(`/api/dossiers/${id}/photos-a-classer`, { method: 'POST', body: fd });
-            if (t.dossierId !== id) return;
-            t.photos.push(p);
-            t.vignettes[p.id] = URL.createObjectURL(fichier);
-          }
-        } catch (e) {
-          if (t.envoi) t.envoi.echecs.push(f.name || 'photo');
-        }
-        if (t.dossierId !== id) return;
-        if (t.envoi) t.envoi.faits += 1;
-        render();
-      }
+  }
+
+  function lancer() {
+    while (!t.pause && t.file.length && t.ouvriers < ENVOIS_SIMULTANES) {
+      t.ouvriers += 1;
+      ouvrier().finally(() => { t.ouvriers -= 1; render(); });
     }
-    await Promise.all(Array.from({ length: Math.min(ENVOIS_SIMULTANES, images.length) }, suivant));
+  }
+
+  async function ouvrier() {
+    while (!t.pause && t.file.length) {
+      const { f, forcer, dossier: id } = t.file.shift();
+      if (t.dossierId !== id) return;
+      try {
+        const { fichier, empreinte } = await reduire(f);
+        if (t.dossierId !== id) return;
+        // Vérifier et retenir l'empreinte sans attendre entre les deux : les
+        // envois parallèles d'une même rafale se voient ainsi l'un l'autre.
+        if (!forcer && estDoublon(empreinte)) {
+          t.doublons.push({ cle: `d${Date.now()}${Math.random().toString(16).slice(2, 8)}`, fichier, empreinte, url: URL.createObjectURL(fichier) });
+          if (t.envoi) t.envoi.doublons += 1;
+        } else {
+          if (empreinte) t.empreintes.push(empreinte);
+          const fd = new FormData();
+          fd.append('file', fichier);
+          if (empreinte) fd.append('empreinte', empreinte);
+          const p = await apiJson(`/api/dossiers/${id}/photos-a-classer`, { method: 'POST', body: fd });
+          if (t.dossierId !== id) return;
+          t.photos.push(p);
+          t.vignettes[p.id] = URL.createObjectURL(fichier);
+        }
+      } catch (e) {
+        if (t.envoi) t.envoi.echecs.push(f.name || 'photo');
+      }
+      if (t.dossierId !== id) return;
+      if (t.envoi) t.envoi.faits += 1;
+      render();
+    }
+  }
+
+  function pause() { t.pause = true; render(); }
+  function reprendre() { t.pause = false; lancer(); render(); }
+  // Abandonner ce qui n'est pas parti ; les envois déjà en route se terminent.
+  function abandonner() {
+    const n = t.file.length;
+    t.file = [];
+    t.pause = false;
+    if (t.envoi) { t.envoi.total -= n; t.envoi.abandonnees += n; }
+    render();
   }
 
   function envoyerDoublons(cles) {
@@ -336,8 +362,16 @@ export function creerTriPhotos(opts) {
 
       ${envoi ? `
       <div class="tp-progress">
-        <div class="tp-progress-txt">${enCours ? `<i data-lucide="loader-2" class="spin" style="width:14px;height:14px"></i>Envoi et analyse : ${envoi.faits}/${envoi.total}` : `<i data-lucide="check-circle-2" style="width:14px;height:14px"></i>${envoi.total - envoi.echecs.length - (envoi.doublons || 0)} photo(s) analysée(s)`}${envoi.doublons ? ` · ${envoi.doublons} doublon(s) écarté(s)` : ''}${envoi.echecs.length ? ` · <span class="err">${envoi.echecs.length} échec(s) : ${escapeHtml(envoi.echecs.slice(0, 3).join(', '))}${envoi.echecs.length > 3 ? '…' : ''}</span>` : ''}</div>
-        <div class="prog-track"><div class="prog-fill" style="width:${pct}%;background:var(--orange)"></div></div>
+        <div class="tp-progress-txt">${enCours
+          ? (t.pause
+            ? `<i data-lucide="pause-circle" style="width:14px;height:14px"></i>En pause : ${envoi.faits}/${envoi.total}${t.ouvriers ? ` · ${t.ouvriers} envoi(s) en train de se terminer` : ''}`
+            : `<i data-lucide="loader-2" class="spin" style="width:14px;height:14px"></i>Envoi et analyse : ${envoi.faits}/${envoi.total}`)
+          : `<i data-lucide="check-circle-2" style="width:14px;height:14px"></i>${envoi.total - envoi.echecs.length - (envoi.doublons || 0)} photo(s) analysée(s)`}${envoi.doublons ? ` · ${envoi.doublons} doublon(s) écarté(s)` : ''}${envoi.abandonnees ? ` · ${envoi.abandonnees} non envoyée(s)` : ''}${envoi.echecs.length ? ` · <span class="err">${envoi.echecs.length} échec(s) : ${escapeHtml(envoi.echecs.slice(0, 3).join(', '))}${envoi.echecs.length > 3 ? '…' : ''}</span>` : ''}
+          ${enCours ? `<span class="tp-progress-actions">${t.pause
+            ? `<button class="btn-pill-sm" data-action="tp-reprendre"><i data-lucide="play" style="width:13px;height:13px"></i>Reprendre</button><button class="btn-pill-sm" data-action="tp-abandonner">Abandonner le reste</button>`
+            : `<button class="btn-pill-sm" data-action="tp-pause"><i data-lucide="pause" style="width:13px;height:13px"></i>Mettre en pause</button>`}</span>` : ''}</div>
+        <div class="prog-track"><div class="prog-fill" style="width:${pct}%;background:${t.pause ? 'var(--ink-400)' : 'var(--orange)'}"></div></div>
+        ${enCours ? `<div class="tp-progress-aide">Pour continuer un autre jour : redéposez le même dossier de photos. Celles déjà envoyées seront reconnues et écartées.</div>` : ''}
       </div>` : ''}
 
       ${t.erreur ? errorBanner(t.erreur) : ''}
@@ -397,6 +431,11 @@ export function creerTriPhotos(opts) {
   function click(action, btn) {
     switch (action) {
       case 'tp-choisir': choisirFichiers(); return true;
+      case 'tp-pause': pause(); return true;
+      case 'tp-reprendre': reprendre(); return true;
+      case 'tp-abandonner':
+        if (confirm(`Abandonner les ${t.file.length} photo(s) pas encore envoyée(s) ? Vous pourrez les redéposer plus tard.`)) abandonner();
+        return true;
       case 'tp-classer': classer([btn.getAttribute('data-id')]); return true;
       case 'tp-supprimer': supprimer(btn.getAttribute('data-id')); return true;
       case 'tp-envoyer-doublon': envoyerDoublons([btn.getAttribute('data-cle')]); return true;
@@ -423,6 +462,14 @@ export function creerTriPhotos(opts) {
 
   // Glisser-déposer : écouteurs posés une fois sur le conteneur de l'app.
   function brancher(app, actif) {
+    // L'envoi vit dans l'onglet : le fermer ou le recharger l'arrête. Le
+    // navigateur demande confirmation tant qu'il reste des photos à envoyer
+    // (il affiche son propre message, pas le nôtre).
+    window.addEventListener('beforeunload', (e) => {
+      if (!envoiEnCours()) return;
+      e.preventDefault();
+      e.returnValue = '';
+    });
     const zone = (e) => actif() && e.target && e.target.closest && e.target.closest('[data-role="tp-drop"]');
     app.addEventListener('dragover', (e) => {
       if (!zone(e)) return;
@@ -445,5 +492,10 @@ export function creerTriPhotos(opts) {
     window.addEventListener('drop', (e) => { if (actif()) e.preventDefault(); });
   }
 
-  return { charger, ouvrir, reinitialiser, nombreAClasser, html, click, change, brancher, nomComposante };
+  // Photos encore à envoyer : fermer l'onglet ou changer de dossier les perdrait.
+  function envoiEnCours() {
+    return !!(t.envoi && t.envoi.faits < t.envoi.total);
+  }
+
+  return { charger, ouvrir, reinitialiser, nombreAClasser, html, click, change, brancher, nomComposante, envoiEnCours };
 }
