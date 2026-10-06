@@ -48617,6 +48617,103 @@ dossiers.get("/:id/hors-ligne", async (c) => {
   });
   return c.json({ dossier, composantes, genere_le: new Date().toISOString() });
 });
+// Plusieurs composantes d'un coup, depuis le bureau : confirmer leur texte, ou
+// les retirer de l'étude (actif = 0) et les y remettre. { ids, confirmed?, actif? }
+dossiers.post("/:id/components/lot", async (c) => {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const ids = Array.isArray(body2.ids) ? [...new Set(body2.ids.map(String))].slice(0, 1000) : [];
+  const champs = {};
+  if (body2.confirmed === 1 || body2.confirmed === 0) champs.confirmed = body2.confirmed;
+  if (body2.actif === 1 || body2.actif === 0) champs.actif = body2.actif;
+  if (!ids.length || !Object.keys(champs).length) return c.json({ error: "ids et confirmed ou actif (0 ou 1) requis" }, 400);
+  const avant = new Map();
+  for (let i = 0; i < ids.length; i += 90) {
+    const tranche = ids.slice(i, i + 90);
+    const rows = (await c.env.DB.prepare(
+      `SELECT * FROM components WHERE dossier_id = ?1 AND id IN (${tranche.map((_, k) => `?${k + 2}`).join(",")})`
+    ).bind(dossier.id, ...tranche).all()).results;
+    rows.forEach((r) => avant.set(r.id, r));
+  }
+  const cibles = ids.filter((id) => avant.has(id));
+  const sets = Object.keys(champs).map((k, i) => `${k} = ?${i + 1}`).join(", ");
+  const n = Object.keys(champs).length;
+  await c.env.DB.batch(cibles.map((id) => c.env.DB.prepare(
+    `UPDATE components SET ${sets}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?${n + 1}`
+  ).bind(...Object.values(champs), id)));
+  for (const id of cibles) {
+    const a = avant.get(id);
+    await noterJournal(c.env.DB, {
+      dossierId: dossier.id, componentId: id, userId: user?.id, action: "modification",
+      champs: differences(a, { ...a, ...champs }, Object.keys(champs).filter((k) => k in LIBELLES_CHAMPS))
+    });
+  }
+  return c.json({ modifiees: cibles.length, ignorees: ids.length - cibles.length });
+});
+// Coûts suggérés par la banque de prix de la firme : pour une composante sans
+// coût, la médiane de son coût par porte (même code Uniformat, immeubles de la
+// même taille), multipliée par les portes du dossier, arrondie à la centaine.
+// Les prix négociés et les observations non validées sont écartés, comme au
+// résumé de la banque.
+async function coutsSuggeres(db, dossier) {
+  const unites = Number(dossier.units);
+  const tranche = trancheDe(unites);
+  if (!tranche) return { tranche: null, suggestions: [] };
+  const obs = (await db.prepare(
+    "SELECT * FROM price_observations WHERE company_id = ?1 AND valide = 1 AND negocie = 0 AND uniformat_code IS NOT NULL AND unites > 0"
+  ).bind(dossier.company_id).all()).results;
+  const annee = anneeCourante();
+  const taux = RESERVE_FUND_PARAMS.inflationRate;
+  const parCode = new Map();
+  for (const o of obs) {
+    if (trancheDe(o.unites)?.cle !== tranche.cle) continue;
+    const v = prixIndexe(o.montant / o.unites, o.annee, annee, taux);
+    if (v == null) continue;
+    const code = String(o.uniformat_code).trim();
+    if (!parCode.has(code)) parCode.set(code, []);
+    parCode.get(code).push(v);
+  }
+  const composantes = (await db.prepare(
+    "SELECT id, name, uniformat_code FROM components WHERE dossier_id = ?1 AND actif = 1 AND replacement_cost IS NULL AND uniformat_code IS NOT NULL"
+  ).bind(dossier.id).all()).results;
+  const suggestions = [];
+  for (const cmp of composantes) {
+    const prix = parCode.get(String(cmp.uniformat_code).trim());
+    if (!prix?.length) continue;
+    const triees = prix.slice().sort((a, b) => a - b);
+    const mediane = quantile(triees, 0.5);
+    suggestions.push({
+      component_id: cmp.id, name: cmp.name, uniformat_code: cmp.uniformat_code,
+      n: triees.length, mince: triees.length < PRIX_ECHANTILLON_MINCE,
+      par_porte: Math.round(mediane), cout: Math.round(mediane * unites / 100) * 100,
+      bas: Math.round(quantile(triees, 0.25) * unites / 100) * 100, haut: Math.round(quantile(triees, 0.75) * unites / 100) * 100
+    });
+  }
+  return { tranche: { cle: tranche.cle, label: tranche.label }, unites, suggestions };
+}
+dossiers.get("/:id/couts-suggeres", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  return c.json(await coutsSuggeres(c.env.DB, dossier));
+});
+// Appliquer : recalculé ici, jamais repris du client, et seulement sur des
+// coûts encore vides — un coût saisi entre-temps n'est pas écrasé.
+dossiers.post("/:id/couts-suggeres/appliquer", async (c) => {
+  const { user, dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const voulus = new Set(Array.isArray(body2.ids) ? body2.ids.map(String) : []);
+  const { suggestions } = await coutsSuggeres(c.env.DB, dossier);
+  const retenues = suggestions.filter((x) => voulus.has(x.component_id));
+  for (const x of retenues) {
+    await c.env.DB.prepare(
+      "UPDATE components SET replacement_cost = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2 AND replacement_cost IS NULL"
+    ).bind(x.cout, x.component_id).run();
+    await noterJournal(c.env.DB, { dossierId: dossier.id, componentId: x.component_id, userId: user?.id, action: "modification", champs: [{ champ: "replacement_cost", avant: null, apres: valeurJournal("replacement_cost", x.cout) }] });
+  }
+  return c.json({ appliques: retenues.map((x) => ({ component_id: x.component_id, replacement_cost: x.cout })) });
+});
 dossiers.post("/:id/components/import", async (c) => {
   const { dossier } = await getOwnedDossier(c, c.req.param("id"));
   if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
