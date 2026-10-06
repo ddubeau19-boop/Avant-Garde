@@ -1896,6 +1896,20 @@ async function archiverDossier() {
 // ---------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------
+const DEFILANTS = '.page-pad, .rev-body, .pub-body, .rvia-scroll, .rvia-body, .rvia-photos-col, .rvia-sections-col, .cscr, .exec-table, .saisie-table, .couts-table, .tp-doublons';
+let derniereVue = null;
+function positionsDefilement(racine) {
+  const vus = {};
+  return Array.from(racine.querySelectorAll(DEFILANTS)).map(el => {
+    const classe = el.className;
+    vus[classe] = (vus[classe] || 0) + 1;
+    return [[classe, vus[classe] - 1], el.scrollTop, el.scrollLeft];
+  }).filter(([, haut, gauche]) => haut || gauche);
+}
+function elementDefilant(racine, [classe, rang]) {
+  return Array.from(racine.querySelectorAll(DEFILANTS)).filter(el => el.className === classe)[rang] || null;
+}
+
 function render() {
   let html;
   try {
@@ -1915,7 +1929,17 @@ function render() {
   if (active && typeof active.selectionStart === 'number') {
     selStart = active.selectionStart; selEnd = active.selectionEnd;
   }
+  // Les écrans défilent dans des conteneurs internes, que le rendu remplace :
+  // sans ceci, chaque rendu (vignettes qui arrivent, envoi en cours,
+  // enregistrement) ramenait la liste en haut. Même vue : on rend la position.
+  const vue = `${state.screen}|${state.dossierId || ''}|${state.screen === 'reviewIA' ? state.reviewIdx : ''}`;
+  const positions = vue === derniereVue ? positionsDefilement(app) : [];
   app.innerHTML = html;
+  positions.forEach(([cle, haut, gauche]) => {
+    const el = elementDefilant(app, cle);
+    if (el) { el.scrollTop = haut; el.scrollLeft = gauche; }
+  });
+  derniereVue = vue;
   if (window.lucide) window.lucide.createIcons();
   if (activeId) {
     const el = document.getElementById(activeId);
