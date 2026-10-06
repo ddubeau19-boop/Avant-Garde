@@ -2973,6 +2973,7 @@ const JOURNAL_REGROUPEMENT_MS = 10 * 60 * 1e3;
 const JOURNAL_VALEUR_MAX = 300;
 const LIBELLES_CHAMPS = {
   date_visite: "Date de la visite",
+  attentions: "Attentions spéciales",
   name: "Nom", done: "Documentée", etat: "État", residual: "Vie résiduelle (%)", install_year: "Année d'installation",
   qty: "Quantité", note: "Note", replacement_cost: "Coût de remplacement", useful_life_years: "Vie utile",
   confirmed: "Confirmée au bureau", rating: "Cote", r_flag: "Remplacement (R)", observation: "Constats",
@@ -3828,6 +3829,9 @@ const COLONNES_AJOUTEES = [
   // Photo choisie par l'ingénieur pour la fiche du rapport (au plus 4 par
   // composante) ; aucune choisie : les 4 premières, comme avant.
   ["photos", "au_rapport", "INTEGER"],
+  // Attentions spéciales saisies au bureau : JSON [{id, titre, notes, texte,
+  // photos: [≤ 2 ids]}]. Présentes, elles remplacent l'attention générée.
+  ["attentions", "TEXT"],
   ["companies", "theme", "TEXT"],
   ["companies", "mise_en_page", "TEXT"],
   ["companies", "bibliotheque", "TEXT"],
@@ -5982,7 +5986,55 @@ function phraseDelai(valeur) {
   // Anciens relevés en texte libre (« à court terme », « dans les 5 ans »…).
   return `Selon notre opinion, l'intervention est à planifier ${brut.charAt(0).toLowerCase()}${brut.slice(1)}.`;
 }
+// Attentions spéciales saisies par l'ingénieur : une situation par élément,
+// chacune son texte et au plus deux photos de la composante.
+const ATTENTIONS_MAX = 8;
+const PHOTOS_PAR_ATTENTION = 2;
+function lireAttentions(component) {
+  try {
+    const liste = JSON.parse(component?.attentions || "[]");
+    return Array.isArray(liste) ? liste : [];
+  } catch {
+    return [];
+  }
+}
+// Ce qui est stocké : validé, tronqué, photos limitées à celles de la composante.
+function nettoyerAttentions(brut, photosDeLaComposante) {
+  if (!Array.isArray(brut)) return null;
+  const permises = new Set(photosDeLaComposante);
+  const texte = (v, max) => String(v ?? "").replace(/\r/g, "").trim().slice(0, max);
+  return brut.slice(0, ATTENTIONS_MAX).map((a) => ({
+    id: /^att_[a-z0-9]{6,24}$/.test(String(a?.id ?? "")) ? a.id : `att_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`,
+    titre: texte(a?.titre, 160),
+    notes: texte(a?.notes, 3000),
+    texte: texte(a?.texte, 6000),
+    photos: [...new Set((Array.isArray(a?.photos) ? a.photos : []).map(String))].filter((id) => permises.has(id)).slice(0, PHOTOS_PAR_ATTENTION)
+  })).filter((a) => a.titre || a.notes || a.texte || a.photos.length);
+}
+// Les attentions qui iront au rapport : un texte (rédigé, sinon les notes).
+function attentionsDuRapport(component) {
+  return lireAttentions(component).map((a) => ({
+    id: a.id,
+    titre: sansNotesInternes(a.titre ?? ""),
+    texte: sansNotesInternes(String(a.texte ?? "").trim() || String(a.notes ?? "").trim()),
+    photos: Array.isArray(a.photos) ? a.photos : []
+  })).filter((a) => a.texte || a.titre);
+}
 function attentionSpeciale(component) {
+  const saisies = attentionsDuRapport(component);
+  if (saisies.length) {
+    const suites = [];
+    if (component?.r_flag) suites.push("Notez que des travaux prévus à la dernière mise à jour du carnet d'entretien n'ont pas été effectués pour cet élément.");
+    suites.push("Nous vous conseillons aussi de documenter ces informations à l'intérieur de votre tableur suivi d'entretien et d'y planifier vos prochains exercices d'observations, entretiens et/ou travaux. Pour le détail, nous vous redirigeons à la section 9.0 : Informations relatives au suivi de l'entretien.");
+    suites.push(FERMETURE_ATTENTION);
+    const cloture = assembler(suites);
+    return {
+      texte: paragraphes([...saisies.map((a) => (a.titre ? `${a.titre}\n${a.texte}` : a.texte).trim()), cloture]),
+      actif: true,
+      elements: saisies,
+      cloture
+    };
+  }
   const rating = Number(component?.rating);
   const consequences = sansNotesInternes(component?.consequences ?? "");
   const actif = rating >= 3 || consequences.length > 0;
@@ -6072,7 +6124,8 @@ async function genFicheElement(component, dossier, apiKey, opts = {}) {
         titre: `ATTENTION SPÉCIALE - ${nom}`,
         texte: attention.texte,
         tableau: null,
-        actif: attention.actif
+        actif: attention.actif,
+        ...attention.elements ? { elements: attention.elements, cloture: attention.cloture } : {}
       }
     ],
     source: etat.source
@@ -6360,6 +6413,83 @@ components.patch("/:id/redaction", async (c) => {
   return c.json({ ok: true, redaction_id: id, valide: !!valide });
 });
 
+// Attentions spéciales d'une composante : la liste entière est remplacée à
+// chaque enregistrement (au plus 8, deux photos chacune, prises parmi les
+// photos de la composante).
+components.put("/:id/attentions", async (c) => {
+  const component = await getOwnedComponent(c, c.req.param("id"));
+  if (!component) return c.json({ error: "composante introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const photosIds = (await c.env.DB.prepare("SELECT id FROM photos WHERE component_id = ?1").bind(component.id).all()).results.map((r) => r.id);
+  const liste = nettoyerAttentions(body2.attentions, photosIds);
+  if (!liste) return c.json({ error: "attentions (liste) requise" }, 400);
+  const avant = lireAttentions(component).length;
+  await c.env.DB.prepare("UPDATE components SET attentions = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2")
+    .bind(liste.length ? JSON.stringify(liste) : null, component.id).run();
+  const auteur = await getCurrentUser(c);
+  if (avant !== liste.length) {
+    await noterJournal(c.env.DB, {
+      dossierId: component.dossier_id, componentId: component.id, userId: auteur?.id, action: "modification",
+      champs: [{ champ: "attentions", avant: `${avant} attention(s)`, apres: `${liste.length} attention(s)` }]
+    });
+  }
+  return c.json({ attentions: liste });
+});
+// L'IA rédige une attention spéciale à partir des notes de l'ingénieur et de
+// ses photos (au plus deux). Rien n'est enregistré : le texte revient au
+// formulaire, où l'ingénieur le relit avant de l'enregistrer.
+components.post("/:id/attentions/rediger", async (c) => {
+  const component = await getOwnedComponent(c, c.req.param("id"));
+  if (!component) return c.json({ error: "composante introuvable" }, 404);
+  const body2 = await c.req.json().catch(() => ({}));
+  const titre = String(body2.titre ?? "").trim().slice(0, 160);
+  const notes = String(body2.notes ?? "").trim().slice(0, 3000);
+  const ids = [...new Set((Array.isArray(body2.photos) ? body2.photos : []).map(String))].slice(0, PHOTOS_PAR_ATTENTION);
+  if (!titre && !notes && !ids.length) return c.json({ error: "un titre, des notes ou une photo sont requis" }, 400);
+  const apiKey = c.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return c.json({ error: "La rédaction par l'IA n'est pas configurée sur cette plateforme." }, 503);
+  const images = [];
+  for (const id of ids) {
+    const photo = await c.env.DB.prepare("SELECT * FROM photos WHERE id = ?1 AND component_id = ?2").bind(id, component.id).first();
+    const obj = photo ? await c.env.PHOTOS.get(photo.r2_key) : null;
+    if (!obj) continue;
+    images.push({ type: "image", source: { type: "base64", media_type: obj.httpMetadata?.contentType ?? "image/jpeg", data: arrayBufferToBase64(await obj.arrayBuffer()) } });
+  }
+  const dossier = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(component.dossier_id).first();
+  const prompt = `Tu rédiges, pour un rapport d'étude du fonds de prévoyance (Québec), UN élément de la
+section ATTENTION SPÉCIALE d'une composante : une situation précise relevée par l'ingénieur.
+
+${JARGON_STYLE_GUIDE}
+
+CE QUE TU ÉCRIS : un paragraphe de 2 à 5 phrases qui
+- situe et décrit la situation observée (localisation, ce qui est vu, étendue si connue);
+- en donne la cause probable, modalisée (semble, serait, pourrait), seulement si les notes ou les photos la suggèrent;
+- dit le risque si rien n'est fait;
+- termine par la recommandation (« nous suggérons »), avec un délai seulement si les notes en donnent un.
+
+RÈGLES ABSOLUES :
+- Les faits viennent des notes de l'ingénieur et de ce qui est visible sur les photos. N'invente
+  aucune dimension, quantité, localisation, cause ni coût.
+- Voix « nous » de firme, registre professionnel, français du Québec.
+- Aucun titre, aucune puce, aucun gras, aucune note interne, aucun « ??? ».
+
+COMPOSANTE :
+${faitsElement(component, dossier, ligneDureeVie(component, dossier))}
+
+SITUATION : ${titre || "(sans titre)"}
+NOTES DE L'INGÉNIEUR : ${notes || "(aucune — décris ce que montrent les photos)"}
+${images.length ? `PHOTOS : ${images.length} photo(s) de la situation ci-jointes.` : "PHOTOS : aucune."}
+
+Réponds uniquement par le paragraphe.`;
+  try {
+    const brut = await callClaude(apiKey, { content: [...images, { type: "text", text: prompt }], maxTokens: 3000 });
+    const texte = sansNotesInternes(brut);
+    if (texte.length < 20) return c.json({ error: "L'IA n'a pas produit de texte utilisable. Réessayez ou écrivez-le." }, 502);
+    return c.json({ texte });
+  } catch {
+    return c.json({ error: "La rédaction par l'IA a échoué. Réessayez dans un instant." }, 502);
+  }
+});
 // État de la banque, pour que la firme voie ce qu'elle a accumulé.
 components.get("/banque/etat", async (c) => {
   const user = await getCurrentUser(c);
@@ -25492,7 +25622,7 @@ function outilsDocx(t, { modeStyles = false } = {}) {
   // catégorie · code, titre, filet court, bandeau de synthèse, puis les quatre
   // sections. Les photos sont celles de l'ingénieur ; sans photo, le texte prend
   // toute la largeur plutôt que de laisser un cadre vide dans un rapport livré.
-  function ficheDocx({ numero, nom, categorie, code, cote, ligne, component, fiche, photos, taches = [] }) {
+  function ficheDocx({ numero, nom, categorie, code, cote, ligne, component, fiche, photos, photosAttention = new Map(), taches = [] }) {
     const blocs = [];
     blocs.push(new Paragraph({
       keepNext: true,
@@ -25524,6 +25654,31 @@ function outilsDocx(t, { modeStyles = false } = {}) {
     ]));
     for (const section of fiche.sections) {
       blocs.push(etiquette(section.cle === "etat" ? "État de l'actif" : section.cle === "duree_vie" ? "Durée de vie et remplacement" : section.cle === "entretien" ? "Commentaires d'entretien" : "Attention spéciale"));
+      // Attentions spéciales saisies : chacune son titre, son texte et ses
+      // photos à côté, puis la recommandation commune une seule fois.
+      if (section.cle === "attention" && section.elements?.length) {
+        for (const el of section.elements) {
+          if (el.titre) blocs.push(new Paragraph({ keepNext: true, spacing: { before: 160, after: 60 }, children: [run(el.titre, { bold: true })] }));
+          const textes = paras(el.texte);
+          const images = el.photos.map((id) => photosAttention.get(id)).filter(Boolean);
+          if (images.length) {
+            blocs.push(new Table({
+              width: { size: 100, type: WidthType.PERCENTAGE },
+              borders: sansBordures,
+              rows: [new TableRow({
+                children: [
+                  new TableCell({ width: { size: 62, type: WidthType.PERCENTAGE }, margins: { right: 200 }, children: textes.length ? textes : [new Paragraph({ children: [] })] }),
+                  new TableCell({ width: { size: 38, type: WidthType.PERCENTAGE }, children: images.flatMap((p) => photoBloc(p, 215, 170)) })
+                ]
+              })]
+            }));
+          } else {
+            blocs.push(...textes);
+          }
+        }
+        blocs.push(...paras(section.cloture));
+        continue;
+      }
       const texte = paras(section.texte);
       if (section.cle === "etat" && photos.length > 0) {
         const aCote = photos.slice(0, 2);
@@ -26127,6 +26282,7 @@ async function generateReportDocx(ctx, opts = {}) {
         component: comp,
         fiche,
         photos: ctx.photos?.get(comp.id) ?? [],
+        photosAttention: ctx.photos?.parPhoto ?? new Map(),
         taches: tachesPourComposante(comp, { biblio: ctx.biblio }).map(tacheAffichee)
       }));
     }
@@ -48779,6 +48935,7 @@ const PHOTO_MAX_OCTETS = 4 * 1024 * 1024;
 const PHOTOS_BUDGET_OCTETS = 40 * 1024 * 1024;
 async function photosDuRapport(env, components2) {
   const parComposante = new Map();
+  parComposante.parPhoto = new Map();
   if (!components2.length) return parComposante;
   const ids = components2.map((comp) => comp.id);
   const lignes = [];
@@ -48794,11 +48951,16 @@ async function photosDuRapport(env, components2) {
     return i < 0 ? TAG_ORDER.length : i;
   };
   const choisies = [];
-  for (const id of ids) {
+  for (const comp of components2) {
+    const id = comp.id;
+    // Une photo d'attention spéciale y est montrée, pas une deuxième fois à
+    // l'état de l'actif (sauf si l'ingénieur l'y a mise lui-même).
+    const dAttention = new Set(attentionsDuRapport(comp).flatMap((a) => a.photos));
     const toutes = lignes.filter((l) => l.component_id === id);
     const elues = toutes.filter((l) => l.au_rapport === 1);
-    const siennes = (elues.length ? elues : toutes).sort((a, b) => rang(a.tag) - rang(b.tag)).slice(0, PHOTOS_PAR_FICHE);
-    choisies.push(...siennes);
+    const siennes = (elues.length ? elues : toutes.filter((l) => !dAttention.has(l.id))).sort((a, b) => rang(a.tag) - rang(b.tag)).slice(0, PHOTOS_PAR_FICHE);
+    choisies.push(...siennes.map((l) => ({ ...l, role: "etat" })));
+    for (const l of toutes) if (dAttention.has(l.id)) choisies.push({ ...l, role: "attention" });
   }
   let budget = PHOTOS_BUDGET_OCTETS;
   const chargees = await enParallele(choisies, 6, async (ligne) => {
@@ -48810,6 +48972,7 @@ async function photosDuRapport(env, components2) {
   });
   for (const p of chargees) {
     if (!p) continue;
+    if (p.ligne.role === "attention") { parComposante.parPhoto.set(p.ligne.id, { image: p.image, tag: p.ligne.tag }); continue; }
     if (!parComposante.has(p.ligne.component_id)) parComposante.set(p.ligne.component_id, []);
     parComposante.get(p.ligne.component_id).push({ image: p.image, tag: p.ligne.tag });
   }
