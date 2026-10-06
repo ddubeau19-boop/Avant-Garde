@@ -205,6 +205,23 @@ CREATE TABLE photos (
   created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+-- Photos déposées en lot au bureau, en attente d'être rattachées à une
+-- composante. L'IA propose une composante et une confiance (0-100) ; la photo
+-- ne passe dans photos qu'une fois approuvée ou classée par l'ingénieur.
+CREATE TABLE photos_a_classer (
+  id            TEXT PRIMARY KEY,
+  dossier_id    TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+  r2_key        TEXT NOT NULL,
+  nom_fichier   TEXT,
+  suggestion_id TEXT,     -- composante proposée par l'IA
+  confiance     INTEGER,
+  autres        TEXT,     -- JSON : jusqu'à deux autres composantes plausibles
+  description   TEXT,     -- ce que l'IA voit sur la photo
+  erreur        TEXT,     -- pourquoi l'IA n'a rien proposé
+  created_by    TEXT,
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE INDEX idx_components_dossier ON components(dossier_id);
 CREATE INDEX idx_photos_component   ON photos(component_id);
 
