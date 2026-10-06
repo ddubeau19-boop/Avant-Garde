@@ -891,3 +891,10 @@ details.ca-bloc summary { cursor: pointer; }
 .tp-progress-actions { margin-left: auto; display: inline-flex; gap: 6px; }
 .tp-progress-actions .btn-pill-sm { display: inline-flex; align-items: center; gap: 5px; padding: 6px 12px; font-size: 12px; }
 .tp-progress-aide { font-size: 11.5px; color: var(--ink-500); }
+
+/* Seuil des propositions sûres */
+.tp-seuil { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 22px; padding: 12px 14px; border: 1px solid var(--ink-200); border-radius: 12px; background: #fff; }
+.tp-seuil-lbl { font-size: 13px; font-weight: 600; color: var(--ink-700); }
+.tp-seuil .seg-btn { display: inline-flex; align-items: baseline; gap: 5px; }
+.tp-seuil .seg-btn small { font-size: 10.5px; opacity: .7; font-family: var(--font-mono); }
+.tp-seuil-aide { font-size: 12px; color: var(--ink-500); flex-basis: 100%; }

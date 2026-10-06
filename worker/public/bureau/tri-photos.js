@@ -15,6 +15,13 @@ const ENVOIS_SIMULTANES = 3;
 // Deux photos dont les empreintes diffèrent d'au plus 5 bits sur 64 sont la
 // même prise de vue (rafale, photo reprise, même fichier déposé deux fois).
 const SEUIL_DOUBLON = 5;
+// Seuils proposés pour les « propositions sûres ». L'IA est prudente : sur un
+// vrai dossier, la plupart de ses propositions justes tombent entre 60 et 80 %.
+const SEUILS = [90, 80, 70, 60, 50];
+const CLE_SEUIL = 'cs_tri_seuil';
+function seuilMemorise() {
+  try { const v = Number(localStorage.getItem(CLE_SEUIL)); return SEUILS.includes(v) ? v : null; } catch (e) { return null; }
+}
 
 // Empreinte visuelle (dHash) : l'image réduite à 9 × 8 en niveaux de gris,
 // chaque bit dit si un pixel est plus clair que son voisin de droite. Robuste
@@ -53,7 +60,7 @@ export function creerTriPhotos(opts) {
   const t = {
     dossierId: null,
     photos: [],
-    seuil: 80,
+    seuil: seuilMemorise() ?? 80,
     charge: false,
     chargement: false,
     erreur: null,
@@ -77,8 +84,17 @@ export function creerTriPhotos(opts) {
     Object.assign(t, { dossierId, photos: [], charge: false, chargement: false, erreur: null, vignettes: {}, choix: {}, envoi: null, classement: false, survol: false, empreintes: [], doublons: [], file: [], pause: false });
   }
 
-  function estDoublon(empreinte) {
-    return !!empreinte && t.empreintes.some((e) => distance(e, empreinte) <= SEUIL_DOUBLON);
+  // 'deja' : la même image est déjà au dossier (photo redéposée, reprise d'un
+  // envoi interrompu) ; 'proche' : presque la même (rafale, photo reprise).
+  function doublonDe(empreinte) {
+    if (!empreinte) return null;
+    let proche = false;
+    for (const e of t.empreintes) {
+      const d = distance(e, empreinte);
+      if (d === 0) return 'deja';
+      if (d <= SEUIL_DOUBLON) proche = true;
+    }
+    return proche ? 'proche' : null;
   }
 
   function nombreAClasser() { return t.photos.length; }
@@ -92,7 +108,7 @@ export function creerTriPhotos(opts) {
       const r = await apiJson(`/api/dossiers/${dossierId}/photos-a-classer`);
       if (t.dossierId !== dossierId) return;
       t.photos = Array.isArray(r && r.photos) ? r.photos : [];
-      if (r && r.seuil) t.seuil = r.seuil;
+      if (r && r.seuil && seuilMemorise() == null) t.seuil = r.seuil;
       // Les empreintes déjà connues du serveur, plus celles d'envois encore en
       // route dans cet onglet.
       const serveur = Array.isArray(r && r.empreintes) ? r.empreintes : [];
@@ -157,7 +173,7 @@ export function creerTriPhotos(opts) {
     if (t.envoi && t.envoi.faits < t.envoi.total) {
       t.envoi.total += images.length;
     } else {
-      t.envoi = { total: images.length, faits: 0, echecs: [], doublons: 0, abandonnees: 0 };
+      t.envoi = { total: images.length, faits: 0, echecs: [], doublons: 0, deja: 0, abandonnees: 0 };
     }
     images.forEach((f) => t.file.push({ f, forcer, dossier: id }));
     lancer();
@@ -180,7 +196,11 @@ export function creerTriPhotos(opts) {
         if (t.dossierId !== id) return;
         // Vérifier et retenir l'empreinte sans attendre entre les deux : les
         // envois parallèles d'une même rafale se voient ainsi l'un l'autre.
-        if (!forcer && estDoublon(empreinte)) {
+        const doublon = forcer ? null : doublonDe(empreinte);
+        if (doublon === 'deja') {
+          // Déjà au dossier : rien à montrer, seulement à compter.
+          if (t.envoi) t.envoi.deja += 1;
+        } else if (doublon) {
           t.doublons.push({ cle: `d${Date.now()}${Math.random().toString(16).slice(2, 8)}`, fichier, empreinte, url: URL.createObjectURL(fichier) });
           if (t.envoi) t.envoi.doublons += 1;
         } else {
@@ -284,7 +304,28 @@ export function creerTriPhotos(opts) {
   // Une photo est « sûre » quand l'IA dépasse le seuil et que l'ingénieur n'a
   // pas changé sa proposition ; dès qu'il choisit lui-même, c'est son choix.
   function estSure(p) {
-    return p.sure && t.choix[p.id] === undefined && composanteExiste(p.suggestion_id);
+    return !!p.suggestion_id && (p.confiance ?? 0) >= t.seuil && t.choix[p.id] === undefined && composanteExiste(p.suggestion_id);
+  }
+
+  function changerSeuil(v) {
+    if (!SEUILS.includes(v)) return;
+    t.seuil = v;
+    try { localStorage.setItem(CLE_SEUIL, String(v)); } catch (e) { /* mémoire facultative */ }
+    render();
+  }
+
+  function seuilHtml() {
+    const avecProposition = t.photos.filter((p) => p.suggestion_id && t.choix[p.id] === undefined && composanteExiste(p.suggestion_id));
+    if (!avecProposition.length) return '';
+    return `
+      <div class="tp-seuil">
+        <span class="tp-seuil-lbl">Propositions sûres à partir de</span>
+        <div class="seg">${SEUILS.map((v) => {
+          const n = avecProposition.filter((p) => (p.confiance ?? 0) >= v).length;
+          return `<button class="seg-btn ${t.seuil === v ? 'on' : ''}" data-action="tp-seuil" data-val="${v}" title="${n} photo(s)">${v} %<small>${n}</small></button>`;
+        }).join('')}</div>
+        <span class="tp-seuil-aide">Plus bas : plus de photos à approuver d'un coup, à vérifier d'un œil sur les vignettes.</span>
+      </div>`;
   }
 
   // ---------------- Rendu ----------------
@@ -366,7 +407,7 @@ export function creerTriPhotos(opts) {
           ? (t.pause
             ? `<i data-lucide="pause-circle" style="width:14px;height:14px"></i>En pause : ${envoi.faits}/${envoi.total}${t.ouvriers ? ` · ${t.ouvriers} envoi(s) en train de se terminer` : ''}`
             : `<i data-lucide="loader-2" class="spin" style="width:14px;height:14px"></i>Envoi et analyse : ${envoi.faits}/${envoi.total}`)
-          : `<i data-lucide="check-circle-2" style="width:14px;height:14px"></i>${envoi.total - envoi.echecs.length - (envoi.doublons || 0)} photo(s) analysée(s)`}${envoi.doublons ? ` · ${envoi.doublons} doublon(s) écarté(s)` : ''}${envoi.abandonnees ? ` · ${envoi.abandonnees} non envoyée(s)` : ''}${envoi.echecs.length ? ` · <span class="err">${envoi.echecs.length} échec(s) : ${escapeHtml(envoi.echecs.slice(0, 3).join(', '))}${envoi.echecs.length > 3 ? '…' : ''}</span>` : ''}
+          : `<i data-lucide="check-circle-2" style="width:14px;height:14px"></i>${envoi.total - envoi.echecs.length - (envoi.doublons || 0) - (envoi.deja || 0)} photo(s) analysée(s)`}${envoi.deja ? ` · ${envoi.deja} déjà envoyée(s)` : ''}${envoi.doublons ? ` · ${envoi.doublons} doublon(s) écarté(s)` : ''}${envoi.abandonnees ? ` · ${envoi.abandonnees} non envoyée(s)` : ''}${envoi.echecs.length ? ` · <span class="err">${envoi.echecs.length} échec(s) : ${escapeHtml(envoi.echecs.slice(0, 3).join(', '))}${envoi.echecs.length > 3 ? '…' : ''}</span>` : ''}
           ${enCours ? `<span class="tp-progress-actions">${t.pause
             ? `<button class="btn-pill-sm" data-action="tp-reprendre"><i data-lucide="play" style="width:13px;height:13px"></i>Reprendre</button><button class="btn-pill-sm" data-action="tp-abandonner">Abandonner le reste</button>`
             : `<button class="btn-pill-sm" data-action="tp-pause"><i data-lucide="pause" style="width:13px;height:13px"></i>Mettre en pause</button>`}</span>` : ''}</div>
@@ -393,6 +434,8 @@ export function creerTriPhotos(opts) {
           <div class="tp-doublon-nom" title="${escapeHtml(d.fichier.name || '')}">${escapeHtml(d.fichier.name || 'Photo')}</div>
           <button class="btn-pill-sm" data-action="tp-envoyer-doublon" data-cle="${d.cle}">Envoyer</button>
         </div>`).join('')}</div>` : ''}
+
+      ${seuilHtml()}
 
       ${sures.length ? `
       <div class="tp-section-head">
@@ -432,6 +475,7 @@ export function creerTriPhotos(opts) {
     switch (action) {
       case 'tp-choisir': choisirFichiers(); return true;
       case 'tp-pause': pause(); return true;
+      case 'tp-seuil': changerSeuil(Number(btn.getAttribute('data-val'))); return true;
       case 'tp-reprendre': reprendre(); return true;
       case 'tp-abandonner':
         if (confirm(`Abandonner les ${t.file.length} photo(s) pas encore envoyée(s) ? Vous pourrez les redéposer plus tard.`)) abandonner();
