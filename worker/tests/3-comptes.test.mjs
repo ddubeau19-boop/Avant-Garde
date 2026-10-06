@@ -81,7 +81,7 @@ test('changer son mot de passe : l\'actuel est exigé, les autres sessions se fe
   const email = `change${Date.now()}@test.ca`;
   const marque = nombreCourriels();
   await api(`/api/companies/${IDS.firmeA}/equipe`, { methode: 'POST', session: adminA, corps: { name: 'Prudent', email } });
-  const s1 = (await api(`/api/auth/jeton/${await lienApres(marque)}`, { methode: 'POST', corps: { password: 'mot de passe initial' } })).json.token;
+  const s1 = (await api(`/api/auth/jeton/${await lienApres(marque, 'Bienvenue, Prudent')}`, { methode: 'POST', corps: { password: 'mot de passe initial' } })).json.token;
   assert.equal((await api('/api/auth/mot-de-passe', { methode: 'POST', session: s1, corps: { actuel: 'faux', nouveau: 'nouveau mot de passe' } })).statut, 400);
   const r = await api('/api/auth/mot-de-passe', { methode: 'POST', session: s1, corps: { actuel: 'mot de passe initial', nouveau: 'nouveau mot de passe' } });
   assert.equal(r.statut, 200);
@@ -93,7 +93,7 @@ test('désactiver un compte ferme ses sessions ; le réactiver rend l\'accès', 
   const email = `depart${Date.now()}@test.ca`;
   const marque = nombreCourriels();
   const inv = await api(`/api/companies/${IDS.firmeA}/equipe`, { methode: 'POST', session: adminA, corps: { name: 'Sur le départ', email } });
-  const s = (await api(`/api/auth/jeton/${await lienApres(marque)}`, { methode: 'POST', corps: { password: 'mot de passe du départ' } })).json.token;
+  const s = (await api(`/api/auth/jeton/${await lienApres(marque, 'Bienvenue, Sur le départ')}`, { methode: 'POST', corps: { password: 'mot de passe du départ' } })).json.token;
   const id = inv.json.membre.id;
   assert.equal((await api(`/api/companies/${IDS.firmeA}/equipe/${id}`, { methode: 'PATCH', session: adminA, corps: { actif: false } })).statut, 200);
   assert.equal((await api('/api/auth/me', { session: s })).statut, 401);

@@ -52,17 +52,23 @@ function fichiersCourriels() {
 // Marque à relever avant l'action qui envoie un courriel.
 export const nombreCourriels = () => Date.now() - 5;
 // Les courriels envoyés depuis la marque, en attendant qu'ils arrivent.
-export async function courrielsApres(marque, { attendus = 1, delai = 10000 } = {}) {
+// `contient` ne garde que ceux qui portent ce texte : la marque laisse passer
+// quelques millisecondes en arrière, et un courriel du test précédent écrit
+// juste avant pouvait être pris pour celui attendu, encore en route.
+export async function courrielsApres(marque, { attendus = 1, delai = 10000, contient } = {}) {
   const fin = Date.now() + delai;
-  let liste = fichiersCourriels().filter((f) => f.moment >= marque);
+  const lire = () => fichiersCourriels().filter((f) => f.moment >= marque)
+    .map((f) => readFileSync(f.chemin, 'utf8'))
+    .filter((t) => !contient || t.includes(contient));
+  let liste = lire();
   while (liste.length < attendus && Date.now() < fin) {
     await pause(150);
-    liste = fichiersCourriels().filter((f) => f.moment >= marque);
+    liste = lire();
   }
-  return liste.map((f) => readFileSync(f.chemin, 'utf8'));
+  return liste;
 }
-export async function lienApres(marque) {
-  const liste = await courrielsApres(marque);
+export async function lienApres(marque, contient) {
+  const liste = await courrielsApres(marque, { contient });
   const m = (liste[liste.length - 1] || '').match(/jeton=([A-Za-z0-9_-]+)/);
   return m ? m[1] : null;
 }
