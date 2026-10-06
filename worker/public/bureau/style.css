@@ -849,3 +849,10 @@ details.ca-bloc summary { cursor: pointer; }
 .pv-publie > i { width: 20px; height: 20px; color: var(--green); flex-shrink: 0; }
 .pv-publie .btn-pill-sm { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; }
 .sig-form { margin: 4px 0 10px; }
+
+/* PDF signé */
+.pdf-etapes { display: flex; flex-direction: column; gap: 8px; }
+.pdf-etape { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid var(--ink-200); border-radius: 12px; font-size: 13.5px; color: var(--ink-700); flex-wrap: wrap; }
+.pdf-etape .n { width: 22px; height: 22px; border-radius: 50%; background: var(--ink); color: #fff; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.pdf-etape .btn-pill-sm { display: inline-flex; align-items: center; gap: 5px; }
+.pdf-etape .btn-pill-sm.primary { border-color: var(--orange); background: var(--orange); color: #fff; }

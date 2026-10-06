@@ -3856,7 +3856,13 @@ const COLONNES_AJOUTEES = [
   ["dossiers", "date_visite", "TEXT"],
   // Version publiée, figée : le .docx produit à la publication (R2) et son signataire.
   ["dossiers", "rapport_publie_r2", "TEXT"],
-  ["dossiers", "publie_par", "TEXT"]
+  ["dossiers", "publie_par", "TEXT"],
+  // PDF signé par l'ingénieur : déposé avant la publication (pdf_signe_*),
+  // puis figé avec elle (rapport_publie_pdf_r2). C'est ce que reçoit le syndicat.
+  ["dossiers", "pdf_signe_r2", "TEXT"],
+  ["dossiers", "pdf_signe_le", "TEXT"],
+  ["dossiers", "pdf_signe_nom", "TEXT"],
+  ["dossiers", "rapport_publie_pdf_r2", "TEXT"]
 ];
 // Tables ajoutées après la mise en production, créées au premier appel.
 const TABLES_AJOUTEES = [
@@ -48021,7 +48027,7 @@ portail.get("/immeubles/:id", async (c) => {
   const company = await c.env.DB.prepare("SELECT * FROM companies WHERE id = ?1").bind(dossier.company_id).first();
   const theme = themeDeFirme(company);
   return c.json({
-    immeuble: { id: dossier.id, name: dossier.name, address: dossier.address, city: dossier.city, dossier_no: dossier.dossier_no, rapport: !!dossier.published_at },
+    immeuble: { id: dossier.id, name: dossier.name, address: dossier.address, city: dossier.city, dossier_no: dossier.dossier_no, rapport: dossier.published_at ? (dossier.rapport_publie_pdf_r2 ? "pdf" : "docx") : false },
     firme: { id: company?.id, name: company?.name, hasLogo: !!company?.logo_r2_key, accent: theme.accent, telephone: theme.telephone, courriel: theme.courriel },
     moi: { id: user.id, name: user.name, fonction, apercu: !!apercu },
     membres: membres.filter((m) => m.actif).map((m) => ({ id: m.id, name: m.name, fonction: m.fonction })),
@@ -48092,11 +48098,20 @@ portail.get("/immeubles/:id/suivi-entretien.xlsx", async (c) => {
   const bytes = await tableurSuiviEntretien(await contexteRapportPortail(c, dossier));
   return new Response(new Blob([bytes]), { headers: { "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "content-disposition": `attachment; filename="${dossier.dossier_no}-suivi-entretien.xlsx"` } });
 });
+// L'étude signée, telle que publiée.
+portail.get("/immeubles/:id/rapport.pdf", async (c) => {
+  const { refus, dossier } = await immeublePortail(c);
+  if (refus) return refus;
+  if (!dossier.published_at || !dossier.rapport_publie_pdf_r2) return c.json({ error: "aucune étude signée publiée" }, 404);
+  return reponsePdf(c, dossier.rapport_publie_pdf_r2, `${dossier.dossier_no}-etude-fonds-prevoyance.pdf`);
+});
 // Le rapport seulement une fois publié par la firme.
 portail.get("/immeubles/:id/rapport.docx", async (c) => {
   const { refus, dossier } = await immeublePortail(c);
   if (refus) return refus;
   if (!dossier.published_at) return c.json({ error: "le rapport n'est pas encore publié par la firme" }, 404);
+  // Publiée avec un PDF signé : c'est lui le livrable, pas un Word modifiable.
+  if (dossier.rapport_publie_pdf_r2) return c.json({ error: "l'étude est remise en PDF signé" }, 404);
   // La version figée à la publication ; à défaut (publié avant qu'elle
   // existe), le rapport regénéré comme auparavant.
   const fige = dossier.rapport_publie_r2 ? await c.env.PHOTOS.get(dossier.rapport_publie_r2) : null;
@@ -48946,6 +48961,18 @@ async function verificationPublication(db, dossier, signataire) {
        COUNT(*) AS total
      FROM components WHERE dossier_id = ?1 AND actif = 1`
   ).bind(dossier.id).first();
+  if (!dossier.pdf_signe_r2) {
+    bloquants.push({ cle: "pdf", message: "Le PDF signé n'est pas déposé : téléchargez le Word à signer, signez-le, puis déposez le PDF." });
+  } else if (dossier.published_at && dossier.pdf_signe_le && dossier.pdf_signe_le <= dossier.published_at) {
+    bloquants.push({ cle: "pdf", message: "Le PDF déposé est celui de la version déjà publiée : déposez le PDF signé de la nouvelle version." });
+  } else {
+    const modif = (await db.prepare(
+      "SELECT MAX(m) AS m FROM (SELECT MAX(updated_at) AS m FROM components WHERE dossier_id = ?1 UNION ALL SELECT updated_at FROM dossiers WHERE id = ?1)"
+    ).bind(dossier.id).first())?.m;
+    if (modif && dossier.pdf_signe_le && modif > dossier.pdf_signe_le) {
+      avertissements.push({ cle: "pdf_ancien", message: "Le dossier a été modifié après le dépôt du PDF signé : vérifiez que le PDF correspond toujours au rapport." });
+    }
+  }
   if (!comp?.total) bloquants.push({ cle: "composantes", message: "Aucune composante active au dossier." });
   else if (comp.non_confirmees) bloquants.push({ cle: "confirmation", message: `${comp.non_confirmees} composante(s) dont le texte n'est pas confirmé.` });
   if (comp?.non_documentees) avertissements.push({ cle: "documentation", message: `${comp.non_documentees} composante(s) sans cote validée : exclues du calcul du fonds.` });
@@ -48964,7 +48991,8 @@ dossiers.get("/:id/publication", async (c) => {
   return c.json({
     ...await verificationPublication(c.env.DB, dossier, user),
     signataire: { name: user.name, title: user.title ?? null, ordre_professionnel: user.ordre_professionnel ?? null, no_membre: user.no_membre ?? null },
-    publication: dossier.published_at ? { published_at: dossier.published_at, par: publiePar?.name ?? null, figee: !!dossier.rapport_publie_r2 } : null
+    publication: dossier.published_at ? { published_at: dossier.published_at, par: publiePar?.name ?? null, figee: !!dossier.rapport_publie_r2, pdf: !!dossier.rapport_publie_pdf_r2 } : null,
+    pdf_signe: dossier.pdf_signe_r2 ? { nom: dossier.pdf_signe_nom, le: dossier.pdf_signe_le } : null
   });
 });
 // Publier : vérifier, produire le rapport une fois, le garder tel quel, aviser
@@ -48981,8 +49009,8 @@ dossiers.post("/:id/publier", async (c) => {
   const r2Key = `rapports/${dossier.id}/${maintenant.replace(/[:.]/g, "-")}.docx`;
   await c.env.PHOTOS.put(r2Key, octets, { httpMetadata: { contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" } });
   await c.env.DB.prepare(
-    "UPDATE dossiers SET published_at = ?1, rapport_publie_r2 = ?2, publie_par = ?3, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?4"
-  ).bind(maintenant, r2Key, user.id, dossier.id).run();
+    "UPDATE dossiers SET published_at = ?1, rapport_publie_r2 = ?2, publie_par = ?3, rapport_publie_pdf_r2 = ?4, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?5"
+  ).bind(maintenant, r2Key, user.id, dossier.pdf_signe_r2, dossier.id).run();
   await noterJournal(c.env.DB, { dossierId: dossier.id, userId: user.id, action: "publication", champs: [{ champ: "published_at", avant: dossier.published_at ?? null, apres: maintenant }] });
   // Les membres déjà actifs reçoivent l'avis ; une invitation en attente mène
   // déjà au portail, où le rapport les attendra.
@@ -48998,7 +49026,7 @@ dossiers.post("/:id/publier", async (c) => {
         titre: `Bonjour ${m.name}`,
         paragraphes: [
           `${firme?.name ?? "Votre firme d'ingénierie"} a publié ${dossier.published_at ? "une nouvelle version de " : ""}l'étude du fonds de prévoyance de ${dossier.name}.`,
-          "Vous pouvez la télécharger dès maintenant depuis votre portail, avec le carnet d'entretien de l'immeuble."
+          "Vous pouvez télécharger l'étude signée (PDF) dès maintenant depuis votre portail, avec le carnet d'entretien de l'immeuble."
         ],
         bouton: { texte: "Ouvrir le portail", url: `${origine}/portail/` },
         replyTo: user.email ? { email: user.email, name: user.name ?? undefined } : void 0
@@ -49010,6 +49038,47 @@ dossiers.post("/:id/publier", async (c) => {
   }
   const publie = await c.env.DB.prepare("SELECT * FROM dossiers WHERE id = ?1").bind(dossier.id).first();
   return c.json({ dossier: { ...publie, stats: await dossierStats(c.env.DB, dossier.id) }, avises, echecs });
+});
+// PDF signé par l'ingénieur, déposé avant la publication. Remplacer le PDF
+// ne touche pas la version déjà publiée : elle a gardé sa propre référence.
+dossiers.post("/:id/pdf-signe", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  const form = await c.req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return c.json({ error: "champ 'file' requis" }, 400);
+  if (file.size > 60 * 1024 * 1024) return c.json({ error: "PDF trop volumineux (60 Mo au plus)" }, 400);
+  const octets = new Uint8Array(await file.arrayBuffer());
+  if (new TextDecoder().decode(octets.slice(0, 5)) !== "%PDF-") return c.json({ error: "le fichier n'est pas un PDF" }, 400);
+  const maintenant = (/* @__PURE__ */ new Date()).toISOString();
+  const r2Key = `rapports/${dossier.id}/signe-${maintenant.replace(/[:.]/g, "-")}.pdf`;
+  await c.env.PHOTOS.put(r2Key, octets, { httpMetadata: { contentType: "application/pdf" } });
+  const nom = String(file.name || "rapport.pdf").slice(0, 200);
+  await c.env.DB.prepare("UPDATE dossiers SET pdf_signe_r2 = ?1, pdf_signe_le = ?2, pdf_signe_nom = ?3 WHERE id = ?4").bind(r2Key, maintenant, nom, dossier.id).run();
+  return c.json({ pdf_signe_le: maintenant, pdf_signe_nom: nom, taille: octets.byteLength }, 201);
+});
+dossiers.delete("/:id/pdf-signe", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  // Le fichier reste en R2 s'il est celui de la version publiée.
+  if (dossier.pdf_signe_r2 && dossier.pdf_signe_r2 !== dossier.rapport_publie_pdf_r2) await c.env.PHOTOS.delete(dossier.pdf_signe_r2);
+  await c.env.DB.prepare("UPDATE dossiers SET pdf_signe_r2 = NULL, pdf_signe_le = NULL, pdf_signe_nom = NULL WHERE id = ?1").bind(dossier.id).run();
+  return c.json({ ok: true });
+});
+async function reponsePdf(c, r2Key, nom) {
+  const obj = r2Key ? await c.env.PHOTOS.get(r2Key) : null;
+  if (!obj) return c.json({ error: "PDF introuvable" }, 404);
+  return new Response(obj.body, { headers: { "content-type": "application/pdf", "content-disposition": `attachment; filename="${nom}"` } });
+}
+dossiers.get("/:id/pdf-signe.pdf", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  return reponsePdf(c, dossier.pdf_signe_r2, `${dossier.dossier_no}-etude-fonds-prevoyance-signee.pdf`);
+});
+dossiers.get("/:id/rapport-publie.pdf", async (c) => {
+  const { dossier } = await getOwnedDossier(c, c.req.param("id"));
+  if (!dossier) return c.json({ error: "dossier introuvable" }, 404);
+  return reponsePdf(c, dossier.published_at ? dossier.rapport_publie_pdf_r2 : null, `${dossier.dossier_no}-etude-fonds-prevoyance.pdf`);
 });
 // La version publiée, telle que le syndicat la reçoit.
 dossiers.get("/:id/rapport-publie.docx", async (c) => {

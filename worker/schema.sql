@@ -149,7 +149,11 @@ CREATE TABLE dossiers (
   client_id            TEXT,  -- syndicat client (clients.id)
   date_visite          TEXT,  -- date de la visite des lieux (AAAA-MM-JJ)
   rapport_publie_r2    TEXT,  -- clé R2 du .docx figé à la publication
-  publie_par           TEXT   -- utilisateur qui a publié (signataire de la version figée)
+  publie_par           TEXT,  -- utilisateur qui a publié (signataire de la version figée)
+  pdf_signe_r2         TEXT,  -- PDF signé déposé par l'ingénieur, en attente de publication
+  pdf_signe_le         TEXT,
+  pdf_signe_nom        TEXT,
+  rapport_publie_pdf_r2 TEXT  -- PDF signé figé à la publication : ce que reçoit le syndicat
 );
 
 CREATE TABLE components (

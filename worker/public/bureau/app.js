@@ -212,6 +212,7 @@ const state = {
   publication: null,          // GET /api/dossiers/:id/publication
   publicationErreur: null,
   publicationResultat: null,  // { avises, echecs } après une publication
+  pdfEnvoi: false,
 
   // Analyse des photos par l'IA, depuis le bureau : { enCours, faits, total, note }.
   analyse: { enCours: false, faits: 0, total: 0, note: null },
@@ -3008,6 +3009,53 @@ function renderRevision() {
   </div>`;
 }
 
+// L'ingénieur signe hors de l'app (Word → PDF, signature ou sceau), puis
+// dépose le PDF : c'est ce fichier que le syndicat télécharge.
+function pdfSigneHtml(pub) {
+  const p = pub.pdf_signe;
+  const dateFr = (iso) => new Date(iso).toLocaleString('fr-CA', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' });
+  return `
+  <div class="pdf-etapes">
+    <div class="pdf-etape"><span class="n">1</span><div style="flex:1">Téléchargez le rapport Word, relisez-le, exportez-le en PDF et signez-le (signature ou sceau).</div>
+      <button class="btn-pill-sm" data-action="download-docx"><i data-lucide="file-text" style="width:14px;height:14px"></i>Word à signer</button></div>
+    <div class="pdf-etape"><span class="n">2</span><div style="flex:1">${p
+      ? `<b>${escapeHtml(p.nom)}</b> · déposé le ${escapeHtml(dateFr(p.le))}`
+      : 'Déposez le PDF signé.'}</div>
+      ${p ? `<button class="btn-pill-sm" data-action="voir-pdf-signe">Voir</button><button class="btn-pill-sm" data-action="retirer-pdf-signe">Retirer</button>` : ''}
+      <button class="btn-pill-sm ${p ? '' : 'primary'}" data-action="deposer-pdf-signe" ${state.pdfEnvoi ? 'disabled' : ''}><i data-lucide="${state.pdfEnvoi ? 'loader-2' : 'upload'}" class="${state.pdfEnvoi ? 'spin' : ''}" style="width:14px;height:14px"></i>${state.pdfEnvoi ? 'Envoi…' : p ? 'Remplacer' : 'Déposer le PDF signé'}</button></div>
+  </div>`;
+}
+
+function choisirPdfSigne() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'application/pdf,.pdf';
+  input.addEventListener('change', () => { const f = input.files && input.files[0]; if (f) deposerPdfSigne(f); });
+  input.click();
+}
+
+async function deposerPdfSigne(file) {
+  state.pdfEnvoi = true;
+  state.publishError = null;
+  render();
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    await apiJson(`/api/dossiers/${state.dossierId}/pdf-signe`, { method: 'POST', body: fd });
+  } catch (e) {
+    state.publishError = e.message || "Échec de l'envoi du PDF.";
+  }
+  state.pdfEnvoi = false;
+  await chargerPublication();
+}
+
+async function retirerPdfSigne() {
+  if (!confirm('Retirer le PDF signé déposé ?')) return;
+  try { await apiJson(`/api/dossiers/${state.dossierId}/pdf-signe`, { method: 'DELETE' }); }
+  catch (e) { state.publishError = e.message; }
+  await chargerPublication();
+}
+
 // Compléter son bloc de signature sans quitter la publication.
 function signatureFormHtml(sig) {
   const ordres = ['OIQ', 'OTPQ', 'OAQ'];
@@ -3061,7 +3109,8 @@ function renderPublier() {
           <i data-lucide="check-circle-2"></i>
           <div style="flex:1"><b>Publiée le ${escapeHtml(new Date(publie.published_at).toLocaleDateString('fr-CA', { day: 'numeric', month: 'long', year: 'numeric' }))}</b>${publie.par ? ` par ${escapeHtml(publie.par)}` : ''}.
             ${publie.figee ? 'Le syndicat télécharge la version figée à ce moment.' : 'Publiée avant les versions figées : le portail regénère le rapport ; republiez pour figer la version.'}</div>
-          ${publie.figee ? `<button class="btn-pill-sm" data-action="telecharger-publie"><i data-lucide="download" style="width:14px;height:14px"></i>Version publiée</button>` : ''}
+          ${publie.pdf ? `<button class="btn-pill-sm" data-action="telecharger-publie-pdf"><i data-lucide="download" style="width:14px;height:14px"></i>PDF publié</button>` : ''}
+          ${publie.figee ? `<button class="btn-pill-sm" data-action="telecharger-publie"><i data-lucide="download" style="width:14px;height:14px"></i>Word publié</button>` : ''}
         </div>` : ''}
         ${res ? `<div class="pv-row ok"><i data-lucide="mail-check"></i><span>${res.avises ? `${res.avises} membre(s) du syndicat avisé(s) par courriel.` : 'Aucun membre actif à aviser.'}${res.echecs.length ? ` Échec d'envoi : ${escapeHtml(res.echecs.join(', '))}.` : ''}</span></div>` : ''}
 
@@ -3079,6 +3128,9 @@ function renderPublier() {
 
         ${bloquants.some((x) => x.cle === 'signataire') ? signatureFormHtml(sig) : ''}
 
+        <div class="pub-section-eyebrow" style="margin-top:22px">Étude signée (PDF) — ce que reçoit le syndicat</div>
+        ${pdfSigneHtml(pub)}
+
         <div class="pub-section-eyebrow" style="margin-top:22px">Destinataires (membres du portail)</div>
         ${dest.length ? dest.map((m) => `
         <div class="recipient-card">
@@ -3088,7 +3140,7 @@ function renderPublier() {
       </div>
       ${state.publishError ? `<div style="padding:0 30px 16px">${errorBanner(state.publishError)}</div>` : ''}
       <div class="pub-footer">
-        <div class="pub-footer-note">En publiant, le rapport Word est produit une fois et figé : c'est cette version que le syndicat télécharge, même si le dossier change ensuite. Les membres actifs reçoivent un courriel.</div>
+        <div class="pub-footer-note">En publiant, le PDF signé et le rapport Word sont figés : le syndicat télécharge ce PDF, même si le dossier change ensuite. Les membres actifs reçoivent un courriel.</div>
         <button class="btn-primary" data-action="publish" ${state.publishing || bloquants.length ? 'disabled' : ''}><i data-lucide="${state.publishing ? 'loader-2' : 'send'}" class="${state.publishing ? 'spin' : ''}"></i>${state.publishing ? 'Production du rapport…' : publie ? 'Publier une nouvelle version' : 'Publier au syndicat'}</button>
       </div>
     </div>`;
@@ -3586,6 +3638,20 @@ function initEvents() {
         state.publicationResultat = null;
         state.screen = 'publier';
         chargerPublication();
+        break;
+      case 'deposer-pdf-signe':
+        choisirPdfSigne();
+        break;
+      case 'retirer-pdf-signe':
+        retirerPdfSigne();
+        break;
+      case 'voir-pdf-signe':
+        telecharger(`/api/dossiers/${state.dossierId}/pdf-signe.pdf`, `${(state.dossier && state.dossier.dossier_no) || 'dossier'}-etude-signee.pdf`)
+          .catch((e) => { state.publishError = e.message; render(); });
+        break;
+      case 'telecharger-publie-pdf':
+        telecharger(`/api/dossiers/${state.dossierId}/rapport-publie.pdf`, `${(state.dossier && state.dossier.dossier_no) || 'dossier'}-etude-fonds-prevoyance.pdf`)
+          .catch((e) => { state.publishError = e.message; render(); });
         break;
       case 'telecharger-publie':
         telecharger(`/api/dossiers/${state.dossierId}/rapport-publie.docx`, `${(state.dossier && state.dossier.dossier_no) || 'dossier'}-etude-fonds-prevoyance.docx`)

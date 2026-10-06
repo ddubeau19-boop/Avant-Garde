@@ -6,6 +6,12 @@ import { api, jeton, IDS, texteDocx, nombreCourriels, lienApres, courrielsApres 
 
 const adminA = jeton(IDS.adminA), ingB = jeton(IDS.ingB);
 const ilYa = (jours) => new Date(Date.now() - jours * 864e5).toISOString().slice(0, 10);
+const PDF = Buffer.from('%PDF-1.4\n% étude signée\n%%EOF\n');
+function deposerPdf(id, octets = PDF, type = 'application/pdf', session = adminA) {
+  const f = new FormData();
+  f.append('file', new Blob([octets], { type }), 'etude-signee.pdf');
+  return api(`/api/dossiers/${id}/pdf-signe`, { methode: 'POST', session, formulaire: f });
+}
 const dateLongue = (iso) => new Date(`${iso}T12:00:00Z`).toLocaleDateString('fr-CA', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
 
 async function nouveauDossier(nom = 'Publication') {
@@ -39,11 +45,11 @@ test('publier : vérifié, figé, et le syndicat est avisé', async () => {
   // Sans signature complète, ni date de visite, ni texte confirmé : refusé.
   await api('/api/auth/signature', { methode: 'PATCH', session: adminA, corps: { ordre_professionnel: '', no_membre: '' } });
   const avant = (await api(`/api/dossiers/${id}/publication`, { session: adminA })).json;
-  assert.deepEqual(avant.bloquants.map((b) => b.cle).sort(), ['confirmation', 'date_visite', 'signataire']);
+  assert.deepEqual(avant.bloquants.map((b) => b.cle).sort(), ['confirmation', 'date_visite', 'pdf', 'signataire']);
   assert.ok(avant.avertissements.some((a) => a.cle === 'membres'));
   const refus = await api(`/api/dossiers/${id}/publier`, { methode: 'POST', session: adminA });
   assert.equal(refus.statut, 409);
-  assert.equal(refus.json.verification.bloquants.length, 3);
+  assert.equal(refus.json.verification.bloquants.length, 4);
   // Publier « maintenant » ne contourne pas la vérification par PATCH ; une
   // date passée (étude livrée hors plateforme) reste permise.
   assert.equal((await api(`/api/dossiers/${id}`, { methode: 'PATCH', session: adminA, corps: { published_at: new Date().toISOString() } })).statut, 400);
@@ -52,6 +58,7 @@ test('publier : vérifié, figé, et le syndicat est avisé', async () => {
   // Une autre firme ne voit ni ne publie rien.
   assert.equal((await api(`/api/dossiers/${id}/publication`, { session: ingB })).statut, 404);
   assert.equal((await api(`/api/dossiers/${id}/publier`, { methode: 'POST', session: ingB })).statut, 404);
+  assert.equal((await deposerPdf(id, PDF, 'application/pdf', ingB)).statut, 404);
 
   // On complète : signature, date de visite, textes confirmés.
   await api('/api/auth/signature', { methode: 'PATCH', session: adminA, corps: { title: 'ing.', ordre_professionnel: 'OIQ', no_membre: '5012345' } });
@@ -59,6 +66,11 @@ test('publier : vérifié, figé, et le syndicat est avisé', async () => {
   await api(`/api/dossiers/${id}`, { methode: 'PATCH', session: adminA, corps: { date_visite: visite } });
   const comps = (await api(`/api/dossiers/${id}/components`, { session: adminA })).json.filter((c) => c.actif !== 0);
   for (const c of comps) await api(`/api/components/${c.id}`, { methode: 'PATCH', session: adminA, corps: { confirmed: 1 } });
+  // Le PDF signé : refusé si ce n'en est pas un.
+  assert.equal((await deposerPdf(id, Buffer.from('pas un pdf'), 'application/pdf')).statut, 400);
+  const depot = await deposerPdf(id);
+  assert.equal(depot.statut, 201);
+  assert.equal(depot.json.pdf_signe_nom, 'etude-signee.pdf');
 
   // Un membre actif du portail, qui sera avisé.
   const email = `ca${Date.now()}@syndicat.test`;
@@ -79,6 +91,7 @@ test('publier : vérifié, figé, et le syndicat est avisé', async () => {
   const avis = await courrielsApres(marque, { contient: nom });
   assert.equal(avis.length, 1);
   assert.match(avis[0], /a publié l'étude du fonds de prévoyance/);
+  assert.match(avis[0], /signée \(PDF\)/);
 
   // La version publiée porte la date de visite et une déclaration complète.
   const fige = await api(`/api/dossiers/${id}/rapport-publie.docx`, { session: adminA, brut: true });
@@ -88,15 +101,33 @@ test('publier : vérifié, figé, et le syndicat est avisé', async () => {
   assert.ok(texte.some((t) => t.includes(`La visite des lieux a été effectuée le ${dateLongue(visite)}`)), 'date de visite dans la déclaration');
   assert.ok(!texte.some((t) => /À COMPLÉTER|NOTE À LA RÉVISION/.test(t)), 'aucune mention interne au rapport livré');
 
-  // Figé : ce que le syndicat télécharge ne suit pas les modifications.
+  // Le syndicat reçoit le PDF signé, pas un Word modifiable.
+  const vue = (await api(`/api/portail/immeubles/${id}`, { session: membre })).json;
+  assert.equal(vue.immeuble.rapport, 'pdf');
+  const pdfPortail = await api(`/api/portail/immeubles/${id}/rapport.pdf`, { session: membre, brut: true });
+  assert.equal(pdfPortail.status, 200);
+  assert.deepEqual(Buffer.from(await pdfPortail.arrayBuffer()), PDF);
+  assert.equal((await api(`/api/portail/immeubles/${id}/rapport.docx`, { session: membre, brut: true })).status, 404);
+
+  // Une nouvelle version exige un nouveau PDF ; remplacer le PDF en attente
+  // ne change pas celui déjà publié.
   await api(`/api/dossiers/${id}`, { methode: 'PATCH', session: adminA, corps: { name: 'Nom changé après publication' } });
-  const portail = await api(`/api/portail/immeubles/${id}/rapport.docx`, { session: membre, brut: true });
-  assert.equal(portail.status, 200);
-  const textePortail = texteDocx(await portail.arrayBuffer());
-  assert.ok(textePortail.some((t) => t.includes(nom)));
-  assert.ok(!textePortail.some((t) => t.includes('Nom changé après publication')));
+  const republier = (await api(`/api/dossiers/${id}/publication`, { session: adminA })).json;
+  assert.ok(republier.bloquants.some((b) => b.cle === 'pdf'));
+  const PDF2 = Buffer.from('%PDF-1.4\n% version 2\n%%EOF\n');
+  await deposerPdf(id, PDF2);
+  assert.deepEqual(Buffer.from(await (await api(`/api/portail/immeubles/${id}/rapport.pdf`, { session: membre, brut: true })).arrayBuffer()), PDF);
+  assert.deepEqual((await api(`/api/dossiers/${id}/publication`, { session: adminA })).json.bloquants, []);
+  // Le Word figé de la première publication garde l'ancien nom.
+  const word = texteDocx(await (await api(`/api/dossiers/${id}/rapport-publie.docx`, { session: adminA, brut: true })).arrayBuffer());
+  assert.ok(word.some((t) => t.includes(nom)));
+  assert.ok(!word.some((t) => t.includes('Nom changé après publication')));
+  // Modifier le dossier après le dépôt du PDF : avertissement.
+  await api(`/api/dossiers/${id}`, { methode: 'PATCH', session: adminA, corps: { units: 9 } });
+  assert.ok((await api(`/api/dossiers/${id}/publication`, { session: adminA })).json.avertissements.some((a) => a.cle === 'pdf_ancien'));
 
   const apres = (await api(`/api/dossiers/${id}/publication`, { session: adminA })).json;
   assert.equal(apres.publication.figee, true);
+  assert.equal(apres.publication.pdf, true);
   assert.equal(apres.publication.par, 'Admin A');
 });
