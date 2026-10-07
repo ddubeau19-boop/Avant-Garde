@@ -944,3 +944,16 @@ details.ca-bloc summary { cursor: pointer; }
 .attn-rediger { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; font-size: 12.5px; margin: 8px 0 4px; }
 .attn-cloture { font-size: 12px; color: var(--ink-500); margin-top: 4px; }
 .tp-plus { display: flex; align-items: center; gap: 12px; justify-content: center; margin: 14px 0 22px; font-size: 12.5px; color: var(--ink-500); }
+
+/* Photo mal classée : déplacer ou retirer */
+.rvia-photo-menu { position: absolute; top: 6px; right: 40px; z-index: 2; width: 28px; height: 28px; border-radius: 50%; border: 0; background: rgba(0,0,0,.45); color: #fff; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+.rvia-photo-menu:hover { background: rgba(0,0,0,.65); }
+.rvia-photo-panneau { margin-top: 10px; background: var(--white, #fff); border: 1px solid var(--ink-200); border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+.rvia-photo-panneau-tete { display: flex; align-items: center; gap: 10px; font-size: 12.5px; font-weight: 600; }
+.rvia-photo-panneau-tete img { width: 56px; height: 42px; object-fit: cover; border-radius: 6px; }
+.rvia-photo-panneau select { width: 100%; font-size: 12px; padding: 5px 6px; }
+.rvia-photo-panneau-actions { display: flex; gap: 4px; flex-wrap: wrap; }
+.rvia-photo-panneau-actions .danger { color: var(--accent-press); }
+.rvia-photos-note.ok { color: var(--green); }
+.prep-ligne { display: flex; align-items: center; gap: 12px; margin: -6px 0 16px; font-size: 12.5px; color: var(--ink-500); flex-wrap: wrap; }
+.lot-ia { display: flex; align-items: center; gap: 12px; justify-content: space-between; flex-wrap: wrap; background: var(--ink-050); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 13px; }
