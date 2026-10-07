@@ -202,7 +202,8 @@ CREATE TABLE components (
   origine_id         TEXT,    -- composante de l'étude précédente
   travaux_periode    TEXT,    -- fait | reporte | abandonne : travaux prévus à l'étude précédente
   travaux_annee      INTEGER, -- année des travaux réalisés
-  attentions         TEXT     -- JSON : attentions spéciales saisies au bureau [{id, titre, notes, texte, photos}]
+  attentions         TEXT,    -- JSON : attentions spéciales saisies au bureau [{id, titre, notes, texte, photos}]
+  textes_sections    TEXT     -- JSON : sections corrigées à la main {duree_vie, entretien, attention}
 );
 
 CREATE TABLE photos (
@@ -269,7 +270,8 @@ CREATE TABLE redactions (
   texte_retenu   TEXT,      -- ce que l'ingénieur a gardé après correction
   valide         INTEGER NOT NULL DEFAULT 0,
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  signature      TEXT       -- empreinte des faits du texte généré : resservi tant qu'elle ne change pas
 );
 
 CREATE INDEX idx_redactions_banque    ON redactions(company_id, valide, uniformat_code);

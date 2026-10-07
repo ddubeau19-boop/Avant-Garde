@@ -216,6 +216,9 @@ const state = {
   inactifsOuverts: false,
   lot: { ouvert: false, choix: { bon: true, na: true, normal: false }, enCours: false, note: null },
   saisie: { ouvert: false, tous: false, ids: [], brouillon: {} },
+  preparation: { enCours: false, faits: 0, total: 0, echecs: 0, note: null },
+  photoMenu: null,
+  photoNote: null,
   sansPhoto: { ouvert: false, chargement: false, choix: {}, enCours: false },
   couts: { ouvert: false, donnees: null, erreur: null, choix: {}, enCours: false },
   publication: null,          // GET /api/dossiers/:id/publication
@@ -872,6 +875,7 @@ async function openDossier(id) {
   state.lot = { ouvert: false, choix: { bon: true, na: true, normal: false }, enCours: false, note: null };
   state.couts = { ouvert: false, donnees: null, erreur: null, choix: {}, enCours: false };
   state.saisie = { ouvert: false, tous: false, ids: [], brouillon: {} };
+  state.preparation = { enCours: false, faits: 0, total: 0, echecs: 0, note: null };
   state.sansPhoto = { ouvert: false, chargement: false, choix: {}, enCours: false };
   state.analyse = { enCours: false, faits: 0, total: 0, note: null };
   await loadDossierDetail(id);
@@ -1226,6 +1230,10 @@ function lotPanelHtml() {
   const reste = state.components.filter(c => c.confirmed !== 1 && !LOT_GROUPES.some(g => g.test(c))).length;
   return `
   <div class="nf-card lot-panel">
+    ${cotesIA(4).length ? `<div class="lot-ia">
+      <div><b>${cotesIA(4).length} cote(s) proposée(s) par l'IA</b> pas encore validée(s) : ${cotesIA(2).length} en bon état ou entretien normal (1-2), ${cotesIA(4).length - cotesIA(2).length} à entretien ou remplacement requis (3-4), à valider une à une.</div>
+      <button type="button" class="btn-secondary" data-action="accepter-cotes-ia" ${cotesIA(2).length ? '' : 'disabled'}>Accepter les ${cotesIA(2).length} cote(s) 1-2</button>
+    </div>` : ''}
     <div class="lot-titre">Confirmer en lot</div>
     <div class="lot-sub">Le texte de ces composantes sera rédigé à la génération du rapport, sans relecture une à une. Les composantes à entretien ou remplacement requis (cotes 3-4) et celles sans cote validée se révisent individuellement${reste ? ` (${reste} restante(s))` : ''}.</div>
     ${LOT_GROUPES.map(g => {
@@ -1515,7 +1523,7 @@ function photosRapportNoteHtml(photos) {
       ? `Le rapport montre ${PHOTOS_PAR_FICHE} photos : sans choix, les ${PHOTOS_PAR_FICHE} premières. Cliquez l'étoile pour choisir.`
       : 'Toutes ces photos iront au rapport. Cliquez l\'étoile pour n\'en garder que certaines.';
   const attn = enAttention.size ? ` ${enAttention.size} photo(s) jointe(s) aux attentions spéciales y figurent, pas à l'état de l'actif.` : '';
-  return `<div class="rvia-photos-note">${escapeHtml(texte + attn)}</div>${state.photoRapportErreur ? `<div class="rvia-photos-note err">${escapeHtml(state.photoRapportErreur)}</div>` : ''}`;
+  return `<div class="rvia-photos-note">${escapeHtml(texte + attn)}</div>${state.photoNote ? `<div class="rvia-photos-note ok">${escapeHtml(state.photoNote)}</div>` : ''}${state.photoRapportErreur ? `<div class="rvia-photos-note err">${escapeHtml(state.photoRapportErreur)}</div>` : ''}`;
 }
 async function basculerPhotoRapport(id) {
   const p = state.reviewPhotos.find(x => x.id === id);
@@ -1540,6 +1548,8 @@ async function basculerPhotoRapport(id) {
 
 function revokeReviewPhotos() {
   state.photoRapportErreur = null;
+  state.photoMenu = null;
+  state.photoNote = null;
   state.reviewObjectUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch (e) {} });
   state.reviewObjectUrls = [];
   state.reviewPhotos = [];
@@ -1648,18 +1658,21 @@ function rvPrev() { if (state.reviewIdx > 0) rvGoTo(state.reviewIdx - 1); }
 function rvSkip() { rvGoTo(state.reviewIdx + 1); }
 
 // Le texte corrigé par l'ingénieur dans la carte est renvoyé tel quel dans `note`.
-function collectRedactionNote() {
-  const cardEl = document.querySelector('.rvia-card');
-  if (!cardEl) return null;
-  const parts = [];
-  cardEl.querySelectorAll('[data-sec-text]').forEach(el => {
-    const title = el.getAttribute('data-sec-title') || '';
+// Une section corrigée garde son texte ; remise telle que générée (ou vidée),
+// elle redevient calculée à partir des données.
+const SECTIONS_CORRIGEABLES = ['duree_vie', 'entretien', 'attention'];
+function collectTextesSections() {
+  const r = state.redaction;
+  const o = {};
+  SECTIONS_CORRIGEABLES.forEach(cle => {
+    const el = document.querySelector(`.rvia-card [data-sec-cle="${cle}"]`);
+    if (!el) return;
+    const sec = r && Array.isArray(r.sections) ? r.sections.find(x => x.cle === cle) : null;
     const txt = el.textContent.trim();
-    if (!txt && !title) return;
-    parts.push((title ? title + '\n' : '') + txt);
+    const orig = (el.getAttribute('data-sec-original') || '').trim();
+    if (txt && (txt !== orig || (sec && sec.corrige))) o[cle] = txt;
   });
-  if (!parts.length) return null;
-  return parts.join('\n\n');
+  return Object.keys(o).length ? o : null;
 }
 
 // Seul l'ÉTAT DE L'ACTIF alimente la banque : c'est la seule sous-section
@@ -1798,13 +1811,132 @@ async function redigerAttention(id) {
   render();
 }
 
+// ---- Photo mal classée : la déplacer vers la bonne composante, ou la retirer ----
+function photoMenuHtml(p) {
+  const courant = orderedComponents()[state.reviewIdx];
+  const autres = state.components.filter(c => !courant || c.id !== courant.id);
+  return `<div class="rvia-photo-panneau">
+    <div class="rvia-photo-panneau-tete"><img src="${p.url}" alt=""><span>Cette photo est mal classée ?</span></div>
+    <select class="detail-input" id="photo_dest_${p.id}" aria-label="Composante de destination">
+      <option value="">Déplacer vers…</option>
+      ${autres.map(c => `<option value="${c.id}">${escapeHtml(c.name)}${c.uniformat_code ? ' · ' + escapeHtml(c.uniformat_code) : ''}</option>`).join('')}
+    </select>
+    <div class="rvia-photo-panneau-actions">
+      <button class="btn-pill-sm" data-action="photo-deplacer" data-id="${p.id}">Déplacer</button>
+      <button class="btn-pill-sm danger" data-action="photo-retirer" data-id="${p.id}">Retirer</button>
+      <button class="btn-pill-sm" data-action="photo-menu" data-id="">Annuler</button>
+    </div>
+  </div>`;
+}
+function photoQuitteComposante(photoId, versId) {
+  const courant = orderedComponents()[state.reviewIdx];
+  const p = state.reviewPhotos.find(x => x.id === photoId);
+  if (p) { try { URL.revokeObjectURL(p.url); } catch (e) {} }
+  state.reviewPhotos = state.reviewPhotos.filter(x => x.id !== photoId);
+  state.attn.liste.forEach(a => { a.photos = (a.photos || []).filter(x => x !== photoId); });
+  state.attn.sauve = JSON.stringify(state.attn.liste);
+  state.components = state.components.map(c => {
+    if (courant && c.id === courant.id) return Object.assign({}, c, { photos: Math.max(0, (c.photos || 0) - 1) });
+    if (versId && c.id === versId) return Object.assign({}, c, { photos: (c.photos || 0) + 1 });
+    return c;
+  });
+  if (courant) delete state.redactionCache[courant.id];
+  if (versId) delete state.redactionCache[versId];
+  state.photoMenu = null;
+}
+async function deplacerPhoto(photoId) {
+  const sel = document.getElementById(`photo_dest_${photoId}`);
+  const versId = sel && sel.value;
+  if (!versId) { state.photoRapportErreur = 'Choisissez la composante où déplacer la photo.'; render(); return; }
+  try {
+    await apiJson(`/api/photos/${photoId}`, { method: 'PATCH', body: JSON.stringify({ component_id: versId }) });
+    const dest = state.components.find(c => c.id === versId);
+    photoQuitteComposante(photoId, versId);
+    state.photoRapportErreur = null;
+    state.photoNote = `Photo déplacée vers « ${dest ? dest.name : 'l’autre composante'} ».`;
+  } catch (e) {
+    state.photoRapportErreur = e.message || "La photo n'a pas été déplacée.";
+  }
+  render();
+}
+async function retirerPhoto(photoId) {
+  if (!confirm('Retirer cette photo du dossier ? Elle ne figurera plus au rapport.')) return;
+  try {
+    await apiJson(`/api/photos/${photoId}`, { method: 'DELETE' });
+    photoQuitteComposante(photoId, null);
+    state.photoRapportErreur = null;
+    state.photoNote = 'Photo retirée.';
+  } catch (e) {
+    state.photoRapportErreur = e.message || "La photo n'a pas été retirée.";
+  }
+  render();
+}
+
+// ---- Préparer tous les textes à l'avance ----
+// Chaque texte est rédigé une fois par le serveur et gardé : la révision
+// s'ouvre ensuite sans attente, et le Word reprend ces mêmes textes.
+async function preparerTextes() {
+  const k = state.preparation;
+  if (k.enCours) return;
+  const liste = state.components.filter(c => c.confirmed !== 1 && !state.redactionCache[c.id]);
+  if (!liste.length) { k.note = 'Tous les textes sont déjà prêts.'; render(); return; }
+  Object.assign(k, { enCours: true, faits: 0, total: liste.length, echecs: 0, note: null });
+  render();
+  let i = 0;
+  const ouvrier = async () => {
+    while (i < liste.length && state.dossierId) {
+      const c = liste[i++];
+      try {
+        const res = await apiRaw(`/api/components/${c.id}/redaction`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+        if (res.ok) state.redactionCache[c.id] = await res.json(); else k.echecs += 1;
+      } catch (e) { k.echecs += 1; }
+      k.faits += 1;
+      render();
+    }
+  };
+  const dossier = state.dossierId;
+  await Promise.all([ouvrier(), ouvrier(), ouvrier()]);
+  if (state.dossierId !== dossier) return;
+  k.enCours = false;
+  k.note = `${k.faits - k.echecs} texte(s) prêt(s)${k.echecs ? `, ${k.echecs} échec(s) — relancez pour réessayer` : ''}. La révision s'ouvre maintenant sans attente.`;
+  render();
+}
+function preparationHtml() {
+  const k = state.preparation;
+  const reste = state.components.filter(c => c.confirmed !== 1 && !state.redactionCache[c.id]).length;
+  if (!k.enCours && !reste && !k.note) return '';
+  return `<div class="prep-ligne">
+    <button class="btn-pill-sm" data-action="preparer-textes" ${k.enCours || !reste ? 'disabled' : ''}><i data-lucide="${k.enCours ? 'loader-2' : 'file-text'}" class="${k.enCours ? 'spin' : ''}" style="width:14px;height:14px"></i>${k.enCours ? `Rédaction ${k.faits}/${k.total}…` : reste ? `Préparer les ${reste} texte(s) à l'avance` : 'Textes prêts'}</button>
+    <span>${k.note ? escapeHtml(k.note) : "Évite d'attendre à chaque composante ; le rapport Word reprend ces mêmes textes."}</span>
+  </div>`;
+}
+
+// ---- Cotes proposées par l'IA : les accepter en lot ----
+function cotesIA(max) { return state.components.filter(c => c.rating != null && !c.done && c.rating <= max); }
+async function accepterCotesIA() {
+  const ids = cotesIA(2).map(c => c.id);
+  if (!ids.length) return;
+  if (!confirm(`Accepter les ${ids.length} cote(s) 1 ou 2 proposées par l'IA ? Les cotes 3 et 4 restent à valider une à une.`)) return;
+  try {
+    const r = await apiJson(`/api/dossiers/${state.dossierId}/components/lot`, { method: 'POST', body: JSON.stringify({ ids, done: 1 }) });
+    const set = new Set(ids);
+    state.components = state.components.map(c => set.has(c.id) ? Object.assign({}, c, { done: 1 }) : c);
+    state.lot.note = `${r.modifiees} cote(s) de l'IA acceptée(s). Elles comptent maintenant dans le fonds.`;
+    await refreshProjection();
+  } catch (e) {
+    state.revisionFlashError = e.message || "Les cotes n'ont pas été acceptées.";
+  }
+  render();
+}
+
 async function rvConfirm() {
   const list = orderedComponents();
   const comp = list[state.reviewIdx];
   if (!comp) return;
-  const body = { confirmed: 1 };
-  const note = collectRedactionNote();
-  if (note) body.note = note;
+  // Les sections déduites des données (durée de vie, entretien, attention
+  // générée) gardent la correction de l'ingénieur ; l'état de l'actif va à la
+  // banque de rédactions plus bas. La note de visite n'est plus touchée.
+  const body = { confirmed: 1, textes_sections: collectTextesSections() };
   state.saveStatus = 'saving';
   render();
   try {
@@ -1824,7 +1956,9 @@ async function rvConfirm() {
         console.warn('banque de rédactions :', e && e.message);
       }
     }
-    state.components = state.components.map(c => String(c.id) === String(comp.id) ? Object.assign({}, c, body) : c);
+    state.components = state.components.map(c => String(c.id) === String(comp.id) ? Object.assign({}, c, body, { textes_sections: body.textes_sections ? JSON.stringify(body.textes_sections) : null }) : c);
+    // Le texte servi en cache ne porte pas encore les corrections.
+    delete state.redactionCache[comp.id];
     state.saveStatus = 'saved';
   } catch (e) {
     state.saveStatus = 'error';
@@ -3531,6 +3665,8 @@ function renderRevision() {
         </div>
       </button>
 
+      ${preparationHtml()}
+
       ${batimentPanelHtml(d)}
       ${journalPanelHtml(d)}
 
@@ -3930,8 +4066,10 @@ function renderReviewIA() {
             ${photosRapportNoteHtml(photos)}
             <div class="rvia-photos-grid">
               ${photos.map(p => `<div class="rvia-photo ${p.au_rapport ? 'au-rapport' : ''}"><img src="${p.url}" alt=""><div class="rvia-photo-tag">${escapeHtml(p.tag)}</div>
-                <button class="rvia-photo-star" data-action="photo-rapport" data-id="${p.id}" title="${p.au_rapport ? 'Retirer du rapport' : 'Mettre au rapport'}" aria-pressed="${p.au_rapport ? 'true' : 'false'}"><i data-lucide="star" style="width:14px;height:14px"></i></button></div>`).join('')}
-            </div>` : `
+                <button class="rvia-photo-star" data-action="photo-rapport" data-id="${p.id}" title="${p.au_rapport ? 'Retirer du rapport' : 'Mettre au rapport'}" aria-pressed="${p.au_rapport ? 'true' : 'false'}"><i data-lucide="star" style="width:14px;height:14px"></i></button>
+                <button class="rvia-photo-menu" data-action="photo-menu" data-id="${p.id}" title="Déplacer ou retirer cette photo" aria-label="Déplacer ou retirer cette photo"><i data-lucide="more-horizontal" style="width:14px;height:14px"></i></button></div>`).join('')}
+            </div>
+            ${state.photoMenu && photos.some(p => p.id === state.photoMenu) ? photoMenuHtml(photos.find(p => p.id === state.photoMenu)) : ''}` : `
             <div class="rvia-no-photos"><i data-lucide="camera-off" style="width:22px;height:22px"></i><div>Aucune photo au dossier</div></div>`)}
             ${r ? coteRapportBlockHtml(r) : ''}
             <div class="rvia-meta">
@@ -4395,6 +4533,22 @@ function initEvents() {
         break;
       case 'rv-skip':
         rvSkip();
+        break;
+      case 'photo-menu':
+        state.photoMenu = btn.getAttribute('data-id') || null;
+        render();
+        break;
+      case 'photo-deplacer':
+        deplacerPhoto(btn.getAttribute('data-id'));
+        break;
+      case 'photo-retirer':
+        retirerPhoto(btn.getAttribute('data-id'));
+        break;
+      case 'preparer-textes':
+        preparerTextes();
+        break;
+      case 'accepter-cotes-ia':
+        accepterCotesIA();
         break;
       case 'dupliquer-dossier':
         dupliquerDossier();

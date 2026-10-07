@@ -2974,6 +2974,7 @@ const JOURNAL_VALEUR_MAX = 300;
 const LIBELLES_CHAMPS = {
   date_visite: "Date de la visite",
   attentions: "Attentions spéciales",
+  textes_sections: "Textes corrigés",
   name: "Nom", done: "Documentée", etat: "État", residual: "Vie résiduelle (%)", install_year: "Année d'installation",
   qty: "Quantité", note: "Note", replacement_cost: "Coût de remplacement", useful_life_years: "Vie utile",
   confirmed: "Confirmée au bureau", rating: "Cote", r_flag: "Remplacement (R)", observation: "Constats",
@@ -3832,6 +3833,12 @@ const COLONNES_AJOUTEES = [
   // Attentions spéciales saisies au bureau : JSON [{id, titre, notes, texte,
   // photos: [≤ 2 ids]}]. Présentes, elles remplacent l'attention générée.
   ["attentions", "TEXT"],
+  // Corrections de l'ingénieur aux sections déduites des données (durée de
+  // vie, entretien, attention générée) : JSON {cle: texte}. Vide : texte généré.
+  ["textes_sections", "TEXT"],
+  // Empreinte des faits qui ont produit un texte généré : même empreinte, même
+  // texte, sans rappeler le modèle (révision et rapport Word).
+  ["redactions", "signature", "TEXT"],
   ["companies", "theme", "TEXT"],
   ["companies", "mise_en_page", "TEXT"],
   ["companies", "bibliotheque", "TEXT"],
@@ -6079,6 +6086,83 @@ function attentionSpeciale(component) {
   suites.push(FERMETURE_ATTENTION);
   return { texte: paragraphes([assembler(parties), constats.join("\n"), assembler(suites)]), actif: true };
 }
+// Sections corrigées à la main par l'ingénieur (hors état de l'actif, qui a sa
+// propre banque de rédactions).
+const SECTIONS_CORRIGEABLES = ["duree_vie", "entretien", "attention"];
+function textesSections(component) {
+  try {
+    const o = JSON.parse(component?.textes_sections || "{}");
+    const r = {};
+    for (const k of SECTIONS_CORRIGEABLES) if (typeof o?.[k] === "string" && o[k].trim()) r[k] = sansNotesInternes(o[k]);
+    return r;
+  } catch {
+    return {};
+  }
+}
+function nettoyerTextesSections(brut) {
+  if (!brut || typeof brut !== "object") return null;
+  const o = {};
+  for (const k of SECTIONS_CORRIGEABLES) {
+    const t = String(brut[k] ?? "").replace(/\r/g, "").trim().slice(0, 8000);
+    if (t) o[k] = t;
+  }
+  return Object.keys(o).length ? JSON.stringify(o) : null;
+}
+// Empreinte des faits que le modèle reçoit : tant qu'elle ne change pas, le
+// texte déjà généré reste juste et resservi tel quel.
+function signatureFaits(component, dossier) {
+  const texte = faitsElement(component, dossier, ligneDureeVie(component, dossier));
+  let h = 0x811c9dc5;
+  for (let i = 0; i < texte.length; i++) { h ^= texte.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return `${texte.length.toString(36)}-${h.toString(36)}`;
+}
+// Une fiche, en reprenant le texte validé, sinon le dernier texte généré pour
+// les mêmes faits ; un nouveau texte généré est gardé pour la fois suivante.
+async function redigerFiche(db, component, dossier, apiKey, { exemples = [], texteRetenu, companyId, generes } = {}) {
+  if (texteRetenu) return { fiche: await genFicheElement(component, dossier, apiKey, { texteRetenu }), redactionId: null };
+  const signature = signatureFaits(component, dossier);
+  let deja = generes ? generes.get(`${component.id}|${signature}`) ?? null : null;
+  if (!generes && db) {
+    deja = await db.prepare(
+      "SELECT id, texte_genere FROM redactions WHERE component_id = ?1 AND signature = ?2 AND texte_genere IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+    ).bind(component.id, signature).first().catch(() => null);
+  }
+  if (deja?.texte_genere) return { fiche: await genFicheElement(component, dossier, apiKey, { texteGenere: deja.texte_genere }), redactionId: deja.id };
+  const fiche = await genFicheElement(component, dossier, apiKey, { exemples });
+  const etat = fiche.sections.find((x) => x.cle === "etat");
+  let redactionId = null;
+  if (db && etat && companyId) {
+    // Consigné même non relu : c'est la moitié du couple (produit, retenu) qui
+    // rendra la correction exploitable. Seul un texte du modèle est resservi.
+    redactionId = newId("red");
+    try {
+      await db.prepare(
+        `INSERT INTO redactions (id, company_id, dossier_id, component_id, cat, uniformat_code, name, rating, observation, texte_genere, signature)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`
+      ).bind(
+        redactionId, companyId, component.dossier_id, component.id,
+        component.cat ?? null, component.uniformat_code ?? null, component.name ?? null,
+        component.rating ?? null, component.observation ?? null, etat.texte,
+        String(fiche.source || "").startsWith("ia") ? signature : null
+      ).run();
+    } catch {
+      redactionId = null;
+    }
+  }
+  if (generes && String(fiche.source || "").startsWith("ia")) generes.set(`${component.id}|${signature}`, { id: redactionId, texte_genere: etat.texte });
+  return { fiche, redactionId };
+}
+async function textesGeneresPour(db, dossierId) {
+  const m = new Map();
+  if (!db || !dossierId) return m;
+  try {
+    const r = await db.prepare(
+      "SELECT id, component_id, signature, texte_genere FROM redactions WHERE dossier_id = ?1 AND signature IS NOT NULL AND texte_genere IS NOT NULL ORDER BY created_at ASC"
+    ).bind(dossierId).all();
+    for (const x of r.results ?? []) m.set(`${x.component_id}|${x.signature}`, x);
+  } catch { /* colonne absente : rien à resservir */ }
+  return m;
+}
 // ----------------------------------------------------------------------------
 // LE GÉNÉRATEUR — un seul, deux consommateurs.
 // ----------------------------------------------------------------------------
@@ -6089,11 +6173,16 @@ async function genFicheElement(component, dossier, apiKey, opts = {}) {
   // Un texte validé par l'ingénieur fait foi : le rapport doit imprimer sa
   // correction, pas une nouvelle génération qui la contredirait.
   const retenu = String(opts.texteRetenu ?? "").trim();
+  const genere = String(opts.texteGenere ?? "").trim();
   const etat = retenu
     ? { texte: retenu, source: "valide" }
+    : genere ? { texte: genere, source: "ia" }
     : await etatDeLActif(component, dossier, apiKey, ligne, opts.exemples);
   const attention = attentionSpeciale(component);
   const carnet = phraseCarnet(dossier);
+  // Un texte repris (validé ou déjà généré) contient déjà la phrase du carnet.
+  const texteEtat = etat.texte.includes(carnet) ? etat.texte : paragraphes([etat.texte, carnet]);
+  const corriges = textesSections(component);
   return {
     titre: code ? `${nom} (${code})` : nom,
     coteRapport: coteRapport(component?.rating),
@@ -6101,28 +6190,31 @@ async function genFicheElement(component, dossier, apiKey, opts = {}) {
       {
         cle: "etat",
         titre: `ÉTAT DE L'ACTIF - ${nom}`,
-        texte: paragraphes([etat.texte, carnet]),
+        texte: texteEtat,
         tableau: null,
         actif: true
       },
       {
         cle: "duree_vie",
         titre: `DURÉE DE VIE ET REMPLACEMENT - ${nom}`,
-        texte: texteDureeVie(component, ligne),
+        texte: corriges.duree_vie || texteDureeVie(component, ligne),
+        corrige: !!corriges.duree_vie,
         tableau: tableauDureeVie(ligne),
         actif: true
       },
       {
         cle: "entretien",
         titre: `COMMENTAIRES D'ENTRETIEN - ${nom}`,
-        texte: texteEntretien(component),
+        texte: corriges.entretien || texteEntretien(component),
+        corrige: !!corriges.entretien,
         tableau: null,
         actif: true
       },
       {
         cle: "attention",
         titre: `ATTENTION SPÉCIALE - ${nom}`,
-        texte: attention.texte,
+        texte: (!attention.elements && corriges.attention) || attention.texte,
+        corrige: !attention.elements && !!corriges.attention,
         tableau: null,
         actif: attention.actif,
         ...attention.elements ? { elements: attention.elements, cloture: attention.cloture } : {}
@@ -6232,12 +6324,14 @@ components.patch("/:id", async (c) => {
     "projet_ca",
     "taches_entretien",
     "travaux_periode",
-    "travaux_annee"
+    "travaux_annee",
+    "textes_sections"
   ]) {
     if (key in body2) {
       fields.push(`${key} = ?${fields.length + 1}`);
       // Retraits et ajouts de tâches : validés avant d'être stockés.
-      values.push(key === "taches_entretien" ? JSON.stringify(nettoyerPersoEntretien(body2[key]))
+      values.push(key === "textes_sections" ? nettoyerTextesSections(body2[key])
+        : key === "taches_entretien" ? JSON.stringify(nettoyerPersoEntretien(body2[key]))
         : key === "travaux_periode" ? (TRAVAUX_PERIODE[body2[key]] ? body2[key] : null)
         : key === "travaux_annee" ? (Number.isInteger(Number(body2[key])) && Number(body2[key]) > 1900 && Number(body2[key]) <= 2200 ? Number(body2[key]) : null)
         : body2[key]);
@@ -6259,7 +6353,8 @@ components.patch("/:id", async (c) => {
 components.post("/:id/analyze", async (c) => {
   const component = await getOwnedComponent(c, c.req.param("id"));
   if (!component) return c.json({ error: "composante introuvable" }, 404);
-  const photos2 = await c.env.DB.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY created_at DESC LIMIT 4").bind(component.id).all();
+  // Les photos choisies pour le rapport d'abord : ce sont les meilleures.
+  const photos2 = await c.env.DB.prepare("SELECT * FROM photos WHERE component_id = ?1 ORDER BY (au_rapport = 1) DESC, created_at DESC LIMIT 4").bind(component.id).all();
   const images = [];
   for (const photo of photos2.results) {
     const obj = await c.env.PHOTOS.get(photo.r2_key);
@@ -6344,30 +6439,12 @@ components.post("/:id/redaction", async (c) => {
 
   const banque = dejaValide ? [] : await banquePour(c.env.DB, user?.company_id);
   const exemples = dejaValide ? [] : exemplesPour(banque, component);
-  const fiche = await genFicheElement(component, dossier, c.env.ANTHROPIC_API_KEY, {
+  const { fiche, redactionId: rid } = await redigerFiche(c.env.DB, component, dossier, c.env.ANTHROPIC_API_KEY, {
     exemples,
-    texteRetenu: dejaValide?.texte_retenu
+    texteRetenu: dejaValide?.texte_retenu,
+    companyId: user?.company_id
   });
-
-  const etat = fiche.sections.find((x) => x.cle === "etat");
-  let redactionId = dejaValide?.id ?? null;
-  if (!dejaValide && etat) {
-    // On consigne le texte produit même non relu : c'est la moitié du couple
-    // (produit, retenu) qui rendra la correction de l'ingénieur exploitable.
-    redactionId = newId("red");
-    try {
-      await c.env.DB.prepare(
-        `INSERT INTO redactions (id, company_id, dossier_id, component_id, cat, uniformat_code, name, rating, observation, texte_genere)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
-      ).bind(
-        redactionId, user.company_id, component.dossier_id, component.id,
-        component.cat ?? null, component.uniformat_code ?? null, component.name ?? null,
-        component.rating ?? null, component.observation ?? null, etat.texte
-      ).run();
-    } catch {
-      redactionId = null;
-    }
-  }
+  const redactionId = dejaValide?.id ?? rid;
 
   return c.json({
     ...fiche,
@@ -26253,10 +26330,15 @@ async function generateReportDocx(ctx, opts = {}) {
   // pour rester loin des limites de sous-requêtes du Worker.
   const banque = ctx.banque ?? [];
   const valides = ctx.textesValides ?? {};
-  const fiches = await enParallele(components2, 6, (comp) => genFicheElement(comp, dossier, apiKey, {
+  // Le texte déjà généré pour les mêmes faits est repris : le Word ne se
+  // réécrit pas à chaque téléchargement, et ce qui est généré ici est gardé.
+  const generes = ctx.textesGeneres ?? new Map();
+  const fiches = await enParallele(components2, 6, async (comp) => (await redigerFiche(ctx.db, comp, dossier, apiKey, {
     exemples: exemplesPour(banque, comp),
-    texteRetenu: valides[comp.id]
-  }));
+    texteRetenu: valides[comp.id],
+    companyId: dossier.company_id,
+    generes
+  })).fiche);
   const parId = new Map(components2.map((c, i) => [c.id, fiches[i]]));
   const observation = [heading("4.0 Observation des éléments")];
   observation.push(body("Chacun des éléments est présenté suivant les quatre sous-sections décrites à la section 3.0. Les cotes employées sont celles de la légende : Bon, Passable – Nécessite un entretien, Mauvais – Requiert la planification d'un remplacement."));
@@ -48845,7 +48927,9 @@ dossiers.post("/:id/components/lot", async (c) => {
   const champs = {};
   if (body2.confirmed === 1 || body2.confirmed === 0) champs.confirmed = body2.confirmed;
   if (body2.actif === 1 || body2.actif === 0) champs.actif = body2.actif;
-  if (!ids.length || !Object.keys(champs).length) return c.json({ error: "ids et confirmed ou actif (0 ou 1) requis" }, 400);
+  // Accepter les cotes proposées par l'IA : la composante devient documentée.
+  if (body2.done === 1) champs.done = 1;
+  if (!ids.length || !Object.keys(champs).length) return c.json({ error: "ids et confirmed, actif (0 ou 1) ou done (1) requis" }, 400);
   const avant = new Map();
   for (let i = 0; i < ids.length; i += 90) {
     const tranche = ids.slice(i, i + 90);
@@ -49075,6 +49159,8 @@ async function buildReportContext(c, opts = {}) {
     texteMaison: await texteMaisonPour(c.env.DB, dossier.company_id),
     banque: await banquePour(c.env.DB, dossier.company_id),
     textesValides: await textesValidesPour(c.env.DB, dossier.id),
+    textesGeneres: await textesGeneresPour(c.env.DB, dossier.id),
+    db: c.env.DB,
     engineerName: user?.name ?? company?.name ?? "",
     signataire: user ?? null,
     apiKey: c.env.ANTHROPIC_API_KEY ?? null,
@@ -49451,6 +49537,21 @@ photos.patch("/:id", async (c) => {
   ).bind(c.req.param("id"), user.company_id).first();
   if (!photo) return c.json({ error: "photo introuvable" }, 404);
   const body2 = await c.req.json().catch(() => ({}));
+  // Déplacer une photo mal classée vers une autre composante du même dossier.
+  if (body2.component_id !== undefined) {
+    const source = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(photo.component_id).first();
+    const cible = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1 AND dossier_id = ?2").bind(String(body2.component_id), source.dossier_id).first();
+    if (!cible) return c.json({ error: "composante introuvable dans ce dossier" }, 404);
+    if (cible.id === source.id) return c.json({ id: photo.id, component_id: cible.id });
+    const n = (await c.env.DB.prepare("SELECT COUNT(*) AS n FROM photos WHERE component_id = ?1").bind(cible.id).first())?.n ?? 0;
+    await c.env.DB.batch([
+      c.env.DB.prepare("UPDATE photos SET component_id = ?1, au_rapport = NULL, tag = ?2 WHERE id = ?3").bind(cible.id, TAG_ORDER[n] ?? `Photo ${n + 1}`, photo.id),
+      ...retirerDesAttentions(c.env.DB, source, photo.id)
+    ]);
+    await noterJournal(c.env.DB, { dossierId: source.dossier_id, componentId: source.id, userId: user.id, action: "photo", champs: [{ champ: "photos", avant: null, apres: `déplacée vers ${cible.name}` }] });
+    await noterJournal(c.env.DB, { dossierId: source.dossier_id, componentId: cible.id, userId: user.id, action: "photo", champs: [{ champ: "photos", avant: null, apres: `reçue de ${source.name}` }] });
+    return c.json({ id: photo.id, component_id: cible.id });
+  }
   if (body2.au_rapport !== 0 && body2.au_rapport !== 1) return c.json({ error: "au_rapport (0 ou 1) requis" }, 400);
   if (body2.au_rapport === 1 && photo.au_rapport !== 1) {
     const n = (await c.env.DB.prepare("SELECT COUNT(*) AS n FROM photos WHERE component_id = ?1 AND au_rapport = 1").bind(photo.component_id).first())?.n ?? 0;
@@ -49458,6 +49559,34 @@ photos.patch("/:id", async (c) => {
   }
   await c.env.DB.prepare("UPDATE photos SET au_rapport = ?1 WHERE id = ?2").bind(body2.au_rapport, photo.id).run();
   return c.json({ id: photo.id, component_id: photo.component_id, au_rapport: body2.au_rapport });
+});
+// Une photo d'attention spéciale qui quitte sa composante quitte aussi l'attention.
+function retirerDesAttentions(db, component, photoId) {
+  const liste = lireAttentions(component);
+  if (!liste.some((a) => (a.photos || []).includes(photoId))) return [];
+  const maj = liste.map((a) => ({ ...a, photos: (a.photos || []).filter((p) => p !== photoId) }));
+  return [db.prepare("UPDATE components SET attentions = ?1 WHERE id = ?2").bind(JSON.stringify(maj), component.id)];
+}
+// Retirer une photo classée (floue, en double, hors sujet). Le fichier n'est
+// effacé que si aucune autre photo ne s'en sert (copies de dossier).
+photos.delete("/:id", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "non authentifié" }, 401);
+  const photo = await c.env.DB.prepare(
+    `SELECT p.* FROM photos p
+       JOIN components cmp ON cmp.id = p.component_id
+       JOIN dossiers d ON d.id = cmp.dossier_id
+       WHERE p.id = ?1 AND d.company_id = ?2`
+  ).bind(c.req.param("id"), user.company_id).first();
+  if (!photo) return c.json({ error: "photo introuvable" }, 404);
+  const source = await c.env.DB.prepare("SELECT * FROM components WHERE id = ?1").bind(photo.component_id).first();
+  await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM photos WHERE id = ?1").bind(photo.id),
+    ...retirerDesAttentions(c.env.DB, source, photo.id)
+  ]);
+  if (!await fichierPhotoUtilise(c.env.DB, photo.r2_key)) await c.env.PHOTOS.delete(photo.r2_key);
+  await noterJournal(c.env.DB, { dossierId: source.dossier_id, componentId: source.id, userId: user.id, action: "photo", champs: [{ champ: "photos", avant: null, apres: "photo retirée" }] });
+  return c.json({ ok: true });
 });
 // ── Banque de prix ───────────────────────────────────────────────────────────
 // Ce que la firme a réellement payé, ramené à un prix unitaire indexé. La
