@@ -5214,6 +5214,12 @@ VOIX : première personne du pluriel professionnel (« nous »), modalisation co
 maison privilégie « nous suggérons » plutôt que « nous recommandons ». Les travaux relevant
 d'un champ de pratique réservé sont renvoyés au corps de métier ou au professionnel visé.
 
+QUANTITÉS : n'écris aucun nombre, superficie, longueur, dimension, pourcentage ni
+dénombrement qui ne soit pas donné tel quel dans les faits saisis par l'ingénieur. Jamais
+d'estimation (« environ », « ≈ », « près de », « une vingtaine ») tirée des photos : dans le
+doute, rien de chiffré — « une portion localisée » plutôt que « environ 20 m² ». Seuls les
+années, durées de vie et montants fournis par les données sont repris.
+
 UNITÉS ET NOMBRES : montants arrondis à la centaine, espace comme séparateur de milliers,
 symbole $ précédé d'une espace (12 500 $). Durées de vie en années entières dans les tableaux,
 fourchettes « environ X à Y ans » en prose. Mesures en impérial d'abord avec l'équivalent
@@ -5261,9 +5267,9 @@ ${opts.guide?.constats?.length ? `FORMULATIONS TYPES DE LA FIRME (d'autres immeu
 
 Réponds UNIQUEMENT avec un objet JSON :
 {"rating": 1|2|3|4 (1=bon état, 2=entretien normal, 3=entretien requis, 4=remplacement requis ; null si non observable),
- "constats": ["un constat par élément, au format « Localisation – ce qui est observé », registre professionnel ; [] si aucun défaut"],
+ "constats": ["un constat par élément, au format « Localisation – ce qui est observé », registre professionnel, sans aucune mesure, superficie, quantité ni pourcentage estimés ; [] si aucun défaut"],
  "etendue": "ponctuel" | "localise" | "generalise" | null,
- "etendueQte": "quantité touchée si estimable (ex: '≈ 4 m²', '3 fenêtres', '20 %'), ou ''",
+ "etendueQte": "toujours '' : une quantité ne s'estime pas sur photo, l'ingénieur la saisit s'il l'a mesurée",
  "limiteObservation": "de_pres" | "distance" | "partiel" | "inaccessible",
  "causePossible": "cause probable, modalisée (semble, serait), ou '' si aucun défaut",
  "natureRisque": "securite" | "infiltration" | "degradation" | "conformite" | "esthetique" | null,
@@ -5286,11 +5292,13 @@ pas de statuer, mets "rating": null et explique-le dans "observation".`
     const parsed = extractJson(text);
     // Les valeurs hors vocabulaire sont écartées plutôt que stockées : le
     // gabarit de rédaction ne sait rien faire d'une étendue « moyenne ».
-    const constats = Array.isArray(parsed.constats) ? parsed.constats.map((c) => String(c).trim()).filter(Boolean) : [];
+    const constats = Array.isArray(parsed.constats) ? parsed.constats.map((c) => sansEstimation(String(c))).filter(Boolean) : [];
     return {
       ...parsed,
       constats,
-      observation: constats.length ? constats.join("\n") : parsed.observation ?? "",
+      observation: constats.length ? constats.join("\n") : sansEstimation(parsed.observation ?? ""),
+      // Une quantité vue sur photo n'est qu'une estimation : jamais retenue.
+      etendueQte: "",
       etendue: ETENDUES[parsed.etendue] ? parsed.etendue : null,
       limiteObservation: LIMITES_OBSERVATION[parsed.limiteObservation] ? parsed.limiteObservation : null,
       natureRisque: NATURES_RISQUE[parsed.natureRisque] ? parsed.natureRisque : null,
@@ -5814,8 +5822,8 @@ function faitsElement(component, dossier, ligne) {
     coteRapportLongue(component?.rating) ? `Cote au rapport : ${coteRapportLongue(component.rating)}` : null,
     anneeMaison(component?.install_year) != null ? `Année de construction ou de dernière réparation : ${anneeMaison(component.install_year)}` : "Année de construction ou de dernière réparation : inconnue",
     `Durée de vie retenue au calcul : ${ligne.duree} ans (${ligne.allocation ? "allocation cyclique" : "remplacement complet"})`,
-    component?.observation ? `Constats de l'inspecteur (données brutes) : ${component.observation}` : null,
-    ETENDUES[component?.etendue] ? `Étendue : ${ETENDUES[component.etendue]}${component?.etendue_qte ? ` (${component.etendue_qte})` : ""}` : null,
+    component?.observation ? `Constats de l'inspecteur (données brutes) : ${sansEstimation(component.observation)}` : null,
+    ETENDUES[component?.etendue] ? `Étendue : ${ETENDUES[component.etendue]}${quantiteSure(component?.etendue_qte) ? ` (${quantiteSure(component.etendue_qte)})` : ""}` : null,
     LIMITES_OBSERVATION[component?.limite_observation] ? `Limite d'observation : ${LIMITES_OBSERVATION[component.limite_observation]}${component?.limite_detail ? ` (${component.limite_detail})` : ""}` : null,
     (() => {
       const attributs = objetJson(component?.attributs);
@@ -6027,6 +6035,22 @@ function attentionsDuRapport(component) {
     photos: Array.isArray(a.photos) ? a.photos : []
   })).filter((a) => a.texte || a.titre);
 }
+// Une quantité approximative (« ≈ 20 m² », « environ 3 m ») vient d'une
+// estimation sur photo : la firme préfère ne rien chiffrer plutôt que de
+// chiffrer faux. Une quantité saisie telle quelle par l'ingénieur reste.
+const MARQUE_ESTIMATION = /(?:≈|~|\benviron\b|\bapprox(?:imativement)?\.?|\bpr[eè]s de\b|\bune? (?:vingtaine|dizaine|quinzaine|trentaine|centaine)\b)/i;
+function quantiteSure(qte) {
+  const t = sansNotesInternes(qte ?? "");
+  return t && !MARQUE_ESTIMATION.test(t) ? t : "";
+}
+function sansEstimation(texte) {
+  return String(texte ?? "")
+    // Les durées (« environ 25 à 30 ans ») restent : ce sont des références.
+    .replace(/[ \t]*,?[ \t]*(?:sur|d'|de|soit|pour)?[ \t]*(?:≈|~|environ|approx(?:imativement)?\.?|près de)[ \t]*\d[\d\s.,]*(?:[ \t]*(?:à|-)[ \t]*\d[\d\s.,]*)?[ \t]*(?:m²|m2|m³|pi²|pi2|pi|m|cm|mm|%|unités?|portes?|fenêtres?|sections?|endroits?)?(?=[\s.,;:)]|$)(?![ \t\dà\-.,]*(?:ans|années?)\b)/gi, "")
+    .replace(/\(\s*\)/g, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
 function attentionSpeciale(component) {
   const saisies = attentionsDuRapport(component);
   if (saisies.length) {
@@ -6058,11 +6082,11 @@ function attentionSpeciale(component) {
   const observation = String(component?.observation ?? "");
   const lignesConstats = observation.includes("\n") ? observation.split(/\n+/) : observation.split(/(?<=[.;])\s+/);
   for (const seg of lignesConstats) {
-    const s = sansNotesInternes(seg).replace(/^[·•\-–]\s*/, "").replace(/[.;]$/, "");
+    const s = sansEstimation(sansNotesInternes(seg)).replace(/^[·•\-–]\s*/, "").replace(/[.;]$/, "");
     if (s) constats.push(`· ${s};`);
   }
   if (ETENDUES[component?.etendue]) {
-    const qte = sansNotesInternes(component?.etendue_qte ?? "");
+    const qte = quantiteSure(component?.etendue_qte);
     constats.push(`· Étendue : ${ETENDUES[component.etendue].toLowerCase()}${qte ? `, ${qte}` : ""};`);
   }
   const cause = sansNotesInternes(component?.cause_possible ?? "");

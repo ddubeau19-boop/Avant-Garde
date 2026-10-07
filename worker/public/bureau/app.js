@@ -3368,7 +3368,7 @@ function compDetailHtml(c) {
       <div class="facet-block">
         <div class="facet-lbl">Étendue</div>
         ${choixHtml(c, 'etendue', ETENDUES)}
-        <input class="detail-input" style="margin-top:6px" data-role="comp-text" data-id="${c.id}" data-field="etendue_qte" value="${escapeHtml(c.etendue_qte || '')}" placeholder="Quantité touchée — ex. ≈ 4 m²">
+        <input class="detail-input" style="margin-top:6px" data-role="comp-text" data-id="${c.id}" data-field="etendue_qte" value="${escapeHtml(c.etendue_qte || '')}" placeholder="Quantité touchée, seulement si mesurée ou comptée — ex. 3 fenêtres">
       </div>
       <div class="facet-block">
         <div class="facet-lbl">Limite d'observation</div>
