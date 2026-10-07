@@ -70,3 +70,15 @@ test('photo mal classée : déplacée (attention nettoyée) ou retirée ; cotes 
   assert.equal(lot.json.modifiees, 1);
   assert.equal((await api(`/api/components/${a.id}`, { session: ingA })).json.done, 1);
 });
+
+test("quantités estimées : jamais au rapport ; une quantité saisie reste", async () => {
+  const { comps: [c] } = await dossierAvec(1);
+  await api(`/api/components/${c.id}`, { methode: 'PATCH', session: ingA, corps: { rating: 3, done: 1, etendue: 'localise', etendue_qte: '≈ 20 m²', observation: 'Aire arrière – Pavé alvéolé envahi de mousse sur environ 20 m², désherbage requis' } });
+  const att = (await api(`/api/components/${c.id}/redaction`, { methode: 'POST', session: ingA, corps: {} })).json.sections.find((s) => s.cle === 'attention');
+  assert.equal(att.actif, true);
+  assert.ok(!/20\s*m²/.test(att.texte), att.texte);
+  assert.match(att.texte, /Pavé alvéolé envahi de mousse, désherbage requis/);
+  await api(`/api/components/${c.id}`, { methode: 'PATCH', session: ingA, corps: { etendue_qte: '3 fenêtres' } });
+  const att2 = (await api(`/api/components/${c.id}/redaction`, { methode: 'POST', session: ingA, corps: {} })).json.sections.find((s) => s.cle === 'attention');
+  assert.match(att2.texte, /3 fenêtres/);
+});
