@@ -204,6 +204,9 @@ const state = {
   revisionError: null,
   revisionFlashError: null,
   selectedScenarioCode: null,
+  scenarioPersoBrouillon: null, // saisie en cours du scénario de l'ingénieur
+  scenarioPersoSaving: false,
+  scenarioPersoErreur: null,
   saveStatus: 'idle', // idle | saving | saved | error
   expanded: {},            // id de composante -> panneau de détail ouvert
   batiment: {},            // contenu de dossiers.batiment_info (lecture seule ici)
@@ -867,6 +870,8 @@ async function dupliquerDossier() {
 }
 
 async function openDossier(id) {
+  state.scenarioPersoBrouillon = null;
+  state.scenarioPersoErreur = null;
   if (String(id) !== String(state.dossierId) && !quitterEnvoiPhotos()) return;
   journal.ouvert = false; journal.entrees = null;
   revokeReviewPhotos();
@@ -3185,7 +3190,8 @@ function fundCardHtml(d, proj, params, excluded) {
   const horizon = params.projectionYears != null ? params.projectionYears : '—';
   // Le moteur expose désormais des scénarios de rattrapage (méthode maison) plutôt qu'une
   // cotisation constante unique : on met en avant le scénario recommandé et sa 1re année.
-  const recommended = proj && Array.isArray(proj.scenarios) ? proj.scenarios.find(s => s.code === proj.recommendedCode) : null;
+  // Scénario retenu au rapport : celui de l'ingénieur s'il en a saisi un.
+  const recommended = proj && Array.isArray(proj.scenarios) ? proj.scenarios.find(s => s.code === (proj.preferredCode || proj.recommendedCode)) : null;
   const headline = recommended ? `${recommended.code} — ${recommended.label}` : (proj ? 'Aucun scénario ne suffit' : '—');
   const an1 = recommended && recommended.years && recommended.years[0] ? fmt(recommended.years[0].cotisation) + ' $' : '—';
   const soldeVal = d.current_fund_balance != null ? fmt(d.current_fund_balance) : '0';
@@ -3200,7 +3206,7 @@ function fundCardHtml(d, proj, params, excluded) {
   <div class="fund-card">
     <div class="fund-top">
       <div style="flex:1">
-        <div class="fund-top-eyebrow">Scénario recommandé</div>
+        <div class="fund-top-eyebrow">Scénario retenu au rapport</div>
         <div class="fund-total" style="font-size:22px">${escapeHtml(headline)}</div>
       </div>
       <div class="fund-side">
@@ -3266,6 +3272,68 @@ function scenarioCardsHtml(proj, selectedCode) {
     </div>
     ${proj.scenarios.some(s => s.approximationNote) ? `<div class="scenario-approx-note">* ${escapeHtml(proj.scenarios.find(s => s.approximationNote).approximationNote)}</div>` : ''}
   </div>`;
+}
+
+// Scénario de l'ingénieur : ses hausses annuelles (an 1 = l'an prochain), puis
+// un taux pour la suite (vide : l'inflation). Retenu au rapport comme B1.
+function lireScenarioPersoClient(d) {
+  try { const o = JSON.parse(d && d.scenario_perso || 'null'); return o && Array.isArray(o.taux) ? o : null; } catch (e) { return null; }
+}
+function pctTexte(n) { return String(n).replace('.', ','); }
+function scenarioPersoHtml(d, proj) {
+  if (!d) return '';
+  const perso = lireScenarioPersoClient(d);
+  const sc = proj && Array.isArray(proj.scenarios) ? proj.scenarios.find(s => s.code === 'C1.1.P') : null;
+  const an1 = new Date().getFullYear() + 1;
+  const inflation = proj && proj.params && proj.params.inflationRate != null ? pctTexte(Math.round(proj.params.inflationRate * 10000) / 100) : '1,76';
+  const brouillon = state.scenarioPersoBrouillon || {};
+  const tauxVal = brouillon.taux != null ? brouillon.taux : perso ? perso.taux.map(pctTexte).join(' ; ') : '';
+  const ensuiteVal = brouillon.ensuite != null ? brouillon.ensuite : perso && perso.ensuite != null ? pctTexte(perso.ensuite) : '';
+  const verdict = sc ? (sc.meetsCriteria
+    ? `<span class="scenario-badge ok">Critères respectés</span>`
+    : `<span class="scenario-badge fail">${sc.firstNegativeYear != null ? `Fonds épuisé en ${an1 + sc.firstNegativeYear - 1}` : 'Solde insuffisant pour le prochain cycle'}</span>`) : '';
+  return `
+  <form class="perso-section" id="scenario-perso-form">
+    <div class="comp-section-head">
+      <span class="lbl">Scénario de l'ingénieur</span>
+      <div class="rule"></div>
+      ${verdict}
+    </div>
+    <div class="perso-sub">Vos hausses annuelles de la cotisation, année par année à partir de ${an1}, séparées par « ; ». Ce scénario devient le scénario de préférence (B1) du rapport. Sans lui, le rapport retient le statu quo s'il suffit, sinon le rattrapage du moteur.</div>
+    <div class="perso-row">
+      <label class="perso-champ large"><span>Hausses (%) — ${an1}, ${an1 + 1}…</span>
+        <input id="sp-taux" data-role="sp-champ" data-f="taux" placeholder="6 ; 6" value="${escapeHtml(tauxVal)}"></label>
+      <label class="perso-champ"><span>Ensuite (%)</span>
+        <input id="sp-ensuite" data-role="sp-champ" data-f="ensuite" inputmode="decimal" placeholder="${inflation} (inflation)" value="${escapeHtml(ensuiteVal)}"></label>
+      <button type="submit" class="btn-primary" ${state.scenarioPersoSaving ? 'disabled' : ''}>${state.scenarioPersoSaving ? 'Enregistrement…' : perso ? 'Mettre à jour' : 'Appliquer au rapport'}</button>
+      ${perso ? `<button type="button" class="btn-pill-sm" data-action="retirer-scenario-perso" ${state.scenarioPersoSaving ? 'disabled' : ''}>Retirer</button>` : ''}
+    </div>
+    ${state.scenarioPersoErreur ? `<div class="perso-erreur">${escapeHtml(state.scenarioPersoErreur)}</div>` : ''}
+  </form>`;
+}
+async function enregistrerScenarioPerso(retirer) {
+  const champ = (id) => { const el = document.getElementById(id); return el ? el.value.trim() : ''; };
+  let valeur = null;
+  if (!retirer) {
+    const morceaux = champ('sp-taux').split(/[;|\n]+/).map(x => x.trim()).filter(Boolean);
+    if (!morceaux.length) { state.scenarioPersoErreur = 'Indiquez au moins une hausse annuelle, par exemple « 6 ; 6 ».'; render(); return; }
+    const ensuite = champ('sp-ensuite');
+    valeur = { taux: morceaux, ensuite: ensuite === '' ? null : ensuite };
+  }
+  state.scenarioPersoSaving = true;
+  state.scenarioPersoErreur = null;
+  render();
+  try {
+    const r = await apiJson(`/api/dossiers/${state.dossierId}`, { method: 'PATCH', body: JSON.stringify({ scenario_perso: valeur }) });
+    state.dossier = Object.assign({}, state.dossier, { scenario_perso: r.scenario_perso });
+    state.scenarioPersoBrouillon = null;
+    state.selectedScenarioCode = null;
+    await refreshProjection();
+  } catch (e) {
+    state.scenarioPersoErreur = e.message || "Échec de l'enregistrement.";
+  }
+  state.scenarioPersoSaving = false;
+  render();
 }
 
 function executiveSummaryHtml(proj, selectedCode) {
@@ -3659,8 +3727,9 @@ function renderRevision() {
         ${reportsCardHtml(allConf, remaining)}
       </div>
 
-      ${scenarioCardsHtml(proj, state.selectedScenarioCode || (proj && proj.recommendedCode) || (proj && proj.scenarios && proj.scenarios[0] && proj.scenarios[0].code))}
-      ${executiveSummaryHtml(proj, state.selectedScenarioCode || (proj && proj.recommendedCode) || (proj && proj.scenarios && proj.scenarios[0] && proj.scenarios[0].code))}
+      ${scenarioCardsHtml(proj, state.selectedScenarioCode || (proj && (proj.preferredCode || proj.recommendedCode)) || (proj && proj.scenarios && proj.scenarios[0] && proj.scenarios[0].code))}
+      ${scenarioPersoHtml(d, proj)}
+      ${executiveSummaryHtml(proj, state.selectedScenarioCode || (proj && (proj.preferredCode || proj.recommendedCode)) || (proj && proj.scenarios && proj.scenarios[0] && proj.scenarios[0].code))}
 
 
       <button class="reviewia-cta tp-cta" data-action="go-photos">
@@ -4158,6 +4227,9 @@ function initEvents() {
     } else if (e.target && e.target.id === 'equipe-form') {
       e.preventDefault();
       inviterMembre();
+    } else if (e.target && e.target.id === 'scenario-perso-form') {
+      e.preventDefault();
+      enregistrerScenarioPerso(false);
     }
   });
 
@@ -4170,6 +4242,7 @@ function initEvents() {
     if (t.matches('[data-role="attn"]')) { const a = attentionById(t.getAttribute('data-id')); if (a) a[t.getAttribute('data-f')] = t.value; }
     else if (t.matches('[data-role="saisie"]')) state.saisie.brouillon[t.getAttribute('data-id') + '|' + t.getAttribute('data-field')] = t.value;
     else if (t.matches('#add-comp-form [data-draft]')) state.addComp[t.getAttribute('data-draft')] = t.value;
+    else if (t.matches('[data-role="sp-champ"]')) { state.scenarioPersoBrouillon = Object.assign({}, state.scenarioPersoBrouillon, { [t.getAttribute('data-f')]: t.value }); }
     else if (t.matches('[data-role="login-email"]')) state.loginEmail = t.value;
     else if (t.matches('[data-role="login-password"]')) state.loginPassword = t.value;
     else if (t.matches('[data-sec-text]')) onSecTextInput(t);
@@ -4396,6 +4469,9 @@ function initEvents() {
       case 'telecharger-publie-pdf':
         telecharger(`/api/dossiers/${state.dossierId}/rapport-publie.pdf`, `${(state.dossier && state.dossier.dossier_no) || 'dossier'}-etude-fonds-prevoyance.pdf`)
           .catch((e) => { state.publishError = e.message; render(); });
+        break;
+      case 'retirer-scenario-perso':
+        enregistrerScenarioPerso(true);
         break;
       case 'telecharger-publie':
         telecharger(`/api/dossiers/${state.dossierId}/rapport-publie.docx`, `${(state.dossier && state.dossier.dossier_no) || 'dossier'}-etude-fonds-prevoyance.docx`)

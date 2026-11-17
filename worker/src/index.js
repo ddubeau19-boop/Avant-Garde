@@ -2973,6 +2973,7 @@ const JOURNAL_REGROUPEMENT_MS = 10 * 60 * 1e3;
 const JOURNAL_VALEUR_MAX = 300;
 const LIBELLES_CHAMPS = {
   date_visite: "Date de la visite",
+  scenario_perso: "Scénario de l'ingénieur",
   attentions: "Attentions spéciales",
   textes_sections: "Textes corrigés",
   name: "Nom", done: "Documentée", etat: "État", residual: "Vie résiduelle (%)", install_year: "Année d'installation",
@@ -3868,6 +3869,8 @@ const COLONNES_AJOUTEES = [
   ["dossiers", "client_id", "TEXT"],
   // Date de la visite des lieux (AAAA-MM-JJ) : au rapport, section 1.6 et déclaration.
   ["dossiers", "date_visite", "TEXT"],
+  // Scénario de financement choisi par l'ingénieur (JSON), retenu au rapport.
+  ["dossiers", "scenario_perso", "TEXT"],
   // Version publiée, figée : le .docx produit à la publication (R2) et son signataire.
   ["dossiers", "rapport_publie_r2", "TEXT"],
   ["dossiers", "publie_par", "TEXT"],
@@ -4262,7 +4265,8 @@ function previsionEtudePrecedente(r, anneeCourante) {
   const projection = projectReserveFund(r.composantes.filter(estActive), {
     currentFundBalance: r.dossier.current_fund_balance,
     baseCotisation: r.dossier.cotisation_annuelle,
-    units: r.dossier.units
+    units: r.dossier.units,
+    scenarioPerso: lireScenarioPerso(r.dossier)
   }, { ...RESERVE_FUND_PARAMS, anneeReference: r.annee });
   const scenario = scenarioRetenu(projection);
   if (!scenario) return null;
@@ -6776,6 +6780,57 @@ function buildScenario(def, baseCotisation, deboursParAn, startBalance, params, 
     soldeFinAn30
   };
 }
+// ----------------------------------------------------------------------------
+// SCÉNARIO DE L'INGÉNIEUR — les hausses annuelles qu'il retient (en %), année
+// par année à partir de l'an 1 (l'an prochain), puis un taux pour la suite
+// (à défaut, l'inflation de la construction). Quand il existe, c'est lui le
+// scénario de préférence (B1) du rapport, comme au rapport approuvé 26-101 PGA
+// (6 % en 2027 et 2028, puis 1,76 %).
+// ----------------------------------------------------------------------------
+const SCENARIO_PERSO_CODE = "C1.1.P";
+const SCENARIO_PERSO_MAX_ANS = 30;
+// Valide ce qui arrive de l'API. null : retire le scénario. Sinon un objet
+// propre, ou une chaîne d'erreur.
+function nettoyerScenarioPerso(brut) {
+  if (brut == null) return null;
+  if (typeof brut !== "object" || Array.isArray(brut)) return "scénario invalide : { taux: [...], ensuite }";
+  const taux = Array.isArray(brut.taux) ? brut.taux : null;
+  if (!taux || taux.length < 1 || taux.length > SCENARIO_PERSO_MAX_ANS) return `indiquez de 1 à ${SCENARIO_PERSO_MAX_ANS} hausses annuelles`;
+  const pct = (v) => {
+    const n = typeof v === "string" ? Number(v.replace(",", ".").replace(/\s|%/g, "")) : Number(v);
+    return Number.isFinite(n) && n >= -50 && n <= 200 ? Math.round(n * 100) / 100 : null;
+  };
+  const propres = taux.map(pct);
+  if (propres.some((v) => v == null)) return "chaque hausse est un pourcentage entre -50 et 200";
+  let ensuite = null;
+  if (brut.ensuite != null && brut.ensuite !== "") {
+    ensuite = pct(brut.ensuite);
+    if (ensuite == null) return "le taux de la suite est un pourcentage entre -50 et 200";
+  }
+  return { taux: propres, ensuite };
+}
+function lireScenarioPerso(dossier) {
+  try {
+    const o = typeof dossier?.scenario_perso === "string" ? JSON.parse(dossier.scenario_perso) : dossier?.scenario_perso;
+    const propre = nettoyerScenarioPerso(o ?? null);
+    return propre && typeof propre === "object" ? propre : null;
+  } catch {
+    return null;
+  }
+}
+function scenarioPersoDef(perso, params) {
+  if (!perso) return null;
+  const ensuite = perso.ensuite != null ? perso.ensuite / 100 : params.inflationRate;
+  const ramp = Array.from({ length: params.projectionYears }, (_, i) => (i < perso.taux.length ? perso.taux[i] / 100 : ensuite));
+  return { code: SCENARIO_PERSO_CODE, label: "Scénario de l'ingénieur", ramp, approxime: false, perso: true };
+}
+// Scénario de préférence du rapport : celui de l'ingénieur s'il existe ; sinon
+// le statu quo s'il suffit ; sinon le rattrapage recommandé par le moteur.
+function scenarioDePreference(projection) {
+  return projection.scenarios.find((s) => s.code === SCENARIO_PERSO_CODE)
+    ?? projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
+    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+}
 function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
   const included = [];
   const excluded = [];
@@ -6814,8 +6869,9 @@ function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
   const startBalance = opts.currentFundBalance ?? 0;
   const baseCotisationMissing = opts.baseCotisation == null;
   const baseCotisation = opts.baseCotisation ?? 0;
-  const scenarios = RESERVE_FUND_SCENARIOS.map(
-    (def) => buildScenario(def, baseCotisation, deboursParAn, startBalance, params, portionFutureTotal)
+  const persoDef = scenarioPersoDef(opts.scenarioPerso ?? null, params);
+  const scenarios = [...(persoDef ? [persoDef] : []), ...RESERVE_FUND_SCENARIOS].map(
+    (def) => ({ ...buildScenario(def, baseCotisation, deboursParAn, startBalance, params, portionFutureTotal), ...(def.perso ? { perso: opts.scenarioPerso } : {}) })
   );
   const recommended = scenarios.find((s) => s.code === "C1.1.1" && s.meetsCriteria) ?? scenarios.find((s) => s.code === "C1.1.3" && s.meetsCriteria) ?? null;
   return {
@@ -6829,6 +6885,8 @@ function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
     totalAvecPortionFuture,
     scenarios,
     recommendedCode: recommended ? recommended.code : null,
+    // Scénario retenu au rapport (B1) : voir scenarioDePreference.
+    preferredCode: (persoDef ? SCENARIO_PERSO_CODE : null) ?? (scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)?.code ?? (recommended ? recommended.code : null)),
     includedComponentIds: included.map((c) => c.id),
     excludedComponents: excluded
   };
@@ -26567,7 +26625,9 @@ async function generateReportDocx(ctx, opts = {}) {
   // celle qu'il verse déjà satisfait le double critère — dans ce cas, le scénario de
   // préférence est le maintien, ce que dit d'ailleurs le texte de la section 6.0.
   const scenarioRecommande = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
-  const scenarioPrefere = scenarioStatuQuo?.meetsCriteria ? scenarioStatuQuo : scenarioRecommande;
+  // Scénario de l'ingénieur s'il en a saisi un ; sinon statu quo ou rattrapage.
+  const scenarioPrefere = scenarioDePreference(projection);
+  const scenarioPerso = scenarioPrefere?.code === SCENARIO_PERSO_CODE ? scenarioPrefere : null;
   // Numérotation du rapport approuvé : B1 = préférence, B2 et B3 = comparatifs.
   const scenariosOrdonnes = [scenarioPrefere, ...projection.scenarios.filter((s) => s !== scenarioPrefere)].filter(Boolean);
   const anneesScenario = scenarioPrefere?.years ?? [];
@@ -26582,7 +26642,11 @@ async function generateReportDocx(ctx, opts = {}) {
   const cotisationSuffisante = scenarioStatuQuo != null && scenarioStatuQuo.meetsCriteria;
   // Sévérité, au sens du rapport approuvé : « légèrement insuffisante » quand
   // le rattrapage reste sous 10 % par année les cinq premières années.
-  const niveau = cotisationSuffisante ? "suffisante" : scenarioPrefere && tauxMax5 <= 0.1 ? "legere" : "insuffisante";
+  // Avec le scénario de l'ingénieur, ce sont ses propres hausses qui disent si
+  // la cotisation actuelle suffisait (pas plus que l'inflation) ou non.
+  const niveau = scenarioPerso
+    ? (tauxMax5 <= projection.params.inflationRate + 1e-4 ? "suffisante" : tauxMax5 <= 0.1 ? "legere" : "insuffisante")
+    : cotisationSuffisante ? "suffisante" : scenarioPrefere && tauxMax5 <= 0.1 ? "legere" : "insuffisante";
   // ---- 1.0 Sommaire du mandat -------------------------------------------
   const anneeConstruction = anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier.built_year);
   const immatriculation = dateTexte(champ("date_immatriculation"));
@@ -26745,6 +26809,11 @@ async function generateReportDocx(ctx, opts = {}) {
       insuffisante: "Nous remarquons que depuis la construction, le niveau de cotisation au fonds de prévoyance a été insuffisant. Ceci nécessitera un ajustement important afin de faire face aux dépenses prévues au cours du prochain cycle. Ce scénario présente une solution qui permet de rééquilibrer le fonds de prévoyance en considération des remplacements prévus."
     }[niveau]));
     if (scenarioPrefere.approximationNote) resultats.push(body(scenarioPrefere.approximationNote, { color: GREY, size: 18 }));
+    if (scenarioPerso && !scenarioPerso.meetsCriteria) {
+      resultats.push(body(scenarioPerso.firstNegativeYear != null
+        ? `NOTE À LA RÉVISION — Le scénario retenu par l'ingénieur épuise le fonds dès ${anneeCourante + scenarioPerso.firstNegativeYear}. Revoir les hausses annuelles avant la publication.`
+        : "NOTE À LA RÉVISION — Le scénario retenu par l'ingénieur ne laisse pas un solde suffisant pour débuter le prochain cycle. Revoir les hausses annuelles avant la publication.", { bold: true, color: ORANGE }));
+    }
     resultats.push(titre2("Répartition des dépenses"));
     resultats.push(tableauMaison(
       ["Année", "Augmentation", "Débours prévus", "Cotisation", "Solde du fonds (fin d'année)"],
@@ -47343,7 +47412,7 @@ function generateReportXlsx(ctx) {
     { wch: 14 },
     { wch: 8 }
   ];
-  const recommended = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  const recommended = scenarioDePreference(projection);
   const summarySheet = utils.aoa_to_sheet([
     ["Plan de gestion de l'actif — Étude du fonds de prévoyance", dossier.name],
     ["Dossier", dossier.dossier_no],
@@ -47358,7 +47427,7 @@ function generateReportXlsx(ctx) {
     ["Horizon de projection", `${projection.params.projectionYears} ans + portion future an 31`],
     [],
     ["Résultats"],
-    ["Scénario recommandé", recommended ? `${recommended.code} — ${recommended.label}` : "Aucun — révision requise"],
+    ["Scénario retenu au rapport", recommended ? `${recommended.code} — ${recommended.label}` : "Aucun — révision requise"],
     ["Solde actuel du fonds ($)", dossier.current_fund_balance ?? ""],
     ["Cotisation annuelle actuelle ($)", projection.baseCotisationMissing ? "non renseignée" : Math.round(projection.baseCotisation)],
     ["Total débours projetés sur 30 ans ($)", Math.round(projection.totalDebours30Ans)],
@@ -49535,7 +49604,8 @@ async function buildReportContext(c, opts = {}) {
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
-    units: dossier.units
+    units: dossier.units,
+    scenarioPerso: lireScenarioPerso(dossier)
   });
   // Fiche client du syndicat (NEQ, représentant) pour la page d'identification
   // et la section 1.0 ; toujours de la même firme que le dossier.
@@ -49566,8 +49636,7 @@ async function buildReportContext(c, opts = {}) {
 }
 // Scénario dont le rapport tire la cotisation recommandée.
 function scenarioRetenu(projection) {
-  return projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
-    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  return scenarioDePreference(projection);
 }
 // Valeurs des champs {{…}} d'un gabarit de firme.
 function valeursChamps(ctx) {
@@ -49621,7 +49690,8 @@ dossiers.get("/:id/projection", async (c) => {
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
-    units: dossier.units
+    units: dossier.units,
+    scenarioPerso: lireScenarioPerso(dossier)
   });
   return c.json(projection);
 });
@@ -49703,9 +49773,18 @@ dossiers.patch("/:id", async (c) => {
     "published_at",
     "batiment_info",
     "cotisation_annuelle",
-    "date_visite"
+    "date_visite",
+    "scenario_perso"
   ]) {
     if (key in body2) {
+      if (key === "scenario_perso") {
+        // Stocké en JSON validé ; null le retire et le rapport revient au moteur.
+        const propre = nettoyerScenarioPerso(body2[key]);
+        if (typeof propre === "string") return c.json({ error: propre }, 400);
+        fields.push(`${key} = ?${fields.length + 1}`);
+        values.push(propre ? JSON.stringify(propre) : null);
+        continue;
+      }
       // Publier maintenant passe par POST /publier, qui vérifie et fige le
       // rapport. Une date passée reste permise : c'est l'historique d'une
       // étude livrée hors de la plateforme (révision aux cinq ans).
@@ -49770,6 +49849,18 @@ async function verificationPublication(db, dossier, signataire) {
     ).bind(dossier.id).first())?.m;
     if (modif && dossier.pdf_signe_le && modif > dossier.pdf_signe_le) {
       avertissements.push({ cle: "pdf_ancien", message: "Le dossier a été modifié après le dépôt du PDF signé : vérifiez que le PDF correspond toujours au rapport." });
+    }
+  }
+  // Un scénario de l'ingénieur qui épuise le fonds ne se signe pas.
+  const perso = lireScenarioPerso(dossier);
+  if (perso) {
+    const actives = (await db.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossier.id).all()).results;
+    const proj = projectReserveFund(actives, { currentFundBalance: dossier.current_fund_balance, baseCotisation: dossier.cotisation_annuelle, units: dossier.units, scenarioPerso: perso });
+    const sc = proj.scenarios.find((x) => x.code === SCENARIO_PERSO_CODE);
+    if (sc && !sc.meetsCriteria) {
+      bloquants.push({ cle: "scenario", message: sc.firstNegativeYear != null
+        ? `Votre scénario de financement épuise le fonds dès l'an ${sc.firstNegativeYear} : revoyez les hausses annuelles.`
+        : "Votre scénario de financement ne laisse pas un solde suffisant pour débuter le prochain cycle : revoyez les hausses annuelles." });
     }
   }
   if (!comp?.total) bloquants.push({ cle: "composantes", message: "Aucune composante active au dossier." });

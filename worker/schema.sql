@@ -153,7 +153,8 @@ CREATE TABLE dossiers (
   pdf_signe_r2         TEXT,  -- PDF signé déposé par l'ingénieur, en attente de publication
   pdf_signe_le         TEXT,
   pdf_signe_nom        TEXT,
-  rapport_publie_pdf_r2 TEXT  -- PDF signé figé à la publication : ce que reçoit le syndicat
+  rapport_publie_pdf_r2 TEXT, -- PDF signé figé à la publication : ce que reçoit le syndicat
+  scenario_perso       TEXT   -- JSON : scénario de financement de l'ingénieur { taux: [% an 1, % an 2…], ensuite: % | null }
 );
 
 CREATE TABLE components (
