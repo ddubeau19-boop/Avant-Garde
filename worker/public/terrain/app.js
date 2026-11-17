@@ -72,13 +72,14 @@ const IMM_DOCS = [
   ['carnet_entretien',          "Carnet d'entretien"],
 ];
 
-// Repris aux pages d'identification, 1.0, 1.6 et 8.0 du rapport.
+// Repris aux pages d'identification, 1.0, 1.6 et 8.0 du rapport. Le NEQ et
+// le représentant viennent de la fiche client quand elle existe : ces champs
+// les complètent ou les remplacent. La date de visite reste au dossier.
 const IMM_MANDAT = [
   { k: 'contact_nom',          q: 'Représentant du mandant (ex. Monsieur Pierre Tremblay)' },
   { k: 'contact_titre',        q: 'Titre du représentant (ex. Administrateur)' },
-  { k: 'neq',                  q: "NEQ du syndicat" },
+  { k: 'neq',                  q: "NEQ du syndicat (si absent de la fiche client)" },
   { k: 'date_immatriculation', q: "Date d'immatriculation (AAAA-MM-JJ)" },
-  { k: 'visite_date',          q: 'Date de la visite (AAAA-MM-JJ)' },
   { k: 'visite_heures',        q: 'Heures de la visite (ex. entre 10 h et 13 h 30)' },
   { k: 'meteo',                q: 'Conditions météo (ex. Ensoleillée, 30 degrés Celsius)' },
   { k: 'intervenants',         q: 'Autres intervenants présents' },
@@ -2033,7 +2034,7 @@ function immeubleHtml() {
     <div class="imm-body">
       <div class="imm-section">
         <h3><span class="n">0</span>Mandat et visite</h3>
-        <p class="imm-hint">Repris tels quels à la page d'identification, aux sections 1.0 et 1.6 et à la déclaration du rapport.</p>
+        <p class="imm-hint">Repris à la page d'identification, aux sections 1.0, 1.4, 1.5 et 1.6 et à la déclaration du rapport.</p>
         ${mandatHtml}
       </div>
 

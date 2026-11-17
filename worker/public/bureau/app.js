@@ -110,6 +110,21 @@ const IMM_CARACS = [
   { k: 'cles_repartition_pcur',   q: 'Clés de répartition PCUR disponibles',                 type: 'ouinon' },
   { k: 'acces_toiture',           q: 'Accès sécuritaire à la toiture',                       type: 'ouinon' },
 ];
+// Même liste qu'au terrain (worker/public/terrain/app.js).
+const IMM_MANDAT = [
+  { k: 'contact_nom',          q: 'Représentant du mandant (ex. Monsieur Pierre Tremblay)' },
+  { k: 'contact_titre',        q: 'Titre du représentant (ex. Administrateur)' },
+  { k: 'neq',                  q: "NEQ du syndicat (si absent de la fiche client)" },
+  { k: 'date_immatriculation', q: "Date d'immatriculation (AAAA-MM-JJ)" },
+  { k: 'visite_heures',        q: 'Heures de la visite (ex. entre 10 h et 13 h 30)' },
+  { k: 'meteo',                q: 'Conditions météo (ex. Ensoleillée, 30 degrés Celsius)' },
+  { k: 'intervenants',         q: 'Autres intervenants présents' },
+  { k: 'unites_visitees',      q: "Nombre d'unités privatives visitées", mode: 'numeric' },
+  { k: 'source_fp',            q: 'Source du solde et de la cotisation (ex. prévu pour 2026 selon le courriel du 28 octobre 2026)' },
+  { k: 'description',          q: "Description de l'immeuble (fondations, revêtement, toiture, mitoyenneté…)", long: true },
+  { k: 'documents_detail',     q: 'Documents de référence détaillés — un par ligne (auteur, date, numéro)', long: true },
+];
+
 const IMM_REMPLACEMENTS = [
   ['pavage',             'Pavage'],
   ['revetement_toiture', 'Revêtement de toiture'],
@@ -3502,6 +3517,9 @@ function batimentPanelHtml(d) {
       : immInputHtml('caracteristiques', cfg.k, '');
     return immLigneHtml(cfg.q, ctl, !!cfg.si);
   }).join('');
+  const mandat = IMM_MANDAT.map(cfg => immLigneHtml(cfg.q, cfg.long
+    ? `<textarea class="detail-input imm-input imm-area" id="imm_mandat_${cfg.k}" data-role="imm-input" data-sec="mandat" data-key="${cfg.k}" rows="3">${escapeHtml(immVal('mandat', cfg.k) || '')}</textarea>`
+    : immInputHtml('mandat', cfg.k, '', cfg.mode))).join('');
   const rempl = IMM_REMPLACEMENTS.map(([k, label]) => immLigneHtml(label, immInputHtml('remplacements', k, 'AAAA', 'numeric'))).join('');
   const entr = IMM_ENTRETIENS.map(([k, label]) => immLigneHtml(label, immInputHtml('entretiens', k, 'mm/aaaa'))).join('');
 
@@ -3510,6 +3528,10 @@ function batimentPanelHtml(d) {
     ${head}
     <div class="imm-body">
       ${state.batimentNote ? `<div class="temp-pass-warn" style="margin:0 0 12px"><i data-lucide="info"></i><span>${escapeHtml(state.batimentNote)}</span></div>` : ''}
+      <div class="imm-section">
+        <div class="imm-section-head"><span class="n">0</span>Mandat et visite</div>
+        ${mandat}
+      </div>
       <div class="imm-section">
         <div class="imm-section-head"><span class="n">1</span>Documents à fournir avant la visite</div>
         ${docs}
