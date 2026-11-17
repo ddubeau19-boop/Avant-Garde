@@ -2973,6 +2973,7 @@ const JOURNAL_REGROUPEMENT_MS = 10 * 60 * 1e3;
 const JOURNAL_VALEUR_MAX = 300;
 const LIBELLES_CHAMPS = {
   date_visite: "Date de la visite",
+  scenario_perso: "Scénario de l'ingénieur",
   attentions: "Attentions spéciales",
   textes_sections: "Textes corrigés",
   name: "Nom", done: "Documentée", etat: "État", residual: "Vie résiduelle (%)", install_year: "Année d'installation",
@@ -3868,6 +3869,8 @@ const COLONNES_AJOUTEES = [
   ["dossiers", "client_id", "TEXT"],
   // Date de la visite des lieux (AAAA-MM-JJ) : au rapport, section 1.6 et déclaration.
   ["dossiers", "date_visite", "TEXT"],
+  // Scénario de financement choisi par l'ingénieur (JSON), retenu au rapport.
+  ["dossiers", "scenario_perso", "TEXT"],
   // Version publiée, figée : le .docx produit à la publication (R2) et son signataire.
   ["dossiers", "rapport_publie_r2", "TEXT"],
   ["dossiers", "publie_par", "TEXT"],
@@ -4262,7 +4265,8 @@ function previsionEtudePrecedente(r, anneeCourante) {
   const projection = projectReserveFund(r.composantes.filter(estActive), {
     currentFundBalance: r.dossier.current_fund_balance,
     baseCotisation: r.dossier.cotisation_annuelle,
-    units: r.dossier.units
+    units: r.dossier.units,
+    scenarioPerso: lireScenarioPerso(r.dossier)
   }, { ...RESERVE_FUND_PARAMS, anneeReference: r.annee });
   const scenario = scenarioRetenu(projection);
   if (!scenario) return null;
@@ -5339,10 +5343,12 @@ Réponds uniquement avec le texte de la note, sans guillemets ni préambule.`;
 // ============================================================================
 const NBSP = " ";
 const FERMETURE_ENTRETIEN = "Pour le détail de planification annuelle, vous référer au tableur suivi d'entretien.";
-const FERMETURE_ATTENTION = "En suivi aux observations ci-haut, nous suggérons des visites de services dans les meilleurs délais. Sur place le professionnel ou le spécialiste pourra suggérer les correctifs appropriés.";
-const CARNET_ABSENT = "Aucun ''carnet d'entretien'' ou registre des travaux antérieurs n'a été fourni. Ainsi, aucune révision d'un ''carnet d'entretien'' n'a été possible. De plus, selon les informations obtenues, aucun travaux majeurs ou projet important n'ont été reportés ou rejetés au cours des dernières années.";
-const CARNET_REVISE = "Suite à la révision du carnet d'entretien existant et selon les confirmations obtenues auprès de l'administration, aucun travaux majeurs ou projet important n'ont été reportés ou rejetés au cours des dernières années.";
-const AVIS_BUDGETAIRE = "Les valeurs présentées sont des montants budgétaires exprimés en dollars actuels, avant planifications et taxes (Loi 16).";
+// Formulations reprises du rapport approuvé 26-101 PGA (novembre 2026).
+const FERMETURE_ATTENTION = "En suivi des observations ci-dessus, nous suggérons des visites de services dans les meilleurs délais. Sur place, le professionnel ou le spécialiste pourra suggérer les correctifs appropriés.";
+const CARNET_ABSENT = "Aucun carnet d'entretien ni registre des travaux antérieurs n'a été fourni. Ainsi, aucune révision d'un carnet d'entretien n'a été possible. De plus, selon les informations obtenues auprès de l'administration, aucun travail majeur ni projet important n'a été reporté ou rejeté au cours de la période visée.";
+const CARNET_REVISE = "À la suite de la révision du carnet d'entretien existant et selon les informations obtenues auprès de l'administration, aucun travail majeur ni projet important n'a été reporté ou rejeté au cours de la période visée.";
+const CARNET_NON_REALISE = "Cependant, des travaux prévus à la dernière mise à jour du carnet d'entretien n'ont pas été réalisés.";
+const PUCE = "•";
 // ----------------------------------------------------------------------------
 // PIÈGE 1 — le gabarit maison transporte les notes de rédaction internes de son
 // auteur (« voir fd », « Vérif durée de vie avec Benoit A. », « SECTION À
@@ -5465,38 +5471,60 @@ function coteRapportLongue(rating) {
 // les textes de la maison.
 // ----------------------------------------------------------------------------
 const ENTRETIEN_BLOCS = {
-  amenagement: "L'entretien d'un aménagement paysager consiste essentiellement à veiller au maintien des pentes positives aux abords du bâtiment afin de favoriser l'éloignement par ruissellement de l'eau des fondations. Les bandes de remblai drainant aménagées là où le niveau du sol est trop élevé doivent être nettoyées pour favoriser un drainage efficace. On doit aussi faire l'émondage de la végétation pour éviter le contact avec le parement extérieur. La végétation en contact avec les parements favorise le maintien de l'humidité et augmente les risques d'éclatement au gel. L'entretien de l'aménagement doit être fait à même le budget d'entretien.",
-  pavage: "Le pavage d'asphalte nécessite peu d'entretien. Il est cependant suggéré de colmater les fissures apparaissant au fil des ans. Les fissures permettent l'infiltration d'eau sous le pavage et peuvent provoquer un soulèvement et/ou une érosion de la sous-fondation. Plus près des portes de garage, les abords et les fosses de captation doivent être nettoyés pour prévenir l'obstruction et assurer un bon ruissellement de l'eau. Les grilles en acier bénéficieront d'une repeinte en moyenne aux 5 ans.\n\nL'entretien des bordures de béton consiste essentiellement au colmatage des fissures avec un coulis afin de prévenir la rétention d'eau dans le béton et l'éclatement au gel. Cependant notre expérience a démontré que cette pratique est plutôt un exercice esthétique.\n\nIl est recommandé de planifier annuellement le nettoyage des pavages, puis des fosses de captation. Ceci particulièrement en fin de printemps afin d'éliminer les résidus de sels déglaçant.",
-  betonCoule: "Le béton coulé nécessite peu d'entretien, cependant l'apparition de petites fissures (d'une largeur inférieure à 2mm) est normale sur une dalle de béton. Ces fissures sont généralement associées au phénomène de retrait lors du mûrissement et pourront être scellées avec un coulis pour prévenir la rétention d'eau et l'éclatement au gel. Lors de dénivelé important, la mise à niveau avec soulèvement par uréthane donne de très bons résultats. Les remplacements sont fréquemment justifiés par les finis de surface affectée par les sels déglaçant.",
-  paveBeton: "Concernant le pavage de pavé de béton, ceux-ci sont très durables. Périodiquement, une mise à niveau des surfaces sera requise afin d'éliminer les différences de niveau qui sont un risque de trébuche et de chute. Les mouvements, affaissements et soulèvements du sol sont les principales causes de ces phénomènes.",
-  muretsModulaires: "Murets modulaires : Ce type de module en bloc de béton nécessite peu d'entretien. Il est suggéré de nettoyer annuellement avec un jet sous pression et ceci en fonction de l'exposition aux sels déglaçant. Au plus long terme, il faudra prévoir les déformations et affaissements et planifier la remise à niveau.",
-  gardeCorps: "Garde-corps acier : Ceux-ci devront être repeint sur une base régulière. Idéalement, la préparation sera faite avec un sablage au jet. Le calcul d'entretien planifie pour des travaux de préparation avec ponçages rotatifs et peinture aux garde-corps en acier aux 10 à 15 ans.\n\nGarde-corps métallique : Ceux-ci sont sans entretien. L'application de peinture sur ce type d'alliage est généralement peu efficace. Lorsque la corrosion est trop présente, le remplacement est suggéré.\n\nVérifier régulièrement la solidité des bases et ancrages. Pour des raisons de sécurité, il est recommandé d'installer des garde-corps au haut des murets, lorsque ceux-ci sont de plus de 24 pouces (600mm) et d'installer une main courante aux escaliers de plus de trois contremarches.",
-  acierGalvanise: "Les structures en acier galvanisées (zinquées) sont sans entretien et considérés avoir la durée de vie de l'immeuble. Après plusieurs années, l'apparition de zones de rouilles pourra être gratté et poncées puis un produit au zinc appliqué.",
-  boisTraite: "Les structures de bois exposés mais sans contact avec le sol présentent régulièrement des durées de vie d'environ 25 ans. En contact avec le sol, celles-ci dépassent difficilement 10 à 15 ans.\n\nLes structures en bois traitées exposés mais sans contact avec le sol, ont des durées de vie pouvant atteindre 40 ans. En contact avec le sol, celles-ci dépassent difficilement 25 à 30 ans.\n\nAinsi, pour tout contextes, il est suggéré de planifier annuellement le traitement des surfaces de bois et particulièrement les parties en contact avec le sol.",
-  clotureBois: "Les clôtures de bois ont une durée de vie variant de 15 à 25 ans. L'élément le plus sensible à la détérioration demeure la base des poteaux. Nous suggérons toujours d'appliquer une teinture hydrofuge aux 3-5 ans ou selon les informations du manufacturier en s'attardant particulièrement à la base des poteaux.",
-  toitures: "Système multicouche et Membrane élastomère : Il est recommandé de planifier annuellement une inspection de la membrane ainsi que des joints de scellant d'ouverture et de contour. Les drains de toiture sont à être nettoyés annuellement afin d'assurer un bon écoulement de l'eau d'accumulation.",
-  bardeaux: "Bardeaux d'asphalte : Il est recommandé de planifier annuellement une inspection des bardeaux ainsi que des joints de scellant d'ouverture et de contour. Le système de gouttière doit être nettoyé annuellement afin d'assurer un bon écoulement de l'eau. L'installation de butoir à chaque descente facilitera l'éloignement de l'eau de la base des fondations.",
-  gouttiere: "Système de gouttière : Ces installations sont sujettes à différents phénomènes. L'accumulation de glace, le blocage par les débris, la fatigue des ancrages sont des situations qui sont à vérifier régulièrement. Plusieurs d'entre-elles affectent la solidité et l'intégrité. Sans anticiper le remplacement complet, certaines situations pourront être à corriger ponctuellement.",
-  maconnerie: "Maçonnerie : Il est recommandé de planifier une observation régulière du revêtement de maçonnerie, principalement pour tout indice de fissuration ou mortier friable. Derrière la maçonnerie, se trouve une membrane qui assure l'étanchéité de l'immeuble. C'est pourquoi, une fissure n'implique pas qu'une infiltration d'eau est active. On devra cependant documenter pour tout indice intérieur d'infiltration d'eau, particulièrement au contour des ouvertures.\n\nScellant de rencontre architecturale : Trop souvent oubliés, les scellants de rencontre entre les revêtements ou de contrôle sont à être vérifiés et corrigés annuellement. Leur bon état assure une efficacité contre les infiltrations de l'eau, du vent et des insectes. Ceux-ci sont partie intégrante de l'enveloppe de votre immeuble. Soyez attentif, les façades ensoleillées de l'immeuble pourront présenter des scellants demandant une attention avant ceux des façades ombragées.",
-  parement: "Un nettoyage doux est suggéré afin de conserver le parement en bon état esthétique. La fréquence du nettoyage sera selon l'exposition aux polluants et accumulations des poussières. Comme présenté plus haut, les scellants sont à être vérifiés et corrigés annuellement. Leur bon état assure une efficacité contre les infiltrations de l'eau, du vent et des insectes.",
-  enduitAcrylique: "Attention : Ce type de composition (aussi connu comme : système d'isolation des façades avec enduits : SIFE) demeure un risque pour l'immeuble. Déjà bien documenté au Canada, plusieurs situations ont démontré que ce produit limite la ventilation du mur extérieur lorsque la cavité de drainage est absente. Il en résulte des dommages par l'eau, pouvant inclure la dégradation avancée de la structure de bois. Les bris et fissurations de surfaces doivent être documenter afin de planifier leur réparation et/ou remplacement.",
-  portesFenetres: "Un nettoyage doux est suggéré afin de conserver les éléments en bon état esthétique. La fréquence du nettoyage sera selon l'exposition aux polluants et poussières. Une lubrification régulière des mécanismes avec un silicone en aérosol assurera un bon mouvement.\n\nToutes les portes devront être vérifiées régulièrement, les mécanismes lubrifiés, la tension du système de fermeture automatique ajusté et les coupe-froids endommagés remplacés.\n\nToutes les portes de communication devront être vérifiées, les mécanismes lubrifiés, la tension du système de fermeture automatique ajusté et les coupe-son endommagés remplacés. Ces éléments sont essentiels pour la protection contre les incendies et la propagation de la fumée.",
-  porteGarage: "Le cout d'une porte est environ 25% du coût total de maintenance et d'entretien pour sa durée de vie. Par exemple, les ressorts ont une durée de vie d'environ 10 000 cycles, ou environ une année alors que pour plusieurs composantes de levage, environ 5 ans. Ainsi les services annuels d'entretien par un entrepreneur spécialisé sont recommandés pour les composantes mécanique et électrique.",
-  pontageFibre: "Pontage de fibre de verre : Un nettoyage doux des surfaces du pontage est suggéré afin de conserver les éléments en bon état. Selon notre expérience, la durée de vie d'un pontage de fibre de verre (avec contreplaquée) est variable et d'environ 20-30 ans. Bien que de construction robuste, celui-ci demeure sensible aux rayonnements du soleil et à la dégradation lente de surface qui est fréquemment la cause des infiltrations d'eau, par exemple : son exposition au soleil, le type équipements et mobiliers qui l'occupe, le type de fixation/ancrage des gardes-corps. Un indice classique est l'apparition de traces d'eau ''jaunâtre'' sous le balcon. Ainsi la raison habituelle de leur remplacement concerne moins sa résistance structurale mais plutôt ces infiltrations d'eau et la délamination de surface. Certains produits existent qui, posés en surface semble vraisemblablement limiter l'assèchement et la porosité de la résine de polyester. Notre expérience ne peut permettre de statuer sur l'avantage coût/ durée de vie de cette pratique. Récemment, il existe sur le marché des pontages construit avec, en son centre, un panneau de plastique recyclé. Ce type, plus dispendieux, a une durée de vie estimé dépassant 25-35 ans.",
-  moellons: "Moellons : Les fondations d'époque de la construction de votre immeuble étaient construites utilisant les matériaux de la région et selon la compréhension technique du moment. Une fondation en moellon est une construction composée de pierres naturelles non taillées ou légèrement taillées, posées les unes sur les autres avec un mortier, parfois à base de chaux, pour créer une structure solide et stable. Généralement, le résultat est plutôt stable. Les joints de mortier n'ont pas de rôle porteur, la charge se transmettant entre les pierres. Le mortier ne sert qu'à combler les vides et donner une certaine étanchéité. Même si ces structures étaient connues pour leur solidités en Europe, celles-ci sont moins adaptés pour le climat du Québec. Ainsi il est fréquent que ce type de fondation nécessitent des travaux correctifs bien avant d'être centenaire. Avec les apports réguliers d'humidité et les cycles de gel et dégel, le mortier finit par se désagréger. D'importantes fissures pourraient apparaître, par exemple, lorsque l'argile (en sous-fondation) perd son contenu en eau lors d'étés secs. Ainsi, des travaux de re jointage pourraient être requis en plus de devoir replacer les pierres qui se seraient délogées. Nous suggérons de documenter toute indice de vieillissement, infiltration d'eau, dégradation, perte de stabilité en compression afin de planifier les travaux appropriés avec un professionnel. Généralement, lors de travaux importants, le remplacement de pierres fissurées ou friables ainsi que l'utilisation d'un mortier haute résistance pourra redonner à votre fondation ses capacités. En situation extrême, les fondations pourraient bénéficier de stabilisation avec pieutage ou muret de soutènement.",
-  drainFrancais: "Le drain français : Le système de drain français a une durée de vie d'environ 35 ans. Les mouvements de sols, la migration des racines et l'érosion des fines particules dans le sol, sont les raisons principales qui affectent l'efficacité de ce système. Un drain français non fonctionnel ne pourra évacuer l'eau accumulée à la base des fondations et pourra créer des situations d'infiltration d'eau.",
-  structure: "Il n'y a pas d'entretien prévu pour la structure. En prévention il sera essentiel de prévenir les risques d'infiltration d'eau au niveau de l'enveloppe, de la toiture et de la dalle du stationnement intérieur.",
-  securiteIncendie: "Ces éléments de sécurité incendie devront être vérifiés annuellement par une firme spécialisée qui émettra les attestations de conformités appropriées. Nous suggérons de planifier les correctifs particuliers dès le rapport d'inspection reçu.",
-  cameras: "Selon notre expérience, la gestion des enregistrements et leur consultation demande certaines précautions. La mise en place d'un système de caméras de surveillance doit répondre à un besoin de sécurité. L'objectif doit justifier la cueillette de renseignements qui pourraient être considérés personnels. Ainsi, aucun copropriétaire ne pourra avoir accès au captures vidéo ou images recueillies. Seules quelques personnes désignées par le conseil d'administration : un administrateur, le gestionnaire ou les personnes responsables de la sécurité de l'immeuble, devraient y avoir accès. Ces enregistrements ne devraient en aucun cas être diffusées ou transférées à un tiers, sauf aux autorités policières ou judiciaires pour identifier notamment les auteurs de vandalisme commis dans l'immeuble ou sur la propriété.",
-  finisInterieurs: "Selon notre expérience, la mise en place d'une procédure de surveillance lors des emménagements/ déménagements demeure le meilleur moyen de limiter les bris et dommages aux finis.",
-  alimentationElectrique: "L'entretien de base consiste à libérer les espaces électriques de tout remisage.\n\nPour l'entretien spécifique nous recommandons de planifier avec un électricien spécialisé. Celui-ci effectuera la vérification, dépoussiérage et thermographie des installations.\n\nLes éléments ayant une durée de vie plus courte sont les transformateurs. Malgré notre expérience d'une durée de vie dépassant les 45 ans, nous remarquons plusieurs situations inattendues de remplacement à l'intérieur de 20 ans. Ceci est inclus dans notre calcul cyclique d'allocation.",
-  chauffeEau: "La durée de vie imposé par la majorité des compagnies en assurance est de 10 ans. Des avenants d'exclusions sont à prévoir lorsque les chauffe-eaux dépassent ce délai.",
+  // Textes alignés sur le rapport approuvé 26-101 PGA (novembre 2026).
+  amenagement: "L'entretien d'un aménagement paysager consiste essentiellement à veiller au maintien des pentes positives aux abords du bâtiment afin de favoriser l'éloignement par ruissellement de l'eau des fondations. Les bandes de remblai drainant aménagées là où le niveau du sol est trop élevé doivent être nettoyées pour favoriser un drainage efficace. On doit aussi faire l'émondage de la végétation pour éviter le contact avec le parement extérieur. La végétation en contact avec les parements favorise le maintien de l'humidité et augmente les risques d'éclatement au gel.\n\nL'entretien de l'aménagement doit être fait à même le budget d'entretien.",
+  pavage: "Le pavage d'asphalte nécessite peu d'entretien. Il est cependant suggéré de colmater les fissures apparaissant au fil des ans. Les fissures permettent l'infiltration d'eau sous le pavage et peuvent provoquer un soulèvement et/ou une érosion de la sous-fondation. Plus près des portes de garage, les abords et les fosses de captation doivent être nettoyés pour prévenir l'obstruction et assurer un bon ruissellement de l'eau. Les grilles en acier bénéficieront d'une repeinte en moyenne aux 5 ans.\n\nL'entretien des bordures de béton consiste essentiellement au colmatage des fissures avec un coulis afin de prévenir la rétention d'eau dans le béton et l'éclatement au gel. Cependant, notre expérience a démontré que cette pratique est plutôt un exercice esthétique.\n\nIl est recommandé de planifier annuellement le nettoyage des pavages, puis des fosses de captation. Ceci particulièrement en fin de printemps afin d'éliminer les résidus de sels de déglaçage.",
+  paveAlveole: "Le pavage en béton alvéolé installé sur remblai nécessite généralement peu d'entretien. Il est toutefois recommandé de procéder à une inspection périodique afin de repérer tout affaissement, déplacement ou désalignement des pavés. Les mouvements du remblai, notamment sous l'effet du gel et du dégel ou d'un compactage insuffisant, peuvent entraîner des déformations de la surface. Les zones affaissées devront être corrigées par le retrait temporaire des pavés, la remise à niveau et le compactage du matériau de fondation, puis la réinstallation des éléments.\n\nLes alvéoles doivent être entretenues afin de préserver leur fonction de drainage et leur stabilité. Selon le type de remplissage, il convient de maintenir le niveau des matériaux granulaires ou de la végétation et de remplacer ceux qui ont été emportés par l'érosion. Un nettoyage périodique permettra également de limiter l'accumulation de débris et de sédiments susceptibles de nuire à l'infiltration des eaux de surface. Les pavés fissurés ou brisés devront être remplacés au besoin.",
+  betonCoule: "Le béton coulé nécessite peu d'entretien, cependant l'apparition de petites fissures (d'une largeur inférieure à 2 mm) est normale sur une dalle de béton. Ces fissures sont généralement associées au phénomène de retrait lors du mûrissement et pourront être scellées avec un coulis pour prévenir la rétention d'eau et l'éclatement au gel. Lors d'un dénivelé important, la mise à niveau avec soulèvement par uréthane donne de très bons résultats. Les remplacements sont fréquemment justifiés par les finis de surface affectés par les sels de déglaçage.\n\nIl est recommandé de planifier annuellement le nettoyage des trottoirs. Ceci particulièrement en fin de printemps afin d'éliminer les résidus de sels de déglaçage.",
+  fondationBeton: "Le béton coulé protégé nécessite peu d'entretien, cependant l'apparition de petites fissures (d'une largeur inférieure à 2 mm) est fréquente sur une dalle de béton. Ces fissures sont généralement associées au phénomène de retrait lors du mûrissement et doivent être scellées avec un coulis pour prévenir la rétention d'eau et l'éclatement au gel. Lorsque les fissures sont plus larges, une vérification de présence de signes d'infiltration à l'intérieur pourra justifier l'implication d'un professionnel. Des travaux d'excavation pourront être requis.",
+  paveBeton: "Concernant le pavage de pavés de béton, ceux-ci sont très durables. Périodiquement, une mise à niveau des surfaces sera requise afin d'éliminer les différences de niveau qui sont un risque de trébuchement et de chute. Les mouvements, affaissements et soulèvements du sol sont les principales causes de ces phénomènes.",
+  muretsModulaires: "Murets modulaires : Ce type de module en bloc de béton nécessite peu d'entretien. Il est suggéré de nettoyer annuellement avec un jet sous pression, et ceci en fonction de l'exposition aux sels de déglaçage. À plus long terme, il faudra prévoir les déformations et affaissements et planifier la remise à niveau.",
+  muretsBois: "Murets en bois traité : Ce type de muret nécessite peu d'entretien. Il faudra aussi s'assurer de la stabilité des bases des garde-corps adjacents.",
+  gardeCorps: "Garde-corps en acier : Ceux-ci devront être repeints sur une base régulière. Idéalement, la préparation sera faite avec un sablage au jet. Le calcul d'entretien planifie des travaux de préparation avec ponçages rotatifs et peinture aux garde-corps en acier aux 10 à 15 ans.\n\nGarde-corps métalliques : Ceux-ci sont sans entretien. L'application de peinture sur ce type d'alliage est généralement peu efficace. Lorsque la corrosion est trop présente, le remplacement est suggéré.\n\nVérifier régulièrement la solidité des bases et ancrages. Pour des raisons de sécurité, il est recommandé d'installer des garde-corps au haut des murets, lorsque ceux-ci sont de plus de 24 pouces (600 mm) et d'installer une main courante aux escaliers de plus de trois contremarches.",
+  balconBeton: "Balcon de béton : Le béton nécessite peu d'entretien, cependant l'apparition de petites fissures (d'une largeur inférieure à 2 mm) est fréquente sur une dalle de béton. Ces fissures sont généralement associées au phénomène de retrait lors du mûrissement et doivent être scellées avec un coulis pour prévenir la rétention d'eau et l'éclatement au gel. Lorsque les fissures sont plus larges, l'implication d'un professionnel pourra être nécessaire.\n\nGarde-corps en acier : Ceux-ci devront être repeints sur une base régulière. Idéalement, la préparation sera faite avec un sablage au jet. Le calcul d'entretien planifie des travaux de préparation avec ponçages rotatifs et peinture aux garde-corps en acier aux 10 à 15 ans.",
+  terrasseToiture: "Ce type de terrasse est souvent associé à des risques d'infiltration d'eau, par le simple fait que l'inspection des membranes sous le revêtement de plancher est limitée. Il est recommandé, lors des travaux aux revêtements, d'effectuer des observations ponctuelles en vue de documenter et planifier l'entretien ou le remplacement.\n\nDe plus, chaque terrasse possède un système de drainage. Celui-ci doit être accessible pour toute intervention et nettoyage régulier. Idéalement, on vérifiera l'efficacité de l'évacuation de l'eau au même moment.",
+  acierGalvanise: "Les structures en acier galvanisé (zingué) sont sans entretien et considérées comme ayant la durée de vie de l'immeuble. Après plusieurs années, les zones de rouille qui apparaîtront pourront être grattées et poncées, puis un produit au zinc appliqué.",
+  boisTraite: "Les structures de bois exposées, mais sans contact avec le sol, présentent régulièrement des durées de vie d'environ 25 ans. En contact avec le sol, celles-ci dépassent difficilement 10 à 15 ans.\n\nLes structures en bois traité exposées, mais sans contact avec le sol, ont des durées de vie pouvant atteindre 40 ans. En contact avec le sol, celles-ci dépassent difficilement 25 à 30 ans.\n\nAinsi, pour tous les contextes, il est suggéré de planifier annuellement le traitement des surfaces de bois et particulièrement les parties en contact avec le sol.",
+  clotureBois: "Les clôtures de bois ont une durée de vie variant de 15 à 25 ans. L'élément le plus sensible à la détérioration demeure la base des poteaux. Nous suggérons toujours d'appliquer une teinture hydrofuge aux 3 à 5 ans ou selon les informations du manufacturier en s'attardant particulièrement à la base des poteaux.",
+  toitures: "Système Membrane élastomère : Il est recommandé de planifier annuellement une inspection de la membrane ainsi que des joints de scellant d'ouverture et de contour. Les drains de toiture doivent être nettoyés annuellement afin d'assurer un bon écoulement de l'eau d'accumulation.",
+  bardeaux: "Bardeaux d'asphalte : Il est recommandé de planifier annuellement une inspection des bardeaux ainsi que des joints de scellant d'ouverture et de contour. Le système de gouttière doit être nettoyé annuellement afin d'assurer un bon écoulement de l'eau. L'installation d'un butoir à chaque descente facilitera l'éloignement de l'eau de la base des fondations.",
+  gouttiere: "Système de gouttière : Ces installations sont sujettes à différents phénomènes. L'accumulation de glace, le blocage par les débris et la fatigue des ancrages sont des situations à vérifier régulièrement. Plusieurs d'entre elles affectent la solidité et l'intégrité. Sans anticiper le remplacement complet, certaines situations pourront être à corriger ponctuellement.",
+  maconnerie: "Maçonnerie : Il est recommandé de planifier une observation régulière du revêtement de maçonnerie, principalement pour tout indice de fissuration ou mortier friable. Derrière la maçonnerie se trouve une membrane qui assure l'étanchéité de l'immeuble. C'est pourquoi une fissure n'implique pas qu'une infiltration d'eau est active. On devra cependant documenter tout indice intérieur d'infiltration d'eau, particulièrement au contour des ouvertures.\n\nScellant de rencontre architecturale : Trop souvent oubliés, les scellants de rencontre entre les revêtements ou de contrôle doivent être vérifiés et corrigés annuellement. Leur bon état assure une efficacité contre les infiltrations de l'eau, du vent et des insectes. Ceux-ci sont partie intégrante de l'enveloppe de votre immeuble. Soyez attentif, les façades ensoleillées de l'immeuble pourront présenter des scellants demandant une attention avant ceux des façades ombragées.",
+  parement: "Un nettoyage doux est suggéré afin de conserver le parement en bon état esthétique. La fréquence du nettoyage sera fonction de l'exposition aux polluants et accumulations des poussières. Comme présenté plus haut, les scellants doivent être vérifiés et corrigés annuellement. Leur bon état assure une efficacité contre les infiltrations de l'eau, du vent et des insectes.",
+  parementBois: "Un nettoyage doux est suggéré afin de conserver le parement en bon état esthétique. La fréquence du nettoyage sera fonction de l'exposition aux polluants et accumulations des poussières. Le vieillissement de ce type de clin est difficile à prévoir, particulièrement en contexte d'assèchement urbain. Dans ces situations, il est suggéré de planifier l'application d'un préservatif.\n\nComme présenté plus haut, les scellants doivent être vérifiés et corrigés annuellement. Leur bon état assure une efficacité contre les infiltrations de l'eau, du vent et des insectes.",
+  enduitAcrylique: "Attention : Ce type de composition (aussi connu comme système d'isolation des façades avec enduits : SIFE) demeure un risque pour l'immeuble. Déjà bien documenté au Canada, plusieurs situations ont démontré que ce produit limite la ventilation du mur extérieur lorsque la cavité de drainage est absente. Il en résulte des dommages par l'eau, pouvant inclure la dégradation avancée de la structure de bois. Les bris et fissurations de surface doivent être documentés afin de planifier leur réparation et/ou leur remplacement.",
+  portesFenetres: "Un nettoyage doux est suggéré afin de conserver les éléments en bon état esthétique. La fréquence du nettoyage sera fonction de l'exposition aux polluants et poussières. Une lubrification régulière des mécanismes avec un silicone en aérosol assurera un bon mouvement.",
+  fenetres: "Fenêtres : Un nettoyage doux des surfaces et une lubrification régulière des mécanismes sont suggérés afin de conserver les éléments en bon état. Pour plusieurs types de fenêtres, le remplacement pourra être reporté à la suite de travaux de modernisation.\n\nScellant d'ouverture : Trop souvent oubliés, les scellants de contour de portes, fenêtres et conduits doivent être vérifiés et corrigés annuellement. Ceux-ci sont partie intégrante de l'enveloppe de votre immeuble. Soyez attentif, les façades ensoleillées de l'immeuble pourront présenter des scellants demandant une attention avant ceux des façades ombragées. Leur bon état assure une efficacité contre les infiltrations de l'eau, du vent et des insectes. Selon notre opinion, l'entretien régulier des scellants sera sous la responsabilité du syndicat.",
+  portesUnites: "Toutes les portes de communication devront être vérifiées, les mécanismes lubrifiés, la tension du système de fermeture automatique ajustée et les coupe-son endommagés remplacés. Ces éléments sont essentiels pour la protection contre les incendies et la propagation de la fumée.",
+  portesRangement: "Bien que ces portes puissent être considérées à usage exclusif, celles-ci devront être vérifiées pour une lubrification régulière des mécanismes afin d'assurer un meilleur mouvement.",
+  porteGarage: "Le coût d'une porte représente environ 25 % du coût total de maintenance et d'entretien pour sa durée de vie. Par exemple, les ressorts ont une durée de vie d'environ 10 000 cycles, soit environ une année, alors que pour plusieurs composantes de levage, environ 5 ans. Ainsi, les services annuels d'entretien par un entrepreneur spécialisé sont recommandés pour les composantes mécaniques et électriques.\n\nToutes les portes devront être vérifiées régulièrement, les mécanismes lubrifiés, la tension du système de fermeture automatique ajustée et les coupe-froid endommagés remplacés.",
+  pontageFibre: "Pontage de fibre de verre : Un nettoyage doux des surfaces du pontage est suggéré afin de conserver les éléments en bon état. Selon notre expérience, la durée de vie d'un pontage de fibre de verre (avec contreplaqué) est variable et d'environ 20 à 30 ans. Bien que de construction robuste, celui-ci demeure sensible aux rayonnements du soleil et à la dégradation lente de surface qui est fréquemment la cause des infiltrations d'eau, par exemple : son exposition au soleil, le type d'équipements et de mobiliers qui l'occupent, le type de fixation ou d'ancrage des garde-corps. Un indice classique est l'apparition de traces d'eau « jaunâtres » sous le balcon. Ainsi, la raison habituelle de leur remplacement concerne moins sa résistance structurale que ces infiltrations d'eau et la délamination de surface. Certains produits posés en surface semblent limiter l'assèchement et la porosité de la résine de polyester. Notre expérience ne permet pas de statuer sur l'avantage coût/durée de vie de cette pratique. Récemment, il existe sur le marché des pontages construits avec, en leur centre, un panneau de plastique recyclé. Ce type, plus dispendieux, a une durée de vie estimée dépassant 25 à 35 ans.",
+  moellons: "Moellons : Les fondations d'époque de la construction de votre immeuble étaient construites en utilisant les matériaux de la région et selon la compréhension technique du moment. Une fondation en moellons est une construction composée de pierres naturelles non taillées ou légèrement taillées, posées les unes sur les autres avec un mortier, parfois à base de chaux, pour créer une structure solide et stable. Généralement, le résultat est plutôt stable. Les joints de mortier n'ont pas de rôle porteur, la charge se transmettant entre les pierres. Le mortier ne sert qu'à combler les vides et à donner une certaine étanchéité. Même si ces structures étaient connues pour leur solidité en Europe, celles-ci sont moins adaptées au climat du Québec. Ainsi, il est fréquent que ce type de fondation nécessite des travaux correctifs bien avant d'être centenaire. Avec les apports réguliers d'humidité et les cycles de gel et dégel, le mortier finit par se désagréger. D'importantes fissures pourraient apparaître, par exemple, lorsque l'argile (en sous-fondation) perd son contenu en eau lors d'étés secs. Ainsi, des travaux de rejointoiement pourraient être requis, en plus de devoir replacer les pierres qui se seraient délogées. Nous suggérons de documenter tout indice de vieillissement, d'infiltration d'eau, de dégradation ou de perte de stabilité en compression afin de planifier les travaux appropriés avec un professionnel. Généralement, lors de travaux importants, le remplacement de pierres fissurées ou friables ainsi que l'utilisation d'un mortier haute résistance pourront redonner à votre fondation ses capacités. En situation extrême, les fondations pourraient bénéficier d'une stabilisation par pieutage ou muret de soutènement.",
+  drainFrancais: "Le drain français : Le système de drain français a une durée de vie d'environ 35 ans. Les mouvements de sols, la migration des racines et l'érosion des fines particules dans le sol sont les raisons principales qui affectent l'efficacité de ce système. Certaines sections du drain français devront recevoir des correctifs au fil des ans. Un drain français non fonctionnel ne pourra évacuer l'eau accumulée à la base des fondations et pourra créer des situations d'infiltration d'eau.",
+  structure: "Il n'y a pas d'entretien prévu pour la structure. En prévention, il sera essentiel de prévenir les risques d'infiltration d'eau au niveau de l'enveloppe et de la toiture.",
+  structureStationnement: "Il n'y a pas d'entretien prévu pour la structure. En prévention, il sera essentiel de prévenir les risques d'infiltration d'eau au niveau de l'enveloppe, de la toiture et de la dalle du stationnement intérieur.",
+  videsSousToit: "Nous suggérons de planifier des visites régulières aux entretoits et des observations fréquentes des plafonds du dernier niveau afin d'identifier tout signe d'infiltration d'eau.",
+  securiteIncendie: "Ces éléments de sécurité incendie devront être vérifiés annuellement par une firme spécialisée qui émettra les attestations de conformité appropriées. Nous suggérons de planifier les correctifs particuliers dès le rapport d'inspection reçu.",
+  cameras: "Selon notre expérience, la gestion des enregistrements et leur consultation demandent certaines précautions. La mise en place d'un système de caméras de surveillance doit répondre à un besoin de sécurité. L'objectif doit justifier la cueillette de renseignements qui pourraient être considérés comme personnels. Ainsi, aucun copropriétaire ne pourra avoir accès aux captures vidéo ou images recueillies. Seules quelques personnes désignées par le conseil d'administration (un administrateur, le gestionnaire ou les personnes responsables de la sécurité de l'immeuble) devraient y avoir accès. Ces enregistrements ne devraient en aucun cas être diffusés ou transférés à un tiers, sauf aux autorités policières ou judiciaires pour identifier notamment les auteurs de vandalisme commis dans l'immeuble ou sur la propriété.",
+  interphone: "Aucun commentaire particulier. Un nettoyage doux est suggéré afin de conserver le panneau en bon état esthétique.",
+  finisInterieurs: "Selon notre expérience, la mise en place d'une procédure de surveillance lors des emménagements/déménagements demeure le meilleur moyen de limiter les bris et dommages aux finis.",
+  tapis: "Il est suggéré d'effectuer une maintenance régulière avec aspirateur. Il sera aussi suggéré de faire un nettoyage annuel de tous les tapis, particulièrement en fin de printemps près des accès principaux et ascenseurs. Notre expérience a démontré l'appréciation des administrateurs pour les tapis de type « carreaux à agencer ». Ceux-ci ont l'avantage de faciliter les remplacements par section lors d'impondérables.",
+  ceramique: "Il est suggéré d'effectuer un nettoyage régulier, particulièrement en hiver et au printemps près des accès, entrées principales et ascenseurs. Les travaux d'entretien fréquents sont les réparations du coulis, particulièrement aux endroits de haute circulation.",
+  escaliersInterieurs: "Il est suggéré d'effectuer un nettoyage régulier, particulièrement en hiver et au printemps afin de retirer les sels de déglaçage qui favorisent la corrosion.",
+  alimentationElectrique: "L'entretien de base consiste à libérer les espaces électriques de tout remisage.\n\nPour l'entretien spécifique, nous recommandons de planifier avec un électricien spécialisé. Celui-ci effectuera la vérification, le dépoussiérage et la thermographie des installations.",
+  transformateur: "Les éléments ayant une durée de vie plus courte sont les transformateurs. Malgré notre expérience d'une durée de vie dépassant 45 ans, nous remarquons plusieurs situations inattendues de remplacement à l'intérieur de 20 ans. Ceci est inclus dans notre calcul cyclique d'allocation.",
+  eclairageInterieur: "Aucun entretien particulier autre qu'un nettoyage régulier.",
+  eclairageExterieur: "Vérifier régulièrement la solidité des fixations et l'état des scellants.",
+  plinthes: "Aucun entretien particulier autre qu'un nettoyage régulier des diffuseurs.",
+  extraction: "Sans être un remplacement, nous suggérons de planifier, au minimum, tous les 3 à 5 ans un nettoyage des conduits et tous les ans un nettoyage des grilles extérieures. Bien que ces systèmes desservent les espaces privatifs, nous croyons que la prise en charge de l'entretien par le syndicat assure une meilleure conformité de sécurité.",
+  chauffeEau: "La durée de vie imposée par la majorité des compagnies d'assurance est de 10 ans. Des avenants d'exclusion sont à prévoir lorsque les chauffe-eau dépassent ce délai.",
   // Repli neutre : composé uniquement de formules maison (§ 2.7 et § 4.3 du
   // corpus). Employé quand ni le code Uniformat ni la catégorie ne désignent un
   // bloc pré-écrit — la maison préfère une suggestion prudente à une invention.
   neutre: "Nous suggérons de documenter toute situation observée à cet élément afin de planifier les travaux appropriés avec un professionnel ou un entrepreneur spécialisé. La mise en place d'un programme d'entretien annuel facilite le transfert des tâches et la priorisation de celles-ci.",
   mecanique: "Ces équipements bénéficient d'un contrat d'entretien annuel par une firme spécialisée qui assurera le suivi des suggestions du manufacturier. Nous suggérons de planifier les correctifs particuliers dès le rapport d'inspection reçu.",
-  plomberie: "Nous vous rappelons que vous avez avantage à planifier, tous les 3 à 5 ans, un nettoyage de ces conduits. Tout travail ou branchement impliquant le réseau intérieur devra être effectué par des entrepreneurs membres de la CMMTQ."
+  eauPotable: "L'entretien des systèmes de plomberie est spécifique et nous recommandons de planifier ces interventions avec un entrepreneur en plomberie.\n\nSelon nos références, la durée de vie utile de ces éléments varie de 25 à 35 ans. Cependant, notre expérience indique régulièrement plus de 50 ans. Vérifier annuellement le bon fonctionnement des valves d'alimentation. Dans le doute, il faudra planifier cette vérification avec un plombier.",
+  plomberie: "L'entretien des systèmes de plomberie d'évacuation est spécifique et nous recommandons de planifier ces interventions avec un entrepreneur en plomberie.\n\nSelon nos références, la durée de vie utile de ces éléments varie de 30 à 40 ans. Cependant, notre expérience indique régulièrement plus de 50 ans pour les conduits. On devra prévoir des ajustements fréquents aux collets de raccord.\n\nLes immeubles en copropriété comportent des systèmes de conduits d'évacuation parfois complexes. Malgré un usage normal, des situations de blocage ou de refoulement sont à prévoir. Sans être un remplacement, nous vous rappelons que vous avez avantage à planifier, tous les 3 à 5 ans, un nettoyage de ces conduits."
 };
 // Clé de recherche 1 — le nom (ou la variante) de l'élément. Ordre significatif :
 // du plus spécifique au plus générique, première correspondance retenue.
@@ -5505,30 +5533,50 @@ const ENTRETIEN_PAR_NOM = [
   { re: /stationnements?\s+[ée]tag/i, blocs: ["betonCoule"] },
   { re: /moellon|pierre\s+(?:naturelle|des\s+champs|taill)/i, blocs: ["moellons"] },
   { re: /drain\s+fran[çc]ais/i, blocs: ["drainFrancais"] },
+  { re: /mur[s]?\s+de\s+fondation|fondation/i, blocs: ["fondationBeton", "drainFrancais"] },
   { re: /goutti[èe]re/i, blocs: ["gouttiere"] },
   { re: /bardeau/i, blocs: ["bardeaux", "gouttiere"] },
   { re: /pontage.{0,20}fibre\s+de\s+verre|fibre\s+de\s+verre/i, blocs: ["pontageFibre"] },
-  { re: /porte\s+de\s+garage/i, blocs: ["porteGarage", "portesFenetres"] },
+  { re: /terrasse[s]?\s+(?:urbaine|sur\s+(?:le\s+)?toit|de\s+toit)|toit[s]?-terrasse/i, blocs: ["terrasseToiture"] },
+  { re: /porte\s+de\s+garage/i, blocs: ["porteGarage"] },
+  { re: /balcon/i, blocs: ["balconBeton"] },
   { re: /garde-corps|main[s]?\s+courante/i, blocs: ["gardeCorps"] },
+  { re: /muret[^.]{0,30}bois|bois[^.]{0,30}muret/i, blocs: ["muretsBois"] },
   { re: /muret/i, blocs: ["muretsModulaires"] },
   { re: /cl[ôo]ture[^.]{0,30}bois|cl[ôo]ture\s+de\s+bois/i, blocs: ["clotureBois"] },
   { re: /acier\s+galvanis|zingu/i, blocs: ["acierGalvanise"] },
+  { re: /parement[^.]{0,20}bois|clin[^.]{0,20}bois/i, blocs: ["parementBois"] },
   { re: /bois\s+trait/i, blocs: ["boisTraite"] },
   { re: /enduit\s+acrylique|\bSIFE\b/i, blocs: ["enduitAcrylique", "parement"] },
   { re: /ma[çc]onnerie|brique|scellant[s]?\s+de\s+rencontre|linteau/i, blocs: ["maconnerie"] },
+  { re: /vide[s]?\s+sous\s+toit|entretoit|comble/i, blocs: ["videsSousToit"] },
   { re: /membrane|toit(?:ure)?\s|toit\b|solin/i, blocs: ["toitures"] },
+  { re: /alv[ée]ol/i, blocs: ["paveAlveole"] },
   { re: /pav[ée]\s+(?:de\s+b[ée]ton|uni)|pav[ée]\s+modulaire/i, blocs: ["paveBeton"] },
   { re: /pavage|asphalte|bordure|stationnement\s+ext/i, blocs: ["pavage"] },
   { re: /all[ée]e|trottoir|dalle|b[ée]ton\s+coul/i, blocs: ["betonCoule"] },
   { re: /am[ée]nagement\s+paysager|plate[s]?-bande|v[ée]g[ée]tation/i, blocs: ["amenagement"] },
   { re: /cam[ée]ra|surveillance|\bCCF\b|\bCCTV\b/i, blocs: ["cameras"] },
+  { re: /interphone|acc[èe]s\s+contr[ôo]l|casier[s]?\s+postau|case[s]?\s+postale|bo[îi]te[s]?\s+postale/i, blocs: ["interphone"] },
   { re: /chauffe-eau|r[ée]servoir[s]?\s+d['’]eau\s+chaude/i, blocs: ["chauffeEau"] },
   { re: /incendie|gicleur|d[ée]tecteur|alarme|extincteur|[ée]clairage\s+d['’]urgence|panneau\s+de\s+sortie/i, blocs: ["securiteIncendie"] },
-  { re: /alimentation\s+[ée]lectrique|panneau\s+[ée]lectrique|transformateur|entr[ée]e\s+[ée]lectrique/i, blocs: ["alimentationElectrique"] },
-  { re: /placopl[âa]tre|gypse|tapis|c[ée]ramique|plafond|lambris|rev[êe]tement\s+de\s+sol|peinture/i, blocs: ["finisInterieurs"] },
-  { re: /colonne|[ée]vacuation\s+sanitaire|eau\s+potable|plomberie|\bDAR\b|anti-?refoulement/i, blocs: ["plomberie"] },
+  { re: /transformateur/i, blocs: ["alimentationElectrique", "transformateur"] },
+  { re: /alimentation\s+[ée]lectrique|panneau\s+[ée]lectrique|entr[ée]e\s+[ée]lectrique/i, blocs: ["alimentationElectrique"] },
+  { re: /[ée]clairage[^.]{0,30}ext[ée]rieur/i, blocs: ["eclairageExterieur"] },
+  { re: /[ée]clairage|luminaire/i, blocs: ["eclairageInterieur"] },
+  { re: /plinthe/i, blocs: ["plinthes"] },
+  { re: /extraction|s[ée]cheuse|sortie[s]?\s+priv|hotte/i, blocs: ["extraction"] },
+  { re: /tapis/i, blocs: ["tapis"] },
+  { re: /c[ée]ramique/i, blocs: ["ceramique"] },
+  { re: /escalier[s]?\s+int[ée]rieur/i, blocs: ["escaliersInterieurs"] },
+  { re: /placopl[âa]tre|gypse|plafond|lambris|rev[êe]tement\s+de\s+sol|peinture/i, blocs: ["finisInterieurs"] },
+  { re: /eau\s+potable|alimentation\s+en\s+eau|\bDAR\b|anti-?refoulement/i, blocs: ["eauPotable"] },
+  { re: /colonne|[ée]vacuation|plomberie/i, blocs: ["plomberie"] },
   { re: /structure/i, blocs: ["structure"] },
-  { re: /fen[êe]tre|porte|scellant\s+d['’]ouverture|vitrage|mur\s+rideau/i, blocs: ["portesFenetres"] },
+  { re: /porte[s]?\s+(?:des\s+)?unit[ée]s|porte[s]?\s+coupe-feu|porte[s]?\s+de\s+communication/i, blocs: ["portesUnites"] },
+  { re: /porte[s]?[^.]{0,30}rangement|rangement[^.]{0,30}porte/i, blocs: ["portesRangement"] },
+  { re: /fen[êe]tre|scellant\s+d['’]ouverture|vitrage|mur\s+rideau/i, blocs: ["fenetres"] },
+  { re: /porte/i, blocs: ["portesFenetres"] },
   { re: /parement|rev[êe]tement\s+ext[ée]rieur|soffite|fibrociment|vinyle|agr[ée]gat|composite/i, blocs: ["parement"] }
 ];
 // Clé de recherche 2 — le préfixe du code Uniformat II. Testée par longueur
@@ -5541,31 +5589,39 @@ const ENTRETIEN_PAR_CODE = {
   "G20": ["betonCoule"],
   "G30.10": ["clotureBois", "acierGalvanise"],
   "G30.20": ["muretsModulaires"],
-  "A10": ["drainFrancais"],
+  "A10": ["fondationBeton", "drainFrancais"],
   "A30": ["betonCoule"],
   "A40": ["betonCoule"],
-  "B10.70": ["boisTraite"],
+  "B10.70": ["terrasseToiture"],
   "B10.80": ["gardeCorps"],
-  "B10": ["boisTraite", "gardeCorps"],
+  "B10": ["balconBeton"],
   "B20.10": ["maconnerie"],
   "B20.30": ["parement"],
-  "B20.40": ["parement"],
+  "B20.40": ["parementBois"],
   "B20.50": ["parement"],
   "B20.60": ["portesFenetres"],
   "B20": ["parement"],
   "B30": ["toitures", "gouttiere"],
-  "B40.60": ["porteGarage", "portesFenetres"],
+  "B40.10": ["fenetres"],
+  "B40.60": ["porteGarage"],
   "B40": ["portesFenetres"],
-  "C10": ["portesFenetres"],
-  "C20": ["portesFenetres"],
+  "C10": ["portesUnites"],
+  "C20.20": ["portesUnites"],
+  "C20.30": ["portesRangement"],
+  "C20": ["portesUnites"],
   "C30": ["finisInterieurs"],
-  "C40": ["gardeCorps"],
+  "C40": ["escaliersInterieurs"],
+  "D20.20": ["eauPotable"],
   "D20.26": ["chauffeEau"],
   "D20.27": ["chauffeEau"],
   "D20": ["plomberie"],
+  "D30.10": ["plinthes"],
+  "D30.46": ["extraction"],
   "D30": ["mecanique"],
   "D40": ["securiteIncendie"],
   "D50.10": ["alimentationElectrique"],
+  "D50.22": ["eclairageExterieur"],
+  "D50.23": ["eclairageInterieur"],
   "D50.31": ["securiteIncendie"],
   "D50.32": ["securiteIncendie"],
   "D50.40-50": ["securiteIncendie"],
@@ -5604,20 +5660,24 @@ function blocsEntretien(component) {
   }
   return ENTRETIEN_PAR_CATEGORIE[component?.cat] ?? ["neutre"];
 }
-function texteEntretien(component) {
-  const blocs = blocsEntretien(component).map((cle) => ENTRETIEN_BLOCS[cle]).filter(Boolean);
+function texteEntretien(component, dossier) {
+  // La dalle du stationnement intérieur n'est mentionnée que si l'immeuble en a un.
+  const nbStat = Number(infoBatiment(dossier)?.caracteristiques?.nb_stationnements_int);
+  const blocs = blocsEntretien(component)
+    .map((cle) => (cle === "structure" && nbStat > 0 ? "structureStationnement" : cle))
+    .map((cle) => ENTRETIEN_BLOCS[cle]).filter(Boolean);
   const corps = paragraphes(blocs.length > 0 ? blocs : [ENTRETIEN_BLOCS.neutre]);
   return paragraphes([corps, FERMETURE_ENTRETIEN]);
 }
 // NOTE de champ de pratique réservé, placée en tête de famille (gabarit § 2.8).
 const NOTE_CHAMP_PRATIQUE = {
-  equipements: "NOTE : Nos vérifications de certaines composantes demeurent sommaires, car ils relèvent de compétences et de champs de pratique réservés. Si une situation nous apparait préoccupante, le rapport en fera mention.",
-  cvac: "NOTE : Nos vérifications de certaines composantes en mécanique du bâtiment demeurent sommaires, car ils relèvent de compétences et de champs de pratique réservés (Corporation des maîtres électriciens du Québec, Corporation des maîtres mécaniciens en tuyauterie du Québec, Corporation des entreprises de traitement de l'air et du froid, etc.). Si une situation nous apparait préoccupante, le rapport en fera mention.",
-  electrique: "NOTE : Nos vérifications de certaines composantes en mécanique du bâtiment demeurent sommaires, car ils relèvent de compétences et de champs de pratique réservés (Corporation des maîtres électriciens du Québec, Corporation des maîtres mécaniciens en tuyauterie du Québec, Corporation des entreprises de traitement de l'air et du froid, etc.). Si une situation nous apparait préoccupante, le rapport en fera mention.",
-  plomberie: "NOTE : Nos vérifications de certaines composantes en mécanique du bâtiment demeurent sommaires, car ils relèvent de compétences et de champs de pratique réservés (Corporation des maîtres électriciens du Québec, Corporation des maîtres mécaniciens en tuyauterie du Québec, Corporation des entreprises de traitement de l'air et du froid, etc.). Si une situation nous apparait préoccupante, le rapport en fera mention."
+  equipements: "NOTE : Nos vérifications de certaines composantes demeurent sommaires, car elles relèvent de compétences et de champs de pratique réservés. Si une situation nous apparait préoccupante, le rapport en fera mention.",
+  cvac: "NOTE : Nos vérifications de certaines composantes en mécanique du bâtiment demeurent sommaires, car elles relèvent de compétences et de champs de pratique réservés (Corporation des maîtres électriciens du Québec, Corporation des maîtres mécaniciens en tuyauterie du Québec, Corporation des entreprises de traitement de l'air et du froid, etc.). Si une situation nous apparait préoccupante, le rapport en fera mention.",
+  electrique: "NOTE : Nos vérifications de certaines composantes en mécanique du bâtiment demeurent sommaires, car elles relèvent de compétences et de champs de pratique réservés (Corporation des maîtres électriciens du Québec, Corporation des maîtres mécaniciens en tuyauterie du Québec, Corporation des entreprises de traitement de l'air et du froid, etc.). Si une situation nous apparait préoccupante, le rapport en fera mention.",
+  plomberie: "NOTE : Nos vérifications de certaines composantes en mécanique du bâtiment demeurent sommaires, car elles relèvent de compétences et de champs de pratique réservés (Corporation des maîtres électriciens du Québec, Corporation des maîtres mécaniciens en tuyauterie du Québec, Corporation des entreprises de traitement de l'air et du froid, etc.). Si une situation nous apparait préoccupante, le rapport en fera mention."
 };
 const LIMITE_RELEVE = {
-  cvac: "Les observations des appareils sont toutefois limitées et relève d'un spécialiste en mécanique du bâtiment.",
+  cvac: "Les observations de la ventilation mécanique sont toutefois limitées et relèvent d'un spécialiste en mécanique du bâtiment.",
   electrique: "Le relevé des systèmes d'électricité est toutefois limité et relève d'un maître électricien.",
   plomberie: "Le relevé des systèmes de plomberie est toutefois limité et relève d'un maître plombier."
 };
@@ -5668,7 +5728,12 @@ function ligneDureeVie(component, dossier) {
   const info = infoBatiment(dossier);
   const anneeInstall = anneeMaison(component?.install_year);
   const anneeReference = anneeInstall ?? anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier?.built_year) ?? null;
-  const annee = anneeReference != null ? anneeReference + duree : null;
+  let annee = anneeReference != null ? anneeReference + duree : null;
+  // Une allocation cyclique ne se place jamais dans le passé : comme le moteur
+  // financier, on la ramène à la première année de l'horizon (l'an prochain).
+  // Un remplacement complet échu garde, lui, son année (« Ex. : 2018 » au § 3.0).
+  const premiereAnnee = (/* @__PURE__ */ new Date()).getFullYear() + 1;
+  if (allocation && annee != null && annee < premiereAnnee) annee = premiereAnnee;
   return {
     allocation,
     reglementaire,
@@ -5685,22 +5750,30 @@ function titreTableauMaison(component, ligne) {
   if (ligne.reglementaire && ligne.reglementaire.libelle === "Étude et rapport") return `${base} – Étude et inspection`;
   return `${base} – ${ligne.allocation ? "Allocation" : "Remplacement"}`;
 }
+function sansCoutDureeVie(ligne) {
+  return montantMaison(ligne.cout) == null || Number(ligne.cout) <= 0;
+}
+// Le tableau reste calculé pour la révision au bureau, même sans coût (« - $ »
+// signale le coût à saisir). Le rapport Word, lui, ne l'imprime pas sans coût.
 function tableauDureeVie(ligne) {
   const entetes = ligne.allocation ? ["Cycle", "Débutant en", ligne.libelleMontant] : ["Durée de vie", "Année de remplacement", "Coût"];
-  const montant = montantMaison(ligne.cout) ?? `-${NBSP}$`;
   return {
     entetes,
-    lignes: [[String(ligne.duree), ligne.annee != null ? String(ligne.annee) : "à confirmer", montant]]
+    lignes: [[String(ligne.duree), ligne.annee != null ? String(ligne.annee) : "à confirmer", montantMaison(ligne.cout) ?? `-${NBSP}$`]]
   };
 }
 function texteDureeVie(component, ligne) {
+  // Le rapport approuvé reste bref : une phrase de méthode pour les allocations,
+  // rien de générique pour un remplacement — le tableau suffit. Les mentions
+  // ci-dessous n'apparaissent que lorsqu'une donnée manque ou est échue.
   const parties = [];
   if (ligne.reglementaire) {
     parties.push(ligne.reglementaire.texte);
+  } else if (sansCoutDureeVie(ligne)) {
+    parties.push("Aucun calcul de remplacement n'est effectué pour cet élément dans cette étude.");
+    return assembler(parties);
   } else if (ligne.allocation) {
-    parties.push(`Ne nécessitant généralement aucun remplacement complet en un même projet, le calcul planifie pour des réparations ponctuelles par cycle de ${ligne.duree} ans.`);
-  } else {
-    parties.push(`Selon nos références, nos observations et notre expérience avec des matériaux et systèmes similaires, la durée de vie utile retenue pour cet élément est d'environ ${ligne.duree} ans.`);
+    parties.push(`Ne nécessitant aucun remplacement complet, le calcul planifie des réparations ponctuelles par cycle de ${ligne.duree} ans.`);
   }
   if (ligne.anneeInstall == null && ligne.anneeReference != null) {
     parties.push(`Aucune information n'a permis de placer le dernier remplacement de ces éléments (considéré ${ligne.anneeReference} au calcul).`);
@@ -5709,12 +5782,8 @@ function texteDureeVie(component, ligne) {
   }
   const anneeCourante = (/* @__PURE__ */ new Date()).getFullYear();
   if (ligne.annee != null && ligne.annee <= anneeCourante && !ligne.allocation) {
-    parties.push("Ceux-ci, ayant atteint leur durée de vie utile, nous suggérons de documenter afin de planifier leur remplacement. La durée de vie prévue étant dépassée, l'année indiquée au tableau est celle du calcul.");
+    parties.push("La durée de vie prévue étant dépassée, l'année indiquée au tableau est celle du calcul. Nous suggérons de documenter afin de planifier le remplacement.");
   }
-  if (montantMaison(ligne.cout) == null) {
-    parties.push("Le coût budgétaire de cet élément reste à confirmer et sera intégré au calcul du scénario de financement.");
-  }
-  parties.push(AVIS_BUDGETAIRE);
   return assembler(parties);
 }
 // ----------------------------------------------------------------------------
@@ -5728,9 +5797,10 @@ function localisationMaison(component) {
   if (empl) morceaux.push(empl.toLowerCase());
   return morceaux.join(", ");
 }
-function phraseCarnet(dossier) {
+function phraseCarnet(dossier, component) {
   const info = infoBatiment(dossier);
-  return info?.documents?.carnet_entretien === "oui" ? CARNET_REVISE : CARNET_ABSENT;
+  const base = info?.documents?.carnet_entretien === "oui" ? CARNET_REVISE : CARNET_ABSENT;
+  return component?.r_flag ? assembler([base, CARNET_NON_REALISE]) : base;
 }
 // Les 7 blocs, dans l'ordre fixe du gabarit maison. Seul le bloc 1 (la
 // description) peut venir du modèle ; les six autres sont écrits ici, à partir
@@ -5764,33 +5834,54 @@ function phraseLimite(component) {
       return "";
   }
 }
+// Appréciation et suivi : formulations du rapport approuvé 26-101 PGA. Les
+// défauts eux-mêmes sont listés dans ATTENTION SPÉCIALE, sans renvoi ici.
 function phraseAppreciation(component) {
   const cote = coteRapport(component?.rating);
   const aConstats = !!String(component?.observation ?? "").trim();
   if (cote === "Bon") {
     return aConstats
       ? "Dans l'ensemble, l'état observé est bon."
-      : "L'ensemble de ces composantes est en bon état, aucune déficience n'a été notée.";
+      : "L'ensemble de ces composantes est en bon état et aucune déficience n'a été notée.";
   }
-  if (cote === "Passable") return "Dans l'ensemble, l'état observé est passable et nécessite un entretien devancé. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.";
-  if (cote === "Mauvais") return "Dans l'ensemble, l'état observé est mauvais et requiert la planification d'un remplacement. Voir les observations et commentaires ci-après dans ATTENTION SPÉCIALE.";
+  if (cote === "Passable") return "Dans l'ensemble, ces composantes sont dans un état passable.";
+  if (cote === "Mauvais") return "Dans l'ensemble, ces composantes sont en mauvais état.";
   if (component?.limite_observation === "inaccessible") return "";
   return "Aucune cote n'a été attribuée à cet élément lors de la visite; son état n'a pas été apprécié dans le cadre du présent relevé.";
 }
-function phraseAnnee(component) {
+// « Celles-ci sont d'origine » quand l'année relevée est celle de la
+// construction ; sinon l'année et sa source ; à défaut, l'absence d'information.
+function phraseAnnee(component, dossier) {
   const annee = anneeMaison(component?.install_year);
-  if (annee == null) return "Aucune information obtenue ne pouvait identifier le dernier remplacement.";
+  if (annee == null) return { texte: "Aucune information obtenue ne pouvait identifier le dernier remplacement.", fusionnable: false };
+  const info = infoBatiment(dossier);
+  const construction = anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier?.built_year);
+  if (construction != null && annee <= construction && component?.source_annee !== "estimee") return { texte: "Celles-ci sont d'origine", fusionnable: true };
   switch (component?.source_annee) {
-    case "plaque": return `Celles-ci sont de ${annee}, selon la plaque signalétique.`;
-    case "carnet": return `Celles-ci sont de ${annee}, selon le carnet d'entretien.`;
-    case "administration": return `Celles-ci sont de ${annee}, selon les informations obtenues de l'administration.`;
-    case "estimee": return `Celles-ci seraient de ${annee}, selon notre estimation.`;
-    default: return `Celles-ci sont de ${annee}.`;
+    case "plaque": return { texte: `Celles-ci sont de ${annee}, selon la plaque signalétique.`, fusionnable: false };
+    case "carnet": return { texte: `Celles-ci sont de ${annee}, selon le carnet d'entretien.`, fusionnable: false };
+    case "administration": return { texte: `Celles-ci sont de ${annee}, selon les informations obtenues de l'administration.`, fusionnable: false };
+    case "estimee": return { texte: `Celles-ci seraient de ${annee}, selon notre estimation.`, fusionnable: false };
+    default: return { texte: `Celles-ci sont de ${annee}`, fusionnable: true };
   }
+}
+const SUIVI_PAR_COTE = {
+  Passable: "En plus de l'entretien régulier, un entretien devancé est nécessaire.",
+  Mauvais: "En plus de l'entretien régulier, un remplacement est nécessaire."
+};
+function phraseAnneeEtSuivi(component, dossier) {
+  const cote = coteRapport(component?.rating);
+  const an = phraseAnnee(component, dossier);
+  const fin = (t) => (/[.!?]$/.test(t) ? t : `${t}.`);
+  if (cote === "Bon") {
+    return an.fusionnable
+      ? `${an.texte} et autre que l'entretien régulier, aucun suivi n'est prévu cette année.`
+      : `${fin(an.texte)} Autre que l'entretien régulier, aucun suivi n'est prévu cette année.`;
+  }
+  return assembler([fin(an.texte), SUIVI_PAR_COTE[cote] ?? null]);
 }
 function blocsEtat(component, dossier, description) {
   const guide = guidePour(component);
-  const cote = coteRapport(component?.rating);
   const projet = phraseFinale(component?.projet_ca);
   const information = guide.information ? INFORMATIONS_REGLEMENTAIRES[guide.information]?.(dossier) : null;
   // L'avis réglementaire forme son propre paragraphe : le rapport Word l'encadre.
@@ -5799,9 +5890,8 @@ function blocsEtat(component, dossier, description) {
     phraseLimite(component),
     guide.portee.join(" "),
     phraseAppreciation(component),
-    phraseAnnee(component),
-    cote === "Bon" ? "Autre que l'entretien régulier, aucun suivi n'est prévu cette année." : null,
     LIMITE_RELEVE[component?.cat] ?? null,
+    phraseAnneeEtSuivi(component, dossier),
     projet ? `Selon les informations obtenues, le conseil d'administration planifie ${projet.charAt(0).toLowerCase()}${projet.slice(1)}` : null
   ]), information]);
 }
@@ -5985,7 +6075,7 @@ Réponds uniquement par la description.`;
 // conséquences consignées par l'inspecteur. Sinon, la variante maison « Aucun
 // commentaire ». Registre : « nous suggérons », jamais « nous exigeons ».
 // ----------------------------------------------------------------------------
-const AUCUNE_ATTENTION = "Aucun commentaire. Aucune situation pouvant affecter de façon significative la durée de vie de cet élément n'a été observée. Le suivi se limite à l'entretien régulier prévu au tableur suivi d'entretien.";
+const AUCUNE_ATTENTION = `${PUCE} Aucun commentaire`;
 const PHRASES_RISQUE = {
   securite: "Cette situation présente un risque pour la sécurité des personnes.",
   infiltration: "Cette situation présente un risque d'infiltration d'eau.",
@@ -6054,11 +6144,9 @@ function sansEstimation(texte) {
 function attentionSpeciale(component) {
   const saisies = attentionsDuRapport(component);
   if (saisies.length) {
-    const suites = [];
-    if (component?.r_flag) suites.push("Notez que des travaux prévus à la dernière mise à jour du carnet d'entretien n'ont pas été effectués pour cet élément.");
-    suites.push("Nous vous conseillons aussi de documenter ces informations à l'intérieur de votre tableur suivi d'entretien et d'y planifier vos prochains exercices d'observations, entretiens et/ou travaux. Pour le détail, nous vous redirigeons à la section 9.0 : Informations relatives au suivi de l'entretien.");
-    suites.push(FERMETURE_ATTENTION);
-    const cloture = assembler(suites);
+    // Fermeture du rapport approuvé, une seule fois. Les travaux non réalisés du
+    // carnet sont signalés à l'état de l'actif (phraseCarnet).
+    const cloture = FERMETURE_ATTENTION;
     return {
       texte: paragraphes([...saisies.map((a) => (a.titre ? `${a.titre}\n${a.texte}` : a.texte).trim()), cloture]),
       actif: true,
@@ -6070,45 +6158,33 @@ function attentionSpeciale(component) {
   const consequences = sansNotesInternes(component?.consequences ?? "");
   const actif = rating >= 3 || consequences.length > 0;
   if (!actif) return { texte: AUCUNE_ATTENTION, actif: false };
-  const parties = [];
-  if (rating >= 4) {
-    parties.push("Puis nous avons aussi remarqué des situations qui requièrent la planification d'un remplacement. Ce classement correspond à la cote « Mauvais – Requiert la planification d'un remplacement » de notre légende.");
-  } else {
-    parties.push("Cependant nous avons aussi remarqué des situations qui nécessitent un entretien devancé. Ce classement correspond à la cote « Passable – Nécessite un entretien » de notre légende.");
-  }
-  // Un constat par ligne : « Localisation – ce qui est observé ». Une note d'un
-  // seul tenant, comme en saisissaient les anciens relevés, est coupée par phrase.
+  // Format du rapport approuvé 26-101 PGA : une phrase d'introduction, les
+  // constats en puces, la fermeture. Un élément en bon état avec une remarque
+  // ponctuelle n'a que sa puce.
   const constats = [];
   const observation = String(component?.observation ?? "");
   const lignesConstats = observation.includes("\n") ? observation.split(/\n+/) : observation.split(/(?<=[.;])\s+/);
   for (const seg of lignesConstats) {
-    const s = sansEstimation(sansNotesInternes(seg)).replace(/^[·•\-–]\s*/, "").replace(/[.;]$/, "");
-    if (s) constats.push(`· ${s};`);
+    const t = sansEstimation(sansNotesInternes(seg)).replace(/^[·•\-–]\s*/, "").replace(/[.;]$/, "");
+    if (t) constats.push(`${PUCE} ${t.charAt(0).toUpperCase()}${t.slice(1)}.`);
   }
   if (ETENDUES[component?.etendue]) {
     const qte = quantiteSure(component?.etendue_qte);
-    constats.push(`· Étendue : ${ETENDUES[component.etendue].toLowerCase()}${qte ? `, ${qte}` : ""};`);
+    constats.push(`${PUCE} Étendue : ${ETENDUES[component.etendue].toLowerCase()}${qte ? `, ${qte}` : ""}.`);
   }
-  const cause = sansNotesInternes(component?.cause_possible ?? "");
-  if (cause) constats.push(`· Cause possible : ${cause.replace(/[.;]$/, "")};`);
-  if (consequences) constats.push(`· ${consequences.replace(/[.;]$/, "")};`);
-  if (constats.length === 0) constats.push("· Aucun commentaire détaillé n'a été consigné au relevé pour cette situation;");
+  if (consequences) constats.push(`${PUCE} ${consequences.charAt(0).toUpperCase()}${consequences.slice(1).replace(/[.;]$/, "")}.`);
+  if (rating < 3) return { texte: constats.join("\n") || AUCUNE_ATTENTION, actif: true };
+  const intro = rating >= 4
+    ? "Cependant, nous avons aussi remarqué des situations qui requièrent la planification d'un remplacement."
+    : "Cependant, nous avons aussi remarqué des situations qui nécessitent un entretien devancé.";
+  if (constats.length === 0) constats.push(`${PUCE} Aucun commentaire détaillé n'a été consigné au relevé pour cette situation.`);
   const suites = [];
   const risque = PHRASES_RISQUE[component?.nature_risque];
   if (risque) suites.push(risque);
   const delai = phraseDelai(component?.delai_suggere);
   if (delai) suites.push(delai);
-  if (rating >= 4) {
-    suites.push("Une inspection complémentaire ou une expertise par un professionnel, incluant un devis correctif et idéalement un processus d'appels d'offres seront requis afin d'évaluer le délai et les coûts connexes aux travaux.");
-  } else {
-    suites.push("Une inspection complémentaire par un entrepreneur spécialisé ou une expertise pourra être requise afin d'évaluer le délai et le coût de l'entretien.");
-  }
-  if (component?.r_flag) {
-    suites.push("Notez que des travaux prévus à la dernière mise à jour du carnet d'entretien n'ont pas été effectués pour cet élément.");
-  }
-  suites.push("Nous vous conseillons aussi de documenter ces informations à l'intérieur de votre tableur suivi d'entretien et d'y planifier vos prochains exercices d'observations, entretiens et/ou travaux. Pour le détail, nous vous redirigeons à la section 9.0 : Informations relatives au suivi de l'entretien.");
   suites.push(FERMETURE_ATTENTION);
-  return { texte: paragraphes([assembler(parties), constats.join("\n"), assembler(suites)]), actif: true };
+  return { texte: paragraphes([intro, constats.join("\n"), assembler(suites)]), actif: true };
 }
 // Sections corrigées à la main par l'ingénieur (hors état de l'actif, qui a sa
 // propre banque de rédactions).
@@ -6203,7 +6279,7 @@ async function genFicheElement(component, dossier, apiKey, opts = {}) {
     : genere ? { texte: genere, source: "ia" }
     : await etatDeLActif(component, dossier, apiKey, ligne, opts.exemples);
   const attention = attentionSpeciale(component);
-  const carnet = phraseCarnet(dossier);
+  const carnet = phraseCarnet(dossier, component);
   // Un texte repris (validé ou déjà généré) contient déjà la phrase du carnet.
   const texteEtat = etat.texte.includes(carnet) ? etat.texte : paragraphes([etat.texte, carnet]);
   const corriges = textesSections(component);
@@ -6213,14 +6289,14 @@ async function genFicheElement(component, dossier, apiKey, opts = {}) {
     sections: [
       {
         cle: "etat",
-        titre: `ÉTAT DE L'ACTIF - ${nom}`,
+        titre: `ÉTAT DE L'ACTIF – ${nom}`,
         texte: texteEtat,
         tableau: null,
         actif: true
       },
       {
         cle: "duree_vie",
-        titre: `DURÉE DE VIE ET REMPLACEMENT - ${nom}`,
+        titre: `DURÉE DE VIE ET REMPLACEMENT – ${nom}`,
         texte: corriges.duree_vie || texteDureeVie(component, ligne),
         corrige: !!corriges.duree_vie,
         tableau: tableauDureeVie(ligne),
@@ -6228,15 +6304,15 @@ async function genFicheElement(component, dossier, apiKey, opts = {}) {
       },
       {
         cle: "entretien",
-        titre: `COMMENTAIRES D'ENTRETIEN - ${nom}`,
-        texte: corriges.entretien || texteEntretien(component),
+        titre: `COMMENTAIRES D'ENTRETIEN – ${nom}`,
+        texte: corriges.entretien || texteEntretien(component, dossier),
         corrige: !!corriges.entretien,
         tableau: null,
         actif: true
       },
       {
         cle: "attention",
-        titre: `ATTENTION SPÉCIALE - ${nom}`,
+        titre: `ATTENTION SPÉCIALE – ${nom}`,
         texte: (!attention.elements && corriges.attention) || attention.texte,
         corrige: !attention.elements && !!corriges.attention,
         tableau: null,
@@ -6704,6 +6780,57 @@ function buildScenario(def, baseCotisation, deboursParAn, startBalance, params, 
     soldeFinAn30
   };
 }
+// ----------------------------------------------------------------------------
+// SCÉNARIO DE L'INGÉNIEUR — les hausses annuelles qu'il retient (en %), année
+// par année à partir de l'an 1 (l'an prochain), puis un taux pour la suite
+// (à défaut, l'inflation de la construction). Quand il existe, c'est lui le
+// scénario de préférence (B1) du rapport, comme au rapport approuvé 26-101 PGA
+// (6 % en 2027 et 2028, puis 1,76 %).
+// ----------------------------------------------------------------------------
+const SCENARIO_PERSO_CODE = "C1.1.P";
+const SCENARIO_PERSO_MAX_ANS = 30;
+// Valide ce qui arrive de l'API. null : retire le scénario. Sinon un objet
+// propre, ou une chaîne d'erreur.
+function nettoyerScenarioPerso(brut) {
+  if (brut == null) return null;
+  if (typeof brut !== "object" || Array.isArray(brut)) return "scénario invalide : { taux: [...], ensuite }";
+  const taux = Array.isArray(brut.taux) ? brut.taux : null;
+  if (!taux || taux.length < 1 || taux.length > SCENARIO_PERSO_MAX_ANS) return `indiquez de 1 à ${SCENARIO_PERSO_MAX_ANS} hausses annuelles`;
+  const pct = (v) => {
+    const n = typeof v === "string" ? Number(v.replace(",", ".").replace(/\s|%/g, "")) : Number(v);
+    return Number.isFinite(n) && n >= -50 && n <= 200 ? Math.round(n * 100) / 100 : null;
+  };
+  const propres = taux.map(pct);
+  if (propres.some((v) => v == null)) return "chaque hausse est un pourcentage entre -50 et 200";
+  let ensuite = null;
+  if (brut.ensuite != null && brut.ensuite !== "") {
+    ensuite = pct(brut.ensuite);
+    if (ensuite == null) return "le taux de la suite est un pourcentage entre -50 et 200";
+  }
+  return { taux: propres, ensuite };
+}
+function lireScenarioPerso(dossier) {
+  try {
+    const o = typeof dossier?.scenario_perso === "string" ? JSON.parse(dossier.scenario_perso) : dossier?.scenario_perso;
+    const propre = nettoyerScenarioPerso(o ?? null);
+    return propre && typeof propre === "object" ? propre : null;
+  } catch {
+    return null;
+  }
+}
+function scenarioPersoDef(perso, params) {
+  if (!perso) return null;
+  const ensuite = perso.ensuite != null ? perso.ensuite / 100 : params.inflationRate;
+  const ramp = Array.from({ length: params.projectionYears }, (_, i) => (i < perso.taux.length ? perso.taux[i] / 100 : ensuite));
+  return { code: SCENARIO_PERSO_CODE, label: "Scénario de l'ingénieur", ramp, approxime: false, perso: true };
+}
+// Scénario de préférence du rapport : celui de l'ingénieur s'il existe ; sinon
+// le statu quo s'il suffit ; sinon le rattrapage recommandé par le moteur.
+function scenarioDePreference(projection) {
+  return projection.scenarios.find((s) => s.code === SCENARIO_PERSO_CODE)
+    ?? projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
+    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+}
 function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
   const included = [];
   const excluded = [];
@@ -6742,8 +6869,9 @@ function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
   const startBalance = opts.currentFundBalance ?? 0;
   const baseCotisationMissing = opts.baseCotisation == null;
   const baseCotisation = opts.baseCotisation ?? 0;
-  const scenarios = RESERVE_FUND_SCENARIOS.map(
-    (def) => buildScenario(def, baseCotisation, deboursParAn, startBalance, params, portionFutureTotal)
+  const persoDef = scenarioPersoDef(opts.scenarioPerso ?? null, params);
+  const scenarios = [...(persoDef ? [persoDef] : []), ...RESERVE_FUND_SCENARIOS].map(
+    (def) => ({ ...buildScenario(def, baseCotisation, deboursParAn, startBalance, params, portionFutureTotal), ...(def.perso ? { perso: opts.scenarioPerso } : {}) })
   );
   const recommended = scenarios.find((s) => s.code === "C1.1.1" && s.meetsCriteria) ?? scenarios.find((s) => s.code === "C1.1.3" && s.meetsCriteria) ?? null;
   return {
@@ -6757,6 +6885,8 @@ function projectReserveFund(components2, opts, params = RESERVE_FUND_PARAMS) {
     totalAvecPortionFuture,
     scenarios,
     recommendedCode: recommended ? recommended.code : null,
+    // Scénario retenu au rapport (B1) : voir scenarioDePreference.
+    preferredCode: (persoDef ? SCENARIO_PERSO_CODE : null) ?? (scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)?.code ?? (recommended ? recommended.code : null)),
     includedComponentIds: included.map((c) => c.id),
     excludedComponents: excluded
   };
@@ -24948,8 +25078,8 @@ const LIBELLES_DOCUMENTS = {
 };
 const TEXTE_MAISON = {
   etendue: [
-    "La portée de notre travail inclut des relevés visuels par des ingénieurs, technologues professionnels, inspecteurs en bâtiment ou des techniciens et la consultation des documents fournis et identifiés dans la section ''Documents de références''.",
-    "Selon les encadrements déjà en place par la règlementation gouvernementale pour certaines études en copropriété (RPC) et à prévoir concernant les études en fonds de prévoyance (Loi 16 et Loi 31), le contexte de ces études doit être effectuée par un membre d'un ordre professionnel : Technologues professionnels (OTPQ), ingénieurs en bâtiment (OIQ) ou architectes (OAQ).",
+    "La portée de notre travail inclut des relevés visuels par des ingénieurs, technologues professionnels, inspecteurs en bâtiment ou des techniciens et la consultation des documents fournis et identifiés dans la section « Documents de référence ».",
+    "Selon les encadrements déjà en place par la règlementation gouvernementale pour certaines études en copropriété (RPC) et à prévoir concernant les études en fonds de prévoyance (Loi 16 et Loi 31), le contexte de ces études doit être effectué par un membre d'un ordre professionnel : Technologues professionnels (OTPQ), ingénieurs en bâtiment (OIQ) ou architectes (OAQ).",
     "Les composantes communes et les systèmes étudiés comprennent :"
   ],
   famillesEtudiees: [
@@ -24964,109 +25094,232 @@ const TEXTE_MAISON = {
     "Installations électriques",
     "Installations de plomberie, d'alimentation et d'évacuation"
   ],
-  objetChamp: "Les suggestions et les avis des coûts associés à ces suggestions, présentées dans ce rapport, sont fondés sur des portions de l'édifice qui étaient accessibles au cours de notre enquête. Certaines conditions existantes n'ont pu être observées, et par conséquent, peuvent ne pas figurer dans l'état général des éléments observés et rapportés dans ce rapport. Notez que la non-disponibilité de plan détaillé, requis en format PDF, force une appréciation subjective de certains éléments.",
+  objetChamp: "Les suggestions et les avis des coûts associés à ces suggestions, présentés dans ce rapport, sont fondés sur des portions de l'édifice qui étaient accessibles au cours de notre enquête. Certaines conditions existantes n'ont pu être observées et, par conséquent, peuvent ne pas figurer dans l'état général des éléments observés et rapportés dans ce rapport. Notez que l'indisponibilité des plans détaillés, requis en format PDF, force une appréciation subjective de certains éléments.",
   contexteEconomique: [
-    "Les dernières années ont été marquées par des ralentissements variables des économies intérieures et mondiales, puis plus récemment les hausses reliées à l'incertitude liée à la situation du COVID 19, amènent à des considérations de prudence.",
-    "Dans ce contexte imprévisible au moyen et long terme, nous croyons judicieux de rappeler que les taux pourront varier. En tenir compte favorisera un meilleur suivi de vos planifications futures."
+    "Les dernières années ont été marquées par des ralentissements variables des économies intérieures et mondiales, puis plus récemment les hausses reliées à l'incertitude liée à la situation de la COVID-19, amènent à des considérations de prudence.",
+    "Dans ce contexte imprévisible à moyen et à long terme, nous croyons judicieux de rappeler que les taux pourront varier. En tenir compte favorisera un meilleur suivi de vos planifications futures."
   ],
-  exigencesLoi: "Selon l'article 1071 du Code civil du Québec, le syndicat de copropriété doit constituer, en fonction du coût estimé des travaux majeurs et du coût de remplacement des parties communes, un fonds de prévoyance, affecté uniquement à ces réparations et remplacements. Le syndicat a donc l'obligation de tenir à jour un dossier estimatif des coûts à venir, à moyen et à long terme. De plus, l'article 1072 précise que les copropriétaires doivent contribuer au fonds de prévoyance pour au moins 5 pour cent (5%) de leur contribution aux charges communes. Il n'y a cependant pas de limite maximale à ce sujet, afin de conserver une cohérence avec l'obligation d'y prévoir un montant estimatif basé sur les réparations majeures et le coût de remplacement à venir des parties communes.",
+  exigencesLoi: "Selon l'article 1071 du Code civil du Québec, le syndicat de copropriété doit constituer, en fonction du coût estimé des travaux majeurs et du coût de remplacement des parties communes, un fonds de prévoyance, affecté uniquement à ces réparations et remplacements. Le syndicat a donc l'obligation de tenir à jour un dossier estimatif des coûts à venir, à moyen et à long terme. De plus, l'article 1072 précise que les copropriétaires doivent contribuer au fonds de prévoyance pour au moins 5 pour cent (5 %) de leur contribution aux charges communes. Il n'y a cependant pas de limite maximale à ce sujet, afin de conserver une cohérence avec l'obligation d'y prévoir un montant estimatif basé sur les réparations majeures et le coût de remplacement à venir des parties communes.",
   quotesParts: "Les valeurs relatives aux quotes-parts des unités, figurant à la déclaration de copropriété, sont détaillées à l'ANNEXE C – CONTRIBUTION MENSUELLE PAR COPROPRIÉTÉ.",
+  // Pages « Carnet d'entretien et étude du fonds de prévoyance — Réalisation,
+  // contenu et modalité ». Convention : « ## » ouvre un sous-titre, « - » une puce.
+  reglement: [
+    "## Règlement encadrant la Loi 16",
+    "La Loi 16, adoptée en décembre 2019, et la Loi 31, en février 2024, représentent une réforme clé pour la gestion des copropriétés au Québec. Même si plusieurs mesures sont entrées en vigueur depuis, certains éléments encadrés attendaient l'adoption d'un règlement. Après quelques modifications, le projet de règlement déposé en 2024 a été adopté en juillet 2025.",
+    "Les dispositions majeures de ce règlement portent sur :",
+    "- Le carnet d'entretien",
+    "- Le fonds de prévoyance",
+    "- L'attestation du syndicat",
+    "## Le carnet d'entretien",
+    "Le carnet d'entretien est un document obligatoire qui devra désormais être rédigé par un professionnel membre d'un des ordres professionnels suivants :",
+    "- L'Ordre des ingénieurs (OIQ),",
+    "- L'Ordre des technologues professionnels (OTPQ),",
+    "- L'Ordre des architectes (OAQ),",
+    "- L'Ordre des évaluateurs agréés (OEAQ).",
+    "Le carnet d'entretien se compose de deux volets :",
+    "- Planification des travaux de maintien et des tâches d'entretien",
+    "- Archivage des interventions réalisées",
+    "Le carnet d'entretien – volet de planification – est pris en charge par le professionnel. Il s'agit de planifier les réparations majeures ainsi que les entretiens réguliers nécessaires au maintien de l'immeuble. Cette planification repose sur l'inspection visuelle des parties communes de la copropriété permettant d'établir la condition de chaque élément et sa durée de vie restante.",
+    "Le carnet d'entretien – planification – doit comprendre :",
+    "- Un inventaire et une description des parties communes de l'immeuble et des matériaux, appareils et équipements qui les composent;",
+    "- Un rapport d'état d'immeuble faisant état de la condition actuelle et de la date d'installation des appareils et équipements de la copropriété;",
+    "- La planification des réparations majeures et remplacements sur les 25 prochaines années;",
+    "- La planification des entretiens et maintenances courantes qui décrit la fréquence à laquelle ils doivent être effectués.",
+    "## Mise à jour annuelle",
+    "Le volet archivage est pris en charge par la copropriété. Le conseil d'administration devra documenter les informations concernant toutes les interventions effectuées sur l'immeuble (plan d'entretien, maintenance régulière, réparations courantes ou majeures), incluant les dates et les garanties, et y insérer la documentation du fabricant. Le conseil d'administration aura aussi la responsabilité de mettre à jour minimalement une fois par année le carnet d'entretien afin d'y consigner les nouveaux renseignements et documents.",
+    "## Révision aux 5 ans",
+    "Le carnet d'entretien devra être mis à jour tous les 5 ans par un professionnel. Pour certains immeubles « au plus 8 parties privatives, 2 étages entièrement hors sol et de destination résidentielle » — le carnet devra être mis à jour tous les 10 ans. Le professionnel révisera le carnet d'entretien « en fonction des renseignements et documents ajoutés lors des mises à jour annuelles ».",
+    "Si certains travaux n'ont pas été effectués alors qu'ils étaient requis ou prévus au carnet d'entretien, le carnet d'entretien révisé devra en faire mention et indiquer les raisons pour lesquelles ils ne l'ont pas été.",
+    "En ce moment, les délais proposés indiquent que les copropriétés existantes auront 3 ans, soit jusqu'à la mi-novembre 2027, pour faire réaliser leur carnet d'entretien par un professionnel. Notez que les suivis annuels sont la responsabilité du syndicat.",
+    "## Le fonds de prévoyance",
+    "L'étude du fonds de prévoyance est le complément au carnet d'entretien. Celle-ci vise à présenter une stratégie à exécuter concernant les remplacements et réparations majeures prévus au carnet d'entretien.",
+    "L'étude doit :",
+    "- S'appuyer sur le contenu du carnet d'entretien",
+    "- Estimer le coût de chaque réparation majeure ou remplacement de partie commune prévu au carnet d'entretien",
+    "- Proposer des scénarios de contribution pour assurer la viabilité du fonds en spécifiant le solde à avoir dans le fonds de prévoyance chaque année et le montant qui doit être ajouté chaque année",
+    "- Inclure des recommandations spécifiques pour les PCUR (parties communes à usage restreint), si leur contribution est distincte",
+    "## Professionnels autorisés",
+    "En plus des 4 ordres mentionnés précédemment, les comptables professionnels agréés (CPA) peuvent aussi produire cette étude. Toutefois, il serait sage de confier au même professionnel la réalisation du carnet d'entretien et de l'étude du fonds de prévoyance afin de réduire les coûts et d'assurer la pleine cohérence des deux documents.",
+    "## Date limite pour l'obtention d'une étude du fonds de prévoyance",
+    "Les copropriétés ont 3 ans à partir de l'entrée en vigueur du règlement le 14 août 2025 pour obtenir une étude, ce qui place la date limite au 14 août 2028.",
+    "## Fréquence de réalisation",
+    "Le syndicat doit obtenir une nouvelle étude tous les 5 ans.",
+    "## L'attestation du syndicat",
+    "À partir du 14 août 2025, toute personne vendant une unité (qui a une promesse d'achat acceptée) ou l'acheteur peut demander au syndicat une attestation présentant la situation financière et technique de la copropriété. Le syndicat disposera de 15 jours pour la remettre.",
+    "L'ensemble des informations concernant l'attestation ainsi que le carnet et l'étude du fonds de prévoyance est disponible à :",
+    "https://www.quebec.ca/nouvelles/actualites/details/le-gouvernement-renforce-la-gouvernance-des-coproprietes-divises-au-quebec-un-reglement-entre-en-vigueur-64398",
+    "https://www.publicationsduquebec.gouv.qc.ca/fileadmin/gazette/pdf_encrypte/lois_reglements/2025F/86184.pdf"
+  ],
+  sommaireExecutif: [
+    "Le sommaire exécutif permet une appréciation succincte des ajustements (%) aux cotisations spécifiques au fonds de prévoyance pour les projets de remplacement visés avec un rétablissement sur les cinq premières années de votre scénario de financement.",
+    "Le but de l'étude du fonds de prévoyance est de préparer un rapport détaillant les dépenses prévues à court, moyen et long terme en vue de financer adéquatement les travaux de remplacement et de rénovations majeures afin de maintenir l'intégrité du bâtiment ainsi que de ses principales composantes.",
+    "Retenons que votre immeuble devra recevoir, en plus des investissements en remplacement d'éléments prévus ici à l'étude (Loi 16, art. 1070 et 1071 C.c.Q.), des investissements annuels (les charges communes) :"
+  ],
+  chargesCommunes: [
+    "Fonds de réserve / « frais annuels courants » et maintenance régulière;",
+    "Fonds d'auto-assurance – franchises d'assurances (Loi 141, art. 1071.1 C.c.Q.);",
+    "Remplacement planifié – Fonds de prévoyance (Loi 16, art. 1070.2 C.c.Q.);",
+    "Réhabilitation d'entretien – suivi d'entretien (Loi 16, art. 1070.2 C.c.Q.);",
+    "Fonds d'imprévus, impondérables et projets spéciaux."
+  ],
   lireRapport: {
-    intro: "Votre immeuble est composé de matériaux divers regroupés en éléments (composantes ou appareils) ''les sections'' et selon la norme ASTM E 1557-02 / Uniformat II. Chacun des éléments est présenté suivant les sous-sections suivantes :",
+    intro: "Votre immeuble est composé de matériaux divers regroupés en éléments (composantes ou appareils, « les sections ») selon la norme ASTM E 1557-02 / Uniformat II. Chacun des éléments est présenté suivant les sous-sections suivantes :",
     etat: [
-      "La première sous-section du carnet d'entretien vise à décrire l'actif sous étude (l'élément), de le localiser par rapport à l'immeuble et de commenter avec une appréciation sommaire de l'état observé. Si possible, la description sera accompagnée de photographies générales.",
-      "Selon les informations obtenues : L'année d'installation ou du dernier du remplacement complet sera mentionnée.",
-      "Généralement l'état de l'élément sera identifié comme Bon : signifiant que des défauts mineurs pouvant nécessiter des réparations ou entretiens réguliers sont existants. Cependant, le fonctionnement est normal et aucun suivi n'est prévu d'ici 12 à 24 mois.",
-      "Lorsque l'état de l'élément observé est ''passable'' ou ''mauvais'' des informations seront fournies dans la sous-section ATTENTION SPÉCIALE.",
+      "La première sous-section du carnet d'entretien vise à décrire l'actif sous étude (l'élément), à le localiser par rapport à l'immeuble et à commenter avec une appréciation sommaire de l'état observé. Si possible, la description sera accompagnée de photographies générales.",
+      "Selon les informations obtenues : l'année d'installation ou du dernier remplacement complet sera mentionnée.",
+      "Révision du Carnet : Lorsque des travaux prévus à la dernière mise à jour du carnet d'entretien n'auront pas été effectués, ceux-ci seront mentionnés et l'icône suivante accompagnera la mention au texte.",
+      "Généralement, l'état de l'élément sera identifié comme Bon : signifiant que des défauts mineurs pouvant nécessiter des réparations ou entretiens réguliers sont existants. Cependant, le fonctionnement est normal et aucun suivi n'est prévu d'ici 12 à 24 mois.",
+      "Lorsque l'état de l'élément observé est « passable » ou « mauvais », des informations seront fournies dans la sous-section ATTENTION SPÉCIALE.",
       "Orientation des bâtiments : Afin de se situer, le lecteur doit se placer dans la rue face à l'immeuble pour identifier la façade avant, les côtés et l'arrière."
     ],
     dureeVie: [
       "À l'aide d'un tableau, cette deuxième sous-section de l'étude indique selon notre opinion et pour fin de calcul, la durée de vie et l'année prévue de son remplacement, ainsi que le coût budgétaire estimé pour ce remplacement ajusté en dollars actuels avant planifications et taxes (Loi 16).",
-      "À l'occasion, pour les éléments ayant une grande durée de vie ou en prévision d'impondérables périodiques, des allocations cycliques seront proposées. Le tableau porte alors les colonnes Cycle | Débutant en | Allocation, plutôt que Durée de vie | Année de remplacement | Coût.",
+      "À l'occasion, pour les éléments ayant une grande durée de vie ou en prévision d'impondérables périodiques, des allocations cycliques seront proposées.",
       "Les hypothèses sur l'espérance de vie sont basées sur les informations fournies dans la documentation des fabricants, manuels de référence comme le Marshall & Swift et divers manuels sur la dépréciation des bâtiments, nos observations des divers éléments et notre expérience avec des matériaux et systèmes similaires.",
-      "L'année de remplacement respecte la durée de vie prévue. À l'occasion, selon nos observations, cette année de remplacement pourra être ajusté. Lorsque la durée de vie prévue est dépassée et ne peut être reportée, celle-ci sera indiquée au tableau.",
+      "L'année de remplacement respecte la durée de vie prévue. À l'occasion, selon nos observations, cette année de remplacement pourra être ajustée. Lorsque la durée de vie prévue est dépassée et ne peut être reportée, celle-ci sera indiquée au tableau. Ex. : 2018.",
       "Les estimations de coût de remplacement sont basées sur les coûts unitaires publiés dans divers manuels de coût, des historiques d'appels d'offres et combinés avec l'expérience acquise par nos professionnels. Certains frais, tels : ingénierie et/ou architecture, appels d'offres et planification, mise en chantier, surveillance, excavations et mesures de sécurité étant très variables, seront à être évalués pour chaque projet et ajoutés aux estimations."
     ],
-    entretien: "Cette troisième sous-section présente les généralités fréquentes qui favorisent une atteinte, voir le dépassement des durées de vie. En plus des suivis prévus au tableur suivi d'entretien, ces quelques suggestions d'expériences tenteront de susciter certaines habitudes. En copropriété, nous suggérons la mise en place d'un programme d'entretien annuel. Cette planification facilite le transfert des taches et la priorisation de celles-ci. En prévision de la mise en place d'un programme d'entretien, nous vous redirigeons à la section 9.0 : Informations relatives au Tableur suivi d'entretien.",
+    entretien: "Cette troisième sous-section présente les généralités fréquentes qui favorisent une atteinte, voire le dépassement, des durées de vie. En plus des suivis prévus au tableur suivi d'entretien, ces quelques suggestions d'expériences tenteront de susciter certaines habitudes. En copropriété, nous suggérons la mise en place d'un programme d'entretien annuel. Cette planification facilite le transfert des tâches et la priorisation de celles-ci. En prévision de la mise en place d'un programme d'entretien, nous vous redirigeons à la section 9.0 : Informations relatives au Tableur suivi d'entretien.",
     attention: [
       "Lorsque des situations pouvant affecter de façon significative la durée de vie de l'élément sont observées, celles-ci seront mentionnées dans la sous-section ATTENTION SPÉCIALE et un classement lui sera attribué :",
-      "Passable - Nécessite un entretien : L'élément présente plusieurs défauts mineurs ou importants nécessitant des réparations ou entretiens devancés. Le fonctionnement est affecté ou à risque. Une inspection complémentaire par un entrepreneur spécialisé ou une expertise pourra être requise afin d'évaluer le délai et le coût de l'entretien. Pour le détail, nous vous redirigeons à la section 9.0 : Informations relatives au Tableur suivi d'entretien. Lorsque des travaux sont suggérés pour planification d'ici à 5 ans, l'icône suivant accompagnera la mention au texte.",
-      "Mauvais – Requiert la planification d'un remplacement : L'élément présente des défauts importants, usure excessive ou obsolescence. Le fonctionnement est à risque, anormal ou peut affecter d'autre élément. Une inspection complémentaire ou une expertise par un professionnel, incluant un devis correctif et idéalement un processus d'appels d'offres seront requis afin d'évaluer le délai et les coûts connexes aux travaux.",
-      "Le suivi recommandé sera de planifier à l'intérieur d'un projet distinct les interventions requises avec le professionnel ou spécialiste approprié et de prévoir les travaux connexes.",
-      "Rappelons que l'étude en carnet d'entretien n'est pas une d'inspection technico-légale, de recherche de déficiences, de leur causes et effets, ni des méthodes correctives à apporter. Ces demandes pourront faire l'objet d'un mandat différent. Ainsi, certaines situations non observées ou affectant peu l'élément ou relevant de la maintenance/ entretien régulier ne pourront être mentionnées. Pour le détail, vous référer à la section 7.0 Limitations légales."
+      "Passable – Nécessite un entretien : L'élément présente plusieurs défauts mineurs ou importants nécessitant des réparations ou entretiens devancés. Le fonctionnement est affecté ou à risque. Une inspection complémentaire par un entrepreneur spécialisé ou une expertise pourra être requise afin d'évaluer le délai et le coût de l'entretien. Pour le détail, nous vous redirigeons à la section 9.0 : Informations relatives au Tableur suivi d'entretien. Lorsque des travaux sont suggérés pour planification d'ici à 5 ans, l'icône suivante accompagnera la mention au texte.",
+      "Mauvais – Requiert la planification d'un remplacement : L'élément présente des défauts importants, une usure excessive ou une obsolescence. Le fonctionnement est à risque, anormal ou peut affecter d'autres éléments. Une inspection complémentaire ou une expertise par un professionnel, incluant un devis correctif et idéalement un processus d'appels d'offres seront requis afin d'évaluer le délai et les coûts connexes aux travaux. Pour le détail, nous vous redirigeons à la section 9.0 : Informations relatives au Tableur suivi d'entretien. Lorsque des travaux importants seront suggérés, l'icône suivante accompagnera la mention au texte.",
+      "Le suivi recommandé sera de planifier à l'intérieur d'un projet distinct les interventions requises avec le professionnel ou spécialiste approprié et de prévoir les travaux connexes. Idéalement, si disponibles, les photos à cette sous-section viseront à permettre une meilleure compréhension et faciliteront le démarrage d'un projet en appels d'offres. Évidemment, en aucun cas ces photos ne pourraient se substituer à un examen rigoureux par un entrepreneur spécialisé ou une expertise par un professionnel mandaté.",
+      "Nous vous conseillons aussi de documenter ces informations dans votre tableur suivi d'entretien et d'y planifier vos prochains exercices d'observations, entretiens et/ou travaux. Pour le détail, nous vous redirigeons à la section 9.0 : Informations relatives au suivi d'entretien.",
+      "Rappelons que l'étude en carnet d'entretien n'est pas une inspection technico-légale, de recherche de déficiences, de leurs causes et effets, ni des méthodes correctives à apporter. Ces demandes pourront faire l'objet d'un mandat différent. Ainsi, certaines situations non observées ou affectant peu l'élément ou relevant de la maintenance/entretien régulier ne pourront être mentionnées. Pour le détail, vous référer à la section 7.0 Limitations légales."
     ],
     annexes: [
-      "SCÉNARIO DE FINANCEMENT — L'ensemble des valeurs de durée de vie, année de remplacement et des coûts associés, sont présentées à l'intérieur des tableaux à l'ANNEXE A – SOMMAIRE DES TRAVAUX et à l'ANNEXE B – CALENDRIER DE REMPLACEMENT – SCÉNARIOS DE FINANCEMENT.",
-      "TABLEUR SUIVI D'ENTRETIEN — Afin de faciliter le suivi de vos tâches d'entretien, un tableur Excel est fourni en annexe complémentaire. Structuré selon les saisons, ce document servira d'outil de suivi et de rappel des observations à effectuer pour documenter l'évolution des éléments de votre immeuble. À même ce tableur, vous pourrez inscrire vos commentaires, insérer les demandes de projets et effectuer les suivis appropriés."
+      "Scénario de financement : L'ensemble des valeurs de durée de vie, année de remplacement et des coûts associés sont présentées à l'intérieur des tableaux PDF à L'ANNEXE–A – SOMMAIRE DES REMPLACEMENTS et à L'ANNEXE–B – CALENDRIER DE REMPLACEMENT – SCÉNARIOS DE FINANCEMENT.",
+      "- Scénario de financement de préférence B1",
+      "- Scénarios comparatifs de financement B2 et B3",
+      "## TABLEUR SUIVI D'ENTRETIEN",
+      "Afin de faciliter le suivi de vos tâches d'entretien, un tableur Excel est fourni en annexe complémentaire. Structuré selon les saisons, ce document servira d'outil de suivi et de rappel des observations à effectuer pour documenter l'évolution des éléments de votre immeuble. À même ce tableur, vous pourrez inscrire vos commentaires, insérer les demandes de projets et effectuer les suivis appropriés."
     ]
   },
   resultats: "Les résultats de notre étude et de nos suggestions sont résumés dans les tableaux suivants. Il convient de noter que dans tous les scénarios de financement développés, le niveau suggéré de cotisation annuelle est fondé sur l'exigence du maintien d'un solde positif du fonds de prévoyance.",
   limitations: {
     mandant: [
-      "Le présent rapport (rapport narratif et scénario de financement) est destiné spécifiquement à l'intention du mandant et selon les services spécifiés à l'offre de services. L'utilisation est définie à la section sommaire du mandat. L'utilisation de ce dernier par une tierce partie est interdite sans le consentement écrit au préalable du mandant ou de Condo-Stratégis. Toute réutilisation, redistribution non autorisée ou interprétation du rapport constitue un risque qui incombera uniquement au mandant et à son destinataire et pour lequel Condo-Stratégis ne pourra être tenue responsable.",
-      "La visite, l'étude et la rédaction seront effectuées selon les informations fournies et/ou disponibles en préalable à la visite. Toute information partagée suite à ce moment pourrait occasionner des frais additionnels de l'étude et la modification de l'offre de service. Certains contextes pourraient rendre l'étude irréalisable et annuler le contrat de service.",
-      "En produisant le présent rapport, Condo-Stratégis affirme être l'auteur de l'étude de la situation reliée aux éléments identifiés seulement et conformément à la section Sommaire du mandat. Le mandant assumera la responsabilité de défendre, d'indemniser ainsi que de dégager Condo-Stratégis de toute responsabilité résultant de l'interprétation des commentaires et/ou de la distribution non autorisée du rapport. Le rapport doit être pris comme un tout et doit inclure tous les plans et annexes correspondantes. Aucune partie du rapport ne peut être utilisée séparément."
+      "Le présent rapport (rapport narratif et scénario de financement) est destiné spécifiquement à l'intention du mandant et selon les services spécifiés à l'offre de services. L'utilisation est définie à la section sommaire du mandat. L'utilisation de ce dernier par une tierce partie est interdite sans le consentement écrit préalable du mandant ou de Condo Stratégis. Toute réutilisation, redistribution non autorisée ou interprétation du rapport constitue un risque qui incombera uniquement au mandant et à son destinataire et pour lequel Condo Stratégis ne pourra être tenue responsable.",
+      "La visite, l'étude et la rédaction seront effectuées selon les informations fournies et/ou disponibles en préalable à la visite. Toute information partagée à la suite de ce moment pourrait occasionner des frais additionnels de l'étude et la modification de l'offre de service. Certains contextes pourraient rendre l'étude irréalisable et annuler le contrat de service.",
+      "En produisant le présent rapport, Condo Stratégis affirme être l'auteur de l'étude de la situation reliée aux éléments identifiés seulement et conformément à la section Sommaire du mandat. Toute réutilisation ou redistribution non autorisée de ce rapport constitue un risque qui incombe uniquement au mandant et à son destinataire et pour lequel Condo Stratégis ne peut être tenue responsable. Le mandant assumera la responsabilité de défendre, d'indemniser ainsi que de dégager Condo Stratégis de toute responsabilité résultant de l'interprétation des commentaires et/ou de la distribution non autorisée du rapport. Le rapport doit être pris comme un tout et doit inclure tous les plans et annexes correspondants. Aucune partie du rapport ne peut être utilisée séparément.",
+      "Le mandataire doit partager l'ensemble des informations afin d'identifier le plus fidèlement le contexte de l'immeuble et de l'étude. À défaut, la visite et/ou l'étude pourraient être soit reportées, soit annulées."
     ],
     visite: [
       "Les visites de relevé sont effectuées en utilisant les méthodes et les procédures qui sont conformes aux règles de l'art et effectuées par des technologues professionnels, des ingénieurs et/ou des techniciens.",
-      "La portée de notre travail lors des visites se limite à des relevés visuels des composantes visibles et accessibles de l'immeuble visant à estimer, selon leur état, leur durée de vie restante en relation avec des valeurs reconnues de durée de vie utile et selon notre opinion d'un comportement normal pour une composante similaire; à l'observation et la documentation des conditions existantes; ainsi qu'à des entretiens avec les occupants ayant des informations pertinentes.",
+      "La portée de notre travail lors des visites se limite à :",
+      "- Des relevés visuels des composantes visibles et accessibles de l'immeuble visant à estimer, selon leur état, leur durée de vie restante en relation avec des valeurs reconnues de durée de vie utile et selon notre opinion d'un comportement normal pour une composante similaire.",
+      "- L'observation et la documentation des conditions existantes ainsi que;",
+      "- Des entretiens avec les occupants ayant des informations pertinentes.",
+      "Le but étant de pouvoir apprécier et commenter sommairement l'état général des éléments et de leur durée de vie utile estimée dans le rapport narratif.",
       "Les relevés visuels ne peuvent pas détecter les vices et défauts cachés et ne visent pas la recherche de déficiences ou la vérification de conformité. Toutefois, dans le cas où nous observons une déficience qui peut influer de façon significative sur la durée de vie de l'élément et jugée pertinente à intégrer dans le rapport, nous le mentionnerons à titre informatif.",
-      "Observations : Le relevé visuel vise à identifier et observer les éléments de construction, des parties communes accessibles, devant être inclus au fonds de prévoyance et à retenir les déficiences et/ou situations observées pouvant affecter de façon significative la durée de vie des composantes primaires de ces éléments. L'étude ne consiste pas en une expertise technico-légale ou une inspection de type pré-achat ou une recherche de déficiences et ne comprend pas la vérification de conformité aux codes en vigueur. Aucune enquête judiciaire, analyse de sol, évaluation environnementale, calcul d'ingénierie détaillé, ou travail d'arpentage n'a été réalisé.",
-      "Commentaires : Les commentaires et suggestions formulées dans ce rapport (si applicable) sont basés sur notre compréhension au moment de la réalisation de l'étude ainsi que sur l'utilisation, le contexte et les conditions actuelles du site, de même que sur la portée du mandat accordé par le mandant. Les observations consistent en un échantillon aléatoire et ponctuel des éléments de l'immeuble. Ainsi, les commentaires et suggestions inclus sont basés sur les observations effectuées aux emplacements témoins uniquement.",
-      "L'inspecteur ne doit pas déplacer d'équipement, enlever des panneaux ou démonter des morceaux ou pièces d'équipement; de plus, aucun test destructif n'est réalisé. Les équipements électroniques, électriques, mécaniques, chauffage et climatisation, les systèmes de sécurité-incendie, les systèmes de gicleurs et autres éléments spécialisés ont bénéficié d'un constat visuel sommaire qui ne comprend pas l'utilisation d'instruments ou procédures d'essais. Ceux-ci relèvent de compétences et de champs de pratiques réservés.",
-      "Durée de vie : Les avis de l'espérance de vie résiduelle estimée des composants évalués sont basés, entre autres, sur nos observations au moment du relevé et nos expériences antérieures, puis comparés aux valeurs de durée de vie disponibles dans la documentation du fabricant lorsque disponible ou à l'intérieur de documents de références de professionnels. La date réelle de la réparation ou du remplacement des composantes communes devra être confirmée par un suivi adéquat en entretien dans l'avenir."
+      "Les relevés n'incluent pas l'utilisation d'instruments, de procédures d'essais ou de processus d'expertise. Les dessins, spécifications, documents d'exploitation et rapports disponibles seront consultés.",
+      "Aucune autre étude ou analyse n'est prévue.",
+      "Observations : Le relevé visuel vise à identifier et observer les éléments de construction, des parties communes accessibles, devant être inclus au fonds de prévoyance et à retenir les déficiences et/ou situations observées pouvant affecter de façon significative la durée de vie des composantes primaires de ces éléments. Une appréciation générale de l'état des éléments sera mentionnée et, si possible, le moment des remplacements complets récents identifié. Le relevé visuel ne peut détecter les vices et défauts cachés. L'étude ne consiste pas en une expertise technico-légale ou une inspection de type pré-achat ou une recherche de déficiences et ne comprend pas la vérification de conformité aux codes en vigueur. Dans le contexte où nous observons une déficience qui peut influer de façon importante sur la durée de vie de l'élément et jugée pertinente à intégrer dans le rapport, nous le mentionnerons à titre informatif.",
+      "Aucune enquête judiciaire, analyse de sol, évaluation environnementale, calcul d'ingénierie détaillé, ou travail d'arpentage n'a été réalisé.",
+      "Commentaires : Les commentaires et suggestions formulés dans ce rapport (si applicable) sont basés sur notre compréhension au moment de la réalisation de l'étude ainsi que sur l'utilisation, le contexte et les conditions actuelles du site, de même que sur la portée du mandat accordé par le mandant et décrit dans la section « Sommaire du mandat ». L'étude a été effectuée conformément aux règles et aux méthodes généralement reconnues par les professionnels en sciences du bâtiment qui pratiquent dans les mêmes conditions. Les observations consistent en un échantillon aléatoire et ponctuel des éléments de l'immeuble. Ainsi, les commentaires et suggestions inclus sont basés sur les observations effectuées aux emplacements témoins uniquement.",
+      "L'inspecteur ne doit pas déplacer d'équipement, enlever des panneaux ou démonter des morceaux ou pièces d'équipement ; de plus, aucun test destructif n'est réalisé.",
+      "Les équipements électroniques, électriques, mécaniques, chauffage et climatisation, les systèmes de sécurité-incendie, les systèmes de gicleurs et autres éléments spécialisés ont bénéficié d'un constat visuel sommaire qui ne comprend pas l'utilisation d'instruments ou procédures d'essais. Ceux-ci relèvent de compétences et de champs de pratique réservés. Il serait pertinent d'en faire une analyse approfondie par des professionnels qualifiés.",
+      "Durée de vie : Les avis de l'espérance de vie résiduelle estimée des composants évalués sont basés, entre autres, sur nos observations au moment du relevé et nos expériences antérieures, puis comparés aux valeurs de durée de vie disponibles dans la documentation du fabricant lorsque disponible ou à l'intérieur de documents de référence de professionnels. La date réelle de la réparation ou du remplacement des composantes communes devra être confirmée par un suivi adéquat en entretien dans l'avenir. Ici, les suivis réguliers suggérés au tableur suivi d'entretien vous seront d'une grande utilité dans la planification et le démarrage de vos projets."
     ],
     financement: [
-      "Lors des calculs de financement, tous les efforts sont faits pour s'assurer de l'exactitude des données à la base des calculs et projections budgétaires développés dans les scénarios de financement. Les coûts de remplacement sont établis selon des références actuelles et nos données pour des travaux similaires, puis ajustés selon les conditions, le contexte et l'accessibilité. Si des estimations de travaux sont existantes, celles-ci seront intégrées aux calculs. Le calcul de projection est indexé et actualisé selon les taux en vigueur ajustés suivant l'évolution des dernières années.",
+      "Lors des calculs de financement, tous les efforts sont faits pour s'assurer de l'exactitude des données à la base des calculs et projections budgétaires développés dans les scénarios de financement.",
+      "- Les coûts de remplacement sont établis selon des références actuelles et nos données pour des travaux similaires, puis ajustés selon les conditions, le contexte et l'accessibilité;",
+      "- Le calcul lié aux parties communes à usage restreint sera selon les clés de répartition, si disponibles à la déclaration de copropriété, et appliqué aux unités identifiées par le conseil d'administration. En l'absence de clé de répartition, des frais additionnels pourront être facturés;",
+      "- Si des estimations de travaux sont existantes, celles-ci seront intégrées aux calculs;",
+      "- Le calcul de projection est indexé et actualisé selon les taux en vigueur ajustés suivant l'évolution des dernières années.",
       "Le but est d'établir une stratégie de contribution au fonds de prévoyance en fonction de l'ensemble des dépenses prévues de remplacement ou de maintien des composantes observées. C'est sur la base de ces opinions et suggestions de stratégie que le syndicat devra fixer les sommes à verser au fonds de prévoyance (loi 16 Art 1071 C.c.Q.).",
-      "La responsabilité ne peut être acceptée pour des facteurs qui nous sont inconnus ou non divulgués et qui pourraient nuire à l'exactitude de ces projections. Le calcul de financement ne traite pas les coûts de maintenance, d'entretien, d'ajustement, d'améliorations, les taxes en vigueur, etc.",
+      "La responsabilité ne peut être acceptée pour des facteurs qui nous sont inconnus ou non divulgués et qui pourraient nuire à l'exactitude de ces projections.",
+      "Le calcul de financement ne traite pas les coûts de maintenance, d'entretien, d'ajustement, d'améliorations, les taxes en vigueur, etc.",
+      "Le rapport présente trois scénarios de financement : #1, #2 et #3. Le scénario #1 est, selon notre expérience, celui qui est préférable. Alors que les scénarios #2 et #3 sont fournis afin de permettre une mise en perspective.",
       "Ce rapport vous sert de guide de travail afin de permettre une planification budgétaire éclairée concernant les montants de cotisations nécessaires et le moment privilégié du remplacement des éléments de l'immeuble. Les opinions des coûts pour les travaux de remplacement prévus dans le présent rapport sont uniquement destinées à des fins budgétaires globales.",
-      "Les valeurs indiquées au présent rapport sont des montants budgétaires exprimés en dollars canadiens, avant les taxes fédérales et provinciales et ce, à la date de l'estimation. Les coûts au rapport sont actuels, avant taxes. Les coûts aux tableaux sont avant taxes, cependant le cumul est indexé.",
+      "Les coûts réels des travaux recommandés au calendrier de remplacement ne peuvent être déterminés uniquement que suite à la mise en place d'un processus d'appel d'offres incluant la production de devis et de plans, à l'étude de documents de soumission, à la compréhension des restrictions du site et l'ampleur des travaux requis au moment des remplacements, les effets connexes aux opérations en cours de travaux et le calendrier des travaux avant la mise en œuvre;",
+      "Les valeurs indiquées au présent rapport sont des montants budgétaires exprimés en dollars canadiens, avant les taxes fédérales et provinciales, et ce, à la date de l'estimation. Les coûts au rapport sont actuels, avant taxes. Les coûts aux tableaux sont avant taxes, cependant le cumul est indexé. Lorsque des coûts additionnels généraux ou d'organisation de chantier sont possibles, une note en fera mention dans le texte.",
+      "Les coûts des composantes exprimés au présent rapport sont énoncés en fonction de l'exécution d'un entretien adéquat permettant de prolonger adéquatement la durée de vie des composantes.",
+      "Les estimations de superficie sont calculées selon les plans fournis, considérés comme conformes à l'immeuble en étude. Aucune vérification des cotes ou référence n'est faite sur place lors des relevés. Notez qu'en l'absence de plan de construction ou d'architecture, des mesures indirectes auront permis une approximation des superficies.",
+      "Notez que les coûts de maintenance, d'entretien, d'ajustement, d'améliorations, etc., ne sont pas inclus au calcul du scénario de financement.",
       "Les plans, croquis et photographies sont ajoutés purement afin de permettre la familiarisation du lecteur avec la propriété."
     ],
     tableur: [
-      "L'élaboration du tableur suivi d'entretien sera sous la forme d'un fichier Excel, facile d'utilisation/ adaptation et contient : un calendrier saisonnier qui identifie les moments de l'entretien préventif des équipements; des grilles de rappel avec les séquences et la description des tâches de vérification pour les composantes communes de la copropriété; la possibilité d'y documenter l'historique des interventions concernant les travaux antérieurs et futurs; des rappels pour les contrats de maintenance et d'entretien annuels.",
-      "Le tableur suivi d'entretien est un document essentiel qui s'insère dans un plan de gestion de l'entretien rigoureux de votre immeuble. Le tableur vous permettra de structurer la démarche d'entretien et le suivi prévisionnel des travaux futurs. Le tableur n'est pas un registre de l'immeuble. Mais s'insère dans le registre d'immeuble qui inclut aussi, par exemple : la déclaration de copropriété, les plans d'architecture, les contrats et garanties, le registre des copropriétaires, les projets, etc.",
-      "L'ajout de commentaires au tableur est une tâche importante en soi et demande un temps de concertation et d'organisation par l'administration. La démarche fait appel à une certaine disponibilité régulière afin de compléter les différentes vérifications, et ce au fil des saisons."
+      "L'élaboration du tableur suivi d'entretien sera sous la forme d'un fichier Excel, facile d'utilisation/adaptation et contient :",
+      "- Un calendrier saisonnier qui identifie les moments de l'entretien préventif des équipements;",
+      "- Des grilles de rappel avec les séquences et la description des tâches de vérification pour les composantes communes de la copropriété.",
+      "- La possibilité d'y documenter l'historique des interventions concernant les travaux antérieurs et futurs;",
+      "- Des rappels pour les contrats de maintenance et d'entretien annuels",
+      "Le tableur sera idéalement intégré à votre plan existant d'entretien annuel et inclus au registre d'immeuble.",
+      "Le tableur suivi d'entretien est un document essentiel qui s'insère dans un plan de gestion de l'entretien rigoureux de votre immeuble. Le tableur vous permettra de structurer la démarche d'entretien et le suivi prévisionnel des travaux futurs. Le tableur n'est pas un registre de l'immeuble, mais s'insère dans le registre d'immeuble qui inclut aussi, par exemple : la déclaration de copropriété, les plans d'architecture, les contrats et garanties, le registre des copropriétaires, les projets, etc.",
+      "Le tableur est le document qui servira de référence pour la planification des entretiens et ceux qui sont complétés. Il est présenté sous la forme d'un calendrier saisonnier qui inclut les rappels avec les séquences et descriptions de tâches de vérification. À l'intérieur de ce document, vous pourrez documenter les interventions d'entretien courantes, les travaux antérieurs complétés, mais aussi les suggestions pour ceux qui sont en projet. Celui-ci présente les rappels des contrats de maintenance et d'entretien où vous pourrez inscrire les particularités pertinentes aux entretiens souhaités ou requis.",
+      "L'ajout de commentaires au tableur est une tâche importante en soi et demande un temps de concertation et d'organisation par l'administration. La démarche fait appel à une certaine disponibilité régulière afin de compléter les différentes vérifications, et ce, au fil des saisons."
     ],
     services: [
       "Lorsque des suggestions pour des services professionnels seront émises, le contexte et l'ampleur de la situation observée seront commentés à titre informatif. Les services de professionnels : technologues (OTPQ), ingénieurs (OIQ) ou architectes (OAQ) sont toujours recommandés pour la gestion de projet d'ampleur et afin de s'assurer que les conditions existantes en planification des ouvrages sont similaires à celles observées durant l'étude.",
-      "En suivi à cette étude viendra le moment de planifier et démarrer les projets retenus; ici nous recommandons que les services de professionnels soient retenus à la préparation des devis pour tout travail, réhabilitation ou processus d'appels d'offres ainsi que pour faire le suivi des travaux afin de s'assurer que les conditions existantes sont similaires à celles observées durant l'étude et que nos suggestions soient bien comprises, et ce, à toutes les étapes des travaux.",
-      "Certaines conditions, qui n'ont pas pu être observées ou prévues au moment de l'étude, pourraient être rencontrées lors de la production des devis par les professionnels ou durant les travaux. Dans l'éventualité où ces nouvelles conditions devaient différer de celles observées à l'emplacement de nos observations, nous demandons d'être immédiatement avisés par écrit afin de permettre une réévaluation de nos suggestions."
+      "En suivi à cette étude viendra le moment de planifier et démarrer les projets retenus ; ici, nous recommandons que les services de professionnels soient retenus à la préparation des devis pour tout travail, réhabilitation ou processus d'appels d'offres ainsi que pour faire le suivi des travaux afin de s'assurer que les conditions existantes sont similaires à celles observées durant l'étude et que nos suggestions soient bien comprises, et ce, à toutes les étapes des travaux.",
+      "Certaines conditions, qui n'ont pas pu être observées ou prévues au moment de l'étude, pourraient survenir lors de la production des devis par les professionnels ou durant les travaux. Dans l'éventualité où ces nouvelles conditions devaient différer de celles observées à l'emplacement de nos observations, nous demandons d'être immédiatement avisés par écrit afin de permettre une réévaluation de nos suggestions. Ainsi, les suggestions émises dans le présent rapport seront considérées comme invalides jusqu'à ce que ces changements soient évalués par Condo Stratégis et que celles-ci soient modifiées en conséquence de ces nouvelles conditions et maintenues par écrit.",
+      "En conséquence, Condo Stratégis ne pourra être tenue responsable de toute interprétation et/ou malentendu par rapport aux états observés, commentaires et suggestions ou à l'application et à l'adaptation de celles-ci."
     ],
     complementaire: [
       "Le rapport d'étude est remis en format PDF. Il comprend une partie narrative et des annexes présentant un scénario de financement. L'ensemble présentera une approche équilibrée (ou légèrement excédentaire) qui vise le rétablissement budgétaire à l'avenir.",
       "L'étude et ses conclusions budgétaires représentent notre opinion et sont énoncées en fonction de la planification et de l'exécution d'un entretien adéquat dans l'avenir.",
       "À la réception du rapport, il est suggéré de lire et d'intégrer les informations pertinentes à votre planification. L'interprétation et/ou l'utilisation divergente du contenu du rapport demeure la responsabilité du conseil d'administration.",
+      "Le rapport pourra servir de plan de travail à la « microgestion » jugée nécessaire par le conseil d'administration en place.",
       "Si des corrections sont requises, votre demande détaillée doit être acheminée par courriel dans les 30 jours de la réception du rapport.",
-      "Suivant cette étude, nous suggérons la consultation d'un gestionnaire ou d'un planificateur financier afin d'élaborer la stratégie appropriée ou la micro-gestion interne requise à votre situation financière.",
+      "Toute demande de modification du rapport selon des informations non disponibles en préalable à la visite sera avec frais. Voir le détail à l'offre de service. Si possible à notre horaire établi, les modifications demandant une rédaction additionnelle, des calculs additionnels et des vérifications pourront occasionner des délais inhabituels. Nous n'effectuons aucune modification considérée « gestion interne » ou « microgestion » qui divergerait de nos opinions.",
+      "L'étude de scénarios alternatifs est possible en rencontre de présentation. Un scénario additionnel pourra être produit et le rapport narratif modifié selon les informations retenues en rencontre de présentation. La présentation n'est pas une formation en gestion d'immeuble, en analyse financière ou en inspection de bâtiment.",
+      "Selon les modalités prévues à l'offre de services, une rencontre de présentation du rapport peut être offerte. Celle-ci est possible dans les 90 jours suivant la réception du rapport, soit à nos bureaux ou en visioconférence. Suivant ce délai, des frais additionnels pourront s'appliquer.",
+      "Suivant cette étude, nous suggérons la consultation d'un gestionnaire ou d'un planificateur financier afin d'élaborer la stratégie appropriée ou la « microgestion » interne requise à votre situation financière.",
       "Le dépôt de ce rapport n'oblige pas Condo Stratégis à témoigner devant un tribunal à moins d'une entente préalable avec l'application d'un tarif horaire.",
       "Aucune autre garantie, expresse ou implicite, n'est faite."
     ]
   },
+  // L'attestation d'ordre professionnel et la mention de visite sont insérées
+  // par le générateur entre la 3e et la 4e puce, comme au rapport approuvé.
   declaration: [
     "Les informations contenues au présent rapport ainsi que les opinions qui en découlent sont exactes et bien fondées, mais toutefois assujetties aux limitations mentionnées au présent rapport;",
     "Les analyses, opinions et conclusions du rapport me sont propres, elles sont neutres et objectives; elles ne sont restreintes que par les limitations que j'ai été appelé à formuler;",
-    "Je n'ai aucun intérêt présent ou futur, réel ou possible, dans la propriété qui fait l'objet de ce rapport et je n'ai aucun lien personnel ni parti pris en ce qui concerne les parties en cause;",
-    "Le soussigné ou son représentant a inspecté personnellement l'intérieur et l'extérieur de la propriété. Il a vu à l'étude des documents et informations fournis par le conseil d'administration ou son représentant susceptible d'influer sur la valeur de remplacement des éléments de la propriété;"
+    "Je n'ai aucun intérêt présent ou futur, réel ou possible, dans la propriété qui fait l'objet de ce rapport et je n'ai aucun lien personnel ni parti pris concernant les parties en cause;",
+    "Le soussigné ou son représentant a inspecté personnellement l'intérieur et l'extérieur de la propriété. Il a vu à l'étude des documents et informations fournis par le conseil d'administration ou son représentant susceptibles d'influer sur la valeur de remplacement des éléments de la propriété;"
   ],
   suiviEntretien: {
     loi16: [
+      "## Exigences de la loi sur les copropriétés",
       "Selon le projet de loi 16, adoptée le 10 janvier 2020, « le conseil d'administration fait établir un carnet d'entretien de l'immeuble, lequel décrit notamment les entretiens faits et à faire ». Il tient ce carnet à jour et le fait réviser périodiquement. La forme, le contenu et les modalités de tenue et de révision du carnet d'entretien, de même que les personnes qui peuvent l'établir et le réviser, ont été déterminés dans le projet de règlement du gouvernement publié le 30 juillet 2025 (décret 991-2025) et en vigueur depuis le 14 août 2025.",
       "(Article 1070.2 C.c.Q.) édicté par l'article 38 de la loi visant l'encadrement des inspections en bâtiment de la copropriété divise.",
-      "Afin de satisfaire les attentes prévues au Code civil, le syndicat, par l'intermédiaire de son conseil d'administration, doit en principe mandater tous les travaux à des entreprises (RBQ), corps de métiers (CMMTQ, CMEQ, etc) ou professionnels (OAQ, OIQ, OTPQ). Cette pratique assure que le personnel est couvert par une assurance erreurs et omissions ainsi qu'autorisé par les compagnies manufacturières à effectuer les travaux, ce qui valide certaines garanties applicables."
+      "Afin de satisfaire aux attentes prévues au Code civil, le syndicat, par l'intermédiaire de son conseil d'administration, doit en principe mandater tous les travaux à des entreprises (RBQ), corps de métiers (CMMTQ, CMEQ, etc.) ou professionnels (OAQ, OIQ, OTPQ). Cette pratique assure que le personnel est couvert par une assurance erreurs et omissions ainsi qu'autorisé par les compagnies manufacturières à effectuer les travaux, ce qui valide certaines garanties applicables.",
+      "## Le tableur de suivi d'entretien",
+      "Le tableur de suivi d'entretien est un élément important dans la gestion efficace et transparente de l'entretien d'un immeuble. Selon nous, c'est un document essentiel qui s'insère dans un plan de gestion de l'entretien rigoureux de votre immeuble. Celui-ci inclura un processus de priorisation des entretiens, des prévisions de budgets révisés, des processus d'appels d'offres clairs et l'embauche de personnel compétent. Le tableur vous permettra de structurer la démarche d'entretien et le suivi prévisionnel des travaux futurs.",
+      "D'actualité, le concept de « Plan de gestion de l'entretien » a toute sa valeur lorsqu'on considère que la première vague d'immeubles de copropriété au Québec approche 60 ans.",
+      "« 13 % des copropriétés ont été construites avant 1960 et 29,5 % entre 1961 et 1990 » — Étude par l'APCHQ 2019 : L'essor de la copropriété au Québec, Condoliaison vol. 24, no 4 – Hiver 2023, p. 32",
+      "« 31 % des habitations en copropriété construites avant 2000 au Québec nécessitent des réparations », certaines importantes — Recensement Statistique Canada 2016, Condoliaison vol. 24, no 4 – Hiver 2023, p. 32",
+      "En effet, la variation du niveau d'entretien des immeubles en copropriété est parfois importante et justifie cette mesure de concertation. En complément à une étude de fonds de prévoyance, qui planifie les budgets de remplacements, le tableur suivi d'entretien permet un suivi structuré prévisionnel de ces budgets d'entretien. Évidemment, l'implication de professionnels et d'entrepreneurs spécialisés sera requise et ceux-ci pourront commenter et expertiser plus précisément les situations d'état mentionnées dans votre rapport de fonds de prévoyance."
     ],
-    actions: [
-      "Documenter les changements visuels des éléments;",
-      "Vérifier l'intégrité des éléments;",
-      "Voir à la maintenance des espaces;",
-      "Effectuer ou mandater les entretiens requis;",
-      "Documenter les travaux effectués."
-    ],
-    niveaux: [
-      "Maintenance : services ménagers, propreté des espaces communs.",
-      "Entretien régulier : prévu au tableur suivi d'entretien et effectué idéalement au moment prévu, par le personnel en place. Il est planifié de façon hebdomadaire, mensuelle ou annuelle.",
-      "Entretien devancé : il devient nécessaire lorsqu'un entretien prévu doit être accompli avant terme, parfois en urgence, afin de corriger une déficience évidente qui risque de s'aggraver ou d'affecter d'autres éléments."
+    // 9.2 Les grandes questions — même convention « ## » / « - ».
+    questions: [
+      "## Comment devons-nous procéder ?",
+      "Le tableur suivi d'entretien fourni est en format Excel. Ce format a été retenu, car il est facile à consulter et à modifier. À cet effet, nous invitons le syndicat à s'approprier le document et à y apporter les modifications qui seront jugées nécessaires.",
+      "Le tableur suivi d'entretien vous fournit une liste de vérification et d'action de départ exhaustive, qui pourra être ajustée et améliorée, au besoin, de précisions spécifiques en réponse à de nouvelles pratiques. Il propose aussi les actions générales qui favoriseront une atteinte des durées de vie des éléments, ou à l'occasion, viseront le respect des attentes esthétiques des administrateurs et/ou des copropriétaires. Avec le vieillissement de votre immeuble, certaines modifications au bâtiment demanderont une mise à jour de votre tableur suivi d'entretien. Des particularités rencontrées pourront demander une validation de certaines pratiques. Finalement, celui-ci devra être agencé avec vos planifications d'inspections annuelles. En tout, vous avez un document « aide-mémoire saisonnier » afin de planifier vos entretiens réguliers en fonction des saisons à venir.",
+      "Les actions générales sont :",
+      "- Documenter les changements visuels des éléments ;",
+      "- Vérifier l'intégrité des éléments ;",
+      "- Voir à la maintenance des espaces ;",
+      "- Effectuer ou mandater les entretiens requis ;",
+      "- Documenter les travaux effectués.",
+      "Le but premier du tableur suivi d'entretien est de vous guider dans une approche visuelle afin de prendre conscience de l'état général de l'immeuble. C'est à partir de ces observations régulières que vous pourrez constater et documenter les changements et variations subtiles qui peuvent indiquer les anomalies et les déficiences à venir dans l'intégrité des éléments.",
+      "Nul besoin d'être spécialiste pour suivre le tableur suivi d'entretien. Les vérifications proposées sont principalement visuelles ou auditives. Vos observations seront suffisantes pour déterminer si le suivi demandé est de nature à une maintenance ou un entretien. À la base, par maintenance nous entendons les services ménagers qui assurent un minimum de propreté des espaces communs. Que ce soit pour des raisons esthétiques ou techniques, la maintenance vise à obtenir un espace de vie propre, agréable et sécuritaire. Plus technique, les entretiens seront selon l'importance : réguliers ou devancés. Le facteur décisionnel étant principalement le délai acceptable pour un travail complété.",
+      "Tout au long du processus des travaux, nous vous conseillons de documenter les informations importantes qui faciliteront les recherches ultérieures ou le transfert par mandat. Une déficience récurrente bénéficiera d'une meilleure compréhension corrective lorsqu'approchée avec son historique évolutif. L'existence d'une garantie particulière pourra alléger le coût de travaux imprévus. Évidemment, nous suggérons que les éléments électriques, mécaniques ou motorisés soient encadrés à l'intérieur d'un plan d'entretien annuel offert par une entreprise reconnue : ascenseur, portes de garage, chaufferie, ventilation, climatisation, pompes de bassin collecteur, etc.",
+      "## Mécanique du bâtiment, système d'ascenseur",
+      "Il est probable que votre immeuble possède des appareils de chauffage, ventilation, pompes de surpression, système de traitement de l'air dans les espaces piscines, ou ventilation des salles techniques. Afin de satisfaire les attentes spécifiques des manufacturiers et l'application des garanties, nous recommandons un contrat d'entretien pour tous ces types d'équipements mécaniques. Concernant ces appareils, ce tableur de suivi d'entretien ne suggère que les vérifications visuelles générales et ne peut se soustraire à un entretien planifié par les corps de métiers correspondants.",
+      "## Devons-nous respecter la planification ?",
+      "Dans le meilleur des mondes, les travaux d'entretien seront effectués selon un programme prévu et régulier « l'entretien régulier » qui est la base de votre tableur de suivi d'entretien. D'ailleurs, avec l'approche « aide-mémoire saisonnier », c'est ce que nous vous souhaitons. Cependant, à l'occasion, il deviendra nécessaire de modifier votre planification en fonction d'un élément inattendu et imprévisible. À l'occasion, des urgences pourront survenir et des correctifs importants devront être entrepris. À ce moment, basée sur ces nouvelles situations, la priorisation sera modifiée. Privilégiant une certaine simplicité décisionnelle, nous avons catégorisé deux niveaux d'entretien : régulier et devancé.",
+      "L'entretien régulier est prévu au tableur suivi d'entretien et sera effectué idéalement au moment prévu, par le personnel en place. Il est planifié de façon hebdomadaire, mensuelle ou annuelle. Le but ultime de cette étape est de tenter d'éviter les dommages et bris prévisibles avec des observations et actions simples. Nettoyer les grilles de regard pluvial, vérifier l'efficacité du système de gouttière, vérifier le fonctionnement des systèmes de ventilation des stationnements intérieurs, vérifier les charnières ou l'ajustement de ferme-porte sont des exemples d'entretien régulier faciles à effectuer.",
+      "L'entretien devancé devient nécessaire lorsqu'un entretien prévu doit être accompli avant terme, parfois en urgence, afin de corriger une déficience évidente qui risque de s'aggraver ou d'affecter d'autres éléments. Fréquemment, ces entretiens devancés devront être effectués avec contrat par un personnel spécialisé, à titre d'exemple : des calfeutrants fissurés ou en perte d'adhérence (ces situations fréquentes sont le début des infiltrations d'eau), l'arrêt du fonctionnement d'une porte de garage (vos copropriétaires se retrouvent soudainement sans possibilité de sortir), le fonctionnement intermittent d'une pompe de drain (lors de pluies diluviennes, l'eau s'accumule au premier niveau de l'immeuble et force l'évacuation), un bruit anormal lors du fonctionnement de l'ascenseur (les copropriétaires à mobilité réduite sont inquiets de son utilisation) ou le tintement anormal d'un détecteur d'incendie (ce tintement répétitif est perçu par certains copropriétaires des unités situées près du vestibule principal).",
+      "Dans plusieurs situations imprévues, soit par la complexité ou l'ampleur, l'implication initiale d'un professionnel pourra s'avérer essentielle. Planifier un mandat en expertise avec une firme en ingénierie ou en architecture identifiera la cause et pourra proposer une vue plus large des possibilités et des options de solutions disponibles. Par la suite, un devis correctif pourra être produit en vue du processus d'appel d'offres et de l'embauche d'entrepreneurs compétents. Pour certains projets, la gestion quotidienne du chantier, avec documentation, par le professionnel devra être considérée comme un aspect de votre réussite, visant le respect des coûts, des délais et de la qualité.",
+      "Si la situation devient rapidement importante, agissez et assurez le confort de vos copropriétaires. Si des mesures additionnelles sont prévisibles, informez vos assureurs, planifiez en conséquence les coûts, les délais et les mesures de substitution temporaires.",
+      "## Les situations de sinistre : déclarer ou réclamer ?",
+      "Parce que certaines situations feront suite à des évènements inattendus ou des constats de problématiques avec dommages « les sinistres », nous vous suggérons de déclarer ces derniers à vos assureurs. Ceux-ci pourront mieux évaluer le contexte, les travaux requis et voir à l'application de vos couvertures en assurance et possiblement une réclamation. Les situations classiques d'infiltration d'eau par la toiture, les revêtements extérieurs, ou les sinistres avec refoulement de drains sanitaires sont les plus fréquentes.",
+      "Lorsque la valeur de la franchise est visée, à la suite d'une réclamation ou selon un prélèvement de votre fonds d'auto-assurance (Loi 141), l'implication d'un expert en sinistre indépendant pourra faciliter le recouvrement de celle-ci.",
+      "Si la situation s'aggrave rapidement, agissez et assurez le confort de vos copropriétaires. Si des mesures additionnelles sont prévisibles, informez vos assureurs et planifiez en conséquence les coûts, les délais et les mesures de substitution temporaires. Lorsque la nécessité de relocaliser les copropriétaires touchés est justifiée, veuillez les informer sans délai afin que ceux-ci puissent obtenir le support de leur assureur.",
+      "## Le personnel en place peut-il entreprendre les travaux d'entretien ?",
+      "Les grands complexes immobiliers ont l'avantage d'employer du personnel qui veille déjà à la maintenance et à l'entretien régulier de l'immeuble. La disponibilité de l'historique d'entretien viendra confirmer les pratiques déjà en place ou pourra étayer une nouvelle vision d'un entretien organisé.",
+      "Les copropriétés de moins grande envergure devront préférablement favoriser l'implication d'un membre du conseil d'administration. Ces derniers immeubles nécessitent en général peu de connaissances et de temps. Malgré ceci, il est fréquent qu'aucun ne puisse satisfaire à l'exercice. L'embauche de personnel externe devient une option."
     ],
     experience: [
       "Chez Condo Stratégis, notre expérience nous permet d'avancer qu'investir dans l'entretien, c'est économiser. Des études ont prouvé qu'il est moins coûteux de mettre en place un plan de gestion de l'entretien que d'attendre que des situations problématiques surgissent. Un bâtiment bien entretenu, c'est le début du confort pour tous les occupants et la tranquillité d'esprit pour les administrateurs dans leur gestion des budgets de remplacement. En outre, avec un entretien régulier, les différents éléments de votre immeuble pourront atteindre leur durée de vie utile.",
@@ -25110,7 +25363,7 @@ const TEXTE_MAISON = {
 // le texte d'une seule d'entre elles.
 // ===========================================================================
 
-// Les 13 sections surchargeables, avec la forme attendue de chacune. La forme
+// Les 16 sections surchargeables, avec la forme attendue de chacune. La forme
 // compte : rendre une chaîne là où le rapport attend une liste de puces ne
 // plante pas, ça produit un rapport silencieusement mal formé.
 const SECTIONS_GABARIT = [
@@ -25118,6 +25371,9 @@ const SECTIONS_GABARIT = [
   { cle: "famillesEtudiees", label: "2.1 Familles d'éléments étudiées", forme: "puces" },
   { cle: "objetChamp", label: "2.3 Objet et champ d'application", forme: "texte" },
   { cle: "contexteEconomique", label: "2.4 Contexte économique", forme: "paragraphes" },
+  { cle: "reglement", label: "Carnet d'entretien et étude du fonds de prévoyance — Réalisation, contenu et modalité", forme: "paragraphes" },
+  { cle: "sommaireExecutif", label: "Sommaire exécutif — introduction", forme: "paragraphes" },
+  { cle: "chargesCommunes", label: "Sommaire exécutif — charges communes", forme: "puces" },
   { cle: "exigencesLoi", label: "2.5 Exigences de la loi sur les copropriétés", forme: "texte" },
   { cle: "quotesParts", label: "2.6 Valeurs relatives des quotes-parts", forme: "texte" },
   { cle: "lireRapport", label: "3.0 Comment lire ce rapport", forme: "objet", sous: [
@@ -25140,8 +25396,7 @@ const SECTIONS_GABARIT = [
   { cle: "declaration", label: "8.0 Déclaration — attestations", forme: "puces" },
   { cle: "suiviEntretien", label: "9.0 Suivi de l'entretien", forme: "objet", sous: [
     { cle: "loi16", forme: "paragraphes" },
-    { cle: "actions", forme: "puces" },
-    { cle: "niveaux", forme: "puces" },
+    { cle: "questions", forme: "paragraphes" },
     { cle: "experience", forme: "paragraphes" }
   ] },
   { cle: "lexique", label: "Annexe — Lexique", forme: "paires" },
@@ -25620,7 +25875,7 @@ function outilsDocx(t, { modeStyles = false } = {}) {
     return new Paragraph({
       spacing: { after: 60 },
       indent: { left: 360, hanging: 200 },
-      children: [run(`·\t${text}`)],
+      children: [run(`•\t${text}`)],
       tabStops: [{ type: TabStopType.LEFT, position: 360 }]
     });
   }
@@ -25734,7 +25989,7 @@ function outilsDocx(t, { modeStyles = false } = {}) {
       heading: "Heading3",
       keepNext: true,
       spacing: { after: 40 },
-      children: [modeStyles ? new TextRun({ text: `${numero} ${nom}` }) : run(`${numero} ${nom}`, { font: policeTitres, bold: true, size: 30, allCaps: true })]
+      children: [modeStyles ? new TextRun({ text: [numero, nom].filter(Boolean).join(" ") }) : run([numero, nom].filter(Boolean).join(" "), { font: policeTitres, bold: true, size: 30, allCaps: true })]
     }));
     // Filet court : la bordure d'un paragraphe fait toute sa largeur, un
     // retrait à droite la ramène à environ 2,5 cm.
@@ -25754,7 +26009,8 @@ function outilsDocx(t, { modeStyles = false } = {}) {
       { libelle: "Délai", valeur: delai ? delai.libelle.replace(/\s*\(.*\)$/, "") : sansNotesInternes(component?.delai_suggere ?? "") || "—" }
     ]));
     for (const section of fiche.sections) {
-      blocs.push(etiquette(section.cle === "etat" ? "État de l'actif" : section.cle === "duree_vie" ? "Durée de vie et remplacement" : section.cle === "entretien" ? "Commentaires d'entretien" : "Attention spéciale"));
+      // « ÉTAT DE L'ACTIF – Nom », comme au rapport approuvé.
+      blocs.push(etiquette(`${section.cle === "etat" ? "État de l'actif" : section.cle === "duree_vie" ? "Durée de vie et remplacement" : section.cle === "entretien" ? "Commentaires d'entretien" : "Attention spéciale"} – ${nom}`));
       // Attentions spéciales saisies : chacune son titre, son texte et ses
       // photos à côté, puis la recommandation commune une seule fois.
       if (section.cle === "attention" && section.elements?.length) {
@@ -25818,9 +26074,10 @@ function outilsDocx(t, { modeStyles = false } = {}) {
           taches.map((x) => [x.texte, x.frequence, x.quand, x.responsable])
         ));
       }
-      if (section.cle === "duree_vie") {
+      // Pas de tableau sans coût : le rapport approuvé n'imprime jamais « - $ ».
+      if (section.cle === "duree_vie" && montantMaison(ligne.cout) != null && Number(ligne.cout) > 0) {
         blocs.push(tableauMaison(
-          ["Élément", "Type", ligne.allocation ? "Cycle" : "Durée de vie", ligne.allocation ? "Débutant en" : "Remplacement", ligne.libelleMontant],
+          ["Élément", "Type", ligne.allocation ? "Cycle" : "Durée de vie", ligne.allocation ? "Débutant en" : "Année de remplacement", ligne.libelleMontant],
           [[
             titreTableauMaison(component, ligne),
             ligne.reglementaire ? ligne.reglementaire.libelle : ligne.allocation ? "Allocation" : "Remplacement",
@@ -26188,6 +26445,62 @@ async function analyserGabaritMiseEnPage(bytes) {
     notes
   };
 }
+// Montant au dollar (ex. « 896 561 $ ») ou au cent quand il y en a (1.5).
+function montantExact(value, { cents = false } = {}) {
+  const n = Number(value);
+  if (value == null || value === "" || !Number.isFinite(n)) return null;
+  const neg = n < 0;
+  const abs = Math.abs(n);
+  const avecCents = cents && Math.round(abs * 100) % 100 !== 0;
+  const [entier, dec] = (avecCents ? abs.toFixed(2) : String(Math.round(abs))).split(".");
+  const chiffres = entier.replace(/\B(?=(\d{3})+(?!\d))/g, NBSP);
+  return `${neg ? "-" : ""}${chiffres}${dec ? "," + dec : ""}${NBSP}$`;
+}
+// Date saisie (AAAA-MM-JJ) ou texte libre, en toutes lettres.
+function dateTexte(valeur) {
+  const s = String(valeur ?? "").trim();
+  if (!s) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 12)).toLocaleDateString("fr-CA", { day: "numeric", month: "long", year: "numeric", timeZone: "UTC" });
+  return sansNotesInternes(s) || null;
+}
+// Taux d'augmentation réel d'une année sur l'autre (le champ pctAugmentation
+// du moteur est arrondi au dixième, ce qui ferait lire 1,8 % pour 1,76 %).
+function tauxAnnuels(scenario, base) {
+  let prec = Number(base) || 0;
+  return (scenario?.years ?? []).map((y) => {
+    const taux = prec > 0 ? y.cotisation / prec - 1 : y.pctAugmentation / 100;
+    prec = y.cotisation;
+    return Math.round(taux * 10000) / 10000;
+  });
+}
+// Regroupe les années consécutives de même taux : [{ debut, fin, taux }].
+function paliersTaux(taux, premiereAnnee) {
+  const paliers = [];
+  taux.forEach((t, i) => {
+    const an = premiereAnnee + i;
+    const dernier = paliers[paliers.length - 1];
+    if (dernier && Math.abs(dernier.taux - t) < 1e-4) dernier.fin = an;
+    else paliers.push({ debut: an, fin: an, taux: t });
+  });
+  return paliers;
+}
+function periodePalier(p) {
+  if (p.debut === p.fin) return `en ${p.debut}`;
+  if (p.fin === p.debut + 1) return `en ${p.debut} et ${p.fin}`;
+  return `de ${p.debut} à ${p.fin}`;
+}
+// « de 6 % en 2027 et 2028 et de 1,76 % par la suite » (rapport approuvé, 5.0).
+function phraseAugmentations(paliers) {
+  const positifs = paliers.filter((p) => p.taux > 0);
+  const morceaux = positifs.map((p, i) => {
+    const dernier = i === positifs.length - 1 && i > 0 && p.fin === paliers[paliers.length - 1].fin;
+    return dernier ? `de ${pourcent(p.taux)} par la suite` : `de ${pourcent(p.taux)} ${periodePalier(p)}`;
+  });
+  if (morceaux.length === 0) return null;
+  if (morceaux.length === 1) return morceaux[0];
+  return `${morceaux.slice(0, -1).join(", ")} et ${morceaux[morceaux.length - 1]}`;
+}
 async function generateReportDocx(ctx, opts = {}) {
   const { dossier, components: components2, projection } = ctx;
   // Thème de la firme : couleurs, polices, coordonnées. Les outils de mise en
@@ -26211,9 +26524,38 @@ async function generateReportDocx(ctx, opts = {}) {
   const noMembreSignataire = String(signataire?.no_membre ?? "").trim() || null;
   const maintenant = /* @__PURE__ */ new Date();
   const anneeCourante = maintenant.getFullYear();
-  const today = maintenant.toLocaleDateString("fr-CA");
+  const today = dateLongue(maintenant);
   const info = infoBatiment(dossier);
   const nomSignataire = ctx.engineerName || nomFirme;
+  // Bloc « ## sous-titre / - puce / paragraphe » des textes de gabarit.
+  const blocsBalises = (lignes) => (lignes ?? []).flatMap((t) => {
+    const s = String(t ?? "").trim();
+    if (!s) return [];
+    if (s.startsWith("## ")) return [titre3(s.slice(3))];
+    if (s.startsWith("- ")) return [puce(s.slice(2))];
+    return [body(s)];
+  });
+  // Données du mandat : fiche d'immeuble (section « Mandat et visite »), à
+  // défaut la fiche client du syndicat.
+  const mandat = info?.mandat ?? {};
+  const champ = (k) => sansNotesInternes(String(mandat?.[k] ?? "")).trim() || null;
+  const client = ctx.client ?? null;
+  const contactClient = (() => {
+    try {
+      const liste = JSON.parse(client?.contacts || "[]");
+      return Array.isArray(liste) ? liste.find((x) => x && String(x.nom ?? "").trim()) ?? null : null;
+    } catch {
+      return null;
+    }
+  })();
+  const contactNom = champ("contact_nom") ?? (sansNotesInternes(String(contactClient?.nom ?? "")).trim() || null);
+  const contactTitre = champ("contact_titre") ?? (sansNotesInternes(String(contactClient?.fonction ?? "")).trim() || null);
+  const neq = champ("neq") ?? (sansNotesInternes(String(client?.neq ?? "")).trim() || null);
+  const signature = [nomSignataire.replace(/\.$/, ""), String(signataire?.title ?? "").trim()].filter(Boolean).join(", ");
+  const adresse = [dossier.address, dossier.city].filter(Boolean).join(", ");
+  const visiteLe = dateVisiteLongue(dossier.date_visite);
+  const unitesVisitees = Number(champ("unites_visitees"));
+  const lieuSignature = champ("lieu_signature") ?? (estStrategis(nomFirme) ? "Montréal" : null);
   // Page de garde : logo et coordonnées de la firme, jamais ceux d'une autre.
   const logo = ctx.logo ?? null;
   const cover = [
@@ -26223,7 +26565,11 @@ async function generateReportDocx(ctx, opts = {}) {
       children: [new ImageRun({ data: logo.data, type: logo.type, transformation: tailleImage(logo, 170, 110) })]
     })] : [],
     new Paragraph({
-      spacing: { before: logo ? 0 : 1200, after: 120 },
+      spacing: { before: logo ? 0 : 1200, after: 80 },
+      children: [outils.run(String(anneeCourante), { font: theme.policeMono, bold: true, color: GREY, size: 24, characterSpacing: 30 })]
+    }),
+    new Paragraph({
+      spacing: { after: 120 },
       children: [outils.run("PLAN DE GESTION DE L'ACTIF", { font: theme.policeMono, bold: true, color: ORANGE, size: 20, characterSpacing: 30 })]
     }),
     new Paragraph({
@@ -26233,18 +26579,32 @@ async function generateReportDocx(ctx, opts = {}) {
     new Paragraph({
       spacing: { after: 480 },
       border: { bottom: { style: BorderStyle.SINGLE, size: 12, color: ORANGE, space: 12 } },
-      children: [outils.run(`${dossier.address ?? ""}${dossier.city ? ", " + dossier.city : ""}`, { color: GREY, size: 22 })]
+      children: [outils.run(adresse, { color: GREY, size: 22 })]
     }),
     outils.tableauMaison(
-      ["Notre dossier", "Préparé le", "Rédigé par"],
-      [[dossier.dossier_no, dateLongue(maintenant), nomSignataire]]
+      ["Notre dossier", "Mandant", "Immeuble"],
+      [[dossier.dossier_no, dossier.name, adresse || "à confirmer"]]
     ),
     new Paragraph({ spacing: { before: 360, after: 80 }, children: [outils.run("Inclus à votre Plan de gestion de l'actif", { font: theme.policeMono, size: 15, color: GREY, allCaps: true, characterSpacing: 20 })] }),
-    ...["Carnet d'entretien", "Étude du fonds de prévoyance", "Scénario de financement", "Tableur suivi d'entretien"].map((t) => puce(t)),
+    ...["Carnet d'entretien", "Étude en Fonds de prévoyance", "Scénario de financement", "Tableur suivi d'entretien"].map((t) => puce(t)),
     new Paragraph({
       spacing: { before: 720 },
       children: [outils.run(coordonneesFirme(theme), { color: GREY, size: 16 })]
     })
+  ];
+  // Fiche d'identification (page 2 du rapport approuvé).
+  const ligneId = (libelle, valeurs, premier = false) => [
+    new Paragraph({ pageBreakBefore: premier, keepNext: true, spacing: { before: premier ? 0 : 200, after: 40 }, children: [outils.run(libelle, { bold: true })] }),
+    ...valeurs.filter(Boolean).map((v) => body(v))
+  ];
+  const identification = [
+    ...ligneId("Mandant :", [[contactNom, contactTitre].filter(Boolean).join(" / ") || null, dossier.name, dossier.address, dossier.city], true),
+    ...ligneId("Immeuble situé au :", [dossier.address || "à confirmer", dossier.city]),
+    ...ligneId("Notre dossier :", [dossier.dossier_no]),
+    ...ligneId("Objectif :", [champ("objectif") ?? "Plan de gestion de l'actif"]),
+    ...ligneId("Visité le :", [visiteLe ?? A_COMPLETER]),
+    ...ligneId("Préparé le :", [today]),
+    ...ligneId("Rédigé par :", [signature, nomFirme])
   ];
   const tableDesMatieres = [
     new Paragraph({
@@ -26265,39 +26625,76 @@ async function generateReportDocx(ctx, opts = {}) {
   // celle qu'il verse déjà satisfait le double critère — dans ce cas, le scénario de
   // préférence est le maintien, ce que dit d'ailleurs le texte de la section 6.0.
   const scenarioRecommande = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
-  const scenarioPrefere = scenarioStatuQuo?.meetsCriteria ? scenarioStatuQuo : scenarioRecommande;
+  // Scénario de l'ingénieur s'il en a saisi un ; sinon statu quo ou rattrapage.
+  const scenarioPrefere = scenarioDePreference(projection);
+  const scenarioPerso = scenarioPrefere?.code === SCENARIO_PERSO_CODE ? scenarioPrefere : null;
+  // Numérotation du rapport approuvé : B1 = préférence, B2 et B3 = comparatifs.
+  const scenariosOrdonnes = [scenarioPrefere, ...projection.scenarios.filter((s) => s !== scenarioPrefere)].filter(Boolean);
   const anneesScenario = scenarioPrefere?.years ?? [];
-  const cotisationAnUn = scenarioPrefere?.years?.[0]?.cotisation ?? null;
-  const cotisationMensuelle = cotisationAnUn != null ? cotisationAnUn / 12 : null;
-  const nbUnites = Number(dossier.units);
-  const cotisationMensuelleParUnite = cotisationMensuelle != null && Number.isFinite(nbUnites) && nbUnites > 0 ? cotisationMensuelle / nbUnites : null;
+  // An 1 du moteur = l'an prochain : les échéances y sont calculées comme
+  // (année d'installation + durée de vie − année courante).
+  const premiereAnnee = anneeCourante + 1;
+  const anneeDe = (y) => anneeCourante + y.year;
+  const taux = scenarioPrefere ? tauxAnnuels(scenarioPrefere, projection.baseCotisation) : [];
+  const paliers = paliersTaux(taux, premiereAnnee);
+  const augmentations = phraseAugmentations(paliers);
+  const tauxMax5 = Math.max(0, ...taux.slice(0, 5));
+  const cotisationSuffisante = scenarioStatuQuo != null && scenarioStatuQuo.meetsCriteria;
+  // Sévérité, au sens du rapport approuvé : « légèrement insuffisante » quand
+  // le rattrapage reste sous 10 % par année les cinq premières années.
+  // Avec le scénario de l'ingénieur, ce sont ses propres hausses qui disent si
+  // la cotisation actuelle suffisait (pas plus que l'inflation) ou non.
+  const niveau = scenarioPerso
+    ? (tauxMax5 <= projection.params.inflationRate + 1e-4 ? "suffisante" : tauxMax5 <= 0.1 ? "legere" : "insuffisante")
+    : cotisationSuffisante ? "suffisante" : scenarioPrefere && tauxMax5 <= 0.1 ? "legere" : "insuffisante";
   // ---- 1.0 Sommaire du mandat -------------------------------------------
   const anneeConstruction = anneeMaison(info?.caracteristiques?.annee_construction) ?? anneeMaison(dossier.built_year);
+  const immatriculation = dateTexte(champ("date_immatriculation"));
+  const retenuePar = contactNom
+    ? `${contactNom}${contactTitre ? `, ${contactTitre.toLowerCase()}` : ""} du ${adresse || dossier.name}`
+    : `le conseil d'administration du ${dossier.name}${adresse ? `, ${adresse}` : ""}`;
+  const docsDetail = String(mandat?.documents_detail ?? "").split(/\n+/).map((l) => sansNotesInternes(l).replace(/^[-•·]\s*/, "").trim()).filter(Boolean);
+  const docsCoches = Object.entries(info?.documents ?? {}).filter(([, v]) => v === "oui").map(([k]) => `${LIBELLES_DOCUMENTS[k] ?? sansNotesInternes(k.replace(/_/g, " "))};`);
+  const docsListe = docsDetail.length
+    ? docsDetail.map((d) => (/[;.]$/.test(d) ? d : `${d};`))
+    : [
+      ...docsCoches,
+      ...(dossier.current_fund_balance != null || dossier.cotisation_annuelle != null ? ["Informations financières pour le budget de l'année en cours;"] : []),
+      ...(neq ? [`Le Registre des entreprises du Québec (NEQ # ${neq});`] : [])
+    ];
+  const sourceFp = champ("source_fp");
   const sommaireMandat = [
     heading("1.0 Sommaire du mandat"),
-    body(`${nomFirme} a été retenue par le conseil d'administration du ${dossier.name}${dossier.address ? `, ${dossier.address}` : ""}${dossier.city ? ` à ${dossier.city}` : ""}, Qc, pour effectuer une étude du Plan de gestion de l'actif.`),
-    body("Le mandat est soumis aux particularités décrites à la section Méthodologie (2.0) et Limitations légales (7.0) et présentées à l'offre de service."),
+    body(assembler([
+      `${nomFirme} a été retenue par ${retenuePar}, pour effectuer une étude du Plan de gestion de l'actif.`,
+      neq ? `Il s'agit d'une entreprise existante${immatriculation ? `, immatriculée le ${immatriculation}` : ""} sous le nom de « ${dossier.name} » (NEQ ${neq}).` : null
+    ])),
+    body("Le mandat est soumis aux particularités décrites aux sections Champ d'application (2.0) et Limitations (7.0) et présentées à l'offre de service."),
     titre2("1.1 Description de l'immeuble"),
     body(assembler([
-      `Ce complexe de condominiums comprend ${dossier.units ? `${dossier.units} unités` : "un nombre d'unités à confirmer"}${dossier.floors ? `, répartis sur ${dossier.floors} étages` : ""}.`,
-      anneeConstruction != null ? `L'immeuble est d'origine construit en ${anneeConstruction}.` : "L'année de construction de l'immeuble reste à confirmer auprès de l'administration.",
+      `Ce complexe de condominiums se compose d'un bâtiment${dossier.floors ? ` de ${dossier.floors} étages` : ""}.`,
+      `L'immeuble${anneeConstruction != null ? `, construit en ${anneeConstruction},` : ""} regroupe ${dossier.units ? `${dossier.units} unités résidentielles` : "un nombre d'unités à confirmer"}.`,
+      anneeConstruction == null ? "L'année de construction de l'immeuble reste à confirmer auprès de l'administration." : null,
       info?.caracteristiques?.date_conversion ? `La conversion en immeuble de copropriété est survenue vers ${sansNotesInternes(String(info.caracteristiques.date_conversion))}.` : null,
       info?.caracteristiques?.nb_stationnements_int ? `On y dénombre ${sansNotesInternes(String(info.caracteristiques.nb_stationnements_int))} espaces de stationnement intérieurs.` : null,
-      info?.caracteristiques?.nb_ascenseurs ? `L'immeuble compte ${sansNotesInternes(String(info.caracteristiques.nb_ascenseurs))} système(s) d'ascenseur.` : null
+      info?.caracteristiques?.nb_ascenseurs ? `L'immeuble compte ${sansNotesInternes(String(info.caracteristiques.nb_ascenseurs))} système(s) d'ascenseur.` : null,
+      champ("description")
     ])),
     titre2("1.3 Historique"),
-    body(info?.documents?.rapports_travaux === "oui" ? "Nous avons été informés des divers travaux qui ont eu lieu au cours des dernières années. Les informations sont incluses au texte." : "Aucun historique de travaux récents n'a été obtenu. Pour fin de calcul, les années de construction ou de dernière réparation consignées au relevé ont été retenues."),
-    titre2("1.4 Documents de références"),
+    body(champ("historique") ?? (info?.documents?.rapports_travaux === "oui" ? "Nous avons également été informés des divers travaux qui ont eu lieu au cours des dernières années. Les informations sont incluses au texte." : "Aucun historique de travaux récents n'a été obtenu. Pour fin de calcul, les années de construction ou de dernière réparation consignées au relevé ont été retenues.")),
+    titre2("1.4 Documents de référence"),
     body("Voici la liste des documents qui ont été consultés pour la préparation de cette étude de fonds de prévoyance :"),
-    ...Object.entries(info?.documents ?? {}).filter(([, v]) => v === "oui").map(([k]) => puce(`${LIBELLES_DOCUMENTS[k] ?? sansNotesInternes(k.replace(/_/g, " "))};`)),
-    ...(Object.values(info?.documents ?? {}).some((v) => v === "oui") ? [] : [body("Aucun document de référence n'a été consigné comme reçu au moment de la rédaction.")]),
+    ...docsListe.map((d) => puce(d)),
+    ...(docsListe.length ? [] : [body("Aucun document de référence n'a été consigné comme reçu au moment de la rédaction.")]),
     titre2("1.5 Données actuelles au fonds de prévoyance"),
-    body(`Solde du fonds de prévoyance : ${montantMaison(dossier.current_fund_balance) ?? "non disponible"}`),
-    body(`Cotisation annuelle : ${montantMaison(dossier.cotisation_annuelle) ?? "non disponible"}`),
+    body(`Solde du fonds de prévoyance : ${montantExact(dossier.current_fund_balance, { cents: true }) ?? "non disponible"}${sourceFp ? ` ${sourceFp}` : ""}`),
+    body(`Cotisation annuelle : ${montantExact(dossier.cotisation_annuelle, { cents: true }) ?? "non disponible"}${sourceFp ? ` ${sourceFp}` : ""}`),
     titre2("1.6 Visite"),
-    body(`Date de la visite : ${dateVisiteLongue(dossier.date_visite) ?? A_COMPLETER}`),
-    body(`Inspecteur : ${nomSignataire}`),
-    body(`Préparé le : ${today}`),
+    body(`Date de la visite : ${visiteLe ?? A_COMPLETER}`),
+    ...(champ("visite_heures") ? [body(`Heure : ${champ("visite_heures")}`)] : []),
+    ...(champ("meteo") ? [body(`Conditions météo : ${champ("meteo")}`)] : []),
+    body(`Inspecteur : ${signature}`),
+    ...(champ("intervenants") ? [body(`Autres intervenants : ${champ("intervenants")}`)] : []),
     ...sectionEvolution(ctx, outils, anneeCourante)
   ];
   // ---- 2.0 Méthodologie ---------------------------------------------------
@@ -26308,14 +26705,12 @@ async function generateReportDocx(ctx, opts = {}) {
     ...T.famillesEtudiees.map((t) => puce(t)),
     body(`Les estimations de coût prévu et le calendrier des travaux de remplacement qui seront requis au cours des ${projection.params.projectionYears} prochaines années sont décrits en format tableau simplifié dans le document joint à l'ANNEXE A – Sommaire des travaux, et en format tableau détaillé à l'ANNEXE B – Calendrier de remplacement – Scénario de financement.`),
     titre2("2.2 Mise à jour"),
-    body(`En raison du nombre de facteurs qui peuvent influer sur la contribution annuelle requise, nous recommandons que l'étude du fonds de prévoyance soit mise à jour au minimum tous les cinq (5) ans, comme prévue au projet de loi 16. Cette mise à jour devra être planifiée dès ${anneeCourante + 5}.`),
+    body(`En raison du nombre de facteurs qui peuvent influer sur la contribution annuelle requise, nous recommandons que l'étude du fonds de prévoyance soit mise à jour au minimum tous les cinq (5) ans, comme le prévoit le projet de loi 16. Cette mise à jour devra être planifiée dès ${anneeCourante + 5}.`),
     titre2("2.3 Objet et champ d'application du rapport"),
     body(T.objetChamp),
     titre2("2.4 Contexte économique"),
     ...T.contexteEconomique.map((t) => body(t)),
-    body(`Ainsi, nous avons préparé des scénarios de financement sur un cycle de ${projection.params.projectionYears} ans pour les besoins du syndicat de la copropriété. Dans ceux-ci, nous avons supposé que les intérêts sont gagnés à un taux de ${pourcent(projection.params.interestRate)}, qu'ils sont non imposables et sont réinvestis dans le fonds, et que le taux d'inflation annuel des coûts de la construction est de ${pourcent(projection.params.inflationRate)}.`),
-    body(`Sources des hypothèses économiques retenues — taux d'intérêt : ${projection.params.interestSource}; inflation des coûts de la construction : ${projection.params.inflationSource}.`, { color: GREY, size: 18 }),
-    body("Les intérêts sont appliqués au solde d'ouverture de chaque année et sont ramenés à zéro lorsque ce solde est négatif. Une cotisation n'est retenue que si elle satisfait un double critère : le solde du fonds ne devient jamais négatif sur l'horizon, et il demeure positif à l'entrée de la 31e année une fois provisionnée la portion des remplacements à longue durée de vie qui suivent immédiatement l'horizon.", { color: GREY, size: 18 }),
+    body(`Ainsi, nous avons préparé des scénarios (cycle de 25 – ${projection.params.projectionYears} ans) de financement pour les besoins du syndicat de la copropriété. Dans ceux-ci, nous avons supposé que les intérêts sont gagnés à un taux de ${pourcent(projection.params.interestRate)} (basé sur la moyenne dix ans des bons du Trésor 1 mois de la Banque du Canada – ${projection.params.interestSource}), que les intérêts sont non imposables et sont réinvestis dans le fonds, et que le taux d'inflation annuel des coûts de la construction est de ${pourcent(projection.params.inflationRate)} (basé sur le taux d'inflation de la construction résidentielle annuel moyen pour le Québec au cours des dix dernières années, tel que consigné par ${projection.params.inflationSource}).`),
     titre2("2.5 Exigences de la loi sur les copropriétés"),
     body(T.exigencesLoi),
     titre2("2.6 Valeurs relatives des quotes-parts"),
@@ -26324,22 +26719,22 @@ async function generateReportDocx(ctx, opts = {}) {
   // ---- 3.0 Comment lire ce rapport ---------------------------------------
   const commentLire = [
     heading("3.0 Comment lire ce rapport"),
-    titre2("Présentation des éléments et composantes de l'immeuble — le carnet d'entretien"),
+    titre2("Plan de gestion de l'actif"),
+    titre3("Présentation des éléments et composantes de l'immeuble — le carnet d'entretien"),
     body(T.lireRapport.intro),
-    puce("ÉTAT DE L'ACTIF"),
-    puce("DURÉE DE VIE ET REMPLACEMENT"),
-    puce("COMMENTAIRES D'ENTRETIEN"),
-    puce("ATTENTION SPÉCIALE"),
-    titre2("État de l'actif"),
+    body("ÉTAT DE L'ACTIF", { bold: true }),
     ...T.lireRapport.etat.map((t) => body(t)),
-    titre2("Présentation des estimations de coût de remplacement des composantes — durée de vie et coût de remplacement"),
+    titre3("Présentation des estimations de coût de remplacement des composantes — l'étude du fonds de prévoyance"),
+    body("DURÉE DE VIE ET COÛT DE REMPLACEMENT", { bold: true }),
     ...T.lireRapport.dureeVie.map((t) => body(t)),
-    titre2("Commentaires d'entretien"),
+    body("COMMENTAIRES D'ENTRETIEN", { bold: true }),
     body(T.lireRapport.entretien),
-    titre2("Présentation des réparations majeures et des remplacements à prévoir — attention spéciale"),
+    titre3("Présentation des réparations majeures et des remplacements à prévoir"),
+    body("ATTENTION SPÉCIALE", { bold: true }),
     ...T.lireRapport.attention.map((t) => body(t)),
     titre2("Annexes"),
-    ...T.lireRapport.annexes.map((t) => body(t))
+    titre3("Scénario de financement"),
+    ...blocsBalises(T.lireRapport.annexes)
   ];
   // ---- 4.0 Observation des éléments --------------------------------------
   const ordreCategories = Object.entries(CATEGORIES).sort((a, b) => a[1].ordre - b[1].ordre).map(([cle]) => cle);
@@ -26365,13 +26760,13 @@ async function generateReportDocx(ctx, opts = {}) {
   })).fiche);
   const parId = new Map(components2.map((c, i) => [c.id, fiches[i]]));
   const observation = [heading("4.0 Observation des éléments")];
-  observation.push(body("Chacun des éléments est présenté suivant les quatre sous-sections décrites à la section 3.0. Les cotes employées sont celles de la légende : Bon, Passable – Nécessite un entretien, Mauvais – Requiert la planification d'un remplacement."));
   let numeroCategorie = 0;
   for (const cle of ordreCategories) {
     const liste = parCategorie.get(cle);
     if (!liste || liste.length === 0) continue;
     numeroCategorie += 1;
-    observation.push(titre2(`4.${numeroCategorie} ${CATEGORIES[cle].label.toUpperCase()}`));
+    // Familles en capitales, sans numérotation, comme au rapport approuvé.
+    observation.push(titre2(CATEGORIES[cle].label.replace(/^Appareils, installations/, "Appareils / installations").toUpperCase()));
     if (NOTE_CHAMP_PRATIQUE[cle]) observation.push(body(NOTE_CHAMP_PRATIQUE[cle], { color: GREY, size: 18 }));
     let numeroElement = 0;
     for (const comp of liste) {
@@ -26379,7 +26774,7 @@ async function generateReportDocx(ctx, opts = {}) {
       if (!fiche) continue;
       numeroElement += 1;
       observation.push(...outils.ficheDocx({
-        numero: `4.${numeroCategorie}.${numeroElement}`,
+        numero: "",
         nom: sansNotesInternes(comp.name ?? "Élément"),
         categorie: CATEGORIES[cle].label,
         code: sansNotesInternes(comp.uniformat_code ?? ""),
@@ -26394,49 +26789,42 @@ async function generateReportDocx(ctx, opts = {}) {
     }
   }
   // ---- 5.0 Résultats et scénarios de financement --------------------------
-  const cotisationSuffisante = scenarioStatuQuo != null && scenarioStatuQuo.meetsCriteria;
   const resultats = [
     heading("5.0 Résultats et scénarios de financement"),
     body(T.resultats),
-    body("ANNEXE A – SOMMAIRE DES TRAVAUX"),
-    body("ANNEXE B – CALENDRIER DE REMPLACEMENT – SCÉNARIO DE FINANCEMENT"),
-    titre2("Portrait financier de départ"),
-    body(`Solde du fonds de prévoyance retenu au départ du calcul : ${montantMaison(dossier.current_fund_balance) ?? "non disponible"}. Cotisation annuelle actuelle : ${projection.baseCotisationMissing ? "non renseignée — traitée comme nulle aux fins de simulation" : montantMaison(projection.baseCotisation) ?? "non disponible"}.`),
-    body(`Débours projetés sur ${projection.params.projectionYears} ans : ${montantMaison(projection.totalDebours30Ans) ?? "—"}. Portion de la 31e année provisionnée pour les composantes à longue durée de vie : ${montantMaison(projection.portionFutureAn31.total) ?? "—"}. Total retenu au calcul de financement : ${montantMaison(projection.totalAvecPortionFuture) ?? "—"}.`),
-    titre2("Comparaison des scénarios"),
-    tableauMaison(
-      ["Scénario", "Cotisation an 1", `Solde fin an ${projection.params.projectionYears}`, "1re année négative", "Critères respectés"],
-      projection.scenarios.map((s) => [
-        `${s.code} — ${s.label}`,
-        montantMaison(s.years[0]?.cotisation) ?? `-${NBSP}$`,
-        montantMaison(s.soldeFinAn30) ?? `-${NBSP}$`,
-        s.firstNegativeYear != null ? `An ${s.firstNegativeYear}` : "—",
-        s.meetsCriteria ? "Oui" : "Non"
-      ])
-    ),
-    ...scenarioStatuQuo ? [body(
-      scenarioStatuQuo.firstNegativeYear != null
-        ? `À titre de comparaison, le statu quo — soit le maintien de la cotisation actuelle, indexée, sans rattrapage — épuise le fonds dès l'an ${scenarioStatuQuo.firstNegativeYear} de la projection.`
-        : "À titre de comparaison, le statu quo — soit le maintien de la cotisation actuelle, indexée, sans rattrapage — maintient un solde positif sur l'horizon complet.",
-      { color: GREY, size: 18 }
-    )] : []
+    body("ANNEXE–A – SOMMAIRE DES REMPLACEMENTS"),
+    body("ANNEXE–B – CALENDRIER DE REMPLACEMENT – SCÉNARIOS DE FINANCEMENT."),
+    puce("Scénario de financement de préférence B1"),
+    puce("Scénarios de financement comparatifs B2 et B3")
   ];
   if (scenarioPrefere) {
-    resultats.push(titre2(`Scénario de financement de préférence — ${scenarioPrefere.code} (${scenarioPrefere.label})`));
-    resultats.push(body(`Le scénario de financement de préférence résume les besoins annuels de financement selon les exigences de la réglementation actuelle ainsi que les besoins ponctuels de remplacement des éléments du bâtiment. Nous suggérons en ${anneeCourante} une cotisation annuelle au fonds de prévoyance de ${montantMaison(cotisationAnUn) ?? "à confirmer"}${cotisationMensuelleParUnite != null ? ` (environ ${montantMaison(cotisationMensuelleParUnite) ?? "—"} par mois par copropriété)` : ""}. Ces investissements sont requis pour rencontrer les dépenses de réparations majeures et de remplacements prévues au cours des ${projection.params.projectionYears} prochaines années, ainsi que pour débuter le prochain cycle par la suite.`));
+    resultats.push(titre2("Annexe B – Scénario de financement"));
+    const premierePhrase = augmentations
+      ? `Tout d'abord, nous considérons une augmentation annuelle de la contribution au fonds de prévoyance ${augmentations}.`
+      : "Tout d'abord, nous considérons le maintien de la cotisation annuelle actuelle au fonds de prévoyance.";
+    resultats.push(body(`Le scénario de financement de préférence (scénario #1) résume les besoins annuels de financement selon les exigences de la réglementation actuelle ainsi que des besoins ponctuels de remplacement des éléments du bâtiment. ${premierePhrase} Ces investissements sont requis pour faire face aux dépenses de réparations majeures et remplacements prévues au cours des ${projection.params.projectionYears} prochaines années qui cumulent ${montantExact(projection.totalDebours30Ans) ?? "—"} ainsi que pour débuter le prochain cycle dès ${anneeCourante + projection.params.projectionYears + 1}.`));
+    resultats.push(body({
+      suffisante: "Nous remarquons que depuis la construction, le niveau de cotisation au fonds de prévoyance a été suffisant pour faire face aux dépenses prévues au cours du prochain cycle. Ce scénario présente le maintien de la cotisation actuelle, indexée, en considération des remplacements prévus.",
+      legere: "Nous remarquons que depuis la construction, malgré une bonne administration prévisionnelle, le niveau de cotisation au fonds de prévoyance a été légèrement insuffisant. Ceci nécessitera un ajustement à long terme afin de faire face aux dépenses prévues au cours du prochain cycle. Ce scénario présente une solution qui permet de rééquilibrer le fonds de prévoyance en considération des remplacements prévus.",
+      insuffisante: "Nous remarquons que depuis la construction, le niveau de cotisation au fonds de prévoyance a été insuffisant. Ceci nécessitera un ajustement important afin de faire face aux dépenses prévues au cours du prochain cycle. Ce scénario présente une solution qui permet de rééquilibrer le fonds de prévoyance en considération des remplacements prévus."
+    }[niveau]));
     if (scenarioPrefere.approximationNote) resultats.push(body(scenarioPrefere.approximationNote, { color: GREY, size: 18 }));
-    if (scenarioPrefere === scenarioStatuQuo && scenarioRecommande && scenarioRecommande !== scenarioStatuQuo) {
-      resultats.push(body(`La cotisation actuelle satisfait déjà le double critère d'acceptation; le maintien est donc retenu comme scénario de préférence. Le scénario ${scenarioRecommande.code} — ${scenarioRecommande.label} demeure présenté au tableau comparatif à titre d'option de capitalisation accélérée, au choix du conseil d'administration.`, { color: GREY, size: 18 }));
+    if (scenarioPerso && !scenarioPerso.meetsCriteria) {
+      resultats.push(body(scenarioPerso.firstNegativeYear != null
+        ? `NOTE À LA RÉVISION — Le scénario retenu par l'ingénieur épuise le fonds dès ${anneeCourante + scenarioPerso.firstNegativeYear}. Revoir les hausses annuelles avant la publication.`
+        : "NOTE À LA RÉVISION — Le scénario retenu par l'ingénieur ne laisse pas un solde suffisant pour débuter le prochain cycle. Revoir les hausses annuelles avant la publication.", { bold: true, color: ORANGE }));
     }
     resultats.push(titre2("Répartition des dépenses"));
     resultats.push(tableauMaison(
-      ["Année", "Débours prévus", "Cotisation", "Solde du fonds (fin d'année)"],
-      anneesScenario.map((y) => [
-        String(anneeCourante + y.year - 1),
-        montantMaison(y.debours) ?? `-${NBSP}$`,
-        montantMaison(y.cotisation) ?? `-${NBSP}$`,
-        montantMaison(y.soldeFin) ?? `-${NBSP}$`
-      ])
+      ["Année", "Augmentation", "Débours prévus", "Cotisation", "Solde du fonds (fin d'année)"],
+      anneesScenario.map((y, i) => [
+        String(anneeDe(y)),
+        pourcent(taux[i] ?? 0),
+        montantExact(y.debours) ?? `-${NBSP}$`,
+        montantExact(y.cotisation) ?? `-${NBSP}$`,
+        montantExact(y.soldeFin) ?? `-${NBSP}$`
+      ]),
+      { colonnesDroite: [2, 3, 4] }
     ));
   } else {
     resultats.push(titre2("Scénario de financement de préférence"));
@@ -26450,55 +26838,64 @@ async function generateReportDocx(ctx, opts = {}) {
   // ---- 6.0 Conclusion et suggestions -------------------------------------
   const conclusion = [
     heading("6.0 Conclusion et suggestions"),
-    body(cotisationSuffisante
-      ? "À la lumière des informations qui étaient disponibles, nous sommes d'opinion que la contribution périodique actuelle au fonds de prévoyance, en regard avec le solde du compte destiné au fonds, est suffisante pour couvrir les remplacements à venir à moyen et long terme. Il serait suggéré, au conseil d'administration, de maintenir le scénario de financement de préférence afin de permettre un bon entretien préventif et une conservation adéquate de l'immeuble."
-      : "À la lumière des informations qui étaient disponibles, nous sommes d'opinion que la contribution périodique actuelle au fonds de prévoyance, en regard avec le solde du compte destiné au fonds, n'est pas suffisante pour couvrir les remplacements à venir à moyen et long terme. Il serait suggéré, au conseil d'administration, d'adopter le scénario de financement de préférence afin de rectifier la situation et permettre un bon entretien préventif et une conservation adéquate de l'immeuble."),
-    ...montantMaison(cotisationAnUn) != null ? [
-      body("Enfin, la contribution optimale au fonds de prévoyance devrait s'établir comme suit :"),
-      puce(`Cotisation annuelle au fonds de prévoyance de ${montantMaison(cotisationAnUn)} dès ${anneeCourante};`),
-      puce(`Cotisation mensuelle moyenne de ${montantMaison(cotisationMensuelle) ?? "à confirmer"};`),
-      cotisationMensuelleParUnite != null
-        ? puce(`Cotisation mensuelle moyenne par copropriété de ${montantMaison(cotisationMensuelleParUnite)};`)
-        : puce("Cotisation mensuelle moyenne par copropriété : à établir selon les quotes-parts de la déclaration de copropriété;"),
-      puce(`Maintien de ce niveau de cotisation, indexé, jusqu'à la fin du cycle de ${projection.params.projectionYears} ans.`)
-    ] : [
-      body("La contribution optimale au fonds de prévoyance n'a pu être arrêtée : aucun des scénarios simulés ne satisfait le double critère d'acceptation à partir des données actuelles. Les montants doivent être établis par l'ingénieur responsable à la section 5.0 avant la diffusion du rapport.", { bold: true, color: ORANGE })
-    ],
-    titre2("Invitation"),
-    body(cotisationSuffisante
-      ? "Actuellement, l'étude démontre une saine gestion par les années passées. Malgré cette bonne situation financière, nous suggérons aux membres du syndicat une rencontre à nos bureaux afin d'optimiser l'utilisation du rapport. Voir les détails à l'offre de services. Sur place nous pourrons entre autres échanger et considérer d'autres options de scénario de financement si nécessaire."
-      : "Dans le contexte où un ajustement des cotisations est nécessaire, nous suggérons aux membres du syndicat de planifier une rencontre à nos bureaux afin de mieux présenter la situation à prévoir. Voir les détails et les frais à l'offre de services. Sur place nous pourrons échanger et considérer d'autres options de scénario de financement qui tiendront compte des impératifs actuels du syndicat."),
-    body("Pour toute divergence avec le scénario de financement, ce dernier devra être considéré comme conforme à l'étude.", { bold: true })
+    body({
+      suffisante: "À la lumière des informations qui étaient disponibles, nous sommes d'opinion que la contribution périodique actuelle au fonds de prévoyance, en regard du solde du compte destiné au fonds, est suffisante pour couvrir les remplacements à venir à moyen et à long terme. Il serait suggéré au conseil d'administration de maintenir le scénario de financement de préférence afin de permettre un bon entretien préventif et une conservation adéquate de l'immeuble.",
+      legere: "À la lumière des informations qui étaient disponibles, nous sommes d'opinion que la contribution périodique actuelle au fonds de prévoyance, en regard du solde du compte destiné au fonds, a été légèrement insuffisante pour couvrir les remplacements à venir à moyen et à long terme. Il serait suggéré au conseil d'administration d'adopter le scénario de financement de préférence afin de rectifier la situation et de permettre un bon entretien préventif et une conservation adéquate de l'immeuble.",
+      insuffisante: "À la lumière des informations qui étaient disponibles, nous sommes d'opinion que la contribution périodique actuelle au fonds de prévoyance, en regard du solde du compte destiné au fonds, a été insuffisante pour couvrir les remplacements à venir à moyen et à long terme. Il serait suggéré au conseil d'administration d'adopter le scénario de financement de préférence afin de rectifier la situation et de permettre un bon entretien préventif et une conservation adéquate de l'immeuble."
+    }[niveau])
   ];
+  if (scenarioPrefere) {
+    conclusion.push(body("Enfin, la contribution optimale au fonds de prévoyance devrait s'établir comme suit :"));
+    paliers.forEach((p, i) => {
+      const dernier = i === paliers.length - 1;
+      if (p.taux <= 0) conclusion.push(puce(`Maintien de la cotisation annuelle actuelle ${periodePalier(p)} ;`));
+      else conclusion.push(puce(dernier && i > 0 ? `Augmentation annuelle continue de ${pourcent(p.taux)} jusqu'à la fin` : `Augmentation annuelle continue de ${pourcent(p.taux)} ${periodePalier(p)} ;`));
+    });
+  } else {
+    conclusion.push(body("La contribution optimale au fonds de prévoyance n'a pu être arrêtée : aucun des scénarios simulés ne satisfait le double critère d'acceptation à partir des données actuelles. Les montants doivent être établis par l'ingénieur responsable à la section 5.0 avant la diffusion du rapport.", { bold: true, color: ORANGE }));
+  }
+  if (niveau === "suffisante" || niveau === "legere") {
+    conclusion.push(titre2("Nous vous félicitons !"));
+    conclusion.push(body(niveau === "legere"
+      ? `L'analyse confirme une saine gestion au cours des dernières années. Alors que, pour des immeubles similaires, les hausses moyennes intègrent un bond de 100 % aux deux premières années du scénario, votre augmentation de seulement ${pourcent(tauxMax5)} place votre organisation dans une position particulièrement avantageuse.`
+      : "L'analyse confirme une saine gestion au cours des dernières années. Alors que, pour des immeubles similaires, les hausses moyennes intègrent un bond de 100 % aux deux premières années du scénario, le maintien de votre cotisation actuelle, indexée, place votre organisation dans une position particulièrement avantageuse."));
+  } else {
+    conclusion.push(titre2("Invitation"));
+    conclusion.push(body("Dans le contexte où un ajustement des cotisations est nécessaire, nous suggérons aux membres du syndicat de planifier une rencontre à nos bureaux afin de mieux présenter la situation à prévoir. Voir les détails et les frais à l'offre de services. Sur place, nous pourrons échanger et considérer d'autres options de scénario de financement qui tiendront compte des impératifs actuels du syndicat."));
+  }
   // ---- 7.0 Limitations légales -------------------------------------------
   const limitations = [
     heading("7.0 Limitations légales"),
     titre2("Mandant"),
-    ...T.limitations.mandant.map((t) => body(t)),
+    ...blocsBalises(T.limitations.mandant),
     titre2("Visite et observation"),
-    ...T.limitations.visite.map((t) => body(t)),
+    ...blocsBalises(T.limitations.visite),
     titre2("Étude et calcul de financement"),
-    ...T.limitations.financement.map((t) => body(t)),
+    ...blocsBalises(T.limitations.financement),
     titre2("Tableur suivi d'entretien"),
-    ...T.limitations.tableur.map((t) => body(t)),
+    ...blocsBalises(T.limitations.tableur),
     titre2("Services professionnels"),
-    ...T.limitations.services.map((t) => body(t)),
+    ...blocsBalises(T.limitations.services),
     titre2("Complémentaire"),
-    ...T.limitations.complementaire.map((t) => body(t))
+    ...blocsBalises(T.limitations.complementaire)
   ];
   // ---- 8.0 Déclaration ----------------------------------------------------
+  // Ordre du rapport approuvé : trois attestations, l'ordre professionnel,
+  // l'inspection personnelle, puis la mention de visite.
+  const attestations = [...T.declaration];
+  attestations.splice(Math.min(3, attestations.length), 0, ordre
+    ? `J'ai rédigé mes analyses, opinions et conclusions de même que le présent rapport en conformité avec les règlements et normes de pratique de l'${ordre.nom} (${ordre.sigle});`
+    : `J'ai rédigé mes analyses, opinions et conclusions de même que le présent rapport en conformité avec les règlements et normes de pratique de ${A_COMPLETER} — ordre professionnel du signataire;`);
+  const unitesTexte = Number.isFinite(unitesVisitees) && unitesVisitees > 0 ? ` ainsi que ${unitesVisitees} unité${unitesVisitees > 1 ? "s" : ""} privative${unitesVisitees > 1 ? "s" : ""}` : "";
   const declaration = [
     heading("8.0 Déclaration"),
     body("Je, soussigné, atteste par la présente, au meilleur de ma connaissance et de ma conviction, que :"),
-    ...T.declaration.map((t) => puce(t)),
-    puce(ordre
-      ? `J'ai rédigé mes analyses, opinions et conclusions de même que le présent rapport en conformité avec les règlements et normes de pratique de l'${ordre.nom} (${ordre.sigle});`
-      : `J'ai rédigé mes analyses, opinions et conclusions de même que le présent rapport en conformité avec les règlements et normes de pratique de ${A_COMPLETER} — ordre professionnel du signataire;`),
-    puce(`La visite des lieux a été effectuée le ${dateVisiteLongue(dossier.date_visite) ?? A_COMPLETER} par ${nomSignataire.replace(/\.$/, "")}. Les espaces communs ont été visités.`),
-    body(`Fait le ${today}.`),
-    body("Je déclare avoir procédé avec diligence dans l'exercice de la profession en ce qui concerne les opinions de valeur reliées au remplacement des éléments du bâtiment en cause."),
+    ...attestations.map((t) => puce(t)),
+    puce(`La visite des lieux a été effectuée le ${visiteLe ?? A_COMPLETER} par ${signature}${/\.$/.test(signature) ? "" : "."} Les espaces communs ont été visités${unitesTexte}.`),
+    body(lieuSignature ? `Fait à ${lieuSignature}, le ${today}.` : `Fait le ${today}.`),
+    body("Je déclare avoir procédé avec diligence dans l'exercice de la profession concernant les opinions de valeur reliées au remplacement des éléments du bâtiment en cause."),
     body("________________________"),
-    body(nomSignataire, { bold: true }),
+    body(signature, { bold: true }),
     body(ordre
       ? `N° de membre de l'${ordre.sigle} : ${noMembreSignataire ?? A_COMPLETER}`
       : `Ordre professionnel et n° de membre : ${noMembreSignataire ?? A_COMPLETER}`)
@@ -26521,20 +26918,16 @@ async function generateReportDocx(ctx, opts = {}) {
   }
   // ---- 9.0 Informations relatives au suivi de l'entretien ------------------
   const suivi = [
-    heading("9.0 Informations relatives au suivi de l'entretien"),
+    heading("9.0 Informations relatives au Tableur suivi d'entretien"),
     titre2("9.1 La loi 16"),
-    ...T.suiviEntretien.loi16.map((t) => body(t)),
+    ...blocsBalises(T.suiviEntretien.loi16),
     titre2("9.2 Les grandes questions"),
-    body("Comment devons-nous procéder ? Les actions générales attendues du conseil d'administration sont les suivantes :"),
-    ...T.suiviEntretien.actions.map((t) => puce(t)),
-    body("Devons-nous respecter la planification ? Trois niveaux d'intervention sont à distinguer :"),
-    ...T.suiviEntretien.niveaux.map((t) => puce(t)),
-    titre2("Notre expérience"),
-    ...T.suiviEntretien.experience.map((t) => body(t))
+    ...blocsBalises(T.suiviEntretien.questions),
+    ...(T.suiviEntretien.experience?.length ? [titre2("Notre expérience"), ...T.suiviEntretien.experience.map((t) => body(t))] : [])
   ];
   // ---- Annexes -------------------------------------------------------------
   const lexique = [
-    heading("Annexe — Lexique et légendes"),
+    heading("Annexes – Lexiques et légendes"),
     body("Voici la définition de quelques termes utilisés en contexte de copropriété :"),
     ...T.lexique.flatMap(([terme, definition]) => [
       new Paragraph({
@@ -26549,7 +26942,7 @@ async function generateReportDocx(ctx, opts = {}) {
     ...T.legendes.map((t) => puce(t))
   ];
   const annexeA = [
-    heading("Annexe A — Sommaire des travaux"),
+    heading("Annexe A – Sommaire des remplacements"),
     body("Sommaire des remplacements et allocations retenus au calcul du scénario de financement. Les montants sont budgétaires, en dollars actuels, avant planifications et taxes (Loi 16)."),
     tableauMaison(
       ["Élément", "Code", "Cote au rapport", "Type de ligne", "Durée / cycle", "Année", "Montant"],
@@ -26562,74 +26955,110 @@ async function generateReportDocx(ctx, opts = {}) {
           ligne.allocation ? "Allocation" : "Remplacement",
           String(ligne.duree),
           ligne.annee != null ? String(ligne.annee) : "à confirmer",
-          montantMaison(ligne.cout) ?? `-${NBSP}$`
+          montantMaison(ligne.cout) ?? "—"
         ];
       })
     )
   ];
-  // ---- Annexe B — Calendrier de remplacement -------------------------------
+  // ---- Annexes B1, B2 et B3 — Calendriers de remplacement ------------------
   const annexeB = [
-    heading("Annexe B — Calendrier de remplacement — Scénario de financement"),
-    body("Le calendrier ci-dessous présente, année par année, les débours prévus, la cotisation et le solde du fonds pour chacun des scénarios simulés. Le scénario de préférence est celui retenu à la section 5.0."),
-    ...projection.scenarios.flatMap((s) => [
-      titre2(`${s.code} — ${s.label}${scenarioPrefere && s.code === scenarioPrefere.code ? " (scénario de préférence)" : ""}`),
-      ...s.approximationNote ? [body(s.approximationNote, { color: GREY, size: 18 })] : [],
-      tableauMaison(
-        ["Année", "Augmentation", "Débours prévus", "Cotisation", "Solde du fonds (fin d'année)"],
-        s.years.map((y) => [
-          String(anneeCourante + y.year - 1),
-          `${y.pctAugmentation.toFixed(1).replace(".", ",")}${NBSP}%`,
-          montantMaison(y.debours) ?? `-${NBSP}$`,
-          montantMaison(y.cotisation) ?? `-${NBSP}$`,
-          montantMaison(y.soldeFin) ?? `-${NBSP}$`
-        ])
-      ),
-      body("")
-    ])
+    heading("Annexes B1, B2 et B3 – Calendriers de remplacement"),
+    body("Le calendrier ci-dessous présente, année par année, les débours prévus, la cotisation et le solde du fonds pour chacun des scénarios. Le scénario B1 est le scénario de préférence retenu à la section 5.0; les scénarios B2 et B3 sont fournis afin de permettre une mise en perspective."),
+    ...scenariosOrdonnes.flatMap((s, n) => {
+      const t = tauxAnnuels(s, projection.baseCotisation);
+      return [
+        titre2(`Annexe B${n + 1} – ${s.label}${s === scenarioPrefere ? " (scénario de préférence)" : " (scénario comparatif)"}`),
+        ...s.approximationNote ? [body(s.approximationNote, { color: GREY, size: 18 })] : [],
+        ...(!s.meetsCriteria ? [body(s.firstNegativeYear != null ? `Ce scénario épuise le fonds dès ${anneeCourante + s.firstNegativeYear}.` : "Ce scénario ne laisse pas un solde suffisant pour débuter le prochain cycle.", { color: GREY, size: 18 })] : []),
+        tableauMaison(
+          ["Année", "Augmentation", "Débours prévus", "Cotisation", "Solde du fonds (fin d'année)"],
+          s.years.map((y, i) => [
+            String(anneeDe(y)),
+            pourcent(t[i] ?? 0),
+            montantExact(y.debours) ?? `-${NBSP}$`,
+            montantExact(y.cotisation) ?? `-${NBSP}$`,
+            montantExact(y.soldeFin) ?? `-${NBSP}$`
+          ]),
+          { colonnesDroite: [2, 3, 4] }
+        ),
+        body("")
+      ];
+    })
   ];
   // ---- Sommaire exécutif — 5 ans -----------------------------------------
   // Balisé pour qu'un gabarit de firme puisse le placer où il veut
-  // ({{SOMMAIRE_EXECUTIF}}) ; sinon il ouvre le rapport.
+  // ({{SOMMAIRE_EXECUTIF}}) ; sinon il ouvre le rapport. Forme du rapport
+  // approuvé : par année, l'ajustement des cotisations puis les travaux.
   const travauxParAnnee = new Map();
   const inclus = new Set(projection.includedComponentIds ?? []);
   for (const comp of components2) {
     if (!inclus.has(comp.id)) continue;
+    const ligne = ligneDureeVie(comp, dossier);
     for (const ev of replacementEventsForComponent(comp, projection.params).events) {
       if (ev.year > 5) continue;
       if (!travauxParAnnee.has(ev.year)) travauxParAnnee.set(ev.year, []);
-      travauxParAnnee.get(ev.year).push(`${sansNotesInternes(comp.name)} — ${montantMaison(ev.cost) ?? `-${NBSP}$`}`);
+      // Montant en dollars actuels, comme aux fiches.
+      travauxParAnnee.get(ev.year).push(`${sansNotesInternes(comp.name)} – ${ligne.allocation ? "allocation" : "remplacement"} ${montantMaison(comp.replacement_cost) ?? `-${NBSP}$`}`);
     }
   }
   const sommaireExecutif = [
     new Paragraph({ children: [new TextRun({ text: MARQUE_DEBUT_SOMMAIRE })] }),
     heading("Sommaire exécutif — 5 ans — Scénario de financement", { sansSaut: pourGabarit }),
-    body(`Le sommaire exécutif permet une appréciation succincte des ajustements aux cotisations du fonds de prévoyance et des projets de remplacement prévus au cours des cinq prochaines années${scenarioPrefere ? `, selon le scénario de financement de préférence (${scenarioPrefere.code})` : ""}.`),
-    ...scenarioPrefere ? [tableauMaison(
-      ["Année", "Augmentation", "Cotisation annuelle", "Travaux prévus"],
-      anneesScenario.slice(0, 5).map((y) => [
-        String(anneeCourante + y.year - 1),
-        `${y.pctAugmentation.toFixed(1).replace(".", ",")}${NBSP}%`,
-        montantMaison(y.cotisation) ?? `-${NBSP}$`,
-        (travauxParAnnee.get(y.year) ?? []).join(" · ") || "Aucun remplacement"
-      ]),
-      { colonnesDroite: [2] }
-    )] : [body("Aucun des scénarios simulés ne satisfait le double critère d'acceptation : le sommaire exécutif sera établi après la révision du calcul de financement.", { bold: true, color: ORANGE })],
-    body("Pour toute divergence avec le scénario de financement, ce dernier devra être considéré comme conforme à l'étude.", { color: GREY, size: 18 }),
-    new Paragraph({ children: [new TextRun({ text: MARQUE_FIN_SOMMAIRE })] })
+    ...(T.sommaireExecutif ?? []).map((t) => body(t)),
+    ...(T.chargesCommunes ?? []).map((t) => puce(t))
   ];
+  if (scenarioPrefere) {
+    sommaireExecutif.push(body("Selon scénario de financement #1 – Annexe B1", { bold: true }));
+    anneesScenario.slice(0, 5).forEach((y, i) => {
+      sommaireExecutif.push(new Paragraph({ keepNext: true, spacing: { before: 120, after: 40 }, children: [outils.run(taux[i] > 0 ? `${anneeDe(y)} – augmentation de ${pourcent(taux[i])} des cotisations` : `${anneeDe(y)} – maintien des cotisations`, { bold: true })] }));
+      const travaux = travauxParAnnee.get(y.year) ?? [];
+      if (travaux.length === 0) sommaireExecutif.push(body("Aucun remplacement"));
+      else for (const t of travaux) sommaireExecutif.push(body(t));
+    });
+    if (anneesScenario.length > 5) {
+      const suite = paliers.filter((p) => p.fin >= premiereAnnee + 5);
+      sommaireExecutif.push(new Paragraph({ spacing: { before: 120, after: 100 }, children: [outils.run(suite.length === 1
+        ? `${premiereAnnee + 5} – ${suite[0].taux > 0 ? `augmentation de ${pourcent(suite[0].taux)} des cotisations` : "maintien des cotisations"} jusqu'en ${suite[0].fin}`
+        : `${premiereAnnee + 5} et suivantes – selon l'Annexe B1`, { bold: true })] }));
+    }
+  } else {
+    sommaireExecutif.push(body("Aucun des scénarios simulés ne satisfait le double critère d'acceptation : le sommaire exécutif sera établi après la révision du calcul de financement.", { bold: true, color: ORANGE }));
+  }
+  sommaireExecutif.push(
+    body("Pour toute divergence avec le scénario de financement, ce dernier devra être considéré comme conforme à l'étude.", { bold: true }),
+    new Paragraph({ children: [new TextRun({ text: MARQUE_FIN_SOMMAIRE })] })
+  );
+  // Pages « Carnet d'entretien et étude du fonds de prévoyance ».
+  const reglement = (T.reglement ?? []).length ? [
+    heading("Carnet d'entretien et étude du fonds de prévoyance"),
+    body("Réalisation, contenu et modalité", { bold: true, color: GREY }),
+    ...blocsBalises(T.reglement)
+  ] : [];
   // Un seul flux paginé : chaque grande section s'ouvre sur une nouvelle page
   // (saut avant les titres de niveau 1) et les fiches se suivent sans page
-  // blanche. Le pied de page porte la firme et la pagination continue.
+  // blanche. Le pied de page reprend la mention du rapport approuvé, la firme
+  // et la pagination continue.
   const piedDePage = {
     options: {
-      children: [new Paragraph({
-        border: { top: { style: BorderStyle.SINGLE, size: 4, color: THEME_DEFAUT.filet, space: 6 } },
-        tabStops: [{ type: TabStopType.RIGHT, position: 9360 }],
-        children: [
-          outils.run(`${nomFirme} — Plan de gestion de l'actif — ${dossier.dossier_no}`, { font: theme.policeMono, size: 14, color: GREY }),
-          new TextRun({ children: ["\t", PageNumber.CURRENT], font: theme.policeMono, size: 14, color: GREY })
-        ]
-      })]
+      children: [
+        new Paragraph({
+          border: { top: { style: BorderStyle.SINGLE, size: 4, color: THEME_DEFAUT.filet, space: 6 } },
+          alignment: AlignmentType.CENTER,
+          children: [outils.run("Rapport pour consultation interne et préparé exclusivement pour le mandant", { font: theme.policeMono, size: 12, color: GREY })]
+        }),
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          spacing: { after: 40 },
+          children: [outils.run(`Toute reproduction est interdite sans le consentement du mandant ou de ${nomFirme}`, { font: theme.policeMono, size: 12, color: GREY })]
+        }),
+        new Paragraph({
+          tabStops: [{ type: TabStopType.RIGHT, position: 9360 }],
+          children: [
+            outils.run(`${nomFirme} — ${dossier.dossier_no}`, { font: theme.policeMono, size: 14, color: GREY }),
+            new TextRun({ children: ["\tPage ", PageNumber.CURRENT, " de ", PageNumber.TOTAL_PAGES], font: theme.policeMono, size: 14, color: GREY })
+          ]
+        })
+      ]
     }
   };
   const doc = new File$1({
@@ -26643,8 +27072,9 @@ async function generateReportDocx(ctx, opts = {}) {
       properties: { page: { margin: { top: 1080, right: 1080, bottom: 1080, left: 1080 } } },
       footers: pourGabarit ? void 0 : { default: piedDePage },
       children: [
-        ...pourGabarit ? [] : [...cover, ...tableDesMatieres],
+        ...pourGabarit ? [] : [...cover, ...identification, ...tableDesMatieres],
         ...sommaireExecutif,
+        ...reglement,
         ...sommaireMandat,
         ...methodologie,
         ...commentLire,
@@ -46982,7 +47412,7 @@ function generateReportXlsx(ctx) {
     { wch: 14 },
     { wch: 8 }
   ];
-  const recommended = projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  const recommended = scenarioDePreference(projection);
   const summarySheet = utils.aoa_to_sheet([
     ["Plan de gestion de l'actif — Étude du fonds de prévoyance", dossier.name],
     ["Dossier", dossier.dossier_no],
@@ -46997,7 +47427,7 @@ function generateReportXlsx(ctx) {
     ["Horizon de projection", `${projection.params.projectionYears} ans + portion future an 31`],
     [],
     ["Résultats"],
-    ["Scénario recommandé", recommended ? `${recommended.code} — ${recommended.label}` : "Aucun — révision requise"],
+    ["Scénario retenu au rapport", recommended ? `${recommended.code} — ${recommended.label}` : "Aucun — révision requise"],
     ["Solde actuel du fonds ($)", dossier.current_fund_balance ?? ""],
     ["Cotisation annuelle actuelle ($)", projection.baseCotisationMissing ? "non renseignée" : Math.round(projection.baseCotisation)],
     ["Total débours projetés sur 30 ans ($)", Math.round(projection.totalDebours30Ans)],
@@ -49174,10 +49604,15 @@ async function buildReportContext(c, opts = {}) {
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
-    units: dossier.units
+    units: dossier.units,
+    scenarioPerso: lireScenarioPerso(dossier)
   });
+  // Fiche client du syndicat (NEQ, représentant) pour la page d'identification
+  // et la section 1.0 ; toujours de la même firme que le dossier.
+  const client = dossier.client_id ? await c.env.DB.prepare("SELECT * FROM clients WHERE id = ?1 AND company_id = ?2").bind(dossier.client_id, dossier.company_id).first().catch(() => null) : null;
   return {
     dossier,
+    client,
     components: components2,
     projection,
     texteMaison: await texteMaisonPour(c.env.DB, dossier.company_id),
@@ -49201,8 +49636,7 @@ async function buildReportContext(c, opts = {}) {
 }
 // Scénario dont le rapport tire la cotisation recommandée.
 function scenarioRetenu(projection) {
-  return projection.scenarios.find((s) => s.code === "C1.1.2" && s.meetsCriteria)
-    ?? projection.scenarios.find((s) => s.code === projection.recommendedCode) ?? null;
+  return scenarioDePreference(projection);
 }
 // Valeurs des champs {{…}} d'un gabarit de firme.
 function valeursChamps(ctx) {
@@ -49256,7 +49690,8 @@ dossiers.get("/:id/projection", async (c) => {
   const projection = projectReserveFund(componentsRaw.results, {
     currentFundBalance: dossier.current_fund_balance,
     baseCotisation: dossier.cotisation_annuelle,
-    units: dossier.units
+    units: dossier.units,
+    scenarioPerso: lireScenarioPerso(dossier)
   });
   return c.json(projection);
 });
@@ -49338,9 +49773,18 @@ dossiers.patch("/:id", async (c) => {
     "published_at",
     "batiment_info",
     "cotisation_annuelle",
-    "date_visite"
+    "date_visite",
+    "scenario_perso"
   ]) {
     if (key in body2) {
+      if (key === "scenario_perso") {
+        // Stocké en JSON validé ; null le retire et le rapport revient au moteur.
+        const propre = nettoyerScenarioPerso(body2[key]);
+        if (typeof propre === "string") return c.json({ error: propre }, 400);
+        fields.push(`${key} = ?${fields.length + 1}`);
+        values.push(propre ? JSON.stringify(propre) : null);
+        continue;
+      }
       // Publier maintenant passe par POST /publier, qui vérifie et fige le
       // rapport. Une date passée reste permise : c'est l'historique d'une
       // étude livrée hors de la plateforme (révision aux cinq ans).
@@ -49405,6 +49849,18 @@ async function verificationPublication(db, dossier, signataire) {
     ).bind(dossier.id).first())?.m;
     if (modif && dossier.pdf_signe_le && modif > dossier.pdf_signe_le) {
       avertissements.push({ cle: "pdf_ancien", message: "Le dossier a été modifié après le dépôt du PDF signé : vérifiez que le PDF correspond toujours au rapport." });
+    }
+  }
+  // Un scénario de l'ingénieur qui épuise le fonds ne se signe pas.
+  const perso = lireScenarioPerso(dossier);
+  if (perso) {
+    const actives = (await db.prepare("SELECT * FROM components WHERE dossier_id = ?1 AND actif = 1").bind(dossier.id).all()).results;
+    const proj = projectReserveFund(actives, { currentFundBalance: dossier.current_fund_balance, baseCotisation: dossier.cotisation_annuelle, units: dossier.units, scenarioPerso: perso });
+    const sc = proj.scenarios.find((x) => x.code === SCENARIO_PERSO_CODE);
+    if (sc && !sc.meetsCriteria) {
+      bloquants.push({ cle: "scenario", message: sc.firstNegativeYear != null
+        ? `Votre scénario de financement épuise le fonds dès l'an ${sc.firstNegativeYear} : revoyez les hausses annuelles.`
+        : "Votre scénario de financement ne laisse pas un solde suffisant pour débuter le prochain cycle : revoyez les hausses annuelles." });
     }
   }
   if (!comp?.total) bloquants.push({ cle: "composantes", message: "Aucune composante active au dossier." });

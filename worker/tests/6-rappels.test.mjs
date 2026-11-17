@@ -31,7 +31,11 @@ test('les études arrivées à révision partent aux administrateurs, une fois p
   assert.ok(!texte.includes(`RV-RECENTE-${suffixe}`), 'une étude récente n\'est pas à réviser');
   assert.ok(!texte.includes(`RV-BROUILLON-${suffixe}`), 'une étude non publiée n\'est pas à réviser');
 
-  // Le mois suivant : déjà rappelées, elles ne repartent pas.
+  // Le mois suivant : déjà rappelées, elles ne repartent pas. La tâche planifiée
+  // tourne en waitUntil : /__scheduled répond avant qu'elle ait fini d'envoyer
+  // et de marquer rappel_revision_le. Sans cette attente, la seconde exécution
+  // peut partir avant le marquage et renvoyer les mêmes rappels.
+  await pause(1500);
   const ensuite = nombreCourriels();
   assert.equal((await planifiee()).status, 200);
   await pause(1500);
