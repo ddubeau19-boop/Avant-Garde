@@ -497,6 +497,7 @@ input, textarea { font-family: var(--font-body); }
 }
 .imm-row.narrow .imm-input { flex: none; width: 112px; text-align: center; }
 .imm-input:focus { border-color: var(--orange); }
+.imm-area { font-weight: 500; resize: vertical; min-height: 72px; font-family: inherit; line-height: 1.4; }
 .imm-foot { font-family: var(--font-mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-400); text-align: center; padding: 6px 0 10px; }
 
 @media (max-width: 360px) {

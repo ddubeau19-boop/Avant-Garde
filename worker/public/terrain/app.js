@@ -79,6 +79,22 @@ const IMM_DOCS = [
   ['carnet_entretien',          "Carnet d'entretien"],
 ];
 
+// Repris aux pages d'identification, 1.0, 1.6 et 8.0 du rapport.
+const IMM_MANDAT = [
+  { k: 'contact_nom',          q: 'Représentant du mandant (ex. Monsieur Pierre Tremblay)' },
+  { k: 'contact_titre',        q: 'Titre du représentant (ex. Administrateur)' },
+  { k: 'neq',                  q: "NEQ du syndicat" },
+  { k: 'date_immatriculation', q: "Date d'immatriculation (AAAA-MM-JJ)" },
+  { k: 'visite_date',          q: 'Date de la visite (AAAA-MM-JJ)' },
+  { k: 'visite_heures',        q: 'Heures de la visite (ex. entre 10 h et 13 h 30)' },
+  { k: 'meteo',                q: 'Conditions météo (ex. Ensoleillée, 30 degrés Celsius)' },
+  { k: 'intervenants',         q: 'Autres intervenants présents' },
+  { k: 'unites_visitees',      q: "Nombre d'unités privatives visitées", mode: 'numeric' },
+  { k: 'source_fp',            q: 'Source du solde et de la cotisation (ex. prévu pour 2026 selon le courriel du 28 octobre 2026)' },
+  { k: 'description',          q: "Description de l'immeuble (fondations, revêtement, toiture, mitoyenneté…)", long: true },
+  { k: 'documents_detail',     q: 'Documents de référence détaillés — un par ligne (auteur, date, numéro)', long: true },
+];
+
 const IMM_CARACS = [
   { k: 'annee_construction',      q: 'Année de construction',                                       type: 'year' },
   { k: 'date_conversion',         q: 'Date de conversion (immeuble converti en copropriété)',       type: 'year' },
@@ -1144,6 +1160,13 @@ function immeubleHtml() {
     </div>`;
   }).join('');
 
+  const mandatHtml = IMM_MANDAT.map(cfg => {
+    const control = cfg.long
+      ? `<textarea class="imm-input imm-area" id="imm_mandat_${esc(cfg.k)}" data-role="imm-text" data-sec="mandat" data-key="${esc(cfg.k)}" rows="3">${esc(immGet('mandat', cfg.k))}</textarea>`
+      : immTextHtml('mandat', cfg.k, '—', cfg.mode);
+    return `<div class="imm-row"><div class="imm-q">${esc(cfg.q)}</div>${control}</div>`;
+  }).join('');
+
   const remplHtml = IMM_REMPLACEMENTS.map(([k, label]) => `
     <div class="imm-row narrow">
       <div class="imm-q">${esc(label)}</div>
@@ -1167,6 +1190,12 @@ function immeubleHtml() {
       <div class="hdr-sub">${esc(d.name)}${d.address ? ' · ' + esc(d.address) : ''}</div>
     </div>
     <div class="imm-body">
+      <div class="imm-section">
+        <h3><span class="n">0</span>Mandat et visite</h3>
+        <p class="imm-hint">Repris tels quels à la page d'identification, aux sections 1.0 et 1.6 et à la déclaration du rapport.</p>
+        ${mandatHtml}
+      </div>
+
       <div class="imm-section">
         <h3><span class="n">1</span>Documents à fournir avant la visite</h3>
         <p class="imm-hint">Chaque document : reçu, non reçu, ou non disponible.</p>
