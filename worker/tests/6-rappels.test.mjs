@@ -23,7 +23,9 @@ test('les études arrivées à révision partent aux administrateurs, une fois p
 
   const avant = nombreCourriels();
   assert.equal((await planifiee()).status, 200);
-  const recus = (await courrielsApres(avant, { attendus: 2 })).filter((c) => c.includes(suffixe));
+  // La même tâche envoie aussi d'autres rappels (carnet d'entretien…) : on
+  // attend les deux courriels qui portent ces études, pas deux courriels quelconques.
+  const recus = await courrielsApres(avant, { attendus: 2, contient: suffixe });
   assert.ok(recus.length >= 2, 'l\'administrateur et le super administrateur de la firme A');
   const texte = recus[0];
   assert.ok(texte.includes(`RV-DUE-${suffixe}`));
@@ -39,7 +41,7 @@ test('les études arrivées à révision partent aux administrateurs, une fois p
   const ensuite = nombreCourriels();
   assert.equal((await planifiee()).status, 200);
   await pause(1500);
-  assert.equal((await courrielsApres(ensuite, { attendus: 0, delai: 0 })).filter((c) => c.includes(suffixe)).length, 0);
+  assert.equal((await courrielsApres(ensuite, { attendus: 0, delai: 0, contient: suffixe })).length, 0);
 });
 
 test('une révision commencée arrête le rappel', async () => {
