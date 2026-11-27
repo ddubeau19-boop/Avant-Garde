@@ -42,7 +42,12 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - uses: android-actions/setup-android@v3
+      # Le SDK Android est déjà installé sur ubuntu-latest (ANDROID_HOME) ;
+      # Gradle télécharge lui-même la plateforme et les build-tools manquants.
+      - name: SDK Android
+        run: |
+          test -n "$ANDROID_HOME" && test -d "$ANDROID_HOME" || { echo "::error::ANDROID_HOME absent du serveur"; exit 1; }
+          echo "SDK : $ANDROID_HOME"
 
       - name: Dépendances
         working-directory: mobile
