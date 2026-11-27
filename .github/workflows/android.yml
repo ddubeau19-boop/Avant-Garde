@@ -65,8 +65,11 @@ jobs:
         env:
           KEYSTORE_B64: ${{ secrets.TERRAIN_KEYSTORE_BASE64 }}
           TERRAIN_KEYSTORE_PASSWORD: ${{ secrets.TERRAIN_KEYSTORE_PASSWORD }}
-          TERRAIN_VERSION_CODE: ${{ github.run_number }}
+          NUMERO: ${{ github.run_number }}
         run: |
+          # +100 : passe devant les APK construits à la main (versions 1, 2…),
+          # sinon Android refuserait d'installer celui-ci par-dessus.
+          export TERRAIN_VERSION_CODE=$((100 + NUMERO))
           if [ -n "$KEYSTORE_B64" ]; then
             echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/terrain.jks"
             export TERRAIN_KEYSTORE="$RUNNER_TEMP/terrain.jks"

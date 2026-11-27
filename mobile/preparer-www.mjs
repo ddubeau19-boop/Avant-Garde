@@ -39,9 +39,13 @@ html = html.replace(
 writeFileSync(chemin, html);
 
 // L'app s'ouvre sur https://localhost/ : on y renvoie vers l'app terrain.
+// Le nom du fichier doit figurer dans l'adresse : le serveur de Capacitor
+// répond à toute adresse sans extension (« terrain/ ») par CE index.html,
+// et la redirection tournerait en boucle (page blanche).
 writeFileSync(join(WWW, 'index.html'),
   '<!DOCTYPE html><html lang="fr-CA"><head><meta charset="utf-8">' +
-  '<meta http-equiv="refresh" content="0; url=terrain/"></head><body></body></html>\n');
+  '<script>location.replace("terrain/index.html")</script>' +
+  '<meta http-equiv="refresh" content="0; url=terrain/index.html"></head><body></body></html>\n');
 
 if (!existsSync(join(WWW, 'terrain', 'natif.js'))) throw new Error('terrain/natif.js manquant.');
 console.log(`www/ prêt (API : ${SITE}).`);
