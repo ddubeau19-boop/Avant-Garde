@@ -1,0 +1,74 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace = "io.stratege.pga.inspection"
+    compileSdk = rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId "io.stratege.pga.inspection"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        // Chaque APK doit porter un numéro plus grand que le précédent, sinon
+        // Android refuse de l'installer par-dessus. Le workflow GitHub fournit
+        // le numéro d'exécution.
+        versionCode((System.getenv("TERRAIN_VERSION_CODE") ?: "1") as Integer)
+        versionName "1." + (System.getenv("TERRAIN_VERSION_CODE") ?: "1")
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    // Signature : la clé de l'app (TERRAIN_KEYSTORE, TERRAIN_KEYSTORE_PASSWORD,
+    // alias « terrain »). Une mise à jour doit être signée avec la même clé,
+    // sinon il faut désinstaller l'app, et perdre ce qui n'était pas envoyé.
+    // Sans clé, l'APK est signé avec la clé de débogage de la machine : bon
+    // pour un essai, pas pour une app qu'on mettra à jour.
+    def cle = System.getenv("TERRAIN_KEYSTORE")
+    signingConfigs {
+        if (cle) {
+            terrain {
+                storeFile file(cle)
+                storePassword System.getenv("TERRAIN_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("TERRAIN_KEY_ALIAS") ?: "terrain"
+                keyPassword System.getenv("TERRAIN_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig cle ? signingConfigs.terrain : signingConfigs.debug
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}

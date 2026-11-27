@@ -9,6 +9,7 @@
 //   « année de construction ou réparation + durée de vie utile ».
 
 import * as HL from './hors-ligne.js';
+import * as NATIF from './natif.js';
 
 const TOKEN_KEY = 'cs_terrain_token';
 
@@ -265,7 +266,7 @@ async function apiFetch(path, opts, config) {
   const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
   const minuterie = ctrl ? setTimeout(() => ctrl.abort(), config.timeout || 20000) : null;
   try {
-    res = await fetch(path, Object.assign({}, opts, { headers }, ctrl ? { signal: ctrl.signal } : {}));
+    res = await fetch(NATIF.SITE + path, Object.assign({}, opts, { headers }, ctrl ? { signal: ctrl.signal } : {}));
   } catch (e) {
     const err = new Error('Erreur réseau. Vérifiez votre connexion.');
     err.reseau = true;
@@ -655,7 +656,8 @@ async function preparerHorsLigne(id) {
 }
 
 function enregistrerServiceWorker() {
-  if (!('serviceWorker' in navigator)) return;
+  // Dans l'app Android, les fichiers sont déjà sur le téléphone.
+  if (NATIF.estNatif || !('serviceWorker' in navigator)) return;
   navigator.serviceWorker.register('./sw.js').catch(() => { /* l'application reste utilisable en ligne */ });
 }
 
@@ -680,8 +682,25 @@ async function loadCompanyLogo() {
    Boot / auth / dossiers
    ============================================================ */
 
+// Bouton retour d'Android : ferme la caméra, sinon fait comme la flèche de
+// retour de l'écran. Sur le premier écran, l'app passe en arrière-plan.
+function retourAndroid() {
+  if (camera.el) {
+    const fermer = camera.el.querySelector('[data-cam="fermer"]');
+    if (fermer) fermer.click();
+    return true;
+  }
+  const fleche = document.querySelector('.hdr-back');
+  if (!fleche) return false;
+  // Quitter un champ l'enregistre (blur) avant de changer d'écran.
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  fleche.click();
+  return true;
+}
+
 async function boot() {
   enregistrerServiceWorker();
+  NATIF.surRetour(retourAndroid);
   await chargerEnvois();
   if (state.token) {
     state.screen = 'loading';
@@ -1103,8 +1122,22 @@ function onRatingClick(raw) {
 /* ---------- photos ---------- */
 
 function triggerPhotoInput() {
+  // Dans l'app Android : l'appareil photo du téléphone, pleine qualité,
+  // avec une copie de sauvegarde dans la galerie.
+  if (NATIF.photoNativeDisponible()) { photoSysteme(); return; }
   const input = document.getElementById('photoFileInput');
   if (input) input.click();
+}
+
+async function photoSysteme() {
+  if (!state.activeId) return;
+  try {
+    const fichier = await NATIF.prendrePhotoNative();
+    if (fichier) await ajouterPhotos([fichier]);
+  } catch (e) {
+    state.error = friendlyError(e);
+    render();
+  }
 }
 
 // Réduit une photo de téléphone (souvent 3 à 8 Mo) à 2048 px de côté en JPEG
@@ -1249,6 +1282,8 @@ async function demarrerFlux() {
   const video = camera.el.querySelector('.cam-video');
   video.srcObject = camera.flux;
   try { await video.play(); } catch (e) { /* lecture auto refusée : l'image démarre au premier toucher */ }
+  // Caméra fermée pendant le démarrage (bouton 📱, retour) : plus rien à régler.
+  if (!camera.el || !camera.flux) return;
   if (captureNativeDisponible()) cameraMessage('');
   else {
     // Conseil affiché quelques secondes seulement : il ne doit pas cacher l'aperçu.
@@ -1762,10 +1797,12 @@ async function downloadReport(kind) {
     const res = await apiFetch(`/api/dossiers/${state.dossier.id}/${chemin}`, null, { timeout: 180000 });
     if (!res.ok) throw new Error("Le rapport n'est pas disponible pour le moment.");
     const blob = await res.blob();
+    const nom = kind === 'suivi' ? `${slug(state.dossier.name)}-suivi-entretien.xlsx` : `${slug(state.dossier.name)}-rapport.${kind}`;
+    if (await NATIF.partagerFichier(blob, nom)) return;
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = kind === 'suivi' ? `${slug(state.dossier.name)}-suivi-entretien.xlsx` : `${slug(state.dossier.name)}-rapport.${kind}`;
+    a.download = nom;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -1915,7 +1952,7 @@ function loginHtml() {
         <button class="btn-primary" type="submit" ${state.loginLoading || !state.online ? 'disabled' : ''}>
           ${state.loginLoading ? `<i data-lucide="loader-2" class="spin" style="width:17px;height:17px"></i>Connexion…` : `<i data-lucide="log-in" style="width:17px;height:17px"></i>Se connecter`}
         </button>
-        <a href="/compte/?retour=/terrain/" style="display:block;text-align:center;margin-top:14px;font-size:12.5px;color:var(--ink-500)">Mot de passe oublié ?</a>
+        <a href="${NATIF.lienSite('/compte/?retour=/terrain/')}" style="display:block;text-align:center;margin-top:14px;font-size:12.5px;color:var(--ink-500)">Mot de passe oublié ?</a>
       </form>
     </div>
   </div>`;
@@ -1937,7 +1974,7 @@ function dossiersHtml() {
     <div class="top-row" style="margin-bottom:20px">
       <div class="brand"><img src="${state.companyLogoUrl || '../assets/logo-mark.png'}" alt=""><span>${esc((state.user && state.user.company && state.user.company.name) || 'Condo Stratégis')}</span></div>
       <div style="display:flex;gap:14px;align-items:center">
-        <a href="/compte/?changer=1&retour=/terrain/" style="color:var(--ink-500);font-size:12px;text-decoration:none">Mot de passe</a>
+        <a href="${NATIF.lienSite('/compte/?changer=1&retour=/terrain/')}" style="color:var(--ink-500);font-size:12px;text-decoration:none">Mot de passe</a>
         <button data-action="logout" style="border:none;background:none;color:var(--ink-500);font-size:12px;cursor:pointer">Déconnexion</button>
       </div>
     </div>

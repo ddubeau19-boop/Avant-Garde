@@ -1,0 +1,86 @@
+name: APK Android
+
+# Construit l'app Android (Capacitor, dossier mobile/) et publie l'APK comme
+# artefact téléchargeable depuis l'onglet Actions. L'app embarque une copie de
+# worker/public/terrain : chaque changement de l'app terrain demande un
+# nouvel APK, d'où le déclenchement sur ces deux dossiers.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/**'
+      - 'worker/public/terrain/**'
+      - 'worker/public/shared/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Construire l'APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Le SDK Android est déjà installé sur ubuntu-latest (ANDROID_HOME) ;
+      # Gradle télécharge lui-même la plateforme et les build-tools manquants.
+      - name: SDK Android
+        run: |
+          test -n "$ANDROID_HOME" && test -d "$ANDROID_HOME" || { echo "::error::ANDROID_HOME absent du serveur"; exit 1; }
+          echo "SDK : $ANDROID_HOME"
+
+      - name: Dépendances
+        working-directory: mobile
+        run: npm ci
+
+      - name: Préparer l'app
+        working-directory: mobile
+        run: node preparer-www.mjs && npx cap sync android
+
+      # Avec les secrets : APK signé avec la clé de l'app, qui s'installe
+      # par-dessus la version précédente. Sans eux (fork, secrets absents) :
+      # clé de débogage du serveur, bon pour un essai seulement.
+      - name: Construire
+        working-directory: mobile/android
+        env:
+          KEYSTORE_B64: ${{ secrets.TERRAIN_KEYSTORE_BASE64 }}
+          TERRAIN_KEYSTORE_PASSWORD: ${{ secrets.TERRAIN_KEYSTORE_PASSWORD }}
+          NUMERO: ${{ github.run_number }}
+        run: |
+          # +100 : passe devant les APK construits à la main (versions 1, 2…),
+          # sinon Android refuserait d'installer celui-ci par-dessus.
+          export TERRAIN_VERSION_CODE=$((100 + NUMERO))
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/terrain.jks"
+            export TERRAIN_KEYSTORE="$RUNNER_TEMP/terrain.jks"
+          else
+            echo "::warning::Secrets de signature absents : APK signé avec une clé de débogage, qui ne s'installera pas par-dessus l'app signée."
+          fi
+          ./gradlew assembleRelease --no-daemon
+          mkdir -p ../out && cp app/build/outputs/apk/release/app-release.apk "../out/inspection-terrain-${TERRAIN_VERSION_CODE}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inspection-terrain-apk
+          path: mobile/out/*.apk
+          retention-days: 90

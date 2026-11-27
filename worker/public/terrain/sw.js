@@ -7,7 +7,7 @@
 // données de visite sont gérées par l'application (hors-ligne.js).
 // ============================================================
 const CACHE = 'cs-terrain-v1';
-const COQUILLE = ['./', './app.js', './hors-ligne.js', './style.css', '../shared/tokens.css', '../assets/logo-mark.png'];
+const COQUILLE = ['./', './app.js', './hors-ligne.js', './natif.js', './style.css', '../shared/tokens.css', '../assets/logo-mark.png'];
 const EXTERNES = ['https://unpkg.com/lucide@0.462.0/dist/umd/lucide.js'];
 const HOTES_EXTERNES = ['unpkg.com', 'fonts.googleapis.com', 'fonts.gstatic.com'];
 

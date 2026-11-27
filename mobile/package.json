@@ -1,0 +1,22 @@
+{
+  "name": "cs-terrain-android",
+  "private": true,
+  "description": "App Android de l'inspection terrain (Capacitor). Embarque worker/public/terrain.",
+  "scripts": {
+    "preparer": "node preparer-www.mjs",
+    "sync": "node preparer-www.mjs && cap sync android",
+    "apk": "node preparer-www.mjs && cap sync android && cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.6.3",
+    "@capacitor/app": "8.1.2",
+    "@capacitor/camera": "8.2.7",
+    "@capacitor/core": "8.6.3",
+    "@capacitor/filesystem": "8.1.6",
+    "@capacitor/share": "8.0.3"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.6.3",
+    "lucide": "0.462.0"
+  }
+}
