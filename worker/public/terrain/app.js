@@ -1107,11 +1107,13 @@ function triggerPhotoInput() {
   if (input) input.click();
 }
 
-// Réduit une photo de téléphone (souvent 3 à 5 Mo) à 1600 px de côté en JPEG
-// avant l'envoi : le rapport Word les intègre toutes, et un Worker n'a que
-// 128 Mo de mémoire. En cas d'échec (format non décodable), l'original part.
+// Réduit une photo de téléphone (souvent 3 à 8 Mo) à 2048 px de côté en JPEG
+// avant l'envoi : environ 0,6 à 1 Mo, assez net pour lire une plaque
+// signalétique ou une fissure. Le rapport Word plafonne lui-même ce qu'il
+// intègre (4 photos par fiche, budget de 40 Mo) pour rester dans la mémoire
+// d'un Worker. En cas d'échec (format non décodable), l'original part.
 async function reduirePhoto(file) {
-  const COTE_MAX = 1600;
+  const COTE_MAX = 2048;
   try {
     if (!window.createImageBitmap || !file.type.startsWith('image/')) return file;
     const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
@@ -1122,7 +1124,7 @@ async function reduirePhoto(file) {
     canvas.height = Math.round(bitmap.height * echelle);
     canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
     bitmap.close && bitmap.close();
-    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.82));
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.88));
     if (!blob) return file;
     return new File([blob], (file.name || 'photo').replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' });
   } catch (err) {
@@ -1189,7 +1191,7 @@ async function ajouterPhoto(file, compId, dossierId) {
 // les photos s'empilent en vignettes, « Terminer » les joint toutes à la
 // composante. L'écran vit hors du rendu de l'app (un <video> recréé à chaque
 // rendu couperait l'image) et se gère lui-même.
-const camera = { el: null, flux: null, prises: [], torche: false, compId: null };
+const camera = { el: null, flux: null, prises: [], torche: false, compId: null, enPrise: false };
 
 function cameraDisponible() {
   return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.isSecureContext);
@@ -1247,10 +1249,21 @@ async function demarrerFlux() {
   const video = camera.el.querySelector('.cam-video');
   video.srcObject = camera.flux;
   try { await video.play(); } catch (e) { /* lecture auto refusée : l'image démarre au premier toucher */ }
-  cameraMessage('');
+  if (captureNativeDisponible()) cameraMessage('');
+  else {
+    // Conseil affiché quelques secondes seulement : il ne doit pas cacher l'aperçu.
+    cameraMessage("Sur cet appareil, la caméra de l'app donne des photos moins nettes. Pour une photo importante (plaque, défaut), utilisez l'appareil photo du téléphone : bouton à gauche.");
+    const el = camera.el;
+    setTimeout(() => { if (camera.el === el) cameraMessage(''); }, 6000);
+  }
   const piste = camera.flux.getVideoTracks()[0];
   const capacites = piste && piste.getCapabilities ? piste.getCapabilities() : {};
   camera.el.querySelector('.cam-torche').hidden = !capacites.torch;
+  // Mise au point continue quand le téléphone la propose : l'aperçu reste net
+  // en passant d'un équipement à l'autre.
+  if (piste && Array.isArray(capacites.focusMode) && capacites.focusMode.includes('continuous')) {
+    try { await piste.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }); } catch (e) { /* facultatif */ }
+  }
 }
 
 function arreterFlux() {
@@ -1272,17 +1285,60 @@ function onCameraVisibilite() {
   if (!piste || piste.readyState === 'ended') demarrerFlux();
 }
 
-async function prendrePhoto() {
-  const video = camera.el && camera.el.querySelector('.cam-video');
-  if (!video || !video.videoWidth) return;
+// Une vraie photo, pas une image du flux vidéo. Le flux d'aperçu n'a ni mise
+// au point au déclenchement, ni HDR, ni réduction du bruit, et sa résolution
+// est souvent bien plus basse que celle du capteur : c'est ce qui donnait des
+// photos floues et granuleuses. ImageCapture.takePhoto() (Chrome sur Android)
+// demande au téléphone une photo comme son app photo la prendrait.
+// Sans ImageCapture (iPhone, Firefox) ou si la prise échoue, on retombe sur
+// l'image du flux, et l'écran conseille l'appareil photo du téléphone.
+function captureNativeDisponible() {
+  return typeof window.ImageCapture === 'function';
+}
+
+async function photoNative(piste) {
+  const capteur = new window.ImageCapture(piste);
+  let reglages;
+  try {
+    const cap = await capteur.getPhotoCapabilities();
+    if (cap && cap.imageWidth && cap.imageWidth.max) {
+      reglages = { imageWidth: cap.imageWidth.max, imageHeight: cap.imageHeight && cap.imageHeight.max };
+    }
+    if (camera.torche && cap && Array.isArray(cap.fillLightMode) && cap.fillLightMode.includes('flash')) {
+      reglages = Object.assign(reglages || {}, { fillLightMode: 'flash' });
+    }
+  } catch (e) { /* réglages inconnus : la photo par défaut du téléphone suffit */ }
+  const prise = reglages ? capteur.takePhoto(reglages).catch(() => capteur.takePhoto()) : capteur.takePhoto();
+  // Une prise qui ne répond pas (pilote capricieux) ne doit pas bloquer le déclencheur.
+  const delai = new Promise((_, rej) => setTimeout(() => rej(new Error('délai')), 8000));
+  return Promise.race([prise, delai]);
+}
+
+function imageDuFlux(video) {
   const canvas = document.createElement('canvas');
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
   canvas.getContext('2d').drawImage(video, 0, 0);
+  return new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.92));
+}
+
+async function prendrePhoto() {
+  const video = camera.el && camera.el.querySelector('.cam-video');
+  if (!video || !video.videoWidth || camera.enPrise) return;
+  camera.enPrise = true;
+  const declencheur = camera.el.querySelector('.cam-declencheur');
+  if (declencheur) declencheur.classList.add('occupe');
   const flash = camera.el.querySelector('.cam-flash');
   flash.classList.remove('on'); void flash.offsetWidth; flash.classList.add('on');
   if (navigator.vibrate) navigator.vibrate(30);
-  const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.92));
+  let blob = null;
+  const piste = camera.flux && camera.flux.getVideoTracks()[0];
+  if (piste && piste.readyState === 'live' && captureNativeDisponible()) {
+    try { blob = await photoNative(piste); } catch (e) { blob = null; }
+  }
+  if (!blob && camera.el) blob = await imageDuFlux(video);
+  camera.enPrise = false;
+  if (declencheur) declencheur.classList.remove('occupe');
   if (!blob || !camera.el) return;
   const n = camera.prises.length + 1;
   const fichier = new File([blob], `photo-${Date.now()}-${n}.jpg`, { type: 'image/jpeg' });
@@ -1303,6 +1359,7 @@ function fermerCamera() {
   arreterFlux();
   camera.prises.forEach(p => URL.revokeObjectURL(p.url));
   camera.prises = [];
+  camera.enPrise = false;
   document.removeEventListener('visibilitychange', onCameraVisibilite);
   if (camera.el) camera.el.remove();
   camera.el = null;
