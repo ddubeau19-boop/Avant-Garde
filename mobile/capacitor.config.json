@@ -1,0 +1,12 @@
+{
+  "appId": "io.stratege.pga.inspection",
+  "appName": "Inspection terrain",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": false,
+    "captureInput": true
+  },
+  "plugins": {
+    "SplashScreen": { "launchShowDuration": 0 }
+  }
+}

@@ -50661,6 +50661,46 @@ prix.delete("/:id", async (c) => {
 globalThis.process = _process;
 globalThis.console = workerdConsole;
 const app = new Hono();
+// L'app Android (Capacitor) embarque l'app terrain : ses pages viennent de
+// https://localhost, pas de ce domaine. Elle s'authentifie par jeton Bearer,
+// jamais par témoin (cookie), donc ouvrir l'API à cette seule origine ne
+// donne rien à un site tiers. ORIGINES_APP (séparées par des virgules)
+// remplace la liste au besoin.
+const ORIGINES_APP_DEFAUT = ["https://localhost"];
+function origineAutorisee(c) {
+  const origine = c.req.header("Origin");
+  if (!origine) return null;
+  const liste = c.env?.ORIGINES_APP ? String(c.env.ORIGINES_APP).split(",").map((s) => s.trim()).filter(Boolean) : ORIGINES_APP_DEFAUT;
+  return liste.includes(origine) ? origine : null;
+}
+app.use("/api/*", async (c, next) => {
+  const origine = origineAutorisee(c);
+  if (c.req.method === "OPTIONS") {
+    if (!origine) return new Response(null, { status: 403 });
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": origine,
+        "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": c.req.header("Access-Control-Request-Headers") || "Authorization, Content-Type",
+        "Access-Control-Max-Age": "86400",
+        "Vary": "Origin"
+      }
+    });
+  }
+  await next();
+  if (origine) {
+    // Une réponse venue d'ailleurs (R2, assets) peut avoir des en-têtes figés.
+    try {
+      c.res.headers.set("Access-Control-Allow-Origin", origine);
+    } catch (e) {
+      c.res = new Response(c.res.body, c.res);
+      c.res.headers.set("Access-Control-Allow-Origin", origine);
+    }
+    c.res.headers.set("Access-Control-Expose-Headers", "Content-Disposition");
+    c.res.headers.append("Vary", "Origin");
+  }
+});
 app.get("/api/health", (c) => c.json({ ok: true }));
 const PUBLIC_PREFIXES = ["/api/health", "/api/auth"];
 app.use("/api/*", async (c, next) => {
